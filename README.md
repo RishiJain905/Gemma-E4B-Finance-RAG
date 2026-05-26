@@ -184,23 +184,23 @@ This means every document is **finance-understood**, not just statistically chun
 ```mermaid
 graph TB
     subgraph Chroma["ChromaDB — Vector Store"]
-        V1[Document Embedding 1]
-        V2[Document Embedding 2]
-        V3[Document Embedding N]
-        V1 --- M1[Metadata: ticker, date, source, doc_type]
-        V2 --- M2[Metadata: ticker, date, source, doc_type]
+        V1["Document Embedding 1"]
+        V2["Document Embedding 2"]
+        V3["Document Embedding N"]
+        V1 --- M1["Metadata: ticker, date, source, doc_type"]
+        V2 --- M2["Metadata: ticker, date, source, doc_type"]
     end
 
     subgraph SQLite["SQLite — Structured Store"]
         subgraph Facts["facts table"]
-            F1[ticker | metric | value | period | source_url]
-            F2[NVDA | revenue_q1 | 26.0B | 2026-Q1 | edgar/...]
+            F1["ticker · metric · value · period · source_url"]
+            F2["NVDA · revenue_q1 · 26.0B · 2026-Q1 · edgar/…"]
         end
         subgraph Cache["cache_meta table"]
-            C1[ticker | last_updated | source | status]
+            C1["ticker · last_updated · source · status"]
         end
         subgraph Filings["filing_index table"]
-            FI1[ticker | filing_type | filing_date | form | accession]
+            FI1["ticker · filing_type · filing_date · form · accession"]
         end
     end
 
