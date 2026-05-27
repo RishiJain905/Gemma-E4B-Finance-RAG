@@ -88,6 +88,7 @@ model:
     dimension: 0    # Fill after Task 1.1.7
     normalize: true
     batch_supported: true
+    pooling: "mean"
 
   # ── Model Paths (Windows) ────────────────────────────
   paths:

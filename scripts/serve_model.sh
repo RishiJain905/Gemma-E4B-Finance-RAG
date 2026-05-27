@@ -33,8 +33,9 @@ start_server() {
         --n-gpu-layers 99 \
         --rope-scaling none \
         --flash-attn 1 \
-        --parallel 1 \
         --cont-batching 1 \
+        --embeddings \
+        --pooling mean \
         > "$LOG_FILE" 2>&1 &
 
     PID=$!
