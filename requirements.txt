@@ -1,0 +1,21 @@
+# requirements.txt
+# ── Core ──────────────────────────────────────────────
+chromadb>=0.6.0
+numpy>=1.24.0
+
+# ── Web / API ─────────────────────────────────────────
+httpx>=0.27.0          # HTTP client for llama-server API
+requests>=2.31.0       # Fallback HTTP client
+
+# ── Data Processing ───────────────────────────────────
+pydantic>=2.0.0        # Data validation / schemas
+python-dateutil>=2.8.0 # Date parsing
+
+# ── Ingestion (Phase 1.3+) ───────────────────────────
+yfinance>=0.2.0        # Yahoo Finance data
+sec-edgar-api>=1.0.0   # SEC EDGAR filings
+gdelt>=1.0.0           # GDELT news
+fredapi>=0.5.0         # FRED economic data
+
+# ── Testing ───────────────────────────────────────────
+pytest>=8.0.0
