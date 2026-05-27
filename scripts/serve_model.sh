@@ -1,10 +1,7 @@
 #!/usr/bin/env bash
-set -euo pipefail
-
-# ──────────────────────────────────────────────
-# TraceAlchemy llama-server Wrapper
-# Usage: ./scripts/serve_model.sh [start|stop|restart|status] [port]
-# ──────────────────────────────────────────────
+# scripts/serve_model.sh — TraceAlchemy llama-server Wrapper
+# ⚠ NOTE: This is a reference script for POSIX systems.
+# See serve_model.ps1 for the Windows/AMD RDNA3 PowerShell version.
 
 MODEL_PATH="$HOME/models/tracealchemy/TraceAlchemy-Gemma-4-E4B-Finance-IT.gguf"
 PORT="${2:-8080}"
@@ -20,13 +17,13 @@ ensure_log_dir() {
 
 start_server() {
     ensure_log_dir
-
     if [ -f "$PID_FILE" ] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
-        echo "❌ Server is already running (PID $(cat "$PID_FILE")). Use 'stop' first or 'restart'."
+        echo "❌ Server is already running (PID $(cat "$PID_FILE"))."
         exit 1
     fi
 
     echo "🚀 Starting TraceAlchemy on port $PORT..."
+    echo "ℹ️  Windows + AMD RDNA3? Use serve_model.ps1 instead."
 
     nohup llama-server \
         -m "$MODEL_PATH" \
@@ -42,109 +39,58 @@ start_server() {
 
     PID=$!
     echo $PID > "$PID_FILE"
-
-    echo "✅ Server started (PID $PID)"
-    echo "   Logs: $LOG_FILE"
-    echo "   API:  http://127.0.0.1:$PORT"
+    echo "✅ Server started (PID $PID) — http://127.0.0.1:$PORT"
 
     sleep 2
     if kill -0 $PID 2>/dev/null; then
         echo "   Status: running"
     else
-        echo "   ⚠️  Server exited prematurely. Check logs:"
+        echo "   ⚠️  Exited early. Check: $LOG_FILE"
         tail -5 "$LOG_FILE"
         exit 1
     fi
 }
 
 stop_server() {
-    if [ ! -f "$PID_FILE" ]; then
-        echo "ℹ️  No PID file found. Server may not be running."
-        local pids
-        pids=$(lsof -ti :"$PORT" 2>/dev/null || true)
-        if [ -n "$pids" ]; then
-            echo "   Found process on port $PORT. Stopping..."
-            kill $pids 2>/dev/null || true
-            echo "✅ Stopped."
-        else
-            echo "   No server found on port $PORT."
-        fi
-        return
-    fi
+    [ -f "$PID_FILE" ] && pid=$(cat "$PID_FILE") || pid=""
 
-    local pid
-    pid=$(cat "$PID_FILE")
-
-    if kill -0 "$pid" 2>/dev/null; then
-        echo "🛑 Stopping TraceAlchemy (PID $pid)..."
-        kill "$pid"
+    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+        echo "🛑 Stopping (PID $pid)..."
+        kill "$pid" 2>/dev/null
         for i in $(seq 1 10); do
-            if ! kill -0 "$pid" 2>/dev/null; then
-                break
-            fi
+            kill -0 "$pid" 2>/dev/null || break
             sleep 1
         done
-        if kill -0 "$pid" 2>/dev/null; then
-            echo "   Force killing..."
-            kill -9 "$pid" 2>/dev/null || true
-        fi
-        echo "✅ Server stopped."
+        kill -9 "$pid" 2>/dev/null || true
+        echo "✅ Stopped."
     else
-        echo "ℹ️  PID $pid is not running. Cleaning up PID file."
+        echo "ℹ️  Not running. Cleaning up."
     fi
-
     rm -f "$PID_FILE"
 }
 
 status_server() {
     if [ -f "$PID_FILE" ] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
-        local pid
         pid=$(cat "$PID_FILE")
-        local uptime
-        uptime=$(ps -o etime= -p "$pid" | xargs)
-        echo "✅ TraceAlchemy is running"
-        echo "   PID:     $pid"
-        echo "   Port:    $PORT"
-        echo "   Uptime:  $uptime"
-        echo "   Logs:    $LOG_FILE"
-
-        if curl -sf http://127.0.0.1:"$PORT"/v1/completions \
+        echo "✅ Running (PID $pid) — http://127.0.0.1:$PORT"
+        curl -sf http://127.0.0.1:"$PORT"/v1/completions \
              -H "Content-Type: application/json" \
-             -d '{"prompt": "test", "max_tokens": 1}' > /dev/null 2>&1; then
-            echo "   API:     responding ✅"
-        else
-            echo "   API:     not responding ❌"
-        fi
+             -d '{"prompt": "test", "max_tokens": 1}' > /dev/null 2>&1 \
+          && echo "   API: responding ✅" || echo "   API: not responding ❌"
     else
-        echo "❌ TraceAlchemy is not running"
+        echo "❌ Not running"
         rm -f "$PID_FILE"
     fi
 }
 
-case "$ACTION" in
-    start)
-        start_server
-        ;;
-    stop)
-        stop_server
-        ;;
-    restart)
-        stop_server
-        sleep 1
-        start_server
-        ;;
-    status)
-        status_server
-        ;;
+case "${ACTION}" in
+    start)  start_server ;;
+    stop)   stop_server ;;
+    restart) stop_server; sleep 1; start_server ;;
+    status) status_server ;;
     *)
         echo "Usage: $0 {start|stop|restart|status} [port]"
-        echo ""
-        echo "Examples:"
-        echo "  $0 start          Start on default port 8080"
-        echo "  $0 start 8081     Start on port 8081"
-        echo "  $0 status         Check if server is running"
-        echo "  $0 stop           Stop the server"
-        echo "  $0 restart        Restart the server"
+        echo "Windows users: use serve_model.ps1"
         exit 1
         ;;
 esac
