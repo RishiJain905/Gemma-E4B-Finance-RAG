@@ -1,0 +1,58 @@
+# configs/model.yaml
+# TraceAlchemy Model Configuration
+# Fill in after completing Phase 1.1 tasks
+
+model:
+  name: "TraceAlchemy-Gemma-4-E4B-Finance-IT"
+  id: "tracealchemy"
+  backend: "llama-server"
+  base_url: "http://127.0.0.1:8080"
+
+  # Architecture
+  family: "Gemma 4 E4B"
+  architecture: "Mixture-of-Experts (MoE)"
+  parameters_total: "~9B"
+  parameters_active: "~2.6B"
+  quantization: "TBD"  # Update after downloading
+
+  # Context & Limits
+  max_context: 32768
+  max_tokens_default: 2048
+  max_tokens_max: 8192
+  supported_modes:
+    - chat
+    - completion
+    - embedding
+
+  # API Endpoints
+  endpoints:
+    chat_completions: "/v1/chat/completions"
+    completions: "/v1/completions"
+    embeddings: "/v1/embeddings"
+
+  # Default Sampling Parameters
+  defaults:
+    temperature: 0.7
+    top_p: 0.95
+    top_k: 40
+    repeat_penalty: 1.1
+
+  # Per-Task Parameters
+  tasks:
+    fact_extraction:
+      temperature: 0.1
+      max_tokens: 1024
+    general_qa:
+      temperature: 0.7
+      max_tokens: 512
+    analysis:
+      temperature: 0.5
+      max_tokens: 2048
+
+  # Embedding
+  embedding:
+    enabled: true
+    endpoint: "http://127.0.0.1:8080/v1/embeddings"
+    dimension: 0  # Fill after Task 1.1.7
+    normalize: true
+    batch_supported: true
