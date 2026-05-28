@@ -18,14 +18,14 @@ function Start-Server {
     New-Item -ItemType Directory -Force -Path (Split-Path $LogFile -Parent) | Out-Null
 
     if (Test-Path $PidFile) {
-        $pid = Get-Content $PidFile
-        if (Get-Process -Id $pid -ErrorAction SilentlyContinue) {
-            Write-Host "❌ Server already running (PID $pid)"
+        $serverPid = [int](Get-Content $PidFile)
+        if (Get-Process -Id $serverPid -ErrorAction SilentlyContinue) {
+            Write-Host "ERROR: Server already running (PID $serverPid)"
             exit 1
         }
     }
 
-    Write-Host "🚀 Starting TraceAlchemy on port $Port ..."
+    Write-Host "Starting TraceAlchemy on port $Port ..."
     Write-Host "   GPU: AMD RDNA3 (gfx1101) | Quant: Q8_0 | Context: 131072"
 
     $args = @(
@@ -49,7 +49,7 @@ function Start-Server {
     $proc = Start-Process -FilePath $ServerExe -ArgumentList $args -NoNewWindow -RedirectStandardOutput $LogFile -RedirectStandardError "$LogFile.err" -PassThru
     $proc.Id | Out-File -FilePath $PidFile -Encoding ascii
 
-    Write-Host "✅ Server started (PID $($proc.Id))"
+    Write-Host "Server started (PID $($proc.Id))"
     Write-Host "   API: http://127.0.0.1:$Port"
     Write-Host "   Log: $LogFile"
 
@@ -57,27 +57,27 @@ function Start-Server {
     if (Get-Process -Id $proc.Id -ErrorAction SilentlyContinue) {
         Write-Host "   Status: running"
     } else {
-        Write-Host "   ⚠️  Exited early. Check log: $LogFile"
+        Write-Host "   WARNING: Exited early. Check log: $LogFile"
         Get-Content $LogFile -Tail 5
     }
 }
 
 function Stop-Server {
     if (Test-Path $PidFile) {
-        $pid = Get-Content $PidFile
-        if (Get-Process -Id $pid -ErrorAction SilentlyContinue) {
-            Write-Host "🛑 Stopping TraceAlchemy (PID $pid)..."
-            Stop-Process -Id $pid -Force
+        $serverPid = [int](Get-Content $PidFile)
+        if (Get-Process -Id $serverPid -ErrorAction SilentlyContinue) {
+            Write-Host "Stopping TraceAlchemy (PID $serverPid)..."
+            Stop-Process -Id $serverPid -Force
         }
         Remove-Item $PidFile -Force -ErrorAction SilentlyContinue
-        Write-Host "✅ Stopped."
+        Write-Host "Stopped."
     } else {
-        Write-Host "ℹ️  No PID file found."
+        Write-Host "INFO: No PID file found."
         $proc = Get-Process | Where-Object { $_.ProcessName -like "*llama-server*" } | Select-Object -First 1
         if ($proc) {
             Write-Host "   Found llama-server (PID $($proc.Id)). Stopping..."
             Stop-Process -Id $proc.Id -Force
-            Write-Host "✅ Stopped."
+            Write-Host "Stopped."
         } else {
             Write-Host "   No server running."
         }
@@ -88,9 +88,9 @@ function Get-Status {
     $running = $false
 
     if (Test-Path $PidFile) {
-        $pid = Get-Content $PidFile
-        if (Get-Process -Id $pid -ErrorAction SilentlyContinue) {
-            Write-Host "✅ TraceAlchemy is running (PID $pid)"
+        $serverPid = [int](Get-Content $PidFile)
+        if (Get-Process -Id $serverPid -ErrorAction SilentlyContinue) {
+            Write-Host "TraceAlchemy is running (PID $serverPid)"
             Write-Host "   API: http://127.0.0.1:$Port"
             $running = $true
         }
@@ -99,13 +99,13 @@ function Get-Status {
     if (-not $running) {
         $proc = Get-Process | Where-Object { $_.ProcessName -like "*llama-server*" } | Select-Object -First 1
         if ($proc) {
-            Write-Host "✅ llama-server running (PID $($proc.Id)) — no PID file"
+            Write-Host "llama-server running (PID $($proc.Id)) - no PID file"
             $running = $true
         }
     }
 
     if (-not $running) {
-        Write-Host "❌ TraceAlchemy is not running"
+        Write-Host "TraceAlchemy is not running"
         Remove-Item $PidFile -Force -ErrorAction SilentlyContinue
     }
 }
