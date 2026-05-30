@@ -7,7 +7,7 @@ sqlite:
 chroma:
   path: "data/chroma"
   collection_name: "tracealchemy_docs"
-  embedding_dimension: 2048
+  embedding_dimension: 2056
 
 embedding:
   provider: "llama-server"
