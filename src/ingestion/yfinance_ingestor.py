@@ -83,6 +83,30 @@ class YFinanceIngestor:
             logger.error("Failed to fetch ticker %s: %s", ticker, e)
             return None
 
+    # ── Fundamentals Ingestion ────────────────────────
+
+    FUNDAMENTAL_METRICS = [
+        # (metric_name, info_key, unit, period_type)
+        ("market_cap",        "marketCap",         "usd",      "point_in_time"),
+        ("pe_ratio_ttm",      "trailingPE",        "ratio",    "ttm"),
+        ("forward_pe",        "forwardPE",         "ratio",    "forward"),
+        ("eps_ttm",           "trailingEps",       "usd",      "ttm"),
+        ("dividend_yield",    "dividendYield",     "percent",  "ttm"),
+        ("price_to_book",     "priceToBook",       "ratio",    "ttm"),
+        ("debt_to_equity",    "debtToEquity",      "ratio",    "ttm"),
+        ("revenue_ttm",       "totalRevenue",      "usd",      "ttm"),
+        ("gross_margin_ttm",  "grossMargins",      "percent",  "ttm"),
+        ("operating_margin",  "operatingMargins",  "percent",  "ttm"),
+        ("profit_margin",     "profitMargins",     "percent",  "ttm"),
+        ("revenue_growth",    "revenueGrowth",     "percent",  "yoy"),
+        ("earnings_growth",   "earningsGrowth",    "percent",  "yoy"),
+        ("return_on_equity",  "returnOnEquity",    "percent",  "ttm"),
+        ("free_cash_flow",    "freeCashflow",      "usd",      "ttm"),
+        ("operating_cf",      "operatingCashflow",  "usd",     "ttm"),
+        ("current_ratio",     "currentRatio",      "ratio",    "ttm"),
+        ("quick_ratio",       "quickRatio",        "ratio",    "ttm"),
+    ]
+
     # ── Normalization Helpers ───────────────────────────
 
     def _normalize_value(self, raw_value):
@@ -113,8 +137,55 @@ class YFinanceIngestor:
 
     def ingest_fundamentals(self):
         """Ingest fundamentals for all core tickers."""
-        # Will be implemented in 1.3.2
-        raise NotImplementedError("Implement in 1.3.2")
+        logger.info("Ingesting fundamentals for %d core tickers...", len(self.core_tickers))
+        success_count = 0
+        skip_count = 0
+
+        for ticker in self.core_tickers:
+            # Cache check — skip if fundamentals are still fresh
+            if self._fundamentals_fresh(ticker):
+                logger.debug("Ticker %s fundamentals are fresh, skipping", ticker)
+                skip_count += 1
+                continue
+
+            t = self._fetch_ticker(ticker)
+            if t is None:
+                continue
+
+            self._ingest_ticker_fundamentals(ticker, t)
+            success_count += 1
+
+        logger.info(
+            "Fundamentals ingestion complete: %d ingested, %d skipped (fresh)",
+            success_count, skip_count
+        )
+
+    def _fundamentals_fresh(self, ticker: str) -> bool:
+        """Check if fundamentals cache is still fresh for this ticker."""
+        ttl_hours = self.watchlist.get("schedule", {}).get("fundamentals", 24)
+        status = self.store.get_cache_status(ticker, "yfinance_fundamentals")
+        if status and status.get("status") == "fresh":
+            # Verify it isn't expired by checking the stored TTL
+            from datetime import datetime, timezone
+            last_updated = status.get("last_updated")
+            if last_updated:
+                try:
+                    if isinstance(last_updated, str):
+                        # Parse SQLite datetime string
+                        try:
+                            from dateutil import parser
+                            updated_dt = parser.parse(last_updated)
+                        except Exception:
+                            updated_dt = datetime.strptime(last_updated, "%Y-%m-%d %H:%M:%S")
+                        if updated_dt.tzinfo is None:
+                            updated_dt = updated_dt.replace(tzinfo=timezone.utc)
+                    else:
+                        updated_dt = last_updated
+                    age_hours = (datetime.now(timezone.utc) - updated_dt).total_seconds() / 3600
+                    return age_hours < ttl_hours
+                except Exception:
+                    return False
+        return False
 
     def ingest_news(self):
         """Ingest recent news and summaries for core tickers."""
@@ -135,9 +206,38 @@ class YFinanceIngestor:
         self._ingest_ticker_fundamentals(ticker, t)
         self._ingest_ticker_news(ticker, t)
 
-    def _ingest_ticker_fundamentals(self, ticker: str, t: Any):
-        """Ingest fundamentals for one ticker (stub)."""
-        raise NotImplementedError("Implement in 1.3.2")
+    def _ingest_ticker_fundamentals(self, ticker: str, t):
+        """Ingest fundamentals for a single ticker."""
+        info = t.info
+        period_label = self._current_period_label()
+        saved = 0
+
+        for metric_name, info_key, unit, period_type in self.FUNDAMENTAL_METRICS:
+            raw_value = info.get(info_key)
+            if raw_value is None:
+                logger.debug("Ticker %s has no %s (%s), skipping", ticker, metric_name, info_key)
+                continue
+
+            # Normalize the value
+            value = self._normalize_value(raw_value)
+            if value is None:
+                continue
+
+            self.store.save_fundamental(
+                ticker=ticker,
+                metric=metric_name,
+                value=value,
+                unit=unit,
+                period=period_label,
+                period_type=period_type,
+                source_type="yfinance",
+            )
+            saved += 1
+
+        # Mark cache as fresh
+        ttl_hours = self.watchlist.get("schedule", {}).get("fundamentals", 24)
+        self.store.mark_cache_fresh(ticker, "yfinance_fundamentals", ttl_hours)
+        logger.info("Ticker %s: saved %d fundamentals, cache marked fresh (%dh)", ticker, saved, ttl_hours)
 
     def _ingest_ticker_news(self, ticker: str, t: Any):
         """Ingest news for one ticker (stub)."""

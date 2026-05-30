@@ -142,11 +142,9 @@ def test_fetch_ticker_exception_returns_none(caplog):
 # ── 7. Stub methods raise NotImplementedError ──
 
 STUB_METHODS = [
-    ("ingest_fundamentals", [], "Implement in 1.3.2"),
     ("ingest_news", [], "Implement in 1.3.3"),
     ("ingest_macro", [], "Implement in 1.3.4"),
-    ("ingest_all", [], "Implement in 1.3.2"),  # ingest_all calls ingest_fundamentals first
-    ("_ingest_ticker_fundamentals", ["NVDA", MagicMock()], "Implement in 1.3.2"),
+    ("ingest_all", [], "Implement in 1.3.3"),  # ingest_all calls ingest_news next
     ("_ingest_ticker_news", ["NVDA", MagicMock()], "Implement in 1.3.3"),
 ]
 
@@ -171,3 +169,125 @@ def test_ingest_ticker_invalid_ticker_returns_early(caplog):
         result = ingestor.ingest_ticker("INVALID")
     # ingest_ticker has no return value; verify it didn't call internals
     assert result is None
+
+
+# ── Fundamentals Ingestion Tests ────────────────────
+
+def test_fundamental_metrics_constant():
+    """FUNDAMENTAL_METRICS has exactly 18 entries."""
+    ingestor = YFinanceIngestor()
+    assert len(ingestor.FUNDAMENTAL_METRICS) == 18
+    names = [m[0] for m in ingestor.FUNDAMENTAL_METRICS]
+    assert "market_cap" in names
+    assert "pe_ratio_ttm" in names
+    assert "quick_ratio" in names
+
+def test_normalize_value():
+    """_normalize_value handles numeric, None, and invalid inputs."""
+    ingestor = YFinanceIngestor()
+    assert ingestor._normalize_value(38.5) == 38.5
+    assert ingestor._normalize_value("42.0") == 42.0
+    assert ingestor._normalize_value(None) is None
+    assert ingestor._normalize_value("bad") is None
+
+def test_current_period_label():
+    """_current_period_label returns YYYY-QN format."""
+    ingestor = YFinanceIngestor()
+    label = ingestor._current_period_label()
+    import re
+    assert re.match(r"\d{4}-Q[1-4]", label)
+
+@patch("src.ingestion.yfinance_ingestor.yf.Ticker")
+def test_ingest_ticker_fundamentals_saves_metrics(mock_ticker, tmp_path):
+    """_ingest_ticker_fundamentals saves metrics and marks cache fresh."""
+    # Create a temporary DB path so we don't pollute data/finance.db
+    from src.storage.store import Store
+    store = Store(db_path=tmp_path / "test.db")
+    ingestor = YFinanceIngestor(store=store)
+    
+    # Mock ticker with sample info
+    mock_t = MagicMock()
+    mock_t.info = {
+        "marketCap": 3200000000000,
+        "trailingPE": 38.5,
+        "trailingEps": 2.84,
+        "totalRevenue": 130500000000,
+        "grossMargins": 0.745,
+    }
+    mock_ticker.return_value = mock_t
+    
+    ingestor._ingest_ticker_fundamentals("NVDA", mock_t)
+    
+    # Verify metrics were saved
+    facts = store.get_fundamentals_batch("NVDA")
+    assert "market_cap" in facts
+    assert "pe_ratio_ttm" in facts
+    assert facts["market_cap"] == 3200000000000.0
+    
+    # Verify cache was marked fresh
+    cache = store.get_cache_status("NVDA", "yfinance_fundamentals")
+    assert cache is not None
+    assert cache["status"] == "fresh"
+
+@patch("src.ingestion.yfinance_ingestor.yf.Ticker")
+def test_fundamentals_fresh_skips_on_fresh_cache(mock_ticker, tmp_path):
+    """ingest_fundamentals skips tickers with fresh cache."""
+    from src.storage.store import Store
+    store = Store(db_path=tmp_path / "test.db")
+    ingestor = YFinanceIngestor(store=store)
+    
+    # Pre-mark cache as fresh
+    store.mark_cache_fresh("NVDA", "yfinance_fundamentals", 24)
+    
+    # Mock ticker should NOT be called because cache is fresh
+    mock_t = MagicMock()
+    mock_t.info = {"marketCap": 100}
+    mock_ticker.return_value = mock_t
+    
+    # Manually call ingest_fundamentals (it only processes core_tickers)
+    # Since NVDA is in core tickers, it should be skipped
+    ingestor.ingest_fundamentals()
+    
+    # Verify the ticker was NOT fetched (skipped due to fresh cache)
+    # We check by verifying no new metrics were saved beyond the cache mark
+    facts = store.get_fundamentals_batch("NVDA")
+    assert facts == {}  # No metrics saved because it was skipped
+
+@patch("src.ingestion.yfinance_ingestor.yf.Ticker")
+def test_ingest_fundamentals_full_pipeline(mock_ticker, tmp_path):
+    """ingest_fundamentals processes all core tickers with stale cache."""
+    from src.storage.store import Store
+    store = Store(db_path=tmp_path / "test.db")
+    ingestor = YFinanceIngestor(store=store)
+    
+    # Mock ticker with complete info
+    mock_t = MagicMock()
+    mock_t.info = {
+        "marketCap": 1000000000,
+        "trailingPE": 25.0,
+        "trailingEps": 5.0,
+        "forwardPE": 20.0,
+        "dividendYield": 0.015,
+        "priceToBook": 3.5,
+        "debtToEquity": 0.5,
+        "totalRevenue": 500000000,
+        "grossMargins": 0.65,
+        "operatingMargins": 0.45,
+        "profitMargins": 0.35,
+        "revenueGrowth": 0.25,
+        "earningsGrowth": 0.30,
+        "returnOnEquity": 0.20,
+        "freeCashflow": 200000000,
+        "operatingCashflow": 300000000,
+        "currentRatio": 2.5,
+        "quickRatio": 1.8,
+        "regularMarketPrice": 150.0,
+    }
+    mock_ticker.return_value = mock_t
+    
+    ingestor.ingest_fundamentals()
+    
+    # Verify at least one core ticker has metrics saved
+    facts = store.get_fundamentals_batch("NVDA")
+    assert len(facts) >= 5  # At least some metrics saved
+    assert "market_cap" in facts
