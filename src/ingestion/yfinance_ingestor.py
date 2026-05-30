@@ -83,6 +83,24 @@ class YFinanceIngestor:
             logger.error("Failed to fetch ticker %s: %s", ticker, e)
             return None
 
+    # ── Normalization Helpers ───────────────────────────
+
+    def _normalize_value(self, raw_value):
+        """Normalize a raw Yahoo Finance value for storage."""
+        if raw_value is None:
+            return None
+        try:
+            return float(raw_value)
+        except (TypeError, ValueError):
+            return None
+
+    def _current_period_label(self) -> str:
+        """Generate a period label like '2026-Q1' for the current quarter."""
+        from datetime import datetime
+        now = datetime.now()
+        quarter = (now.month - 1) // 3 + 1
+        return f"{now.year}-Q{quarter}"
+
     # ── Ingestion Pipeline Methods (stubs) ────────────
 
     def ingest_all(self):
