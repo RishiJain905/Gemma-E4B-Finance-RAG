@@ -244,6 +244,10 @@ class Store:
 
     # ── Cache Management ──────────────────────────────
 
+    def get_cache_status(self, ticker: str, source: str) -> Optional[dict]:
+        """Get cache freshness metadata for a ticker + source."""
+        return self.sqlite.get_cache_status(ticker, source)
+
     def mark_cache_fresh(self, ticker: str, source: str, ttl_hours: int = 24):
         self.sqlite.mark_cache_fresh(ticker, source, ttl_hours)
 
