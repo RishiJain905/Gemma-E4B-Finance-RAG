@@ -254,17 +254,35 @@ CREATE INDEX IF NOT EXISTS idx_ingestion_log_run ON ingestion_log(run_id);
     def mark_cache_stale(self, ticker: str, source: str, error: str = None):
         """Mark cache metadata as stale, optionally with an error message."""
         sql = """
-        UPDATE cache_meta SET status='stale', error_message=?
+        UPDATE cache_meta SET
+            status = 'stale',
+            error_message = ?,
+            next_scheduled_update = datetime('now', '-1 hour')
         WHERE ticker=? AND source=?
         """
         with self._connect() as conn:
             conn.execute(sql, (error, ticker, source))
             conn.commit()
 
+    def upsert_cache_stale(self, ticker: str, source: str, error: str = None):
+        """Insert or update a stale cache row (for tickers without prior cache entries)."""
+        sql = """
+        INSERT INTO cache_meta (ticker, source, last_updated, next_scheduled_update, status, error_message)
+        VALUES (?, ?, datetime('now'), datetime('now', '-1 hour'), 'stale', ?)
+        ON CONFLICT(ticker, source, metric_scope) DO UPDATE SET
+            status = 'stale',
+            next_scheduled_update = datetime('now', '-1 hour'),
+            error_message = excluded.error_message
+        """
+        with self._connect() as conn:
+            conn.execute(sql, (ticker, source, error))
+            conn.commit()
+
     def get_stale_cache_entries(self, limit: int = 20) -> list[dict]:
-        """Find entries past their scheduled update time."""
+        """Find entries past their scheduled update time or explicitly marked stale."""
         sql = (
-            "SELECT * FROM cache_meta WHERE next_scheduled_update < datetime('now') "
+            "SELECT * FROM cache_meta "
+            "WHERE (next_scheduled_update < datetime('now') OR status = 'stale') "
             "AND status != 'fetching' LIMIT ?"
         )
         with self._connect() as conn:

@@ -254,6 +254,9 @@ class Store:
     def mark_cache_stale(self, ticker: str, source: str, error: str = None):
         self.sqlite.mark_cache_stale(ticker, source, error)
 
+    def upsert_cache_stale(self, ticker: str, source: str, error: str = None):
+        self.sqlite.upsert_cache_stale(ticker, source, error)
+
     def get_stale_entries(self, limit: int = 20) -> list[dict]:
         return self.sqlite.get_stale_cache_entries(limit)
 

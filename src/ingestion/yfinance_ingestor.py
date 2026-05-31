@@ -223,9 +223,187 @@ class YFinanceIngestor:
         )
 
     def ingest_macro(self):
-        """Ingest macro indicators."""
-        # Will be implemented in 1.3.4
-        raise NotImplementedError("Implement in 1.3.4")
+        """Ingest macro indicators (index ETFs and broad market data)."""
+        macro_tickers = self.watchlist.get("macro_tickers", [])
+        if not macro_tickers:
+            logger.info("No macro tickers configured, skipping macro ingestion")
+            return
+
+        logger.info("Ingesting macro indicators for %d tickers...", len(macro_tickers))
+        saved = 0
+        skipped = 0
+
+        for ticker in macro_tickers:
+            if self._macro_fresh(ticker):
+                skipped += 1
+                continue
+
+            t = self._fetch_ticker(ticker)
+            if t is None:
+                continue
+
+            info = t.info
+            period_label = self._current_period_label()
+
+            for metric_name, info_key, unit, period_type in self.MACRO_METRICS:
+                raw_value = info.get(info_key)
+                if raw_value is None:
+                    continue
+                value = self._normalize_value(raw_value)
+                if value is None:
+                    continue
+
+                self.store.save_fundamental(
+                    ticker=ticker,
+                    metric=metric_name,
+                    value=value,
+                    unit=unit,
+                    period=period_label,
+                    period_type=period_type,
+                    source_type="yfinance_macro",
+                )
+                saved += 1
+
+            ttl_hours = self.watchlist.get("schedule", {}).get("macro", 24)
+            self.store.mark_cache_fresh(ticker, "yfinance_macro", ttl_hours)
+
+        logger.info("Macro ingestion complete: %d metrics saved, %d skipped (fresh)", saved, skipped)
+
+    # ── Macro Indicators ──────────────────────────────
+
+    MACRO_METRICS = [
+        ("price",          "regularMarketPrice",     "usd",      "point_in_time"),
+        ("change_percent", "regularMarketChangePercent", "percent", "point_in_time"),
+        ("volume",         "regularMarketVolume",    "shares",   "point_in_time"),
+        ("day_range_low",  "regularMarketDayLow",    "usd",      "point_in_time"),
+        ("day_range_high", "regularMarketDayHigh",   "usd",      "point_in_time"),
+        ("fifty_two_week_low",  "fiftyTwoWeekLow",   "usd",      "point_in_time"),
+        ("fifty_two_week_high", "fiftyTwoWeekHigh",  "usd",      "point_in_time"),
+    ]
+
+    def _macro_fresh(self, ticker: str) -> bool:
+        """Check if macro cache is still fresh for this ticker."""
+        ttl_hours = self.watchlist.get("schedule", {}).get("macro", 24)
+        status = self.store.get_cache_status(ticker, "yfinance_macro")
+        if status and status.get("status") == "fresh":
+            from datetime import datetime, timezone
+            last_updated = status.get("last_updated")
+            if last_updated:
+                try:
+                    if isinstance(last_updated, str):
+                        try:
+                            from dateutil import parser
+                            updated_dt = parser.parse(last_updated)
+                        except Exception:
+                            updated_dt = datetime.strptime(last_updated, "%Y-%m-%d %H:%M:%S")
+                        if updated_dt.tzinfo is None:
+                            updated_dt = updated_dt.replace(tzinfo=timezone.utc)
+                    else:
+                        updated_dt = last_updated
+                    age_hours = (datetime.now(timezone.utc) - updated_dt).total_seconds() / 3600
+                    return age_hours < ttl_hours
+                except Exception:
+                    return False
+        return False
+
+    # ── Incremental / Stale-Only Ingestion ────────────
+
+    def ingest_stale_only(self):
+        """Only ingest tickers with stale fundamentals or news."""
+        logger.info("Checking for stale cache entries...")
+
+        stale_entries = self.store.get_stale_entries(limit=50)
+
+        tickers_needing_fundamentals = set()
+        tickers_needing_news = set()
+
+        for entry in stale_entries:
+            ticker = entry["ticker"]
+            source = entry.get("source")
+
+            if source and "fundamental" in source:
+                tickers_needing_fundamentals.add(ticker)
+            elif source and "news" in source:
+                tickers_needing_news.add(ticker)
+
+        for ticker in self.core_tickers:
+            if not self._fundamentals_fresh(ticker):
+                tickers_needing_fundamentals.add(ticker)
+            if not self._news_fresh(ticker):
+                tickers_needing_news.add(ticker)
+
+        macro_tickers = self.watchlist.get("macro_tickers", [])
+        needs_macro = any(not self._macro_fresh(t) for t in macro_tickers)
+
+        if not tickers_needing_fundamentals and not tickers_needing_news and not needs_macro:
+            logger.info("All cache entries are fresh — nothing to ingest.")
+            return
+
+        if stale_entries:
+            logger.info("Found %d stale cache entries", len(stale_entries))
+
+        for ticker in tickers_needing_fundamentals:
+            logger.info("Stale fundamentals for %s — fetching...", ticker)
+            t = self._fetch_ticker(ticker)
+            if t:
+                self._ingest_ticker_fundamentals(ticker, t)
+
+        still_stale_news = tickers_needing_news - tickers_needing_fundamentals
+        for ticker in still_stale_news:
+            logger.info("Stale news for %s — fetching...", ticker)
+            t = self._fetch_ticker(ticker)
+            if t:
+                self._ingest_ticker_news(ticker, t)
+
+        if tickers_needing_fundamentals:
+            logger.info(
+                "Re-fetching news for %d tickers that just got fresh fundamentals...",
+                len(tickers_needing_fundamentals),
+            )
+            for ticker in tickers_needing_fundamentals:
+                if self._news_fresh(ticker):
+                    continue
+                t = self._fetch_ticker(ticker)
+                if t:
+                    self._ingest_ticker_news(ticker, t)
+
+        self.ingest_macro()
+
+    def reset_cache_all(self):
+        """Force all cache entries to stale — next run will re-fetch everything."""
+        logger.warning("Resetting ALL cache entries to stale...")
+        for ticker in self.all_tickers:
+            self.store.upsert_cache_stale(ticker, "yfinance_fundamentals")
+            self.store.upsert_cache_stale(ticker, "yfinance_news")
+        for ticker in self.watchlist.get("macro_tickers", []):
+            self.store.upsert_cache_stale(ticker, "yfinance_macro")
+        logger.info("All cache entries marked stale. Next ingest will re-fetch everything.")
+
+    def status_report(self) -> dict:
+        """Print a status report of what's fresh and what's stale."""
+        report = {"fresh": 0, "stale": 0, "not_cached": 0, "details": []}
+
+        for ticker in self.all_tickers:
+            fund_status = self.store.get_cache_status(ticker, "yfinance_fundamentals")
+            news_status = self.store.get_cache_status(ticker, "yfinance_news")
+
+            entry = {
+                "ticker": ticker,
+                "fundamentals": fund_status["status"] if fund_status else "not_cached",
+                "news": news_status["status"] if news_status else "not_cached",
+            }
+
+            if fund_status and news_status:
+                if fund_status["status"] == "fresh" and news_status["status"] == "fresh":
+                    report["fresh"] += 1
+                else:
+                    report["stale"] += 1
+            else:
+                report["not_cached"] += 1
+
+            report["details"].append(entry)
+
+        return report
 
     def ingest_ticker(self, ticker: str):
         """Ingest everything for a single ticker."""

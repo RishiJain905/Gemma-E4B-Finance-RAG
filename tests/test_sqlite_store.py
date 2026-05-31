@@ -177,6 +177,29 @@ def test_get_stale_cache_entries(store: SQLiteStore):
     assert "NVDA" in tickers
 
 
+def test_mark_cache_stale_appears_in_stale_entries(store: SQLiteStore):
+    """mark_cache_stale makes entry visible even when next_scheduled_update is in the future."""
+    store.mark_cache_fresh("AAPL", "yfinance_fundamentals", ttl_hours=24)
+    entry = store.get_cache_status("AAPL", "yfinance_fundamentals")
+    assert entry["next_scheduled_update"] > entry["last_updated"]
+
+    store.mark_cache_stale("AAPL", "yfinance_fundamentals")
+    stale = store.get_stale_cache_entries(limit=20)
+    tickers = {r["ticker"] for r in stale}
+    assert "AAPL" in tickers
+
+
+def test_upsert_cache_stale_creates_row(store: SQLiteStore):
+    """upsert_cache_stale creates a stale row for tickers with no prior cache entry."""
+    assert store.get_cache_status("NEWCO", "yfinance_fundamentals") is None
+    store.upsert_cache_stale("NEWCO", "yfinance_fundamentals")
+    entry = store.get_cache_status("NEWCO", "yfinance_fundamentals")
+    assert entry is not None
+    assert entry["status"] == "stale"
+    stale = store.get_stale_cache_entries(limit=20)
+    assert "NEWCO" in {r["ticker"] for r in stale}
+
+
 # ── Ingestion Log ─────────────────────────────────
 
 def test_log_ingestion_start(store: SQLiteStore):

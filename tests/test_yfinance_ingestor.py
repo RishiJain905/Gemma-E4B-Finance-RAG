@@ -139,21 +139,280 @@ def test_fetch_ticker_exception_returns_none(caplog):
     assert "failed to fetch" in caplog.text.lower()
 
 
-# ── 7. Stub methods raise NotImplementedError ──
+# ── 7. Macro & Incremental Ingestion Tests ──────────
 
-STUB_METHODS = [
-    ("ingest_macro", [], "Implement in 1.3.4"),
-]
+MACRO_INFO = {
+    "regularMarketPrice": 520.0,
+    "regularMarketChangePercent": 1.2,
+    "regularMarketVolume": 50000000,
+    "regularMarketDayLow": 515.0,
+    "regularMarketDayHigh": 525.0,
+    "fiftyTwoWeekLow": 400.0,
+    "fiftyTwoWeekHigh": 530.0,
+}
 
 
-@pytest.mark.parametrize("method_name,args,expected_msg", STUB_METHODS)
-def test_stub_raises_not_implemented(method_name, args, expected_msg):
-    """Each stub method raises NotImplementedError containing its phase tag."""
-    ingestor = YFinanceIngestor()
-    method = getattr(ingestor, method_name)
-    with pytest.raises(NotImplementedError) as exc_info:
-        method(*args)
-    assert expected_msg in str(exc_info.value)
+def test_macro_fresh_within_ttl(tmp_path):
+    """_macro_fresh returns True when cache is fresh within TTL."""
+    from src.storage.store import Store
+
+    store = Store(db_path=tmp_path / "test.db")
+    ingestor = YFinanceIngestor(store=store)
+    store.mark_cache_fresh("SPY", "yfinance_macro", 24)
+
+    assert ingestor._macro_fresh("SPY") is True
+
+
+def test_macro_fresh_stale(tmp_path):
+    """_macro_fresh returns False when cache exceeds TTL."""
+    from datetime import datetime, timedelta, timezone
+    from src.storage.store import Store
+
+    store = Store(db_path=tmp_path / "test.db")
+    ingestor = YFinanceIngestor(store=store)
+
+    stale_time = datetime.now(timezone.utc) - timedelta(hours=25)
+    store.mark_cache_fresh("SPY", "yfinance_macro", 24)
+    with store.sqlite._connect() as conn:
+        conn.execute(
+            "UPDATE cache_meta SET last_updated = ? WHERE ticker = ? AND source = ?",
+            (stale_time.strftime("%Y-%m-%d %H:%M:%S"), "SPY", "yfinance_macro"),
+        )
+        conn.commit()
+
+    assert ingestor._macro_fresh("SPY") is False
+
+
+@patch.object(YFinanceIngestor, "_fetch_ticker")
+def test_ingest_macro_saves_metrics(mock_fetch, tmp_path):
+    """ingest_macro saves MACRO_METRICS to SQLite with source_type=yfinance_macro."""
+    from src.storage.store import Store
+
+    store = Store(db_path=tmp_path / "test.db")
+    fake_watchlist = tmp_path / "wl.yaml"
+    fake_watchlist.write_text(
+        yaml.safe_dump({
+            "core": [],
+            "macro_tickers": ["SPY"],
+            "schedule": {"fundamentals": 24, "news": 6, "macro": 24},
+        })
+    )
+    ingestor = YFinanceIngestor(store=store, watchlist_path=fake_watchlist)
+
+    mock_t = MagicMock()
+    mock_t.info = MACRO_INFO
+    mock_fetch.return_value = mock_t
+
+    ingestor.ingest_macro()
+
+    facts = store.get_fundamentals_batch("SPY")
+    assert "price" in facts
+    assert facts["price"] == 520.0
+
+    with store.sqlite._connect() as conn:
+        row = conn.execute(
+            "SELECT source_type FROM fundamentals WHERE ticker=? AND metric=?",
+            ("SPY", "price"),
+        ).fetchone()
+    assert row["source_type"] == "yfinance_macro"
+
+    cache = store.get_cache_status("SPY", "yfinance_macro")
+    assert cache is not None
+    assert cache["status"] == "fresh"
+
+
+@patch.object(YFinanceIngestor, "_fetch_ticker")
+def test_ingest_macro_skips_fresh(mock_fetch, tmp_path):
+    """ingest_macro skips tickers with fresh macro cache."""
+    from src.storage.store import Store
+
+    store = Store(db_path=tmp_path / "test.db")
+    fake_watchlist = tmp_path / "wl.yaml"
+    fake_watchlist.write_text(
+        yaml.safe_dump({
+            "core": [],
+            "macro_tickers": ["SPY"],
+            "schedule": {"fundamentals": 24, "news": 6, "macro": 24},
+        })
+    )
+    ingestor = YFinanceIngestor(store=store, watchlist_path=fake_watchlist)
+    store.mark_cache_fresh("SPY", "yfinance_macro", 24)
+
+    ingestor.ingest_macro()
+
+    mock_fetch.assert_not_called()
+
+
+def test_status_report_counts(tmp_path):
+    """status_report tallies fresh, stale, and not_cached tickers correctly."""
+    from src.storage.store import Store
+
+    store = Store(db_path=tmp_path / "test.db")
+    fake_watchlist = tmp_path / "wl.yaml"
+    fake_watchlist.write_text(
+        yaml.safe_dump({
+            "core": ["T1", "T2", "T3"],
+            "extended": [],
+            "macro_tickers": [],
+            "schedule": {"fundamentals": 24, "news": 6, "macro": 24},
+        })
+    )
+    ingestor = YFinanceIngestor(store=store, watchlist_path=fake_watchlist)
+
+    # T1: both fresh
+    store.mark_cache_fresh("T1", "yfinance_fundamentals", 24)
+    store.mark_cache_fresh("T1", "yfinance_news", 6)
+
+    # T2: fundamentals stale, news fresh
+    store.upsert_cache_stale("T2", "yfinance_fundamentals")
+    store.mark_cache_fresh("T2", "yfinance_news", 6)
+
+    # T3: not cached at all
+
+    report = ingestor.status_report()
+    assert report["fresh"] == 1
+    assert report["stale"] == 1
+    assert report["not_cached"] == 1
+
+
+def test_reset_cache_all_marks_stale(tmp_path):
+    """reset_cache_all marks all tickers stale, including previously uncached."""
+    from src.storage.store import Store
+
+    store = Store(db_path=tmp_path / "test.db")
+    fake_watchlist = tmp_path / "wl.yaml"
+    fake_watchlist.write_text(
+        yaml.safe_dump({
+            "core": ["T1"],
+            "extended": [],
+            "macro_tickers": ["SPY"],
+            "schedule": {"fundamentals": 24, "news": 6, "macro": 24},
+        })
+    )
+    ingestor = YFinanceIngestor(store=store, watchlist_path=fake_watchlist)
+
+    store.mark_cache_fresh("T1", "yfinance_fundamentals", 24)
+    store.mark_cache_fresh("T1", "yfinance_news", 6)
+
+    ingestor.reset_cache_all()
+
+    assert store.get_cache_status("T1", "yfinance_fundamentals")["status"] == "stale"
+    assert store.get_cache_status("T1", "yfinance_news")["status"] == "stale"
+    assert store.get_cache_status("SPY", "yfinance_macro")["status"] == "stale"
+
+
+@patch.object(YFinanceIngestor, "_fetch_ticker")
+@patch.object(YFinanceIngestor, "_ingest_ticker_fundamentals")
+def test_ingest_stale_only_fetches_stale_fundamentals(
+    mock_ingest_fundamentals, mock_fetch, tmp_path
+):
+    """Stale fundamentals entry triggers _ingest_ticker_fundamentals."""
+    from src.storage.store import Store
+
+    store = Store(db_path=tmp_path / "test.db")
+    fake_watchlist = tmp_path / "wl.yaml"
+    fake_watchlist.write_text(
+        yaml.safe_dump({
+            "core": ["NVDA"],
+            "schedule": {"fundamentals": 24, "news": 6, "macro": 24},
+        })
+    )
+    ingestor = YFinanceIngestor(store=store, watchlist_path=fake_watchlist)
+
+    store.upsert_cache_stale("NVDA", "yfinance_fundamentals")
+    store.mark_cache_fresh("NVDA", "yfinance_news", 6)
+
+    mock_t = MagicMock()
+    mock_fetch.return_value = mock_t
+
+    with patch.object(ingestor, "ingest_macro"):
+        ingestor.ingest_stale_only()
+
+    mock_ingest_fundamentals.assert_called_once_with("NVDA", mock_t)
+
+
+@patch.object(YFinanceIngestor, "_fetch_ticker")
+@patch.object(YFinanceIngestor, "_ingest_ticker_news")
+def test_ingest_stale_only_fetches_stale_news(
+    mock_ingest_news, mock_fetch, tmp_path
+):
+    """Stale news entry triggers _ingest_ticker_news."""
+    from src.storage.store import Store
+
+    store = Store(db_path=tmp_path / "test.db")
+    fake_watchlist = tmp_path / "wl.yaml"
+    fake_watchlist.write_text(
+        yaml.safe_dump({
+            "core": ["NVDA"],
+            "schedule": {"fundamentals": 24, "news": 6, "macro": 24},
+        })
+    )
+    ingestor = YFinanceIngestor(store=store, watchlist_path=fake_watchlist)
+
+    store.mark_cache_fresh("NVDA", "yfinance_fundamentals", 24)
+    store.upsert_cache_stale("NVDA", "yfinance_news")
+
+    mock_t = MagicMock()
+    mock_fetch.return_value = mock_t
+
+    with patch.object(ingestor, "ingest_macro"):
+        ingestor.ingest_stale_only()
+
+    mock_ingest_news.assert_called_once_with("NVDA", mock_t)
+
+
+@patch.object(YFinanceIngestor, "_fetch_ticker")
+def test_ingest_stale_only_noop_when_fresh(mock_fetch, tmp_path, caplog):
+    """When all cache is fresh, ingest_stale_only returns without fetching."""
+    import logging
+    from src.storage.store import Store
+
+    store = Store(db_path=tmp_path / "test.db")
+    fake_watchlist = tmp_path / "wl.yaml"
+    fake_watchlist.write_text(
+        yaml.safe_dump({
+            "core": ["NVDA"],
+            "macro_tickers": [],
+            "schedule": {"fundamentals": 24, "news": 6, "macro": 24},
+        })
+    )
+    ingestor = YFinanceIngestor(store=store, watchlist_path=fake_watchlist)
+
+    store.mark_cache_fresh("NVDA", "yfinance_fundamentals", 24)
+    store.mark_cache_fresh("NVDA", "yfinance_news", 6)
+
+    with caplog.at_level(logging.INFO, logger="src.ingestion.yfinance_ingestor"):
+        ingestor.ingest_stale_only()
+
+    mock_fetch.assert_not_called()
+    assert "nothing to ingest" in caplog.text.lower()
+
+
+@patch.object(YFinanceIngestor, "_fetch_ticker")
+@patch.object(YFinanceIngestor, "_ingest_ticker_fundamentals")
+def test_ingest_stale_only_handles_not_cached(
+    mock_ingest_fundamentals, mock_fetch, tmp_path
+):
+    """Ticker with no cache row is added to the fundamentals fetch set."""
+    from src.storage.store import Store
+
+    store = Store(db_path=tmp_path / "test.db")
+    fake_watchlist = tmp_path / "wl.yaml"
+    fake_watchlist.write_text(
+        yaml.safe_dump({
+            "core": ["NVDA"],
+            "schedule": {"fundamentals": 24, "news": 6, "macro": 24},
+        })
+    )
+    ingestor = YFinanceIngestor(store=store, watchlist_path=fake_watchlist)
+
+    mock_t = MagicMock()
+    mock_fetch.return_value = mock_t
+
+    with patch.object(ingestor, "ingest_macro"):
+        ingestor.ingest_stale_only()
+
+    mock_ingest_fundamentals.assert_called_once_with("NVDA", mock_t)
 
 
 # ── 8. ingest_ticker with invalid ticker ──
