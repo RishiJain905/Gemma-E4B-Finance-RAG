@@ -188,9 +188,39 @@ class YFinanceIngestor:
         return False
 
     def ingest_news(self):
-        """Ingest recent news and summaries for core tickers."""
-        # Will be implemented in 1.3.3
-        raise NotImplementedError("Implement in 1.3.3")
+        """Ingest recent news for all core tickers."""
+        logger.info("Ingesting news for %d core tickers...", len(self.core_tickers))
+        success_count = 0
+        skip_count = 0
+
+        for ticker in self.core_tickers:
+            if self._news_fresh(ticker):
+                logger.debug("Ticker %s news is fresh, skipping", ticker)
+                skip_count += 1
+                continue
+
+            status = self.store.get_cache_status(ticker, "yfinance_fundamentals")
+            if not status or status.get("status") != "fresh":
+                logger.info(
+                    "Ticker %s fundamentals not yet ingested, doing fundamentals first",
+                    ticker,
+                )
+                t = self._fetch_ticker(ticker)
+                if t:
+                    self._ingest_ticker_fundamentals(ticker, t)
+
+            t = self._fetch_ticker(ticker)
+            if t is None:
+                continue
+
+            self._ingest_ticker_news(ticker, t)
+            success_count += 1
+
+        logger.info(
+            "News ingestion complete: %d ingested, %d skipped (fresh)",
+            success_count,
+            skip_count,
+        )
 
     def ingest_macro(self):
         """Ingest macro indicators."""
@@ -239,6 +269,172 @@ class YFinanceIngestor:
         self.store.mark_cache_fresh(ticker, "yfinance_fundamentals", ttl_hours)
         logger.info("Ticker %s: saved %d fundamentals, cache marked fresh (%dh)", ticker, saved, ttl_hours)
 
+    # ── News Ingestion ────────────────────────────────
+
+    def _news_fresh(self, ticker: str) -> bool:
+        """Check if news cache is still fresh for this ticker."""
+        ttl_hours = self.watchlist.get("schedule", {}).get("news", 6)
+        status = self.store.get_cache_status(ticker, "yfinance_news")
+        if status and status.get("status") == "fresh":
+            from datetime import datetime, timezone
+            last_updated = status.get("last_updated")
+            if last_updated:
+                try:
+                    if isinstance(last_updated, str):
+                        try:
+                            from dateutil import parser
+                            updated_dt = parser.parse(last_updated)
+                        except Exception:
+                            updated_dt = datetime.strptime(last_updated, "%Y-%m-%d %H:%M:%S")
+                        if updated_dt.tzinfo is None:
+                            updated_dt = updated_dt.replace(tzinfo=timezone.utc)
+                    else:
+                        updated_dt = last_updated
+                    age_hours = (datetime.now(timezone.utc) - updated_dt).total_seconds() / 3600
+                    return age_hours < ttl_hours
+                except Exception:
+                    return False
+        return False
+
+    def _extract_news_fields(self, article: dict) -> dict | None:
+        """Normalize nested (yfinance>=0.2.50) or flat news article schemas."""
+        if not isinstance(article, dict):
+            return None
+
+        content = article.get("content")
+        if isinstance(content, dict):
+            return {
+                "id": content.get("id") or article.get("id"),
+                "title": content.get("title", ""),
+                "summary": content.get("summary") or content.get("description") or "",
+                "publisher": (content.get("provider") or {}).get("displayName", ""),
+                "link": (
+                    (content.get("canonicalUrl") or {}).get("url")
+                    or (content.get("clickThroughUrl") or {}).get("url")
+                    or ""
+                ),
+                "pub_raw": content.get("pubDate") or content.get("displayTime"),
+                "type": content.get("contentType", "STORY"),
+            }
+
+        return {
+            "id": article.get("uuid") or article.get("id"),
+            "title": article.get("title", ""),
+            "summary": article.get("summary", ""),
+            "publisher": article.get("publisher", ""),
+            "link": article.get("link", ""),
+            "pub_raw": article.get("providerPublishTime"),
+            "type": article.get("type", "news"),
+        }
+
+    def _make_news_doc_id(self, ticker: str, article: dict) -> str:
+        """Create a unique document ID for a news article."""
+        fields = self._extract_news_fields(article)
+        article_id = fields.get("id") if fields else None
+        if article_id:
+            return f"news/{ticker}/{article_id}"
+
+        link = fields.get("link", "") if fields else article.get("link", "")
+        if link:
+            url_id = link.rstrip("/").rsplit("/", 1)[-1]
+        else:
+            title = fields.get("title", "") if fields else article.get("title", "")
+            url_id = str(hash(title))
+        return f"news/{ticker}/{url_id}"
+
+    def _format_news_article(self, article: dict) -> str | None:
+        """Format a news article into a searchable document text."""
+        fields = self._extract_news_fields(article)
+        if not fields:
+            return None
+
+        title = fields.get("title", "")
+        summary = fields.get("summary", "")
+        publisher = fields.get("publisher", "")
+
+        if not title and not summary:
+            return None
+
+        parts = []
+        if title:
+            parts.append(f"# {title}")
+        if summary:
+            parts.append(summary)
+        if publisher:
+            parts.append(f"—— Source: {publisher}")
+
+        return "\n\n".join(parts)
+
+    def _format_news_date(self, pub_raw) -> str:
+        """Convert pubDate (ISO8601) or Unix timestamp to YYYY-MM-DD."""
+        if not pub_raw:
+            return ""
+
+        from datetime import datetime, timezone
+
+        if isinstance(pub_raw, (int, float)):
+            return datetime.fromtimestamp(pub_raw, tz=timezone.utc).strftime("%Y-%m-%d")
+
+        if isinstance(pub_raw, str):
+            try:
+                from dateutil import parser
+                dt = parser.parse(pub_raw)
+                return dt.strftime("%Y-%m-%d")
+            except Exception:
+                pass
+
+        return ""
+
     def _ingest_ticker_news(self, ticker: str, t: Any):
-        """Ingest news for one ticker (stub)."""
-        raise NotImplementedError("Implement in 1.3.3")
+        """Ingest recent news for a single ticker and store as ChromaDB docs."""
+        try:
+            news_raw = t.news
+        except Exception as e:
+            logger.warning("Ticker %s news fetch failed: %s", ticker, e)
+            return
+
+        if not news_raw:
+            logger.info("Ticker %s has no news articles to ingest", ticker)
+            return
+
+        saved = 0
+        skipped = 0
+        for article in news_raw:
+            doc_id = self._make_news_doc_id(ticker, article)
+            text = self._format_news_article(article)
+            if text is None:
+                skipped += 1
+                continue
+
+            existing = self.store.chroma.get_document(doc_id)
+            if existing:
+                skipped += 1
+                continue
+
+            fields = self._extract_news_fields(article)
+            date_str = self._format_news_date(fields.get("pub_raw") if fields else None)
+
+            self.store.save_document(
+                document_id=doc_id,
+                text=text,
+                ticker=ticker,
+                source="yfinance_news",
+                date=date_str,
+                metadata={
+                    "title": fields.get("title", "") if fields else "",
+                    "publisher": fields.get("publisher", "") if fields else "",
+                    "link": fields.get("link", "") if fields else "",
+                    "type": fields.get("type", "news") if fields else "news",
+                },
+            )
+            saved += 1
+
+        ttl_hours = self.watchlist.get("schedule", {}).get("news", 6)
+        self.store.mark_cache_fresh(ticker, "yfinance_news", ttl_hours)
+        logger.info(
+            "Ticker %s: %d news articles saved, %d skipped, cache marked fresh (%dh)",
+            ticker,
+            saved,
+            skipped,
+            ttl_hours,
+        )

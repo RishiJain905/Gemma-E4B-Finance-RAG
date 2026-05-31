@@ -142,10 +142,7 @@ def test_fetch_ticker_exception_returns_none(caplog):
 # ── 7. Stub methods raise NotImplementedError ──
 
 STUB_METHODS = [
-    ("ingest_news", [], "Implement in 1.3.3"),
     ("ingest_macro", [], "Implement in 1.3.4"),
-    ("ingest_all", [], "Implement in 1.3.3"),  # ingest_all calls ingest_news next
-    ("_ingest_ticker_news", ["NVDA", MagicMock()], "Implement in 1.3.3"),
 ]
 
 
@@ -291,3 +288,239 @@ def test_ingest_fundamentals_full_pipeline(mock_ticker, tmp_path):
     facts = store.get_fundamentals_batch("NVDA")
     assert len(facts) >= 5  # At least some metrics saved
     assert "market_cap" in facts
+
+
+# ── News Ingestion Tests ────────────────────────────
+
+NESTED_ARTICLE = {
+    "id": "outer-id",
+    "content": {
+        "id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+        "title": "NVIDIA Hits Record High",
+        "summary": "Shares rose on strong AI demand.",
+        "description": "Shares rose on strong AI demand.",
+        "provider": {"displayName": "Reuters"},
+        "canonicalUrl": {"url": "https://finance.yahoo.com/news/nvidia-record-high-123456789.html"},
+        "pubDate": "2026-05-30T14:30:00Z",
+        "contentType": "STORY",
+    },
+}
+
+FLAT_ARTICLE = {
+    "uuid": "flat-uuid-001",
+    "title": "AMD Expands Data Center",
+    "summary": "New chip lineup targets enterprise.",
+    "publisher": "Bloomberg",
+    "link": "https://finance.yahoo.com/news/amd-data-center-987654321.html",
+    "providerPublishTime": 1717000000,
+    "type": "news",
+}
+
+
+def test_extract_news_fields_nested():
+    """Nested yfinance>=0.2.50 schema extracts title, publisher, link."""
+    ingestor = YFinanceIngestor()
+    fields = ingestor._extract_news_fields(NESTED_ARTICLE)
+    assert fields["title"] == "NVIDIA Hits Record High"
+    assert fields["publisher"] == "Reuters"
+    assert "nvidia-record-high" in fields["link"]
+    assert fields["id"] == "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+
+
+def test_extract_news_fields_flat():
+    """Old flat schema still parses correctly."""
+    ingestor = YFinanceIngestor()
+    fields = ingestor._extract_news_fields(FLAT_ARTICLE)
+    assert fields["title"] == "AMD Expands Data Center"
+    assert fields["publisher"] == "Bloomberg"
+    assert fields["id"] == "flat-uuid-001"
+
+
+def test_make_news_doc_id_prefers_uuid():
+    """Doc ID uses article/content UUID when available."""
+    ingestor = YFinanceIngestor()
+    doc_id = ingestor._make_news_doc_id("NVDA", NESTED_ARTICLE)
+    assert doc_id == "news/NVDA/a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+
+
+def test_format_news_article_malformed_returns_none():
+    """Article with no title and no summary returns None."""
+    ingestor = YFinanceIngestor()
+    assert ingestor._format_news_article({"content": {"title": "", "summary": ""}}) is None
+    assert ingestor._format_news_article({}) is None
+
+
+def test_format_news_date_iso_and_unix():
+    """Date formatting handles ISO8601 and Unix timestamps."""
+    ingestor = YFinanceIngestor()
+    assert ingestor._format_news_date("2026-05-30T14:30:00Z") == "2026-05-30"
+    assert ingestor._format_news_date(1717000000) == "2024-05-29"
+
+
+@patch.object(YFinanceIngestor, "_fetch_ticker")
+def test_ingest_ticker_news_nested_schema(mock_fetch, tmp_path):
+    """Nested-schema article is saved with correct metadata."""
+    from src.storage.store import Store
+
+    store = Store(db_path=tmp_path / "test.db")
+    ingestor = YFinanceIngestor(store=store)
+
+    mock_t = MagicMock()
+    mock_t.news = [NESTED_ARTICLE]
+    mock_fetch.return_value = mock_t
+
+    ingestor.store.chroma.get_document = MagicMock(return_value=None)
+    ingestor.store.save_document = MagicMock(return_value="news/NVDA/a1b2c3d4")
+
+    ingestor._ingest_ticker_news("NVDA", mock_t)
+
+    ingestor.store.save_document.assert_called_once()
+    call_kwargs = ingestor.store.save_document.call_args.kwargs
+    assert call_kwargs["ticker"] == "NVDA"
+    assert call_kwargs["source"] == "yfinance_news"
+    assert call_kwargs["metadata"]["title"] == "NVIDIA Hits Record High"
+    assert call_kwargs["metadata"]["publisher"] == "Reuters"
+    assert call_kwargs["date"] == "2026-05-30"
+
+    cache = store.get_cache_status("NVDA", "yfinance_news")
+    assert cache is not None
+    assert cache["status"] == "fresh"
+
+
+@patch.object(YFinanceIngestor, "_fetch_ticker")
+def test_ingest_ticker_news_flat_schema(mock_fetch, tmp_path):
+    """Flat-schema article parses and saves correctly."""
+    from src.storage.store import Store
+
+    store = Store(db_path=tmp_path / "test.db")
+    ingestor = YFinanceIngestor(store=store)
+
+    mock_t = MagicMock()
+    mock_t.news = [FLAT_ARTICLE]
+
+    ingestor.store.chroma.get_document = MagicMock(return_value=None)
+    ingestor.store.save_document = MagicMock()
+
+    ingestor._ingest_ticker_news("AMD", mock_t)
+
+    ingestor.store.save_document.assert_called_once()
+    call_kwargs = ingestor.store.save_document.call_args.kwargs
+    assert call_kwargs["document_id"] == "news/AMD/flat-uuid-001"
+    assert call_kwargs["metadata"]["publisher"] == "Bloomberg"
+    assert call_kwargs["date"] == "2024-05-29"
+
+
+def test_ingest_ticker_news_skips_duplicate(tmp_path):
+    """Existing doc_id in ChromaDB is skipped (idempotent)."""
+    from src.storage.store import Store
+
+    store = Store(db_path=tmp_path / "test.db")
+    ingestor = YFinanceIngestor(store=store)
+
+    mock_t = MagicMock()
+    mock_t.news = [NESTED_ARTICLE]
+
+    ingestor.store.chroma.get_document = MagicMock(return_value={"id": "existing"})
+    ingestor.store.save_document = MagicMock()
+
+    ingestor._ingest_ticker_news("NVDA", mock_t)
+
+    ingestor.store.save_document.assert_not_called()
+
+
+def test_ingest_ticker_news_skips_malformed(tmp_path):
+    """Malformed article (no title+summary) is skipped."""
+    from src.storage.store import Store
+
+    store = Store(db_path=tmp_path / "test.db")
+    ingestor = YFinanceIngestor(store=store)
+
+    mock_t = MagicMock()
+    mock_t.news = [{"content": {"title": "", "summary": ""}}]
+
+    ingestor.store.chroma.get_document = MagicMock(return_value=None)
+    ingestor.store.save_document = MagicMock()
+
+    ingestor._ingest_ticker_news("NVDA", mock_t)
+
+    ingestor.store.save_document.assert_not_called()
+
+
+def test_news_fresh_within_ttl(tmp_path):
+    """_news_fresh returns True when cache is fresh within TTL."""
+    from src.storage.store import Store
+
+    store = Store(db_path=tmp_path / "test.db")
+    ingestor = YFinanceIngestor(store=store)
+    store.mark_cache_fresh("NVDA", "yfinance_news", 6)
+
+    assert ingestor._news_fresh("NVDA") is True
+
+
+def test_news_fresh_stale_after_ttl(tmp_path):
+    """_news_fresh returns False when cache exceeds TTL."""
+    from datetime import datetime, timedelta, timezone
+    from src.storage.store import Store
+
+    store = Store(db_path=tmp_path / "test.db")
+    ingestor = YFinanceIngestor(store=store)
+
+    stale_time = datetime.now(timezone.utc) - timedelta(hours=7)
+    store.mark_cache_fresh("NVDA", "yfinance_news", 6)
+    with store.sqlite._connect() as conn:
+        conn.execute(
+            "UPDATE cache_meta SET last_updated = ? WHERE ticker = ? AND source = ?",
+            (stale_time.strftime("%Y-%m-%d %H:%M:%S"), "NVDA", "yfinance_news"),
+        )
+        conn.commit()
+
+    assert ingestor._news_fresh("NVDA") is False
+
+
+@patch.object(YFinanceIngestor, "_fetch_ticker")
+@patch.object(YFinanceIngestor, "_ingest_ticker_fundamentals")
+@patch.object(YFinanceIngestor, "_ingest_ticker_news")
+def test_ingest_news_fundamentals_first(
+    mock_ingest_news, mock_ingest_fundamentals, mock_fetch, tmp_path
+):
+    """ingest_news runs fundamentals first when fundamentals cache is absent."""
+    from src.storage.store import Store
+
+    store = Store(db_path=tmp_path / "test.db")
+    ingestor = YFinanceIngestor(store=store)
+
+    fake_watchlist = tmp_path / "wl.yaml"
+    fake_watchlist.write_text(
+        yaml.safe_dump({"core": ["NVDA"], "schedule": {"fundamentals": 24, "news": 6}})
+    )
+    ingestor = YFinanceIngestor(store=store, watchlist_path=fake_watchlist)
+
+    mock_t = MagicMock()
+    mock_t.news = []
+    mock_fetch.return_value = mock_t
+
+    ingestor.ingest_news()
+
+    mock_ingest_fundamentals.assert_called_once_with("NVDA", mock_t)
+    mock_ingest_news.assert_called_once_with("NVDA", mock_t)
+
+
+@patch.object(YFinanceIngestor, "_fetch_ticker")
+@patch.object(YFinanceIngestor, "_ingest_ticker_news")
+def test_ingest_news_skips_fresh_cache(mock_ingest_news, mock_fetch, tmp_path):
+    """ingest_news skips tickers with fresh news cache."""
+    from src.storage.store import Store
+
+    store = Store(db_path=tmp_path / "test.db")
+
+    fake_watchlist = tmp_path / "wl.yaml"
+    fake_watchlist.write_text(
+        yaml.safe_dump({"core": ["NVDA"], "schedule": {"fundamentals": 24, "news": 6}})
+    )
+    ingestor = YFinanceIngestor(store=store, watchlist_path=fake_watchlist)
+    store.mark_cache_fresh("NVDA", "yfinance_news", 6)
+
+    ingestor.ingest_news()
+
+    mock_fetch.assert_not_called()
+    mock_ingest_news.assert_not_called()
