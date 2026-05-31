@@ -210,9 +210,9 @@ class ChromaStore:
                              source: Optional[str] = None,
                              limit: int = 20) -> list[dict]:
         """Get all documents for a ticker, optionally filtered by source."""
-        where = {"ticker": ticker.upper()}
+        where: dict = {"ticker": ticker.upper()}
         if source:
-            where["source"] = source
+            where = {"$and": [{"ticker": ticker.upper()}, {"source": source}]}
 
         results = self.collection.get(where=where, limit=limit)
         formatted = []

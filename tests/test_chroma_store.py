@@ -256,7 +256,7 @@ def test_get_ticker_documents(chroma_store):
     results = chroma_store.get_ticker_documents("nvda", source="sec", limit=10)
 
     chroma_store.collection.get.assert_called_once_with(
-        where={"ticker": "NVDA", "source": "sec"},
+        where={"$and": [{"ticker": "NVDA"}, {"source": "sec"}]},
         limit=10,
     )
     assert len(results) == 2
