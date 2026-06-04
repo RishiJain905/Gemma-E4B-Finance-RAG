@@ -20,3 +20,9 @@ cache:
   default_ttl_hours: 24
   filing_ttl_hours: 168
   earnings_ttl_hours: 336
+
+sec:
+  # SEC EDGAR requires a descriptive User-Agent identifying the requester.
+  # Resolution order in SECEdgarFilingFetcher: constructor param >
+  # SEC_EDGAR_USER_AGENT env var > this config default.
+  user_agent: "TraceAlchemy Research contact@tracealchemy.example.com"
