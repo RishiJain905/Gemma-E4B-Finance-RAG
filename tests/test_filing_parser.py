@@ -213,6 +213,44 @@ def test_parse_response_recovers_truncated_array(parser):
     assert len(facts) == 2
 
 
+# ── 1b. Operations-table parser (deterministic, no model) ──
+
+AAPL_OPERATIONS_SNIPPET = """
+CONDENSED CONSOLIDATED STATEMENTS OF OPERATIONS (Unaudited)
+(In millions, except per-share amounts)
+Three Months Ended Six Months Ended
+Total net sales 111,184 95,359 254,940 219,659
+Gross margin 54,781 44,867 124,012 103,142
+Research and development 11,419 8,550 22,306 16,818
+Operating income 35,885 29,589 86,737 72,421
+Net income $ 29,578 $ 24,780 $ 71,675 $ 61,110
+Earnings per share: Basic $ 2.02 $ 1.65 Diluted $ 2.01 $ 1.65
+"""
+
+
+def test_operations_table_extraction_aapl(parser):
+    """Deterministic parser extracts core metrics from a real-style operations table."""
+    facts = parser._extract_facts_from_operations_table(
+        AAPL_OPERATIONS_SNIPPET, "2026-Q1",
+    )
+    by_metric = {f["metric"]: f for f in facts}
+    assert "total_revenue" in by_metric
+    assert "net_income" in by_metric
+    assert by_metric["total_revenue"]["value"] == pytest.approx(111.184, rel=1e-3)
+    assert by_metric["net_income"]["value"] == pytest.approx(29.578, rel=1e-3)
+    assert by_metric["eps_diluted"]["value"] == pytest.approx(2.01, rel=1e-3)
+
+
+def test_extract_facts_uses_table_without_model(parser, monkeypatch):
+    """extract_facts_from_filing returns table facts when core metrics are present."""
+    monkeypatch.setattr(parser, "_call_model", lambda _prompt: None)
+    facts = parser.extract_facts_from_filing(
+        "AAPL", "10-Q", AAPL_OPERATIONS_SNIPPET, "2026-Q1",
+    )
+    assert parser._has_core_metrics(facts)
+    assert facts[0]["source_type"] == "sec_10-Q"
+
+
 # ── 2. _select_extraction_sections (deterministic) ──
 
 def test_select_sections_finds_income_statement(parser):

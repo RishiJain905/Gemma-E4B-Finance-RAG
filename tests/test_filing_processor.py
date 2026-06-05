@@ -314,18 +314,9 @@ def test_live_end_to_end_pipeline(tmp_path):
     # Process a single filing end-to-end (download -> parse -> store).
     result = processor.process_pending_filings(limit=1)
 
-    # The orchestrator + model are exercised live here. Extraction can still
-    # yield zero facts when the in-scope-out parser's section selector
-    # (TraceAlchemyFilingParser._select_extraction_sections, capped at the
-    # first 15K chars) does not reach a filing's financial statements — which
-    # happens for AAPL's inline-XBRL filings whose statements sit far deeper.
-    # That is a property of the 1.4.2 parser, not the orchestrator under test,
-    # so skip (keeping the suite green) rather than fail when no facts surface.
-    if result["processed"] < 1:
-        pytest.skip(
-            "Pipeline ran live but the parser extracted no facts from the "
-            f"available filing (parser section-window limitation): {result}"
-        )
+    assert result["processed"] >= 1, (
+        f"expected at least one filing processed end-to-end: {result}"
+    )
 
     # Facts persisted to the fundamentals table.
     with store.sqlite._connect() as conn:

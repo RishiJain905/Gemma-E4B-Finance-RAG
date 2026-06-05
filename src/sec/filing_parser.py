@@ -49,6 +49,22 @@ class TraceAlchemyFilingParser:
     # slice is far more reliable than a large noisy one.
     MAX_PROMPT_TEXT_CHARS = 5000
 
+    # Core metrics required for a successful filing parse (table or model).
+    CORE_METRICS = frozenset({"total_revenue", "net_income"})
+
+    # Smaller schema used for the model path — faster and less likely to truncate.
+    CORE_EXTRACTION_FIELDS = [
+        ("total_revenue", "Total Revenue / Revenue", "billion_usd",
+         "Total revenue or total net sales"),
+        ("gross_profit", "Gross Profit / Gross margin", "billion_usd",
+         "Gross profit or gross margin"),
+        ("operating_income", "Operating Income", "billion_usd",
+         "Operating income"),
+        ("net_income", "Net Income", "billion_usd", "Net income"),
+        ("eps_basic", "Earnings Per Share (Basic)", "usd", "Basic EPS"),
+        ("eps_diluted", "Earnings Per Share (Diluted)", "usd", "Diluted EPS"),
+    ]
+
     # ── Extraction Schema ──────────────────────────────
 
     # Metrics extracted from 10-K / 10-Q filings
@@ -113,7 +129,7 @@ class TraceAlchemyFilingParser:
         self,
         endpoint: Optional[str] = None,
         model: Optional[str] = None,
-        timeout: int = 120,
+        timeout: int = 240,
     ):
         self.endpoint = endpoint or self.DEFAULT_ENDPOINT
         self.model = model or self.DEFAULT_MODEL
@@ -145,20 +161,55 @@ class TraceAlchemyFilingParser:
             List of fact dicts:
                 {metric, value, unit, period, period_type, source_type}
         """
-        # For long filings, use the income statement + balance sheet sections
-        # to keep within context window limits
+        period_label = period or ""
         extracted_text = self._select_extraction_sections(filing_text, filing_type)
 
+        # Primary path: deterministic parse of the operations table (reliable on
+        # inline-XBRL filings where the model often times out or returns empty).
+        table_facts = self._extract_facts_from_operations_table(
+            extracted_text, period_label,
+        )
+        if self._has_core_metrics(table_facts):
+            logger.info(
+                "Parsed %s %s filing for %s: %d facts via operations table",
+                filing_type, period_label, ticker, len(table_facts),
+            )
+            return table_facts
+
+        # Fallback: model extraction with a compact field list.
         prompt = self._build_extraction_prompt(
             ticker, filing_type, extracted_text,
+            fields=self.CORE_EXTRACTION_FIELDS,
         )
-
         raw_response = self._call_model(prompt)
-        facts = self._parse_model_response(raw_response, ticker, period or "")
+        model_facts = self._parse_model_response(raw_response, ticker, period_label)
+        facts = self._merge_facts(table_facts, model_facts)
+
+        if not self._has_core_metrics(facts):
+            # Retry on a tighter operations-only window.
+            tight = self._select_operations_slice(filing_text)
+            if tight and tight != extracted_text:
+                table_facts = self._extract_facts_from_operations_table(
+                    tight, period_label,
+                )
+                if self._has_core_metrics(table_facts):
+                    logger.info(
+                        "Parsed %s %s filing for %s: %d facts via tight table slice",
+                        filing_type, period_label, ticker, len(table_facts),
+                    )
+                    return table_facts
+                prompt = self._build_extraction_prompt(
+                    ticker, filing_type, tight, fields=self.CORE_EXTRACTION_FIELDS,
+                )
+                raw_response = self._call_model(prompt)
+                model_facts = self._parse_model_response(
+                    raw_response, ticker, period_label,
+                )
+                facts = self._merge_facts(table_facts, model_facts)
 
         logger.info(
             "Parsed %s %s filing for %s: %d facts extracted",
-            filing_type, period, ticker, len(facts),
+            filing_type, period_label, ticker, len(facts),
         )
         return facts
 
@@ -213,7 +264,11 @@ class TraceAlchemyFilingParser:
     # ── Prompt Engineering ─────────────────────────────
 
     def _build_extraction_prompt(
-        self, ticker: str, filing_type: str, text: str,
+        self,
+        ticker: str,
+        filing_type: str,
+        text: str,
+        fields: Optional[list[tuple]] = None,
     ) -> str:
         """Build the extraction prompt sent to the model.
 
@@ -223,9 +278,10 @@ class TraceAlchemyFilingParser:
           - Specific example format
           - Temperature should be 0.1 in the API call
         """
+        field_list = fields or self.EXTRACTION_FIELDS
         field_descriptions = "\n".join(
             f"  - \"{field_name}\": {label} ({unit}) — {desc}"
-            for field_name, label, unit, desc in self.EXTRACTION_FIELDS
+            for field_name, label, unit, desc in field_list
         )
 
         return f"""You are a financial document parser. Extract structured financial metrics from the following {ticker} {filing_type} filing text.
@@ -291,12 +347,124 @@ Return the JSON array now."""
         for pattern in self._STATEMENT_HEADER_PATTERNS:
             match = re.search(pattern, text, re.IGNORECASE)
             if match:
-                # Keep a little lead-in for context, then take a tight window.
                 start = max(0, match.start() - 100)
-                return text[start:start + self.SECTION_SLICE_CHARS]
+                end = start + self.SECTION_SLICE_CHARS
+                slice_ = text[start:end]
+                if self._slice_has_operations_table(slice_):
+                    return slice_
+
+        tight = self._select_operations_slice(filing_text)
+        if tight:
+            return tight
 
         # Fallback: first 12K chars (no recognizable statement header).
         return text[:12000]
+
+    def _select_operations_slice(self, filing_text: str) -> str:
+        """Return a tight slice anchored on the operations / net-sales table."""
+        text = filing_text[:200000]
+
+        for pattern in self._STATEMENT_HEADER_PATTERNS:
+            match = re.search(pattern, text, re.IGNORECASE)
+            if not match:
+                continue
+            start = max(0, match.start() - 100)
+            end = start + 2800
+            bs = re.search(
+                r"CONSOLIDATED\s+BALANCE\s+SHEETS?",
+                text[start:],
+                re.IGNORECASE,
+            )
+            if bs and bs.start() < end - start:
+                end = start + bs.start()
+            slice_ = text[start:end]
+            if self._slice_has_operations_table(slice_):
+                return slice_
+
+        anchor = re.search(r"Total net sales", text, re.IGNORECASE)
+        if anchor:
+            start = max(0, anchor.start() - 200)
+            return text[start:start + 2800]
+        return ""
+
+    @staticmethod
+    def _slice_has_operations_table(text: str) -> bool:
+        """True when the slice contains a recognizable income-statement table."""
+        lower = text.lower()
+        return "total net sales" in lower and "net income" in lower
+
+    @staticmethod
+    def _has_core_metrics(facts: list[dict]) -> bool:
+        return TraceAlchemyFilingParser.CORE_METRICS.issubset(
+            {f.get("metric") for f in facts}
+        )
+
+    @staticmethod
+    def _merge_facts(primary: list[dict], secondary: list[dict]) -> list[dict]:
+        """Merge fact lists; primary wins on duplicate metrics."""
+        by_metric: dict[str, dict] = {}
+        for fact in secondary:
+            metric = fact.get("metric")
+            if metric:
+                by_metric[metric] = fact
+        for fact in primary:
+            metric = fact.get("metric")
+            if metric:
+                by_metric[metric] = fact
+        return list(by_metric.values())
+
+    # Regex specs for the deterministic operations-table parser. Values are in
+    # millions when the filing states "(In millions" — scaled to billion_usd.
+    _OPERATIONS_TABLE_SPECS = (
+        ("total_revenue", r"(?:Total net sales|Total revenue)\s+\$?\s*([\d,]+)", "billion_usd"),
+        ("total_revenue", r"\bRevenue\s+\$?\s*([\d,]+)", "billion_usd"),
+        ("gross_profit", r"Gross (?:profit|margin)\s+\$?\s*([\d,]+)", "billion_usd"),
+        ("research_development", r"Research and development\s+\$?\s*([\d,]+)", "billion_usd"),
+        ("operating_income", r"Operating income\s+\$?\s*([\d,]+)", "billion_usd"),
+        ("net_income", r"Net income\s+\$?\s*([\d,]+)", "billion_usd"),
+        ("eps_basic", r"Basic\s+\$\s*([\d.]+)", "usd"),
+        ("eps_diluted", r"Diluted\s+\$\s*([\d.]+)", "usd"),
+    )
+
+    def _extract_facts_from_operations_table(
+        self, text: str, period: str,
+    ) -> list[dict]:
+        """Parse core metrics directly from a condensed operations table."""
+        if not text or not self._slice_has_operations_table(text):
+            return []
+
+        blob = re.sub(r"\s+", " ", text)
+        in_millions = bool(re.search(r"\(\s*in\s+millions", blob, re.IGNORECASE))
+        period_type = "annual" if "Q" not in (period or "") else "quarterly"
+        source_type = f"sec_{filing_type_from_period(period)}"
+
+        facts: list[dict] = []
+        seen: set[str] = set()
+
+        for metric, pattern, unit in self._OPERATIONS_TABLE_SPECS:
+            if metric in seen:
+                continue
+            match = re.search(pattern, blob, re.IGNORECASE)
+            if not match:
+                continue
+            raw = match.group(1).replace(",", "")
+            try:
+                value = float(raw)
+            except ValueError:
+                continue
+            if unit == "billion_usd" and in_millions:
+                value = value / 1000.0
+            facts.append({
+                "metric": metric,
+                "value": value,
+                "unit": unit,
+                "period": period,
+                "period_type": period_type,
+                "source_type": source_type,
+            })
+            seen.add(metric)
+
+        return facts
 
     def _split_filing_sections(self, filing_text: str) -> dict[str, str]:
         """Split a filing into logical sections by common headers."""
