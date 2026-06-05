@@ -67,13 +67,25 @@ class ChromaStore:
 
     DEFAULT_PATH = Path(__file__).parent.parent.parent / "data/chroma"
 
+    # Documents longer than CHUNK_CHARS are split into overlapping windows so
+    # each embedded sequence stays well under the llama-server batch limit.
+    # With the default embedding batch_size of 10, a 1000-char window is
+    # ~630 tokens worst case (~1.58 chars/token for dense filings), so a full
+    # request is ~6.3K tokens — comfortably below the 8192 ubatch ceiling.
+    DEFAULT_CHUNK_CHARS = 1000
+    DEFAULT_CHUNK_OVERLAP = 150
+
     def __init__(self,
                  persist_directory: Optional[Path] = None,
                  collection_name: str = "tracealchemy_docs",
-                 embedding_endpoint: str = "http://127.0.0.1:8087/v1/embeddings"):
+                 embedding_endpoint: str = "http://127.0.0.1:8087/v1/embeddings",
+                 chunk_chars: int = DEFAULT_CHUNK_CHARS,
+                 chunk_overlap: int = DEFAULT_CHUNK_OVERLAP):
 
         self.persist_directory = persist_directory or self.DEFAULT_PATH
         self.persist_directory.mkdir(parents=True, exist_ok=True)
+        self.chunk_chars = chunk_chars
+        self.chunk_overlap = chunk_overlap
 
         # Create embedding function
         self.embedding_fn = TraceAlchemyEmbeddingFunction(
@@ -120,11 +132,74 @@ class ChromaStore:
         if date:
             meta["date"] = date
 
+        chunks = self._chunk_text(text, self.chunk_chars, self.chunk_overlap)
+
+        # Short documents are stored as a single entry under their original id,
+        # preserving the existing id scheme and avoiding the embedder's batch limit.
+        if len(chunks) <= 1:
+            self.collection.add(
+                documents=[text],
+                metadatas=[meta],
+                ids=[document_id]
+            )
+            return
+
+        # Long documents are split so each embedded chunk fits the batch limit
+        # and retrieval stays granular. Each chunk is its own entry: "{id}#{i}".
+        total = len(chunks)
+        ids = [f"{document_id}#{i}" for i in range(total)]
+        metadatas = []
+        for i in range(total):
+            chunk_meta = dict(meta)
+            chunk_meta["parent_id"] = document_id
+            chunk_meta["chunk_index"] = i
+            chunk_meta["chunk_count"] = total
+            metadatas.append(chunk_meta)
+
         self.collection.add(
-            documents=[text],
-            metadatas=[meta],
-            ids=[document_id]
+            documents=chunks,
+            metadatas=metadatas,
+            ids=ids
         )
+
+    @staticmethod
+    def _chunk_text(text: str, chunk_chars: int, overlap: int) -> list[str]:
+        """Split text into overlapping windows, breaking on whitespace when possible.
+
+        Returns a single-element list for text at or below the chunk size,
+        and an empty list for empty input.
+        """
+        text = (text or "").strip()
+        if not text:
+            return []
+        if len(text) <= chunk_chars:
+            return [text]
+
+        chunks: list[str] = []
+        start = 0
+        n = len(text)
+        while start < n:
+            end = min(start + chunk_chars, n)
+            # Prefer a whitespace boundary near the window end to avoid mid-word cuts.
+            if end < n:
+                space = text.rfind(" ", start, end)
+                if space > start:
+                    end = space
+            chunk = text[start:end].strip()
+            if chunk:
+                chunks.append(chunk)
+            if end >= n:
+                break
+            nxt = max(end - overlap, start + 1)
+            # Snap the overlap start forward to a word boundary so the next
+            # chunk doesn't begin mid-word.
+            if nxt < n and not text[nxt - 1].isspace():
+                space = text.find(" ", nxt)
+                if space == -1:
+                    break
+                nxt = space + 1
+            start = nxt
+        return chunks
 
     def add_documents_batch(self,
                             ids: list[str],

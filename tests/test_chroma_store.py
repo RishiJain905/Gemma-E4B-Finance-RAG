@@ -284,3 +284,71 @@ def test_heartbeat_success(chroma_store):
 def test_heartbeat_failure(chroma_store):
     chroma_store.client.heartbeat.side_effect = Exception("Connection failed")
     assert chroma_store.heartbeat() is False
+
+
+# ── Chunking tests ───────────────────────────────────
+
+def test_chunk_text_short_returns_single():
+    assert ChromaStore._chunk_text("hello", 1000, 150) == ["hello"]
+
+
+def test_chunk_text_empty_returns_empty():
+    assert ChromaStore._chunk_text("", 1000, 150) == []
+    assert ChromaStore._chunk_text("   ", 1000, 150) == []
+
+
+def test_chunk_text_splits_long_with_overlap():
+    # 50 space-separated words, each "wordNN" -> well over the small chunk size
+    text = " ".join(f"word{i:02d}" for i in range(50))
+    chunks = ChromaStore._chunk_text(text, chunk_chars=60, overlap=15)
+
+    assert len(chunks) > 1
+    # No chunk exceeds the window size.
+    assert all(len(c) <= 60 for c in chunks)
+    # No mid-word cuts: every token is a clean "wordNN".
+    for c in chunks:
+        for token in c.split():
+            assert token.startswith("word")
+    # Overlap means consecutive chunks share at least one token.
+    first_tokens = set(chunks[0].split())
+    second_tokens = set(chunks[1].split())
+    assert first_tokens & second_tokens
+
+
+def test_add_document_short_unchanged(chroma_store):
+    chroma_store.add_document(document_id="doc-1", text="short text", ticker="nvda")
+    chroma_store.collection.add.assert_called_once_with(
+        documents=["short text"],
+        metadatas=[{"ticker": "NVDA"}],
+        ids=["doc-1"],
+    )
+
+
+def test_add_document_chunks_long_text(chroma_store):
+    long_text = " ".join(f"token{i:04d}" for i in range(400))  # ~3600 chars
+    chroma_store.add_document(
+        document_id="sec/NVDA/10-Q-2026-Q1",
+        text=long_text,
+        ticker="nvda",
+        source="sec",
+    )
+
+    chroma_store.collection.add.assert_called_once()
+    kwargs = chroma_store.collection.add.call_args.kwargs
+    ids = kwargs["ids"]
+    docs = kwargs["documents"]
+    metas = kwargs["metadatas"]
+
+    assert len(ids) > 1
+    assert len(ids) == len(docs) == len(metas)
+    # Ids are suffixed "#0", "#1", ... off the parent id.
+    assert ids[0] == "sec/NVDA/10-Q-2026-Q1#0"
+    assert ids[1] == "sec/NVDA/10-Q-2026-Q1#1"
+    # Each chunk carries parent + index metadata alongside the base metadata.
+    assert metas[0]["parent_id"] == "sec/NVDA/10-Q-2026-Q1"
+    assert metas[0]["ticker"] == "NVDA"
+    assert metas[0]["source"] == "sec"
+    assert metas[0]["chunk_index"] == 0
+    assert metas[0]["chunk_count"] == len(ids)
+    # Each chunk respects the configured window size.
+    assert all(len(d) <= chroma_store.chunk_chars for d in docs)

@@ -43,6 +43,12 @@ class TraceAlchemyFilingParser:
     DEFAULT_ENDPOINT = "http://127.0.0.1:8087/v1/chat/completions"
     DEFAULT_MODEL = "tracealchemy"
 
+    # Max filing-text characters embedded in the extraction prompt. The
+    # section selector already returns a tight, targeted slice; this is the
+    # upper bound (and what trims the no-marker fallback). A small, focused
+    # slice is far more reliable than a large noisy one.
+    MAX_PROMPT_TEXT_CHARS = 5000
+
     # ── Extraction Schema ──────────────────────────────
 
     # Metrics extracted from 10-K / 10-Q filings
@@ -242,57 +248,54 @@ RULES:
 
 FILING TEXT:
 --- START OF {filing_type} FOR {ticker} ---
-{text[:12000]}
+{text[:self.MAX_PROMPT_TEXT_CHARS]}
 --- END OF {filing_type} FOR {ticker} ---
 
 Return the JSON array now."""
 
+    # Width of the targeted slice taken from the statement header. ~4.5K chars
+    # comfortably spans the operations table plus the following statements
+    # (comprehensive income / balance sheet) while staying small enough that
+    # the model reliably returns a complete, non-empty JSON array.
+    SECTION_SLICE_CHARS = 4500
+
+    # Specific statement headers, matched in priority order. These anchor on
+    # the ACTUAL financial-statement table. Loose markers like "INCOME
+    # STATEMENT" / "STATEMENT OF INCOME" are deliberately excluded: they
+    # false-match prose in the notes (e.g. AAPL's "Disaggregation of Income
+    # Statement Expenses") and select the wrong slice.
+    _STATEMENT_HEADER_PATTERNS = [
+        r"CONDENSED\s+CONSOLIDATED\s+STATEMENTS?\s+OF\s+OPERATIONS",
+        r"CONSOLIDATED\s+STATEMENTS?\s+OF\s+OPERATIONS",
+        r"CONDENSED\s+CONSOLIDATED\s+STATEMENTS?\s+OF\s+INCOME",
+        r"CONSOLIDATED\s+STATEMENTS?\s+OF\s+INCOME",
+        r"CONSOLIDATED\s+INCOME\s+STATEMENTS?",
+        r"STATEMENTS?\s+OF\s+OPERATIONS",
+    ]
+
     def _select_extraction_sections(self, filing_text: str, filing_type: str) -> str:
-        """Select the most relevant sections of a filing for extraction.
+        """Select the most relevant section of a filing for extraction.
 
-        For 10-K/Q, the key sections are:
-          - Consolidated Income Statements
-          - Consolidated Balance Sheets
-          - Consolidated Statements of Cash Flows
+        Strategy: locate the consolidated *statement of operations / income*
+        table by matching SPECIFIC headers only (in priority order), then
+        return a tight bounded slice centered on that header. The slice spans
+        the income statement and the immediately-following statements (the
+        balance sheet typically lands within it), which keeps the model input
+        small and signal-dense instead of a large noisy blob.
 
-        If we can find these sections, extract just them to save context.
-        Otherwise, fall back to the first N characters of the filing.
+        Falls back to the first 12K characters when no statement header is
+        found, so the model still gets the front matter of the filing.
         """
-        text = filing_text[:15000]  # Cap to avoid context overflow
+        text = filing_text[:200000]  # Cap to avoid context overflow
 
-        # Try to find income statement section using common section markers
-        section_markers = [
-            "CONSOLIDATED INCOME STATEMENT",
-            "CONSOLIDATED STATEMENTS OF INCOME",
-            "CONSOLIDATED STATEMENT OF INCOME",
-            "INCOME STATEMENT",
-            "STATEMENT OF INCOME",
-            "CONSOLIDATED STATEMENTS OF OPERATIONS",
-            "STATEMENT OF OPERATIONS",
-        ]
+        for pattern in self._STATEMENT_HEADER_PATTERNS:
+            match = re.search(pattern, text, re.IGNORECASE)
+            if match:
+                # Keep a little lead-in for context, then take a tight window.
+                start = max(0, match.start() - 100)
+                return text[start:start + self.SECTION_SLICE_CHARS]
 
-        for marker in section_markers:
-            idx = text.upper().find(marker)
-            if idx >= 0:
-                # Found the income statement — grab from here
-                start = max(0, idx - 200)
-                # Also get balance sheet if available
-                bs_markers = [
-                    "CONSOLIDATED BALANCE SHEET",
-                    "CONSOLIDATED BALANCE SHEETS",
-                    "BALANCE SHEET",
-                    "BALANCE SHEETS",
-                ]
-                end_idx = len(text)
-                for bs_marker in bs_markers:
-                    bs_pos = text.upper().find(bs_marker, idx + 100)
-                    if bs_pos > 0:
-                        end_idx = bs_pos + 3000
-                        break
-
-                return text[start:end_idx]
-
-        # Fallback: first 12K chars
+        # Fallback: first 12K chars (no recognizable statement header).
         return text[:12000]
 
     def _split_filing_sections(self, filing_text: str) -> dict[str, str]:
@@ -353,7 +356,10 @@ Return the JSON array now."""
                 {"role": "user", "content": prompt},
             ],
             "temperature": 0.1,
-            "max_tokens": 2048,
+            # The extraction schema has 20+ fields; a full JSON array can run
+            # ~3-4K completion tokens. Raise the limit (model.yaml allows up to
+            # 8192) so the array isn't truncated before its closing bracket.
+            "max_tokens": 4096,
             "top_p": 0.1,  # Narrow sampling for deterministic extraction
         }
 
@@ -380,6 +386,53 @@ Return the JSON array now."""
             return None
 
     # ── Response Parsing ──────────────────────────────
+
+    @staticmethod
+    def _recover_truncated_objects(text: str) -> list[dict]:
+        """Recover complete JSON objects from a truncated/unclosed array.
+
+        When the model's JSON array is cut off by max_tokens before its
+        closing ``]`` (or a trailing object is half-written), strict parsing
+        fails. This scans the text and assembles every fully-balanced
+        ``{...}`` object that parsed cleanly, discarding any incomplete tail.
+        """
+        objects: list[dict] = []
+        depth = 0
+        in_string = False
+        escape = False
+        start = -1
+
+        for i, ch in enumerate(text):
+            if in_string:
+                if escape:
+                    escape = False
+                elif ch == "\\":
+                    escape = True
+                elif ch == '"':
+                    in_string = False
+                continue
+
+            if ch == '"':
+                in_string = True
+            elif ch == "{":
+                if depth == 0:
+                    start = i
+                depth += 1
+            elif ch == "}":
+                if depth > 0:
+                    depth -= 1
+                    if depth == 0 and start >= 0:
+                        candidate = text[start:i + 1]
+                        try:
+                            obj = json.loads(candidate)
+                        except json.JSONDecodeError:
+                            pass
+                        else:
+                            if isinstance(obj, dict):
+                                objects.append(obj)
+                        start = -1
+
+        return objects
 
     def _parse_model_response(
         self, raw_response: Optional[str], ticker: str, period: str,
@@ -408,16 +461,20 @@ Return the JSON array now."""
         try:
             data = json.loads(text)
         except json.JSONDecodeError:
-            # Try to find JSON array with regex
+            # Try to find a complete JSON array with regex
             match = re.search(r"\[.*\]", text, re.DOTALL)
             if match:
                 try:
                     data = json.loads(match.group())
                 except json.JSONDecodeError:
-                    logger.error("Failed to parse model response as JSON")
-                    return []
+                    data = self._recover_truncated_objects(text)
             else:
-                logger.error("No JSON array found in model response")
+                # No closing bracket (e.g. response truncated by max_tokens) —
+                # recover whatever complete objects were emitted before the cut.
+                data = self._recover_truncated_objects(text)
+
+            if not data:
+                logger.error("Failed to parse model response as JSON")
                 return []
 
         if not isinstance(data, list):

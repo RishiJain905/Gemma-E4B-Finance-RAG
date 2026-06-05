@@ -195,6 +195,24 @@ def test_parse_response_default_unit(parser):
     assert facts[0]["unit"] == "billion_usd"
 
 
+def test_parse_response_recovers_truncated_array(parser):
+    """A JSON array cut off by max_tokens still yields its complete objects."""
+    # Closing ] is missing and the final object is half-written.
+    raw = (
+        '[{"metric": "total_revenue", "value": 111.184, "unit": "billion_usd"}, '
+        '{"metric": "net_income", "value": 71.675, "unit": "billion_usd"}, '
+        '{"metric": "operating_income", "value": 35.8'
+    )
+    facts = parser._parse_model_response(raw, "AAPL", "2026-Q1")
+
+    by_metric = {f["metric"]: f for f in facts}
+    # The two complete objects are recovered; the truncated tail is dropped.
+    assert by_metric["total_revenue"]["value"] == 111.184
+    assert by_metric["net_income"]["value"] == 71.675
+    assert "operating_income" not in by_metric
+    assert len(facts) == 2
+
+
 # ── 2. _select_extraction_sections (deterministic) ──
 
 def test_select_sections_finds_income_statement(parser):
@@ -212,6 +230,31 @@ def test_select_sections_finds_income_statement(parser):
     assert "Revenue 26000" in selected
     # Balance sheet content after the income statement is included.
     assert "CONSOLIDATED BALANCE SHEETS" in selected
+
+
+def test_select_sections_prefers_operations_over_loose_income_prose(parser):
+    """A real 'statements of operations' table wins over loose prose earlier on.
+
+    Mirrors AAPL's 10-Q: the loose phrase 'Income Statement' appears in the
+    notes BEFORE the operations table; the selector must still anchor on the
+    operations table so the revenue/net-income figures are captured.
+    """
+    text = (
+        "Disaggregation of Income Statement Expenses is discussed below.\n"
+        + "filler prose line\n" * 50
+        + "CONDENSED CONSOLIDATED STATEMENTS OF OPERATIONS\n"
+        + "Total net sales 111184\nNet income 29578\n"
+        + "Earnings per share: Basic 2.02\n"
+        + "CONSOLIDATED BALANCE SHEETS\n"
+        + "Total assets 371082\n"
+    )
+    selected = parser._select_extraction_sections(text, "10-Q")
+
+    assert "CONDENSED CONSOLIDATED STATEMENTS OF OPERATIONS" in selected
+    assert "Total net sales 111184" in selected
+    assert "Net income 29578" in selected
+    # The loose-prose region must NOT be what anchored the slice.
+    assert "Disaggregation of Income Statement Expenses" not in selected
 
 
 def test_select_sections_fallback_when_no_markers(parser):
@@ -267,12 +310,17 @@ def test_build_prompt_includes_fields_and_metadata(parser):
 
 
 def test_build_prompt_truncates_long_text(parser):
-    """Filing text longer than 12000 chars is truncated in the prompt."""
-    long_text = "A" * 20000
+    """Filing text is truncated to MAX_PROMPT_TEXT_CHARS in the prompt.
+
+    The prompt now embeds a tight, targeted slice rather than a large noisy
+    blob, so the body cap was lowered from 12000 to MAX_PROMPT_TEXT_CHARS.
+    """
+    cap = parser.MAX_PROMPT_TEXT_CHARS
+    long_text = "A" * (cap + 8000)
     prompt = parser._build_extraction_prompt("NVDA", "10-K", long_text)
-    # Only 12000 chars of the body should appear.
-    assert "A" * 12000 in prompt
-    assert "A" * 12001 not in prompt
+    # Only `cap` chars of the body should appear.
+    assert "A" * cap in prompt
+    assert "A" * (cap + 1) not in prompt
 
 
 # ── 5. filing_type_from_period (deterministic) ──────
