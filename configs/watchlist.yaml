@@ -33,3 +33,4 @@ schedule:
   fundamentals: 24    # Re-fetch fundamentals daily
   news: 6             # Re-fetch news every 6 hours
   macro: 24           # Macro indicators daily
+  sec_filings: 12     # Check for new SEC filings every 12 hours
