@@ -225,11 +225,16 @@ async def search(request: SearchRequest):
     if not store:
         raise HTTPException(status_code=503, detail="Store not initialized")
 
-    results = store.search(
-        query=request.query,
-        n_results=request.n_results,
-        ticker=request.ticker,
-    )
+    try:
+        results = store.search(
+            query=request.query,
+            n_results=request.n_results,
+            ticker=request.ticker,
+        )
+    except Exception as e:
+        logger.warning("Search failed (embedding server may be down): %s", e)
+        # Return empty results gracefully when embedding server is unavailable
+        results = {"documents": [], "facts": [], "ticker": request.ticker}
 
     return SearchResponse(
         documents=results.get("documents", []),
