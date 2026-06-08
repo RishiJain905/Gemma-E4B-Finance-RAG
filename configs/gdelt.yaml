@@ -1,0 +1,37 @@
+# configs/gdelt.yaml
+# GDELT news configuration
+
+# GDELT 2.0 query parameters
+max_records: 250          # Max articles per query (GDELT limit)
+lookback_days: 7          # How far back to search on initial run
+request_delay: 5.0        # GDELT DOC API: max 1 req / 5 sec (shared throttle)
+max_retries_on_429: 2     # Retries after 429 with exponential backoff (delay * 2^n)
+gkg_max_files_per_fetch: 24   # Max GKG 15-min CSV files per enrichment pass
+use_title_tone_fallback: true  # Lexicon fallback when GKG URL match missing
+
+# Domain filters — restrict to financial news sources (GDELT query length limit)
+max_finance_domains: 5     # Cap OR-clause size; full list is too long for DOC API
+finance_domains:
+  - reuters.com
+  - bloomberg.com
+  - cnbc.com
+  - marketwatch.com
+  - seekingalpha.com
+  - finance.yahoo.com
+  - wsj.com
+  - ft.com
+  - investing.com
+  - barrons.com
+  - economist.com
+  - nytimes.com
+
+# Topic filters (GDELT GCAM codes)
+# See: http://data.gdeltproject.org/api/v2/guides/GCAM-MASTER.txt
+financial_topics:
+  - "FINANCE"            # General financial news
+  - "MARKETS"            # Market movements
+  - "ECON_MACRO"         # Macroeconomic indicators
+  - "ECON_INDICATOR"     # Specific economic data releases
+  - "CORPORATE"          # Corporate news (earnings, M&A)
+  - "REGULATION"         # Regulatory actions
+  - "TRADE"              # Trade policy
