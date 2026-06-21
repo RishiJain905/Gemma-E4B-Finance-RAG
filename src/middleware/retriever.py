@@ -22,8 +22,30 @@ from typing import Optional
 
 from src.storage.store import Store
 from .config import MiddlewareConfig
+from .lexical_index import LexicalIndex
 
 logger = logging.getLogger(__name__)
+
+
+def rrf_fuse(vector_hits: list[dict], lexical_hits: list[dict],
+             k: int = 60) -> list[tuple[str, float]]:
+    """Reciprocal Rank Fusion of two ranked lists (Phase 2.1.2.1).
+
+    Each hit needs an ``id``. Returns ``(id, rrf_score)`` sorted high → low.
+    An id ranked highly by *both* channels beats one ranked highly by only one.
+    """
+    scores: dict[str, float] = {}
+    for rank, h in enumerate(vector_hits):
+        hid = h.get("id")
+        if hid is None:
+            continue
+        scores[hid] = scores.get(hid, 0.0) + 1.0 / (k + rank + 1)
+    for rank, h in enumerate(lexical_hits):
+        hid = h.get("id")
+        if hid is None:
+            continue
+        scores[hid] = scores.get(hid, 0.0) + 1.0 / (k + rank + 1)
+    return sorted(scores.items(), key=lambda x: -x[1])
 
 
 class Retriever:
@@ -54,6 +76,49 @@ class Retriever:
     def __init__(self, store: Store, config: Optional[MiddlewareConfig] = None):
         self.store = store
         self.config = config or MiddlewareConfig()
+        # Phase 2.1.2 — lazy singletons for the lexical channel + re-ranker.
+        self._lexical: Optional[LexicalIndex] = None
+        self._reranker = None
+        # Tracks the document-retrieval path actually used for a retrieve() call
+        # ("vector" | "hybrid" | "hybrid+rerank") — surfaced in the /query response.
+        self._doc_retrieval_strategy = "vector"
+
+    @property
+    def lexical(self) -> LexicalIndex:
+        """Lazily-built, cached BM25 index over the chroma corpus."""
+        if self._lexical is None:
+            self._lexical = LexicalIndex(self.store)
+        return self._lexical
+
+    @property
+    def reranker(self):
+        """Lazily-built, cached cross-encoder re-ranker (Phase 2.1.2.2)."""
+        if self._reranker is None:
+            from .reranker import Reranker
+            self._reranker = Reranker(self.config)
+        return self._reranker
+
+    def refresh_lexical_index(self) -> None:
+        """Rebuild the BM25 index (call after ingestion / scheduler runs).
+
+        Always invokes ``LexicalIndex.refresh()`` so callers/tests can assert a
+        rebuild happened. No-op when the lexical channel is disabled.
+        """
+        if not self.config.enable_lexical:
+            return
+        _ = self.lexical  # ensure the index exists
+        self._lexical.refresh()  # noqa: SLF001
+
+    def warm_lexical_index(self) -> None:
+        """Eagerly build the BM25 index (best-effort, never raises).
+
+        Called on middleware startup so the first query doesn't pay the build
+        cost and the index is ready for fusion.
+        """
+        try:
+            self.lexical._ensure()  # noqa: SLF001
+        except Exception as e:  # noqa: BLE001 - never fail startup
+            logger.warning("Lexical index warm-up failed: %s", e)
 
     # ── Public API ─────────────────────────────────────
 
@@ -74,9 +139,11 @@ class Retriever:
                 "facts": list[dict],
                 "documents": list[dict],
                 "ticker": str or None,
-                "strategy": str,  # Which retrieval strategy was used
+                "strategy": str,  # Logical retrieval strategy used
+                "retrieval_strategy": str,  # doc path: vector|hybrid|hybrid+rerank
             }
         """
+        self._doc_retrieval_strategy = "vector"  # reset; upgraded by hybrid path
         ticker = intent.get("ticker")
         metrics = intent.get("metrics", [])
         question_type = intent.get("question_type", "general")
@@ -138,6 +205,7 @@ class Retriever:
             "documents": documents,
             "ticker": ticker,
             "strategy": strategy,
+            "retrieval_strategy": self._doc_retrieval_strategy,
         }
 
     # ── Strategy Selection ────────────────────────────
@@ -260,15 +328,100 @@ class Retriever:
 
     # ── Document Retrieval (ChromaDB) ──────────────────
 
+    def retrieve_documents(self, query: str, ticker: Optional[str],
+                           n_results: int) -> list[dict]:
+        """Public document retrieval (hybrid + re-rank per config).
+
+        Used by ``/search`` so it exposes ``fusion_score`` / ``rerank_score``.
+        """
+        return self._retrieve_documents(query, ticker, n_results)
+
     def _retrieve_documents(self, query: str, ticker: Optional[str],
                             n_results: int) -> list[dict]:
-        """Retrieve semantically relevant documents from ChromaDB."""
-        results = self.store.search(
-            query=query,
-            n_results=n_results,
-            ticker=ticker,
+        """Retrieve relevant documents — hybrid (vector+BM25+RRF, optional
+        re-rank) when enabled, else the original vector-only path.
+
+        ``n_results`` is the final count returned. The hybrid path retrieves
+        ``rerank_candidates`` broadly, fuses, then re-ranks / truncates to
+        ``n_results``.
+        """
+        if not self.config.enable_lexical:
+            results = self.store.search(query=query, n_results=n_results,
+                                        ticker=ticker)
+            return results.get("documents", [])
+        return self._retrieve_documents_hybrid(query, ticker, n_results)
+
+    def _retrieve_documents_hybrid(self, query: str, ticker: Optional[str],
+                                   n_results: int) -> list[dict]:
+        """Vector + BM25 → RRF → (optional) cross-encoder re-rank → top n."""
+        candidates = max(self.config.rerank_candidates, n_results)
+        vfilter = {"ticker": ticker} if ticker else None
+        broad_n = max(candidates // 2, n_results)
+
+        # 1. Vector channel (ranked by cosine). Mirror store.search: ticker-
+        #    filtered first, then a broad (unfiltered) pass appended (deduped)
+        #    so false-positive tickers (e.g. "P", "GDP") still surface docs.
+        vector_hits = self.store.chroma.search(
+            query=query, n_results=candidates, filter_dict=vfilter,
         )
-        return results.get("documents", [])
+        if ticker:
+            seen = {h["id"] for h in vector_hits}
+            for h in self.store.chroma.search(query=query, n_results=broad_n,
+                                              filter_dict=None):
+                if h["id"] not in seen:
+                    vector_hits.append(h)
+                    seen.add(h["id"])
+
+        # 2. Lexical (BM25) channel — same ticker + broad shape; best-effort.
+        lexical_hits: list[dict] = []
+        try:
+            lexical_hits = self.lexical.search(query=query, k=candidates,
+                                                where=vfilter)
+            if ticker:
+                seen = {h["id"] for h in lexical_hits}
+                for h in self.lexical.search(query=query, k=broad_n, where=None):
+                    if h["id"] not in seen:
+                        lexical_hits.append(h)
+                        seen.add(h["id"])
+        except Exception as e:  # noqa: BLE001 - never let lexical break a query
+            logger.warning("Lexical search failed, vector-only fallback: %s", e)
+
+        # 3. RRF fuse.
+        fused = rrf_fuse(vector_hits, lexical_hits, k=self.config.rrf_k)
+
+        # 4. Hydrate fused ids to full doc dicts (text + metadata).
+        by_id: dict[str, dict] = {}
+        for h in vector_hits:
+            by_id.setdefault(h["id"], h)
+        for h in lexical_hits:
+            by_id.setdefault(h["id"], h)
+        fused_docs: list[dict] = []
+        for doc_id, rrf_score in fused:
+            d = dict(by_id.get(doc_id, {"id": doc_id, "document": "",
+                                        "metadata": {}}))
+            d["fusion_score"] = float(rrf_score)
+            fused_docs.append(d)
+
+        # Record the strategy actually used (vector if lexical produced nothing).
+        if lexical_hits:
+            self._doc_retrieval_strategy = "hybrid"
+        else:
+            self._doc_retrieval_strategy = "vector"
+
+        # 5. Re-rank or truncate to the final count.
+        if self.config.enable_reranker and fused_docs:
+            try:
+                fused_docs = self.reranker.rerank(
+                    query, fused_docs, top_n=n_results,
+                )
+                self._doc_retrieval_strategy = "hybrid+rerank"
+            except Exception as e:  # noqa: BLE001 - fallback to fused order
+                logger.warning("Reranker failed, using fused order: %s", e)
+                fused_docs = fused_docs[:n_results]
+        else:
+            fused_docs = fused_docs[:n_results]
+
+        return fused_docs
 
     # ── Multi-Ticker Extraction ────────────────────────
 

@@ -48,6 +48,8 @@ class QueryResponse(BaseModel):
     documents_used: int = 0
     latency_ms: float = 0.0
     model_available: bool = True
+    retrieval_strategy: Optional[str] = Field(
+        None, description="Document retrieval path used: vector|hybrid|hybrid+rerank")
     freshness: dict = Field(
         default_factory=lambda: {
             "overall": "unknown",

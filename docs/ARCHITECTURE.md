@@ -44,6 +44,63 @@ intent parsing, hybrid retrieval, and prompt augmentation.
 | Unified scheduler | `src/scheduler/__init__.py` (`UnifiedScheduler`) | Orchestrates ingestion with staggered execution + TTL tracking |
 | Ingestors | `src/ingestion/`, `src/macros/`, `src/sec/` | Per-source data fetching |
 | Resilience utils | `src/utils/resilience.py` | Retry/backoff, circuit breaker, dead-letter queue |
+| Lexical index | `src/middleware/lexical_index.py` (`LexicalIndex`) | BM25 keyword index over the ChromaDB corpus (Phase 2.1.2.1) |
+| Re-ranker | `src/middleware/reranker.py` (`Reranker`) | Cross-encoder / LLM re-ranker of fused candidates (Phase 2.1.2.2) |
+
+---
+
+## Retrieval Pipeline (Phase 2.1.2)
+
+Document retrieval runs an optional **hybrid + re-rank** pipeline, each stage
+independently toggleable via `configs/middleware.yaml` (or env overrides
+`ENABLE_LEXICAL`, `ENABLE_RERANKER`, `RERANKER_BACKEND`, …) for A/B eval:
+
+```
+query
+  │
+  1. vector search (ChromaDB, cosine)   ── top `rerank_candidates`
+  2. BM25 lexical search (rank_bm25)    ── top `rerank_candidates`
+  3. RRF fusion (retriever.rrf_fuse)     ── one ranked list
+  4. cross-encoder re-rank (Reranker)    ── top `rerank_top_n` (= top_k_documents)
+  │
+  ▼  documents (+ facts from SQLite) → prompt augmenter
+```
+
+- **Vector channel** — `ChromaStore.search` (cosine similarity), ticker-filtered
+  when a ticker is detected.
+- **Lexical channel** — `LexicalIndex` (BM25Okapi) over the same corpus
+  (`ChromaStore.iter_documents()`). Tokenizer: lowercase + alphanumeric runs,
+  so tickers/product codes (`MI300X`, `CRWD`) stay intact. Documents that share
+  no query token are dropped; BM25's negative-IDF scores (common terms) are kept
+  and used only for ranking.
+- **RRF** — `rrf_fuse(vector, lexical, k=rrf_k)`; an id ranked highly by both
+  channels beats one ranked highly by only one.
+- **Re-ranker** — `Reranker` with two backends: `cross-encoder`
+  (`sentence-transformers`, default `cross-encoder/ms-marco-MiniLM-L-6-v2`,
+  downloads on first use) or `llm` (the TraceAlchemy model on `:8087` scoring
+  `(query, doc)` pairs). Lazy-loaded, cached, and falls back to the fused order
+  on any load/score failure — a query never fails because of the re-ranker.
+
+The `/query` response reports which path ran via `retrieval_strategy`:
+`vector` | `hybrid` | `hybrid+rerank`. `/search` document results carry
+`fusion_score` / `rerank_score` for inspecting ranking quality.
+
+### Lexical index freshness
+
+The BM25 index is built from the corpus and goes stale as documents are added.
+The chosen strategy is **lazy rebuild on corpus-count change**:
+
+- Built eagerly on middleware startup (`Retriever.warm_lexical_index()` in the
+  lifespan) so the first query doesn't pay the build cost.
+- On every search, `LexicalIndex._ensure()` compares `ChromaStore.count()` to
+  the count at build time; if it changed (ingestion added/removed docs), the
+  index rebuilds before scoring.
+- `POST /refresh/{ticker}` additionally calls `Retriever.refresh_lexical_index()`
+  to force an immediate rebuild after an on-demand refresh. Scheduler-driven
+  ingestion is covered by the lazy count-change check on the next query.
+
+If the corpus is empty or the build fails, `LexicalIndex.search` returns `[]`
+and the retriever falls back to vector-only — the query still succeeds.
 
 ---
 

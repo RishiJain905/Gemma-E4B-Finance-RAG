@@ -37,6 +37,17 @@ setup, code style, testing, and the pull-request process.
    `requirements.txt` already pins `pytest`; `pytest-cov` is needed for the
    coverage commands below.
 
+> **One-time model download (Phase 2.1.2 re-ranker):** enabling the
+> cross-encoder re-ranker (`enable_reranker: true` with
+> `reranker_backend: "cross-encoder"`) lazy-loads
+> `cross-encoder/ms-marco-MiniLM-L-6-v2` via `sentence-transformers` on first
+> use — a ~90 MB download from Hugging Face cached under
+> `~/.cache/huggingface/`. This happens automatically the first time a query
+> runs with the re-ranker on; it is **not** needed for the default config
+> (`enable_reranker: false`) or the `llm` backend (which reuses the
+> TraceAlchemy model on `:8087`). If the download fails (offline), the
+> re-ranker falls back to the fused order and logs a warning.
+
 4. **Configure secrets** — create a `.env` in the project root:
 
    ```

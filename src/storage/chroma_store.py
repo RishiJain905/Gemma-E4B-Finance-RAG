@@ -273,6 +273,32 @@ class ChromaStore:
         """How many documents are in the collection?"""
         return self.collection.count()
 
+    def iter_documents(self, where: Optional[dict] = None,
+                       limit: Optional[int] = None) -> tuple[list[str], list[str], list[dict]]:
+        """Return the full corpus as (ids, texts, metadatas).
+
+        Used by the BM25 lexical index (Phase 2.1.2.1) to build a keyword index
+        over the same documents ChromaDB stores. ``where`` filters by metadata
+        (e.g. {"ticker": "NVDA"}); ``limit`` caps the result count.
+        """
+        kwargs: dict = {"include": ["documents", "metadatas"]}
+        if where is not None:
+            kwargs["where"] = where
+        if limit is not None:
+            kwargs["limit"] = limit
+        results = self.collection.get(**kwargs)
+        ids = list(results.get("ids") or [])
+        texts = list(results.get("documents") or [])
+        metas = list(results.get("metadatas") or [])
+        # Guard against a missing documents/metadata slot (shouldn't happen, but
+        # keep the three lists aligned in length).
+        n = len(ids)
+        if len(texts) < n:
+            texts += [""] * (n - len(texts))
+        if len(metas) < n:
+            metas += [{}] * (n - len(metas))
+        return ids, texts, metas
+
     # ── Ticker-Specific Operations ────────────────────
 
     def search_by_ticker(self, query: str, ticker: str,

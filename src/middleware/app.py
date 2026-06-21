@@ -42,12 +42,13 @@ logger = logging.getLogger(__name__)
 config: Optional[MiddlewareConfig] = None
 store: Optional[Store] = None
 model_client: Optional[httpx.AsyncClient] = None
+retriever = None  # Shared Retriever (built on startup) — Phase 2.1.2
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Startup and shutdown lifecycle."""
-    global config, store, model_client
+    global config, store, model_client, retriever
 
     logger.info("Starting middleware...")
     from src.utils.env import load_env
@@ -57,6 +58,13 @@ async def lifespan(app: FastAPI):
         embedding_endpoint=config.embedding_endpoint,
     )
     model_client = httpx.AsyncClient(timeout=60)
+
+    # Shared retriever so the BM25 lexical index is built once and reused
+    # across requests (Phase 2.1.2). Warm it eagerly on startup.
+    from .retriever import Retriever
+    retriever = Retriever(store=store, config=config)
+    if config.enable_lexical:
+        retriever.warm_lexical_index()
 
     yield  # App runs here
 
@@ -154,10 +162,11 @@ async def query(request: QueryRequest):
     # Step 1b: Staleness-aware freshness check (Phase 1.7.4)
     freshness_meta = _evaluate_and_refresh(intent.get("ticker"), request.refresh)
 
-    # Step 2: Dual retrieval (delegated to 1.5.3)
+    # Step 2: Dual retrieval (delegated to 1.5.3). Uses the shared retriever
+    # built on startup so the BM25 index is reused (Phase 2.1.2).
     from .retriever import Retriever
-    retriever = Retriever(store=store, config=config)
-    retrieval = retriever.retrieve(
+    r = retriever or Retriever(store=store, config=config)
+    retrieval = r.retrieve(
         query=request.question,
         intent=intent,
         top_k_documents=config.top_k_documents,
@@ -198,6 +207,7 @@ async def query(request: QueryRequest):
         latency_ms=elapsed_ms,
         model_available=model_available,
         freshness=freshness_meta,
+        retrieval_strategy=retrieval.get("retrieval_strategy"),
     )
 
 
@@ -474,6 +484,13 @@ async def refresh_ticker(ticker: str, body: Optional[RefreshRequest] = None):
 
     refreshed, errors = _refresh_ticker_sources(ticker, to_refresh)
 
+    # Keep the BM25 lexical index fresh after ingestion (Phase 2.1.2.3).
+    if retriever is not None:
+        try:
+            retriever.refresh_lexical_index()
+        except Exception as e:  # noqa: BLE001 - never fail the refresh response
+            logger.warning("Lexical index refresh failed: %s", e)
+
     return RefreshResponse(
         ticker=ticker,
         refreshed=refreshed,
@@ -541,25 +558,45 @@ def _extract_citations(text: str) -> list[SourceCitation]:
 
 @app.post("/search", response_model=SearchResponse)
 async def search(request: SearchRequest):
-    """Raw hybrid search — returns retrieved data without model inference."""
+    """Raw hybrid search — returns retrieved data without model inference.
+
+    Documents come through the shared retriever's hybrid path (vector + BM25 +
+    re-rank, per config) so ``fusion_score`` / ``rerank_score`` are exposed for
+    inspecting ranking quality (Phase 2.1.2.3).
+    """
     if not store:
         raise HTTPException(status_code=503, detail="Store not initialized")
 
+    from .retriever import Retriever
+    r = retriever or Retriever(store=store, config=config)
+
+    documents: list[dict] = []
+    facts: list[dict] = []
+    ticker_out = request.ticker
     try:
-        results = store.search(
+        facts_results = store.search(
             query=request.query,
             n_results=request.n_results,
             ticker=request.ticker,
         )
-    except Exception as e:
-        logger.warning("Search failed (embedding server may be down): %s", e)
-        # Return empty results gracefully when embedding server is unavailable
-        results = {"documents": [], "facts": [], "ticker": request.ticker}
+        facts = facts_results.get("facts", [])
+        ticker_out = facts_results.get("ticker") or request.ticker
+    except Exception as e:  # noqa: BLE001
+        logger.warning("Search facts failed (embedding server may be down): %s", e)
+
+    try:
+        documents = r.retrieve_documents(
+            query=request.query,
+            ticker=request.ticker,
+            n_results=request.n_results,
+        )
+    except Exception as e:  # noqa: BLE001
+        logger.warning("Search documents failed: %s", e)
 
     return SearchResponse(
-        documents=results.get("documents", []),
-        facts=results.get("facts", []),
-        ticker=results.get("ticker"),
+        documents=documents,
+        facts=facts,
+        ticker=ticker_out,
     )
 
 
