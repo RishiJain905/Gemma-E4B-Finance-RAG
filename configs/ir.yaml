@@ -1,0 +1,19 @@
+# configs/ir.yaml
+# Company IR pages ingestion configuration
+
+request_delay: 3.0          # Seconds between ticker fetches
+max_retries: 3
+timeout: 30                 # HTTP request timeout in seconds
+
+# User-Agent for IR page requests
+user_agent: "TraceAlchemy Research (contact@tracealchemy.example.com)"
+
+# Document types to store
+doc_types:
+  - press_release
+  - presentation
+  - earnings_material
+  - event
+
+# Max items to fetch per ticker per run
+max_items_per_ticker: 20

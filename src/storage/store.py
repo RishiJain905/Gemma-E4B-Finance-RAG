@@ -260,6 +260,183 @@ class Store:
     def get_stale_entries(self, limit: int = 20) -> list[dict]:
         return self.sqlite.get_stale_cache_entries(limit)
 
+    # ── Freshness / Staleness-Aware Querying (Phase 1.7.4) ─
+
+    # Maps a logical data source to its cache_meta source identifier and the
+    # watchlist.yaml schedule key that defines its TTL (in hours).
+    FRESHNESS_SOURCES = {
+        "yfinance_fundamentals": {"cache_source": "yfinance_fundamentals", "ttl_key": "fundamentals"},
+        "yfinance_news":         {"cache_source": "yfinance_news",         "ttl_key": "news"},
+        "sec_filings":           {"cache_source": "sec_filings_discovery", "ttl_key": "sec_filings"},
+        "gdelt_news":            {"cache_source": "gdelt_news",            "ttl_key": "gdelt_news"},
+        "earnings_transcripts":  {"cache_source": "earnings_transcripts",  "ttl_key": "transcripts"},
+        "ir_pages":              {"cache_source": "ir_pages",              "ttl_key": "ir_pages"},
+    }
+
+    _DEFAULT_TTLS = {
+        "fundamentals": 24, "news": 6, "macro": 24, "sec_filings": 12,
+        "gdelt_news": 6, "transcripts": 168, "ir_pages": 24,
+    }
+
+    def _schedule_ttls(self) -> dict:
+        """Lazily load the schedule TTL map from configs/watchlist.yaml."""
+        cached = getattr(self, "_ttl_cache", None)
+        if cached is not None:
+            return cached
+        ttls = dict(self._DEFAULT_TTLS)
+        try:
+            import yaml
+            wl_path = Path(__file__).parent.parent.parent / "configs/watchlist.yaml"
+            if wl_path.exists():
+                with open(wl_path) as f:
+                    config = yaml.safe_load(f) or {}
+                ttls.update(config.get("schedule", {}) or {})
+        except Exception:
+            pass
+        self._ttl_cache = ttls
+        return ttls
+
+    @staticmethod
+    def _age_hours(last_updated) -> Optional[float]:
+        """Compute age in hours from a cache_meta last_updated value."""
+        if not last_updated:
+            return None
+        from datetime import datetime, timezone
+        try:
+            if isinstance(last_updated, str):
+                try:
+                    from dateutil import parser
+                    dt = parser.parse(last_updated)
+                except Exception:
+                    dt = datetime.strptime(last_updated, "%Y-%m-%d %H:%M:%S")
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+            else:
+                dt = last_updated
+            return (datetime.now(timezone.utc) - dt).total_seconds() / 3600
+        except Exception:
+            return None
+
+    def is_ticker_fresh(self, ticker: str, source: str, ttl_hours: int) -> bool:
+        """Check if a specific source for a ticker exists and is within TTL.
+
+        Args:
+            ticker: Ticker symbol
+            source: cache_meta source identifier (e.g., "yfinance_fundamentals")
+            ttl_hours: TTL in hours
+
+        Returns:
+            True if data exists and is within TTL, False otherwise.
+        """
+        status = self.sqlite.get_cache_status(ticker, source)
+        if not status:
+            return False
+        if status.get("status") == "stale":
+            return False
+        age = self._age_hours(status.get("last_updated"))
+        if age is None:
+            return False
+        return age < ttl_hours
+
+    def mark_source_fresh(self, ticker: str, source: str, ttl_hours: int):
+        """Mark a source as freshly updated (now + ttl_hours)."""
+        self.sqlite.mark_cache_fresh(ticker, source, ttl_hours)
+
+    def mark_source_stale(self, ticker: str, source: str, error: str = ""):
+        """Mark a source as stale (e.g., after a failed fetch). Upserts."""
+        self.sqlite.upsert_cache_stale(ticker, source, error or None)
+
+    def get_freshness_report(self, ticker: str) -> dict:
+        """Get freshness status for all data sources for a given ticker.
+
+        Returns a dict with per-source status ("fresh" | "stale" |
+        "never_fetched"), age_hours, ttl_hours, last_updated, plus an
+        overall rollup and the list of stale source names.
+        """
+        ttls = self._schedule_ttls()
+        sources: dict[str, dict] = {}
+        stale_sources: list[str] = []
+        fresh_count = 0
+        present_count = 0
+
+        for name, cfg in self.FRESHNESS_SOURCES.items():
+            ttl_hours = ttls.get(cfg["ttl_key"], self._DEFAULT_TTLS.get(cfg["ttl_key"], 24))
+            cache = self.sqlite.get_cache_status(ticker, cfg["cache_source"])
+
+            if not cache:
+                sources[name] = {
+                    "status": "never_fetched",
+                    "last_updated": None,
+                    "age_hours": None,
+                    "ttl_hours": ttl_hours,
+                }
+                continue
+
+            present_count += 1
+            age = self._age_hours(cache.get("last_updated"))
+            if cache.get("status") == "stale":
+                status = "stale"
+            elif age is not None and age < ttl_hours:
+                status = "fresh"
+            else:
+                status = "stale"
+
+            if status == "fresh":
+                fresh_count += 1
+            else:
+                stale_sources.append(name)
+
+            sources[name] = {
+                "status": status,
+                "last_updated": str(cache.get("last_updated")) if cache.get("last_updated") else None,
+                "age_hours": round(age, 2) if age is not None else None,
+                "ttl_hours": ttl_hours,
+            }
+
+        if present_count == 0:
+            overall = "never_fetched"
+        elif fresh_count == present_count:
+            overall = "fresh"
+        elif fresh_count == 0:
+            overall = "stale"
+        else:
+            overall = "partial"
+
+        return {
+            "ticker": ticker,
+            "sources": sources,
+            "overall": overall,
+            "stale_sources": stale_sources,
+        }
+
+    def get_stale_tickers(self, source: str) -> list[str]:
+        """Get all tickers whose data for a given logical source is stale.
+
+        ``source`` may be a logical name from FRESHNESS_SOURCES (e.g.
+        "yfinance_fundamentals") or a raw cache_meta source identifier.
+        Tickers with no cache entry are not included (use the watchlist for
+        never-fetched tickers).
+        """
+        cfg = self.FRESHNESS_SOURCES.get(source)
+        cache_source = cfg["cache_source"] if cfg else source
+        ttl_key = cfg["ttl_key"] if cfg else None
+        ttl_hours = self._schedule_ttls().get(ttl_key, 24) if ttl_key else 24
+
+        sql = "SELECT ticker, last_updated, status FROM cache_meta WHERE source=?"
+        with self.sqlite._connect() as conn:
+            rows = conn.execute(sql, (cache_source,)).fetchall()
+
+        stale = []
+        for row in rows:
+            r = dict(row)
+            if r.get("status") == "stale":
+                stale.append(r["ticker"])
+                continue
+            age = self._age_hours(r.get("last_updated"))
+            if age is None or age >= ttl_hours:
+                stale.append(r["ticker"])
+        return stale
+
     # ── Utilities ─────────────────────────────────────
 
     @staticmethod

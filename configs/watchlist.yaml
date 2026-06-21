@@ -36,3 +36,4 @@ schedule:
   sec_filings: 12     # Check for new SEC filings every 12 hours
   gdelt_news: 6       # GDELT global news every 6 hours
   transcripts: 168    # Earnings transcripts weekly (7 days)
+  ir_pages: 24        # Company IR pages (press releases / presentations) daily

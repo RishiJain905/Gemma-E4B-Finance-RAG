@@ -22,10 +22,13 @@ from fastapi import FastAPI, HTTPException
 from src.storage.store import Store
 from .config import MiddlewareConfig
 from .models import (
+    FreshnessResponse,
     HealthResponse,
     MacroSnapshotResponse,
     QueryRequest,
     QueryResponse,
+    RefreshRequest,
+    RefreshResponse,
     SearchRequest,
     SearchResponse,
     SentimentResponse,
@@ -126,6 +129,9 @@ async def query(request: QueryRequest):
     parser = IntentParser()
     intent = parser.parse(request.question, override_ticker=request.ticker)
 
+    # Step 1b: Staleness-aware freshness check (Phase 1.7.4)
+    freshness_meta = _evaluate_and_refresh(intent.get("ticker"), request.refresh)
+
     # Step 2: Dual retrieval (delegated to 1.5.3)
     from .retriever import Retriever
     retriever = Retriever(store=store, config=config)
@@ -162,6 +168,202 @@ async def query(request: QueryRequest):
         facts_used=len(retrieval.get("facts", [])),
         documents_used=len(retrieval.get("documents", [])),
         latency_ms=elapsed_ms,
+        freshness=freshness_meta,
+    )
+
+
+# ── Freshness / Refresh (Phase 1.7.4) ──────────────────
+
+# Maps user-facing short source aliases to the logical source names used by
+# Store.FRESHNESS_SOURCES.
+_SOURCE_ALIASES = {
+    "fundamentals": "yfinance_fundamentals",
+    "yfinance_fundamentals": "yfinance_fundamentals",
+    "news": "yfinance_news",
+    "yfinance_news": "yfinance_news",
+    "sec": "sec_filings",
+    "sec_filings": "sec_filings",
+    "gdelt": "gdelt_news",
+    "gdelt_news": "gdelt_news",
+    "earnings": "earnings_transcripts",
+    "earnings_transcripts": "earnings_transcripts",
+    "ir": "ir_pages",
+    "ir_pages": "ir_pages",
+}
+
+
+def _normalize_sources(sources: Optional[list[str]]) -> list[str]:
+    """Map short aliases to logical source names, dropping unknown ones."""
+    if not sources:
+        return []
+    out = []
+    for s in sources:
+        logical = _SOURCE_ALIASES.get(str(s).lower().strip())
+        if logical and logical not in out:
+            out.append(logical)
+    return out
+
+
+def _refresh_one_source(ticker: str, logical: str) -> None:
+    """Run the ingestion for a single logical source for one ticker.
+
+    Marks the source fresh in cache_meta on success. Raises on failure so the
+    caller can record the error.
+    """
+    from src.storage.store import Store
+    cfg = Store.FRESHNESS_SOURCES.get(logical)
+    cache_source = cfg["cache_source"] if cfg else logical
+    ttl = store._schedule_ttls().get(cfg["ttl_key"], 24) if cfg else 24
+
+    if logical == "yfinance_fundamentals":
+        from src.ingestion.yfinance_ingestor import YFinanceIngestor
+        ing = YFinanceIngestor(store=store)
+        t = ing._fetch_ticker(ticker)
+        if t is not None:
+            ing._ingest_ticker_fundamentals(ticker, t)  # marks cache fresh
+    elif logical == "yfinance_news":
+        from src.ingestion.yfinance_ingestor import YFinanceIngestor
+        ing = YFinanceIngestor(store=store)
+        t = ing._fetch_ticker(ticker)
+        if t is not None:
+            ing._ingest_ticker_news(ticker, t)  # marks cache fresh
+    elif logical == "sec_filings":
+        from src.sec import FilingScheduler
+        sched = FilingScheduler(store=store)
+        sched.processor.discover_new_filings(ticker)
+        store.mark_source_fresh(ticker, cache_source, ttl)
+    elif logical == "gdelt_news":
+        from src.macros.gdelt_ingestor import GDELTIngestor
+        GDELTIngestor(store=store).fetch_and_store_for_ticker(ticker)
+        store.mark_source_fresh(ticker, cache_source, ttl)
+    elif logical == "earnings_transcripts":
+        from src.macros.earnings_transcripts import EarningsTranscriptIngestor
+        EarningsTranscriptIngestor(store=store).fetch_and_process(ticker)
+        store.mark_source_fresh(ticker, cache_source, ttl)
+    elif logical == "ir_pages":
+        from src.macros.ir_ingestor import IRIngestor
+        IRIngestor(store=store).fetch_for_ticker(ticker)
+        store.mark_source_fresh(ticker, cache_source, ttl)
+    else:
+        raise ValueError(f"Unknown source: {logical}")
+
+
+def _refresh_ticker_sources(ticker: str, sources: list[str]) -> tuple[list[str], list[str]]:
+    """Refresh the given logical sources for a ticker.
+
+    Returns (refreshed, errors).
+    """
+    refreshed: list[str] = []
+    errors: list[str] = []
+    for logical in sources:
+        try:
+            _refresh_one_source(ticker, logical)
+            refreshed.append(logical)
+        except Exception as e:  # noqa: BLE001 - never let a refresh crash the query
+            logger.warning("Refresh failed for %s/%s: %s", ticker, logical, e)
+            store.mark_source_stale(ticker, _logical_cache_source(logical), str(e))
+            errors.append(f"{logical}: {e}")
+    return refreshed, errors
+
+
+def _logical_cache_source(logical: str) -> str:
+    from src.storage.store import Store
+    cfg = Store.FRESHNESS_SOURCES.get(logical)
+    return cfg["cache_source"] if cfg else logical
+
+
+def _evaluate_and_refresh(ticker: Optional[str], do_refresh: bool) -> dict:
+    """Check freshness for a ticker and optionally refresh stale sources.
+
+    Returns the freshness metadata block for the query response.
+    """
+    meta = {
+        "overall": "unknown",
+        "refreshed_during_query": [],
+        "stale_sources_used": [],
+        "warning": None,
+    }
+    if not ticker or not store:
+        return meta
+
+    try:
+        report = store.get_freshness_report(ticker)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("Freshness check failed for %s: %s", ticker, e)
+        return meta
+
+    meta["overall"] = report.get("overall", "unknown")
+    # Only present-but-expired sources are auto-refreshed during a query;
+    # never_fetched sources are left to the scheduler / explicit refresh.
+    stale = [
+        name for name, info in report.get("sources", {}).items()
+        if info.get("status") == "stale"
+    ]
+    if not stale:
+        return meta
+
+    if do_refresh:
+        refreshed, _errors = _refresh_ticker_sources(ticker, stale)
+        meta["refreshed_during_query"] = refreshed
+        meta["stale_sources_used"] = [s for s in stale if s not in refreshed]
+    else:
+        meta["stale_sources_used"] = stale
+        meta["warning"] = (
+            f"{ticker} has stale data for: {', '.join(stale)}. "
+            "Answer may not reflect the latest information."
+        )
+    return meta
+
+
+@app.get("/freshness/{ticker}", response_model=FreshnessResponse)
+async def get_freshness(ticker: str):
+    """Get a freshness report for a ticker across all data sources."""
+    if not store:
+        raise HTTPException(status_code=503, detail="Store not initialized")
+
+    report = store.get_freshness_report(ticker.upper())
+    return FreshnessResponse(
+        ticker=report["ticker"],
+        overall=report["overall"],
+        sources=report["sources"],
+        stale_sources=report["stale_sources"],
+    )
+
+
+@app.post("/refresh/{ticker}", response_model=RefreshResponse)
+async def refresh_ticker(ticker: str, body: Optional[RefreshRequest] = None):
+    """Trigger on-demand refresh for a ticker.
+
+    If ``sources`` is omitted, all currently-stale sources are refreshed.
+    """
+    if not store:
+        raise HTTPException(status_code=503, detail="Store not initialized")
+
+    ticker = ticker.upper()
+    start = time.time()
+
+    requested = _normalize_sources(body.sources if body else None)
+    report = store.get_freshness_report(ticker)
+    stale = [
+        name for name, info in report.get("sources", {}).items()
+        if info.get("status") in ("stale", "never_fetched")
+    ]
+
+    if requested:
+        to_refresh = requested
+        skipped = [s for s in report.get("sources", {}) if s not in requested]
+    else:
+        to_refresh = stale
+        skipped = [s for s in report.get("sources", {}) if s not in stale]
+
+    refreshed, errors = _refresh_ticker_sources(ticker, to_refresh)
+
+    return RefreshResponse(
+        ticker=ticker,
+        refreshed=refreshed,
+        skipped=skipped,
+        errors=errors,
+        duration_s=round(time.time() - start, 2),
     )
 
 

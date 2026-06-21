@@ -20,6 +20,8 @@ class QueryRequest(BaseModel):
     max_tokens: Optional[int] = Field(None, ge=64, le=8192,
                                        description="Max response tokens")
     stream: bool = Field(False, description="Enable streaming response")
+    refresh: bool = Field(True, description="Auto-refresh stale data before answering")
+    include_sources: bool = Field(True, description="Include source citations")
 
 
 class SourceCitation(BaseModel):
@@ -45,6 +47,15 @@ class QueryResponse(BaseModel):
     facts_used: int = 0
     documents_used: int = 0
     latency_ms: float = 0.0
+    freshness: dict = Field(
+        default_factory=lambda: {
+            "overall": "unknown",
+            "refreshed_during_query": [],
+            "stale_sources_used": [],
+            "warning": None,
+        },
+        description="Freshness metadata for the data used in the answer",
+    )
     timestamp: str = Field(default_factory=lambda: datetime.utcnow().isoformat() + "Z")
 
 
@@ -91,3 +102,26 @@ class SentimentResponse(BaseModel):
     article_count: int = 0
     positive_ratio: float = 0.0
     negative_ratio: float = 0.0
+
+
+class FreshnessResponse(BaseModel):
+    """Freshness report for a ticker across all data sources."""
+    ticker: str
+    overall: str = "unknown"
+    sources: dict = Field(default_factory=dict)
+    stale_sources: list[str] = Field(default_factory=list)
+
+
+class RefreshRequest(BaseModel):
+    """On-demand refresh request body."""
+    sources: Optional[list[str]] = Field(
+        None, description="Sources to refresh (default: all stale sources)")
+
+
+class RefreshResponse(BaseModel):
+    """Result of an on-demand refresh."""
+    ticker: str
+    refreshed: list[str] = Field(default_factory=list)
+    skipped: list[str] = Field(default_factory=list)
+    errors: list[str] = Field(default_factory=list)
+    duration_s: float = 0.0

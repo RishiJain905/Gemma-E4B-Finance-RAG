@@ -19,6 +19,7 @@ sec-edgar-api>=1.0.0   # SEC EDGAR filings
 pyrate-limiter>=3.1.0,<4  # Required by sec-edgar-api (4.x drops raise_when_fail)
 gdelt>=0.1.14          # GDELT news (PyPI latest; no 1.x release yet)
 fredapi>=0.5.0         # FRED economic data
+feedparser>=6.0.0      # RSS/Atom parsing for company IR feeds
 
 # ── Testing ───────────────────────────────────────────
 pytest>=8.0.0

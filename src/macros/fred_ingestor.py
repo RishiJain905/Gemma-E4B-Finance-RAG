@@ -18,6 +18,7 @@ from typing import Optional
 import yaml
 
 from src.storage.store import Store
+from src.utils.resilience import retry_with_backoff
 
 logger = logging.getLogger(__name__)
 
@@ -98,8 +99,16 @@ class FREDIngestor:
         """
         label = self.config.get("indicators", {}).get(series_id, series_id)
 
+        @retry_with_backoff(
+            max_attempts=self.config.get("max_retries", 3),
+            base_delay=self.config.get("request_delay", 0.25),
+            retryable_exceptions=(ConnectionError, TimeoutError, IOError),
+        )
+        def _get_series():
+            return self.client.get_series(series_id, limit=limit)
+
         try:
-            series = self.client.get_series(series_id, limit=limit)
+            series = _get_series()
 
             if series is None or series.empty:
                 logger.warning("No data returned for FRED series %s", series_id)
