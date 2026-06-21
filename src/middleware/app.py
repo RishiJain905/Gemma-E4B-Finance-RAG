@@ -23,10 +23,12 @@ from src.storage.store import Store
 from .config import MiddlewareConfig
 from .models import (
     HealthResponse,
+    MacroSnapshotResponse,
     QueryRequest,
     QueryResponse,
     SearchRequest,
     SearchResponse,
+    SentimentResponse,
     SourceCitation,
 )
 
@@ -241,6 +243,82 @@ async def search(request: SearchRequest):
         facts=results.get("facts", []),
         ticker=results.get("ticker"),
     )
+
+
+# ── Macro / Sentiment / Guidance ───────────────────────
+
+@app.get("/macro/snapshot", response_model=MacroSnapshotResponse)
+async def macro_snapshot():
+    """
+    Get a quick snapshot of key macro-economic indicators.
+    Returns cached data from SQLite (no live FRED API call).
+    """
+    if not store:
+        raise HTTPException(status_code=503, detail="Store not initialized")
+
+    macro = store.get_fundamentals_batch("MACRO", metrics=[
+        "GDP", "CPIAUCSL", "FEDFUNDS", "UNRATE", "DGS10", "T10Y2Y",
+    ])
+
+    return MacroSnapshotResponse(
+        gdp=macro.get("GDP"),
+        inflation_cpi=macro.get("CPIAUCSL"),
+        fed_rate=macro.get("FEDFUNDS"),
+        unemployment=macro.get("UNRATE"),
+        ten_year_treasury=macro.get("DGS10"),
+        ten_two_spread=macro.get("T10Y2Y"),
+    )
+
+
+@app.get("/sentiment/{ticker}", response_model=SentimentResponse)
+async def sentiment(ticker: str, days: int = 7):
+    """
+    Get GDELT sentiment summary for a ticker.
+
+    Args:
+        ticker: Stock ticker symbol
+        days: Lookback period in days (default: 7)
+
+    Returns average tone score, article count, and sentiment ratios.
+    """
+    if not store:
+        raise HTTPException(status_code=503, detail="Store not initialized")
+
+    from src.macros.gdelt_ingestor import GDELTIngestor
+    ingestor = GDELTIngestor(store=store)
+    summary = ingestor.get_sentiment_summary(ticker.upper(), days=days)
+
+    return SentimentResponse(
+        ticker=summary.get("ticker", ticker.upper()),
+        average_tone=summary.get("average_tone"),
+        article_count=summary.get("article_count", 0),
+        positive_ratio=summary.get("positive_ratio", 0.0),
+        negative_ratio=summary.get("negative_ratio", 0.0),
+    )
+
+
+@app.get("/guidance/{ticker}", response_model=dict)
+async def guidance(ticker: str):
+    """
+    Get the latest earnings guidance for a ticker.
+    Returns revenue guidance range, EPS, and margin from the most
+    recent earnings transcript.
+    """
+    if not store:
+        raise HTTPException(status_code=503, detail="Store not initialized")
+
+    from src.macros.earnings_transcripts import EarningsTranscriptIngestor
+    ingestor = EarningsTranscriptIngestor(store=store)
+    guidance_data = ingestor.get_latest_guidance(ticker.upper())
+
+    if not guidance_data:
+        return {"ticker": ticker.upper(), "guidance": {}, "status": "not_found"}
+
+    return {
+        "ticker": ticker.upper(),
+        "guidance": guidance_data,
+        "status": "found",
+    }
 
 
 # ── Root ───────────────────────────────────────────────

@@ -40,6 +40,17 @@ class Retriever:
       - general: Both stores, broad search
     """
 
+    MACRO_KEYWORDS = [
+        "interest rate", "fed rate", "federal reserve", "inflation",
+        "cpi", "gdp", "economy", "economic", "recession", "unemployment",
+        "treasury yield", "bond yield", "yield curve", "macro",
+        "market outlook", "economic indicator", "gross domestic product",
+        "jobs report", "nonfarm payroll", "consumer sentiment",
+        "housing market", "industrial production",
+        "fed funds", "interest rates", "rate hike", "rate cut",
+        "fed funds rate",
+    ]
+
     def __init__(self, store: Store, config: Optional[MiddlewareConfig] = None):
         self.store = store
         self.config = config or MiddlewareConfig()
@@ -73,6 +84,14 @@ class Retriever:
 
         strategy = self._select_strategy(question_type, ticker, metrics)
 
+        # Text-based macro detection: _select_strategy only sees metrics, not the
+        # raw question, so upgrade the strategy when the query mentions macro topics.
+        if question_type not in ("sentiment", "news") and self._query_mentions_macro(query):
+            if ticker is None:
+                strategy = "macro"
+            elif strategy in ("hybrid", "facts_only", "broad"):
+                strategy = "macro_hybrid"
+
         facts = []
         documents = []
 
@@ -80,6 +99,15 @@ class Retriever:
             facts = self._retrieve_facts(ticker, metrics, timeframe, top_k_facts)
 
         elif strategy == "documents_only":
+            documents = self._retrieve_documents(query, ticker, top_k_documents)
+
+        elif strategy == "macro":
+            facts = self._retrieve_macro_facts(top_k_facts)
+            documents = self._retrieve_documents(query, ticker=None, n_results=top_k_documents)
+
+        elif strategy == "macro_hybrid":
+            facts = self._retrieve_facts(ticker, metrics, timeframe, top_k_facts)
+            facts.extend(self._retrieve_macro_facts(top_k_facts))
             documents = self._retrieve_documents(query, ticker, top_k_documents)
 
         elif strategy == "hybrid":
@@ -121,17 +149,40 @@ class Retriever:
             return "comparison"
         if question_type in ("sentiment", "news"):
             return "documents_only"
+        if question_type == "risk":
+            return "documents_only"
         if question_type == "fact_lookup" and metrics and ticker:
             return "facts_only"
         if question_type == "fact_lookup" and ticker:
             return "hybrid"
+        if ticker is None and self._is_macro_question(metrics, question_type):
+            return "macro"  # NEW: macro-only strategy
+        if ticker and self._is_macro_question(metrics, question_type):
+            return "macro_hybrid"  # NEW: company + macro
         if question_type == "trend" and ticker:
             return "hybrid"
-        if question_type == "risk":
-            return "documents_only"
         if ticker:
             return "hybrid"
         return "broad"
+
+    def _is_macro_question(self, metrics: list[str], question_type: str) -> bool:
+        """Detect if a question is about macro-economic topics."""
+        if question_type in ("sentiment", "news"):
+            return False
+        # Check if any extracted metric maps to FRED indicators
+        macro_metrics = {"gdp", "inflation", "cpi", "interest_rates",
+                         "unemployment", "yield"}
+        if metrics and any(m in macro_metrics for m in metrics):
+            return True
+        # The question text has macro keywords — this info comes
+        # from the intent parser which we don't have here directly,
+        # but the higher-level query method can pass it
+        return False
+
+    def _query_mentions_macro(self, query: str) -> bool:
+        """Return True if the query text mentions any macro-economic keyword."""
+        lowered = query.lower()
+        return any(keyword in lowered for keyword in self.MACRO_KEYWORDS)
 
     # ── Fact Retrieval (SQLite) ────────────────────────
 
@@ -163,6 +214,30 @@ class Retriever:
                 if not any(f.get("metric") == r.get("metric") for f in facts):
                     facts.append(dict(r))
 
+        return facts[:limit]
+
+    def _retrieve_macro_facts(self, limit: int = 15) -> list[dict]:
+        """Retrieve macro-economic facts from FRED data in SQLite."""
+        macro_metrics = [
+            "GDP", "FEDFUNDS", "CPIAUCSL", "UNRATE",
+            "DGS10", "T10Y2Y", "UMCSENT",
+        ]
+        batch = self.store.get_fundamentals_batch("MACRO", metrics=macro_metrics)
+        facts = []
+        for metric, value in batch.items():
+            if value is not None:
+                facts.append({
+                    "metric": metric,
+                    "value": value,
+                    "ticker": "MACRO",
+                    "source_type": "fred",
+                })
+        # Fallback: query recent facts from MACRO
+        if len(facts) < limit:
+            recent = self.store.sqlite.search_facts(ticker="MACRO", limit=limit)
+            for r in recent:
+                if not any(f.get("metric") == r.get("metric") for f in facts):
+                    facts.append(dict(r))
         return facts[:limit]
 
     def _retrieve_all_facts(self, limit: int) -> list[dict]:

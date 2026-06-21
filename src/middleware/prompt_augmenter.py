@@ -35,6 +35,14 @@ class PromptAugmenter:
     Adapts the prompt template based on question type.
     """
 
+    MACRO_LABELS = {
+        "GDP": "GDP", "GDPC1": "Real GDP", "CPIAUCSL": "CPI (Inflation)",
+        "PCEPILFE": "Core PCE", "FEDFUNDS": "Fed Funds Rate", "DFF": "Fed Funds Rate (Daily)",
+        "DGS10": "10-Year Treasury", "DGS2": "2-Year Treasury", "T10Y2Y": "10Y-2Y Spread",
+        "UNRATE": "Unemployment Rate", "PAYEMS": "Nonfarm Payrolls",
+        "UMCSENT": "Consumer Sentiment", "HOUST": "Housing Starts", "INDPRO": "Industrial Production",
+    }
+
     def __init__(self, config: Optional[MiddlewareConfig] = None):
         self.config = config or MiddlewareConfig()
 
@@ -66,6 +74,11 @@ class PromptAugmenter:
         # 2. Retrieved facts (if any)
         if facts:
             sections.append(self._format_facts_section(facts, ticker))
+
+        # 2.5 Macro context (if any)
+        macro_section = self._format_macro_context(facts)
+        if macro_section:
+            sections.append(macro_section)
 
         # 3. Retrieved documents (if any)
         if documents:
@@ -182,6 +195,28 @@ class PromptAugmenter:
                 f"- **{metric}**: {value_str}{unit_str}{period_str} "
                 f"[Source: {source}/{ticker or 'unknown'}]"
             )
+
+        return "\n".join(lines)
+
+    # ── Macro Context Section ──────────────────────────
+
+    def _format_macro_context(self, facts: list[dict]) -> str:
+        """Format macro-economic context into a readable section."""
+        macro_facts = [f for f in facts if f.get("ticker") == "MACRO"]
+        if not macro_facts:
+            return ""
+
+        lines = ["## Macro-Economic Context\n"]
+        for fact in macro_facts:
+            metric = fact.get("metric", "unknown")
+            value = fact.get("value")
+            unit = fact.get("unit", "")
+            period = fact.get("period", "")
+
+            label = self.MACRO_LABELS.get(metric, metric)
+            value_str = f"{value:,.2f}" if isinstance(value, float) else str(value)
+            period_str = f" ({period})" if period else ""
+            lines.append(f"- **{label}**: {value_str}{unit}{period_str}")
 
         return "\n".join(lines)
 

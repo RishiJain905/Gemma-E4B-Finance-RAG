@@ -71,3 +71,23 @@ class SearchResponse(BaseModel):
     documents: list[dict] = Field(default_factory=list)
     facts: list[dict] = Field(default_factory=list)
     ticker: Optional[str] = None
+
+
+class MacroSnapshotResponse(BaseModel):
+    """Snapshot of key macro-economic indicators."""
+    gdp: Optional[float] = None
+    inflation_cpi: Optional[float] = None
+    fed_rate: Optional[float] = None
+    unemployment: Optional[float] = None
+    ten_year_treasury: Optional[float] = None
+    ten_two_spread: Optional[float] = None
+    timestamp: str = Field(default_factory=lambda: datetime.utcnow().isoformat() + "Z")
+
+
+class SentimentResponse(BaseModel):
+    """Sentiment summary for a ticker."""
+    ticker: str
+    average_tone: Optional[float] = None
+    article_count: int = 0
+    positive_ratio: float = 0.0
+    negative_ratio: float = 0.0

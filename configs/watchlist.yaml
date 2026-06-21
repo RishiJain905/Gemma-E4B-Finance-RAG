@@ -34,3 +34,5 @@ schedule:
   news: 6             # Re-fetch news every 6 hours
   macro: 24           # Macro indicators daily
   sec_filings: 12     # Check for new SEC filings every 12 hours
+  gdelt_news: 6       # GDELT global news every 6 hours
+  transcripts: 168    # Earnings transcripts weekly (7 days)
