@@ -1,0 +1,42 @@
+# configs/fred.yaml
+# FRED API configuration
+
+api_key: "${FRED_API_KEY}"  # Set FRED_API_KEY in .env
+request_delay: 0.25         # Be kind to FRED servers
+max_retries: 3
+
+# Macro indicators to track
+indicators:
+  # GDP
+  GDP: "Gross Domestic Product"
+  GDPC1: "Real GDP (Chained)"
+
+  # Inflation
+  CPIAUCSL: "CPI (All Urban Consumers)"
+  PCEPILFE: "Core PCE (Fed's preferred gauge)"
+  T10YIE: "10-Year Breakeven Inflation Rate"
+
+  # Interest Rates
+  FEDFUNDS: "Federal Funds Rate"
+  DFF: "Federal Funds Rate (Daily)"
+  DGS1: "1-Year Treasury Rate"
+  DGS10: "10-Year Treasury Rate"
+  DGS2: "2-Year Treasury Rate"
+  T10Y2Y: "10-Year minus 2-Year Treasury Spread"
+
+  # Employment
+  UNRATE: "Unemployment Rate"
+  PAYEMS: "Nonfarm Payrolls"
+  IC4WSA: "Initial Jobless Claims (4-Week Avg)"
+
+  # Housing
+  HOUST: "Housing Starts"
+  PERMIT: "Building Permits"
+
+  # Consumer
+  UMCSENT: "Consumer Sentiment (U. of Michigan)"
+  DSPIC96: "Real Disposable Personal Income"
+
+  # Manufacturing
+  INDPRO: "Industrial Production"
+  TCU: "Capacity Utilization"

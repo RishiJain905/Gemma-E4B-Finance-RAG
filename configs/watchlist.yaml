@@ -1,0 +1,39 @@
+# configs/watchlist.yaml
+# Core tracked tickers — these get full ingestion (fundamentals + news + documents)
+core:
+  - NVDA
+  - AMD
+  - AAPL
+  - MSFT
+  - META
+  - CRWD
+
+# Extended watchlist — fundamentals only, less frequent updates
+extended:
+  - GOOGL
+  - AMZN
+  - TSLA
+  - AVGO
+  - ORCL
+  - INTC
+  - QCOM
+  - PANW
+  - PLTR
+  - SNOW
+
+# Macro indicators — fetched but not tied to a ticker
+macro_tickers:
+  - SPY    # S&P 500 ETF (market proxy)
+  - QQQ    # Nasdaq ETF (tech proxy)
+  - TLT    # Long-term treasuries (rates proxy)
+  - GLD    # Gold (inflation/hedge proxy)
+
+# Ingestion schedule (in hours)
+schedule:
+  fundamentals: 24    # Re-fetch fundamentals daily
+  news: 6             # Re-fetch news every 6 hours
+  macro: 24           # Macro indicators daily
+  sec_filings: 12     # Check for new SEC filings every 12 hours
+  gdelt_news: 6       # GDELT global news every 6 hours
+  transcripts: 168    # Earnings transcripts weekly (7 days)
+  ir_pages: 24        # Company IR pages (press releases / presentations) daily

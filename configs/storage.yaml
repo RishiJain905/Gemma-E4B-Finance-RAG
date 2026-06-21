@@ -1,0 +1,28 @@
+# configs/storage.yaml
+# Storage layer configuration
+
+sqlite:
+  path: "data/finance.db"
+
+chroma:
+  path: "data/chroma"
+  collection_name: "tracealchemy_docs"
+  embedding_dimension: 2560   # TraceAlchemy embedding output dimension (informational)
+
+embedding:
+  provider: "llama-server"
+  endpoint: "http://127.0.0.1:8087/v1/embeddings"
+  model: "tracealchemy"
+  pooling: "mean"
+  batch_size: 10
+
+cache:
+  default_ttl_hours: 24
+  filing_ttl_hours: 168
+  earnings_ttl_hours: 336
+
+sec:
+  # SEC EDGAR requires a descriptive User-Agent identifying the requester.
+  # Resolution order in SECEdgarFilingFetcher: constructor param >
+  # SEC_EDGAR_USER_AGENT env var > this config default.
+  user_agent: "TraceAlchemy Research contact@tracealchemy.example.com"

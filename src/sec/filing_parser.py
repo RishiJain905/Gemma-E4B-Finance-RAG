@@ -1,0 +1,706 @@
+"""
+src/sec/filing_parser.py
+TraceAlchemy filing parser — sends SEC filing text to the local model
+and extracts structured financial facts.
+
+The model acts as a parser, not a generator:
+  - Input: SEC filing text (10-K or 10-Q excerpt)
+  - Output: Structured JSON with extracted financial metrics
+  - Model config: temperature=0.1, max_tokens=1024 (deterministic extraction)
+
+Usage:
+    parser = TraceAlchemyFilingParser()
+    text = download_filing_text_from_somewhere()
+    facts = parser.extract_facts_from_filing("NVDA", "10-Q", text)
+    # Returns: [{"metric": "total_revenue", "value": 26.0, "unit": "billion_usd", "period": "2026-Q1"}, ...]
+"""
+
+import json
+import logging
+import re
+from typing import Optional
+
+import httpx
+
+logger = logging.getLogger(__name__)
+
+
+class TraceAlchemyFilingParser:
+    """Parses SEC filing text into structured financial facts using TraceAlchemy.
+
+    The TraceAlchemy model is served via llama-server at the configured endpoint.
+    It's fine-tuned on financial data — this parser crafts a deterministic
+    extraction prompt and validates the structured output.
+
+    Attributes:
+        endpoint: llama-server chat completions endpoint
+        model: Model identifier sent to the API
+        extraction_fields: The list of financial metrics the parser extracts
+    """
+
+    # ── Endpoint Configuration ─────────────────────────
+
+    DEFAULT_ENDPOINT = "http://127.0.0.1:8087/v1/chat/completions"
+    DEFAULT_MODEL = "tracealchemy"
+
+    # Max filing-text characters embedded in the extraction prompt. The
+    # section selector already returns a tight, targeted slice; this is the
+    # upper bound (and what trims the no-marker fallback). A small, focused
+    # slice is far more reliable than a large noisy one.
+    MAX_PROMPT_TEXT_CHARS = 5000
+
+    # Core metrics required for a successful filing parse (table or model).
+    CORE_METRICS = frozenset({"total_revenue", "net_income"})
+
+    # Smaller schema used for the model path — faster and less likely to truncate.
+    CORE_EXTRACTION_FIELDS = [
+        ("total_revenue", "Total Revenue / Revenue", "billion_usd",
+         "Total revenue or total net sales"),
+        ("gross_profit", "Gross Profit / Gross margin", "billion_usd",
+         "Gross profit or gross margin"),
+        ("operating_income", "Operating Income", "billion_usd",
+         "Operating income"),
+        ("net_income", "Net Income", "billion_usd", "Net income"),
+        ("eps_basic", "Earnings Per Share (Basic)", "usd", "Basic EPS"),
+        ("eps_diluted", "Earnings Per Share (Diluted)", "usd", "Diluted EPS"),
+    ]
+
+    # ── Extraction Schema ──────────────────────────────
+
+    # Metrics extracted from 10-K / 10-Q filings
+    # Each entry: (field_name, label, unit, description)
+    EXTRACTION_FIELDS = [
+        # Income Statement
+        ("total_revenue", "Total Revenue / Revenue", "billion_usd",
+         "Total revenue, sometimes labeled 'Total revenue' or 'Revenue'"),
+        ("cost_of_revenue", "Cost of Revenue", "billion_usd",
+         "Cost of revenue / cost of goods sold"),
+        ("gross_profit", "Gross Profit", "billion_usd",
+         "Gross profit (revenue minus cost of revenue)"),
+        ("research_development", "Research and Development", "billion_usd",
+         "R&D expenses"),
+        ("sales_marketing", "Sales and Marketing", "billion_usd",
+         "Sales and marketing expenses"),
+        ("general_administrative", "General and Administrative", "billion_usd",
+         "G&A expenses"),
+        ("operating_income", "Operating Income / Income from Operations", "billion_usd",
+         "Operating income (EBIT)"),
+        ("interest_income_expense", "Interest Income (Expense)", "billion_usd",
+         "Net interest income or expense"),
+        ("other_income_expense", "Other Income (Expense)", "billion_usd",
+         "Other income or expense items"),
+        ("pretax_income", "Income Before Income Taxes", "billion_usd",
+         "Income before taxes"),
+        ("income_tax_provision", "Provision for Income Taxes", "billion_usd",
+         "Income tax expense"),
+        ("net_income", "Net Income", "billion_usd",
+         "Net income (earnings)"),
+
+        # Per Share
+        ("eps_basic", "Earnings Per Share (Basic)", "usd",
+         "Basic earnings per share"),
+        ("eps_diluted", "Earnings Per Share (Diluted)", "usd",
+         "Diluted earnings per share"),
+        ("weighted_avg_shares_basic", "Weighted Average Shares (Basic)", "millions",
+         "Basic weighted average shares outstanding"),
+        ("weighted_avg_shares_diluted", "Weighted Average Shares (Diluted)", "millions",
+         "Diluted weighted average shares outstanding"),
+
+        # Balance Sheet (if available)
+        ("total_assets", "Total Assets", "billion_usd",
+         "Total assets"),
+        ("total_liabilities", "Total Liabilities", "billion_usd",
+         "Total liabilities"),
+        ("total_equity", "Total Stockholders' Equity", "billion_usd",
+         "Total shareholders' equity"),
+
+        # Cash Flow
+        ("operating_cash_flow", "Net Cash Provided by Operating Activities", "billion_usd",
+         "Cash from operating activities"),
+        ("investing_cash_flow", "Net Cash Used in Investing Activities", "billion_usd",
+         "Cash from investing activities"),
+        ("financing_cash_flow", "Net Cash Used in Financing Activities", "billion_usd",
+         "Cash from financing activities"),
+        ("free_cash_flow", "Free Cash Flow", "billion_usd",
+         "Free cash flow (operating CF minus capex)"),
+    ]
+
+    def __init__(
+        self,
+        endpoint: Optional[str] = None,
+        model: Optional[str] = None,
+        timeout: int = 240,
+    ):
+        self.endpoint = endpoint or self.DEFAULT_ENDPOINT
+        self.model = model or self.DEFAULT_MODEL
+        self.timeout = timeout
+        self._client = httpx.Client(timeout=timeout)
+
+    def __del__(self):
+        if hasattr(self, "_client"):
+            self._client.close()
+
+    # ── Public API ─────────────────────────────────────
+
+    def extract_facts_from_filing(
+        self,
+        ticker: str,
+        filing_type: str,
+        filing_text: str,
+        period: Optional[str] = None,
+    ) -> list[dict]:
+        """Extract structured financial facts from an SEC filing text.
+
+        Args:
+            ticker: Stock ticker symbol
+            filing_type: "10-K" or "10-Q"
+            filing_text: Full or excerpted filing text
+            period: Fiscal period label (e.g., "2026", "2026-Q1")
+
+        Returns:
+            List of fact dicts:
+                {metric, value, unit, period, period_type, source_type}
+        """
+        period_label = period or ""
+        extracted_text = self._select_extraction_sections(filing_text, filing_type)
+
+        # Primary path: deterministic parse of the operations table (reliable on
+        # inline-XBRL filings where the model often times out or returns empty).
+        table_facts = self._extract_facts_from_operations_table(
+            extracted_text, period_label,
+        )
+        if self._has_core_metrics(table_facts):
+            logger.info(
+                "Parsed %s %s filing for %s: %d facts via operations table",
+                filing_type, period_label, ticker, len(table_facts),
+            )
+            return table_facts
+
+        # Fallback: model extraction with a compact field list.
+        prompt = self._build_extraction_prompt(
+            ticker, filing_type, extracted_text,
+            fields=self.CORE_EXTRACTION_FIELDS,
+        )
+        raw_response = self._call_model(prompt)
+        model_facts = self._parse_model_response(raw_response, ticker, period_label)
+        facts = self._merge_facts(table_facts, model_facts)
+
+        if not self._has_core_metrics(facts):
+            # Retry on a tighter operations-only window.
+            tight = self._select_operations_slice(filing_text)
+            if tight and tight != extracted_text:
+                table_facts = self._extract_facts_from_operations_table(
+                    tight, period_label,
+                )
+                if self._has_core_metrics(table_facts):
+                    logger.info(
+                        "Parsed %s %s filing for %s: %d facts via tight table slice",
+                        filing_type, period_label, ticker, len(table_facts),
+                    )
+                    return table_facts
+                prompt = self._build_extraction_prompt(
+                    ticker, filing_type, tight, fields=self.CORE_EXTRACTION_FIELDS,
+                )
+                raw_response = self._call_model(prompt)
+                model_facts = self._parse_model_response(
+                    raw_response, ticker, period_label,
+                )
+                facts = self._merge_facts(table_facts, model_facts)
+
+        logger.info(
+            "Parsed %s %s filing for %s: %d facts extracted",
+            filing_type, period_label, ticker, len(facts),
+        )
+        return facts
+
+    def extract_facts_from_filing_chunked(
+        self,
+        ticker: str,
+        filing_type: str,
+        filing_text: str,
+        period: Optional[str] = None,
+        chunk_size: int = 8000,
+    ) -> list[dict]:
+        """Extract facts from a very long filing by chunking the text.
+
+        Falls back to the main method for most filings; this is for
+        complete 10-K filings that can be 50K+ characters.
+
+        Strategy: extract from the income statement section first,
+        then supplement with balance sheet if available.
+        """
+        # Try the simple approach first
+        facts = self.extract_facts_from_filing(ticker, filing_type, filing_text, period)
+
+        # If we got the core income statement metrics, that's sufficient
+        core_metrics = {"total_revenue", "net_income", "eps_diluted"}
+        extracted_metrics = {f["metric"] for f in facts}
+        if core_metrics.issubset(extracted_metrics):
+            return facts
+
+        # If not, try chunking — look for specific sections
+        sections = self._split_filing_sections(filing_text)
+        all_facts = []
+
+        for section_name, section_text in sections.items():
+            if len(section_text) < 100:
+                continue
+            section_facts = self.extract_facts_from_filing(
+                ticker, filing_type, section_text[:chunk_size], period,
+            )
+            all_facts.extend(section_facts)
+
+        # Deduplicate by (metric, period)
+        seen: set[tuple] = set()
+        deduped = []
+        for f in all_facts:
+            key = (f["metric"], f["period"])
+            if key not in seen:
+                seen.add(key)
+                deduped.append(f)
+
+        return deduped
+
+    # ── Prompt Engineering ─────────────────────────────
+
+    def _build_extraction_prompt(
+        self,
+        ticker: str,
+        filing_type: str,
+        text: str,
+        fields: Optional[list[tuple]] = None,
+    ) -> str:
+        """Build the extraction prompt sent to the model.
+
+        The prompt is designed for determinism:
+          - Explicit field list from EXTRACTION_FIELDS
+          - JSON-only output (no explanations)
+          - Specific example format
+          - Temperature should be 0.1 in the API call
+        """
+        field_list = fields or self.EXTRACTION_FIELDS
+        field_descriptions = "\n".join(
+            f"  - \"{field_name}\": {label} ({unit}) — {desc}"
+            for field_name, label, unit, desc in field_list
+        )
+
+        return f"""You are a financial document parser. Extract structured financial metrics from the following {ticker} {filing_type} filing text.
+
+Extract ONLY the metrics listed below. For each metric you find in the text, include:
+  - "metric": the field name from the list
+  - "value": the numeric value (as a float, in the specified unit)
+  - "unit": the unit from the list
+  - "confidence": 1.0 if explicitly stated, 0.5 if derived/calculated
+
+Fields to extract:
+{field_descriptions}
+
+RULES:
+1. Return ONLY valid JSON — no markdown, no explanations, no code fences.
+2. If a metric is NOT found in the text, DO NOT include it in the output.
+3. Values must be in the specified unit (billion_usd means billions of dollars).
+4. Convert values to the correct unit (e.g., $26,000,000,000 → 26.0 for billion_usd).
+5. Report the filing period as you find it.
+
+FILING TEXT:
+--- START OF {filing_type} FOR {ticker} ---
+{text[:self.MAX_PROMPT_TEXT_CHARS]}
+--- END OF {filing_type} FOR {ticker} ---
+
+Return the JSON array now."""
+
+    # Width of the targeted slice taken from the statement header. ~4.5K chars
+    # comfortably spans the operations table plus the following statements
+    # (comprehensive income / balance sheet) while staying small enough that
+    # the model reliably returns a complete, non-empty JSON array.
+    SECTION_SLICE_CHARS = 4500
+
+    # Specific statement headers, matched in priority order. These anchor on
+    # the ACTUAL financial-statement table. Loose markers like "INCOME
+    # STATEMENT" / "STATEMENT OF INCOME" are deliberately excluded: they
+    # false-match prose in the notes (e.g. AAPL's "Disaggregation of Income
+    # Statement Expenses") and select the wrong slice.
+    _STATEMENT_HEADER_PATTERNS = [
+        r"CONDENSED\s+CONSOLIDATED\s+STATEMENTS?\s+OF\s+OPERATIONS",
+        r"CONSOLIDATED\s+STATEMENTS?\s+OF\s+OPERATIONS",
+        r"CONDENSED\s+CONSOLIDATED\s+STATEMENTS?\s+OF\s+INCOME",
+        r"CONSOLIDATED\s+STATEMENTS?\s+OF\s+INCOME",
+        r"CONSOLIDATED\s+INCOME\s+STATEMENTS?",
+        r"STATEMENTS?\s+OF\s+OPERATIONS",
+    ]
+
+    def _select_extraction_sections(self, filing_text: str, filing_type: str) -> str:
+        """Select the most relevant section of a filing for extraction.
+
+        Strategy: locate the consolidated *statement of operations / income*
+        table by matching SPECIFIC headers only (in priority order), then
+        return a tight bounded slice centered on that header. The slice spans
+        the income statement and the immediately-following statements (the
+        balance sheet typically lands within it), which keeps the model input
+        small and signal-dense instead of a large noisy blob.
+
+        Falls back to the first 12K characters when no statement header is
+        found, so the model still gets the front matter of the filing.
+        """
+        text = filing_text[:200000]  # Cap to avoid context overflow
+
+        for pattern in self._STATEMENT_HEADER_PATTERNS:
+            match = re.search(pattern, text, re.IGNORECASE)
+            if match:
+                start = max(0, match.start() - 100)
+                end = start + self.SECTION_SLICE_CHARS
+                slice_ = text[start:end]
+                if self._slice_has_operations_table(slice_):
+                    return slice_
+
+        tight = self._select_operations_slice(filing_text)
+        if tight:
+            return tight
+
+        # Fallback: first 12K chars (no recognizable statement header).
+        return text[:12000]
+
+    def _select_operations_slice(self, filing_text: str) -> str:
+        """Return a tight slice anchored on the operations / net-sales table."""
+        text = filing_text[:200000]
+
+        for pattern in self._STATEMENT_HEADER_PATTERNS:
+            match = re.search(pattern, text, re.IGNORECASE)
+            if not match:
+                continue
+            start = max(0, match.start() - 100)
+            end = start + 2800
+            bs = re.search(
+                r"CONSOLIDATED\s+BALANCE\s+SHEETS?",
+                text[start:],
+                re.IGNORECASE,
+            )
+            if bs and bs.start() < end - start:
+                end = start + bs.start()
+            slice_ = text[start:end]
+            if self._slice_has_operations_table(slice_):
+                return slice_
+
+        anchor = re.search(r"Total net sales", text, re.IGNORECASE)
+        if anchor:
+            start = max(0, anchor.start() - 200)
+            return text[start:start + 2800]
+        return ""
+
+    @staticmethod
+    def _slice_has_operations_table(text: str) -> bool:
+        """True when the slice contains a recognizable income-statement table."""
+        lower = text.lower()
+        return "total net sales" in lower and "net income" in lower
+
+    @staticmethod
+    def _has_core_metrics(facts: list[dict]) -> bool:
+        return TraceAlchemyFilingParser.CORE_METRICS.issubset(
+            {f.get("metric") for f in facts}
+        )
+
+    @staticmethod
+    def _merge_facts(primary: list[dict], secondary: list[dict]) -> list[dict]:
+        """Merge fact lists; primary wins on duplicate metrics."""
+        by_metric: dict[str, dict] = {}
+        for fact in secondary:
+            metric = fact.get("metric")
+            if metric:
+                by_metric[metric] = fact
+        for fact in primary:
+            metric = fact.get("metric")
+            if metric:
+                by_metric[metric] = fact
+        return list(by_metric.values())
+
+    # Regex specs for the deterministic operations-table parser. Values are in
+    # millions when the filing states "(In millions" — scaled to billion_usd.
+    _OPERATIONS_TABLE_SPECS = (
+        ("total_revenue", r"(?:Total net sales|Total revenue)\s+\$?\s*([\d,]+)", "billion_usd"),
+        ("total_revenue", r"\bRevenue\s+\$?\s*([\d,]+)", "billion_usd"),
+        ("gross_profit", r"Gross (?:profit|margin)\s+\$?\s*([\d,]+)", "billion_usd"),
+        ("research_development", r"Research and development\s+\$?\s*([\d,]+)", "billion_usd"),
+        ("operating_income", r"Operating income\s+\$?\s*([\d,]+)", "billion_usd"),
+        ("net_income", r"Net income\s+\$?\s*([\d,]+)", "billion_usd"),
+        ("eps_basic", r"Basic\s+\$\s*([\d.]+)", "usd"),
+        ("eps_diluted", r"Diluted\s+\$\s*([\d.]+)", "usd"),
+    )
+
+    def _extract_facts_from_operations_table(
+        self, text: str, period: str,
+    ) -> list[dict]:
+        """Parse core metrics directly from a condensed operations table."""
+        if not text or not self._slice_has_operations_table(text):
+            return []
+
+        blob = re.sub(r"\s+", " ", text)
+        in_millions = bool(re.search(r"\(\s*in\s+millions", blob, re.IGNORECASE))
+        period_type = "annual" if "Q" not in (period or "") else "quarterly"
+        source_type = f"sec_{filing_type_from_period(period)}"
+
+        facts: list[dict] = []
+        seen: set[str] = set()
+
+        for metric, pattern, unit in self._OPERATIONS_TABLE_SPECS:
+            if metric in seen:
+                continue
+            match = re.search(pattern, blob, re.IGNORECASE)
+            if not match:
+                continue
+            raw = match.group(1).replace(",", "")
+            try:
+                value = float(raw)
+            except ValueError:
+                continue
+            if unit == "billion_usd" and in_millions:
+                value = value / 1000.0
+            facts.append({
+                "metric": metric,
+                "value": value,
+                "unit": unit,
+                "period": period,
+                "period_type": period_type,
+                "source_type": source_type,
+            })
+            seen.add(metric)
+
+        return facts
+
+    def _split_filing_sections(self, filing_text: str) -> dict[str, str]:
+        """Split a filing into logical sections by common headers."""
+        sections = {}
+        current_section = "preamble"
+        current_text = []
+
+        section_headers = [
+            "CONSOLIDATED INCOME STATEMENT",
+            "CONSOLIDATED STATEMENTS OF INCOME",
+            "CONSOLIDATED BALANCE SHEET",
+            "CONSOLIDATED STATEMENTS OF CASH FLOWS",
+            "CONSOLIDATED STATEMENTS OF STOCKHOLDERS",
+            "NOTES TO CONSOLIDATED FINANCIAL STATEMENTS",
+            "MANAGEMENT'S DISCUSSION AND ANALYSIS",
+            "RISK FACTORS",
+            "BUSINESS",
+        ]
+
+        for line in filing_text.split("\n"):
+            upper_line = line.strip().upper()
+            matched = False
+            for header in section_headers:
+                if header in upper_line:
+                    if current_text:
+                        sections[current_section] = "\n".join(current_text)
+                    current_section = header.lower().replace(" ", "_").replace("'", "")
+                    current_text = [line]
+                    matched = True
+                    break
+
+            if not matched:
+                current_text.append(line)
+
+        if current_text:
+            sections[current_section] = "\n".join(current_text)
+
+        return sections
+
+    # ── Model API Call ────────────────────────────────
+
+    def _call_model(self, prompt: str) -> Optional[str]:
+        """Send the extraction prompt to the TraceAlchemy model.
+
+        Uses the fact_extraction task parameters (temperature=0.1).
+        """
+        payload = {
+            "model": self.model,
+            "messages": [
+                {
+                    "role": "system",
+                    "content": (
+                        "You are a precise financial document parser. "
+                        "Extract only the requested fields. Return valid JSON only."
+                    ),
+                },
+                {"role": "user", "content": prompt},
+            ],
+            "temperature": 0.1,
+            # The extraction schema has 20+ fields; a full JSON array can run
+            # ~3-4K completion tokens. Raise the limit (model.yaml allows up to
+            # 8192) so the array isn't truncated before its closing bracket.
+            "max_tokens": 4096,
+            "top_p": 0.1,  # Narrow sampling for deterministic extraction
+        }
+
+        try:
+            response = self._client.post(self.endpoint, json=payload)
+            response.raise_for_status()
+            data = response.json()
+
+            content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+            if not content:
+                logger.warning("Model returned empty response")
+                return None
+
+            return content
+
+        except httpx.HTTPStatusError as e:
+            logger.error("Model API error (HTTP %d): %s", e.response.status_code, e)
+            return None
+        except httpx.RequestError as e:
+            logger.error("Model API request failed: %s", e)
+            return None
+        except (KeyError, IndexError, json.JSONDecodeError) as e:
+            logger.error("Failed to parse model API response: %s", e)
+            return None
+
+    # ── Response Parsing ──────────────────────────────
+
+    @staticmethod
+    def _recover_truncated_objects(text: str) -> list[dict]:
+        """Recover complete JSON objects from a truncated/unclosed array.
+
+        When the model's JSON array is cut off by max_tokens before its
+        closing ``]`` (or a trailing object is half-written), strict parsing
+        fails. This scans the text and assembles every fully-balanced
+        ``{...}`` object that parsed cleanly, discarding any incomplete tail.
+        """
+        objects: list[dict] = []
+        depth = 0
+        in_string = False
+        escape = False
+        start = -1
+
+        for i, ch in enumerate(text):
+            if in_string:
+                if escape:
+                    escape = False
+                elif ch == "\\":
+                    escape = True
+                elif ch == '"':
+                    in_string = False
+                continue
+
+            if ch == '"':
+                in_string = True
+            elif ch == "{":
+                if depth == 0:
+                    start = i
+                depth += 1
+            elif ch == "}":
+                if depth > 0:
+                    depth -= 1
+                    if depth == 0 and start >= 0:
+                        candidate = text[start:i + 1]
+                        try:
+                            obj = json.loads(candidate)
+                        except json.JSONDecodeError:
+                            pass
+                        else:
+                            if isinstance(obj, dict):
+                                objects.append(obj)
+                        start = -1
+
+        return objects
+
+    def _parse_model_response(
+        self, raw_response: Optional[str], ticker: str, period: str,
+    ) -> list[dict]:
+        """Parse the model's JSON response into our standard fact format.
+
+        Handles:
+          - Pure JSON array with no wrapper
+          - JSON array in a markdown code block
+          - JSON with extra text before/after
+          - Failed parse = empty list (logged)
+        """
+        if not raw_response:
+            return []
+
+        # Strip markdown code fences if present
+        text = raw_response.strip()
+        if text.startswith("```"):
+            # Remove opening fence (possibly with language tag)
+            text = re.sub(r"^```\w*\n?", "", text)
+            # Remove closing fence
+            text = re.sub(r"\n?```$", "", text)
+            text = text.strip()
+
+        # Try to find a JSON array in the response
+        try:
+            data = json.loads(text)
+        except json.JSONDecodeError:
+            # Try to find a complete JSON array with regex
+            match = re.search(r"\[.*\]", text, re.DOTALL)
+            if match:
+                try:
+                    data = json.loads(match.group())
+                except json.JSONDecodeError:
+                    data = self._recover_truncated_objects(text)
+            else:
+                # No closing bracket (e.g. response truncated by max_tokens) —
+                # recover whatever complete objects were emitted before the cut.
+                data = self._recover_truncated_objects(text)
+
+            if not data:
+                logger.error("Failed to parse model response as JSON")
+                return []
+
+        if not isinstance(data, list):
+            logger.warning("Model response is not a JSON array")
+            return []
+
+        # Convert to our standard fact format
+        period_type = "annual" if "Q" not in (period or "") else "quarterly"
+        facts = []
+
+        for item in data:
+            if not isinstance(item, dict):
+                continue
+
+            metric = item.get("metric", "")
+            value = item.get("value")
+            unit = item.get("unit", "billion_usd")
+
+            # Validate we have the minimum fields
+            if not metric or value is None:
+                continue
+
+            # Normalize the value to float
+            try:
+                value = float(value)
+            except (TypeError, ValueError):
+                logger.debug("Skipping metric %s: non-numeric value %s", metric, value)
+                continue
+
+            facts.append({
+                "metric": metric,
+                "value": value,
+                "unit": unit,
+                "period": period,
+                "period_type": period_type,
+                "source_type": f"sec_{filing_type_from_period(period)}",
+            })
+
+        return facts
+
+    # ── Cleanup ────────────────────────────────────────
+
+    def close(self):
+        """Close the HTTP client."""
+        if hasattr(self, "_client"):
+            self._client.close()
+
+
+def filing_type_from_period(period: str) -> str:
+    """Derive the filing type suffix from a period string.
+
+    Examples:
+      "2025"    → "10-K"
+      "2026-Q1" → "10-Q"
+      "2026-Q2" → "10-Q"
+    """
+    if not period:
+        return "10-K"
+    if "-Q" in period:
+        return "10-Q"
+    return "10-K"
