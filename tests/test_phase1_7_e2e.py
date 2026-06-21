@@ -61,13 +61,13 @@ def test_scenario_1_full_daily_run(store):
     result = scheduler.run_daily()
 
     # Daily sources ran; hourly/weekly-only sources were not part of the run.
-    assert set(result) == {"yfinance", "fred", "sec_filings"}
+    assert set(result) == {"yfinance", "fred", "sec_filings", "ir_pages"}
     assert all(r["status"] == "success" for r in result.values())
     assert "gdelt" not in result
     assert "earnings_transcripts" not in result
 
     # cache_meta entries were created under the unified:* convention.
-    for name in ("yfinance", "fred", "sec_filings"):
+    for name in ("yfinance", "fred", "sec_filings", "ir_pages"):
         cache = store.get_cache_status("SCHEDULER", f"unified:{name}")
         assert cache is not None and cache["status"] == "fresh"
 
@@ -92,6 +92,7 @@ def test_scenario_2_staleness_aware_query(store, monkeypatch):
     with TestClient(app) as client:
         monkeypatch.setattr(middleware_app, "store", store)
         with patch("src.middleware.app._call_model", new_callable=AsyncMock) as mock_call, \
+                patch("src.middleware.app._check_model_health", new_callable=AsyncMock, return_value=True), \
                 patch("src.middleware.app._refresh_one_source") as mock_one:
             mock_call.return_value = ("NVDA answer", [])
             resp = client.post(

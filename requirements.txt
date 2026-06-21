@@ -21,5 +21,10 @@ gdelt>=0.1.14          # GDELT news (PyPI latest; no 1.x release yet)
 fredapi>=0.5.0         # FRED economic data
 feedparser>=6.0.0      # RSS/Atom parsing for company IR feeds
 
+# ── Parsing ───────────────────────────────────────────
+beautifulsoup4>=4.12.0  # HTML parsing for IR page scraping
+lxml>=5.0.0             # Fast XML/HTML parser backend
+
 # ── Testing ───────────────────────────────────────────
 pytest>=8.0.0
+pytest-cov>=4.1.0       # Coverage reporting

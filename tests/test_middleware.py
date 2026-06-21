@@ -509,6 +509,7 @@ class TestAPIEndpoints:
 
         mock_citations = [SourceCitation(source_type="sec_10q", ticker="NVDA")]
         with patch("src.middleware.app._call_model", new_callable=AsyncMock) as mock_call, \
+                patch("src.middleware.app._check_model_health", new_callable=AsyncMock, return_value=True), \
                 patch("src.middleware.app._refresh_ticker_sources", return_value=([], [])):
             mock_call.return_value = ("NVDA revenue was $26B in Q1 2026.", mock_citations)
             response = client.post("/query", json={
@@ -525,6 +526,7 @@ class TestAPIEndpoints:
     def test_query_with_ticker_override(self, client):
         """POST /query with ticker override works."""
         with patch("src.middleware.app._call_model", new_callable=AsyncMock) as mock_call, \
+                patch("src.middleware.app._check_model_health", new_callable=AsyncMock, return_value=True), \
                 patch("src.middleware.app._refresh_ticker_sources", return_value=([], [])):
             mock_call.return_value = ("AMD revenue data.", [])
             response = client.post("/query", json={

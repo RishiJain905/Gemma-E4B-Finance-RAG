@@ -73,10 +73,15 @@ class UnifiedScheduler:
             "ttl_key": "transcripts",
             "weight": 5,
         },
+        "ir_pages": {
+            "class": "IRIngestor",
+            "ttl_key": "ir_pages",
+            "weight": 6,
+        },
     }
 
     # Run-mode source selections.
-    DAILY_SOURCES = ["yfinance", "fred", "sec_filings"]
+    DAILY_SOURCES = ["yfinance", "fred", "sec_filings", "ir_pages"]
     HOURLY_SOURCES = ["gdelt"]
     WEEKLY_SOURCES = ["earnings_transcripts", "sec_filings"]
 
@@ -185,6 +190,12 @@ class UnifiedScheduler:
             from src.macros.earnings_transcripts import EarningsTranscriptIngestor
             results = EarningsTranscriptIngestor(store=self.store).fetch_all_core()
             return {"tickers_processed": len(results)}
+
+        if name == "ir_pages":
+            from src.macros.ir_ingestor import IRIngestor
+            results = IRIngestor(store=self.store).fetch_all_core()
+            stored = sum(r.get("items_stored", 0) for r in results.values())
+            return {"tickers_processed": len(results), "items_stored": stored}
 
         raise ValueError(f"Unknown source: {name}")
 

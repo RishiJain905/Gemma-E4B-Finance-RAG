@@ -85,7 +85,7 @@ model:
   embedding:
     enabled: true
     endpoint: "http://127.0.0.1:8087/v1/embeddings"
-    dimension: 0    # Fill after Task 1.1.7
+    dimension: 2560    # TraceAlchemy embedding output dimension (informational)
     normalize: true
     batch_supported: true
     pooling: "mean"

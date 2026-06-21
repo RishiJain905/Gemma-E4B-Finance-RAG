@@ -44,6 +44,9 @@ class FREDIngestor:
         config_path: Optional[Path] = None,
         api_key: Optional[str] = None,
     ):
+        from src.utils.env import load_env
+        load_env()  # ensure .env credentials are available in os.environ
+
         self.store = store or Store()
         self.config = self._load_config(config_path)
         self._client = None  # Lazy init
@@ -105,7 +108,11 @@ class FREDIngestor:
             retryable_exceptions=(ConnectionError, TimeoutError, IOError),
         )
         def _get_series():
-            return self.client.get_series(series_id, limit=limit)
+            # sort_order="desc" makes FRED return the *most recent* observations
+            # (the API's default `limit` returns the oldest observations).
+            return self.client.get_series(
+                series_id, limit=limit, sort_order="desc",
+            )
 
         try:
             series = _get_series()
@@ -114,7 +121,10 @@ class FREDIngestor:
                 logger.warning("No data returned for FRED series %s", series_id)
                 return None
 
-            # Get the latest value
+            # fredapi returns the Series indexed (and sorted) by date ascending,
+            # so the last row is always the most recent observation regardless
+            # of the API sort order.
+            series = series.sort_index()
             latest = series.iloc[-1]
             latest_date = series.index[-1]
 

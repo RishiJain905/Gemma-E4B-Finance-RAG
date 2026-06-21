@@ -17,11 +17,14 @@ Usage:
     # Returns: {"facts": [...], "documents": [...]}
 """
 
+import logging
 from pathlib import Path
 from typing import Optional
 
 from .chroma_store import ChromaStore
 from .sqlite_store import SQLiteStore
+
+logger = logging.getLogger(__name__)
 
 
 class Store:
@@ -58,7 +61,8 @@ class Store:
             with self.sqlite._connect() as conn:
                 conn.execute("SELECT 1")
             return True
-        except Exception:
+        except Exception as e:
+            logger.error("SQLite heartbeat failed: %s", e)
             return False
 
     # ─── Structured Facts (SQLite) ────────────────────

@@ -50,6 +50,8 @@ async def lifespan(app: FastAPI):
     global config, store, model_client
 
     logger.info("Starting middleware...")
+    from src.utils.env import load_env
+    load_env()  # load .env credentials before initializing components
     config = MiddlewareConfig()
     store = Store(
         embedding_endpoint=config.embedding_endpoint,
@@ -77,17 +79,37 @@ app = FastAPI(
 
 @app.get("/health", response_model=HealthResponse)
 async def health():
-    """Check storage backends and model availability."""
+    """Enhanced health check with storage, model, scheduler, and freshness."""
     if not store:
         raise HTTPException(status_code=503, detail="Store not initialized")
 
     storage_health = store.heartbeat()
     model_ok = await _check_model_health()
 
+    # Scheduler status (best-effort).
+    scheduler_status = None
+    try:
+        from src.scheduler import UnifiedScheduler
+        sched = UnifiedScheduler(store=store)
+        scheduler_status = sched.status_report()
+    except Exception as e:  # noqa: BLE001
+        logger.warning("Scheduler status unavailable: %s", e)
+
+    # Per-ticker freshness summary (best-effort).
+    freshness_summary: dict[str, str] = {}
+    for ticker in ["NVDA", "AMD", "AAPL", "MSFT", "META", "CRWD"]:
+        try:
+            report = store.get_freshness_report(ticker)
+            freshness_summary[ticker] = report["overall"]
+        except Exception:  # noqa: BLE001
+            freshness_summary[ticker] = "error"
+
     return HealthResponse(
         status="ok" if storage_health.get("sqlite") else "degraded",
         storage=storage_health,
         model_available=model_ok,
+        scheduler=scheduler_status,
+        freshness=freshness_summary,
     )
 
 
@@ -151,12 +173,18 @@ async def query(request: QueryRequest):
         retrieval=retrieval,
     )
 
-    # Step 4: Call the model
-    answer_text, citations = await _call_model(
-        prompt=augmented_prompt,
-        temperature=request.temperature or config.default_temperature,
-        max_tokens=request.max_tokens or config.max_tokens,
-    )
+    # Step 4: Call the model — or degrade gracefully when it is unavailable.
+    model_available = await _check_model_health()
+    if model_available:
+        answer_text, citations = await _call_model(
+            prompt=augmented_prompt,
+            temperature=request.temperature or config.default_temperature,
+            max_tokens=request.max_tokens or config.max_tokens,
+        )
+    else:
+        logger.warning("Model unavailable — returning degraded answer")
+        answer_text = _format_degraded_answer(retrieval, intent)
+        citations = []
 
     elapsed_ms = round((time.time() - start) * 1000, 1)
 
@@ -168,8 +196,42 @@ async def query(request: QueryRequest):
         facts_used=len(retrieval.get("facts", [])),
         documents_used=len(retrieval.get("documents", [])),
         latency_ms=elapsed_ms,
+        model_available=model_available,
         freshness=freshness_meta,
     )
+
+
+def _format_degraded_answer(retrieval: dict, intent: dict) -> str:
+    """Format retrieved data as a readable answer when the model is unavailable."""
+    parts = ["⚠️ Model unavailable — showing raw retrieved data:\n"]
+    facts = retrieval.get("facts", [])
+    docs = retrieval.get("documents", [])
+
+    if facts:
+        parts.append("**Structured Facts:**")
+        for f in facts[:5]:
+            parts.append(
+                f"- {f.get('metric')}: {f.get('value')} "
+                f"({f.get('period', 'N/A')})"
+            )
+        parts.append("")
+
+    if docs:
+        parts.append("**Relevant Documents:**")
+        for d in docs[:3]:
+            meta = d.get("metadata", {}) or {}
+            parts.append(
+                f"- {d.get('id', 'unknown')} "
+                f"({meta.get('source', d.get('source', 'unknown'))})"
+            )
+        parts.append("")
+
+    if not facts and not docs:
+        parts.append("No stored data found for this question.")
+        parts.append("")
+
+    parts.append("Start llama-server to get AI-grounded answers.")
+    return "\n".join(parts)
 
 
 # ── Freshness / Refresh (Phase 1.7.4) ──────────────────
@@ -204,8 +266,59 @@ def _normalize_sources(sources: Optional[list[str]]) -> list[str]:
     return out
 
 
+# Logical sources that have a scheduler-managed ingestion pipeline. Refreshing
+# these routes through the UnifiedScheduler so TTL tracking, staggered
+# execution, and dead-letter handling stay consistent with cron-driven runs.
+SCHEDULER_SOURCE_MAP = {
+    "sec_filings": "sec_filings",
+    "earnings_transcripts": "earnings_transcripts",
+    "ir_pages": "ir_pages",
+}
+
+
+def _refresh_via_scheduler(ticker: str, logical: str) -> None:
+    """Route a per-ticker refresh through the UnifiedScheduler's source runner.
+
+    For scheduler-managed sources (SEC filings, earnings transcripts, IR pages)
+    this ensures the same TTL tracking and error handling as the cron path.
+    The underlying ingestors mark per-ticker cache freshness; we additionally
+    mark the requested ticker fresh so the freshness report reflects the run.
+    Falls through to direct ingestion for non-scheduler sources.
+    """
+    source_name = SCHEDULER_SOURCE_MAP.get(logical)
+    if not source_name:
+        _refresh_one_source_direct(ticker, logical)
+        return
+
+    from src.scheduler import UnifiedScheduler
+    from src.storage.store import Store
+
+    sched = UnifiedScheduler(store=store)
+    sched._run_source(source_name, force=True)
+
+    # Reflect the run in this ticker's freshness even if the underlying
+    # ingestor only marks the synthetic scheduler ticker.
+    cfg = Store.FRESHNESS_SOURCES.get(logical)
+    if cfg:
+        ttl = store._schedule_ttls().get(cfg["ttl_key"], 24)
+        store.mark_source_fresh(ticker, cfg["cache_source"], ttl)
+
+
 def _refresh_one_source(ticker: str, logical: str) -> None:
     """Run the ingestion for a single logical source for one ticker.
+
+    Scheduler-managed sources are routed through the UnifiedScheduler bridge;
+    all others are ingested directly. Marks the source fresh in cache_meta on
+    success. Raises on failure so the caller can record the error.
+    """
+    if logical in SCHEDULER_SOURCE_MAP:
+        _refresh_via_scheduler(ticker, logical)
+        return
+    _refresh_one_source_direct(ticker, logical)
+
+
+def _refresh_one_source_direct(ticker: str, logical: str) -> None:
+    """Direct per-ticker ingestion for a single logical source.
 
     Marks the source fresh in cache_meta on success. Raises on failure so the
     caller can record the error.
@@ -342,6 +455,9 @@ async def refresh_ticker(ticker: str, body: Optional[RefreshRequest] = None):
     ticker = ticker.upper()
     start = time.time()
 
+    # Distinguish "no sources field" (refresh all stale) from "sources field
+    # provided but all unknown" (refresh nothing — silently skip unknowns).
+    sources_provided = bool(body and body.sources)
     requested = _normalize_sources(body.sources if body else None)
     report = store.get_freshness_report(ticker)
     stale = [
@@ -349,7 +465,7 @@ async def refresh_ticker(ticker: str, body: Optional[RefreshRequest] = None):
         if info.get("status") in ("stale", "never_fetched")
     ]
 
-    if requested:
+    if sources_provided:
         to_refresh = requested
         skipped = [s for s in report.get("sources", {}) if s not in requested]
     else:

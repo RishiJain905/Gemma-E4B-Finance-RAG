@@ -3,12 +3,15 @@ src/storage/chroma_store.py
 ChromaDB vector store for document embeddings.
 """
 
+import logging
 from pathlib import Path
 from typing import Optional
 import httpx
 import numpy as np
 import chromadb
 from chromadb import Documents, EmbeddingFunction, Embeddings
+
+logger = logging.getLogger(__name__)
 
 
 class TraceAlchemyEmbeddingFunction(EmbeddingFunction):
@@ -316,5 +319,6 @@ class ChromaStore:
         try:
             self.client.heartbeat()
             return True
-        except Exception:
+        except Exception as e:
+            logger.error("ChromaDB heartbeat failed: %s", e)
             return False

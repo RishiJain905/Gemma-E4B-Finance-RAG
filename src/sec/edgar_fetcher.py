@@ -60,6 +60,9 @@ class SECEdgarFilingFetcher:
         request_delay: float = REQUEST_DELAY_SECONDS,
         user_agent: Optional[str] = None,
     ):
+        from src.utils.env import load_env
+        load_env()  # ensure .env credentials are available in os.environ
+
         self.store = store or Store()
         self.request_delay = request_delay
         # Resolution order: constructor param > env var > config default.

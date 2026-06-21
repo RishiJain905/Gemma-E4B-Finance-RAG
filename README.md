@@ -1,430 +1,322 @@
 # Gemma-E4B-Finance-RAG
 
-**A hybrid RAG system for financial research powered by a fine-tuned Gemma 4 E4B model.**
+A hybrid Retrieval-Augmented Generation (RAG) system for financial research. It
+ingests data from six sources, stores structured facts and document embeddings
+in dual backends, and answers natural-language financial questions using a
+fine-tuned **Gemma 4 E4B** model (codename *TraceAlchemy*) served locally by
+`llama-server`.
 
-Built on top of [trjxter/TraceAlchemy-Gemma-4-E4B-Finance-IT-gguf](https://huggingface.co/trjxter/TraceAlchemy-Gemma-4-E4B-Finance-IT-gguf) — a finance-specialized GGUF model — this system couples real-time data ingestion with a two-tier storage architecture (vector + structured) to deliver grounded, trustworthy answers about stocks, markets, and economic indicators.
-
----
-
-## Architecture Overview
-
-```mermaid
-graph TB
-    subgraph Data_Sources["📡 Data Sources"]
-        SEC[SEC EDGAR Filings]
-        YF[Yahoo Finance]
-        FRED[FRED Economic Data]
-        GDELT[GDELT News]
-        EARN[Earnings Transcripts]
-        IR[Company IR Pages]
-    end
-
-    subgraph Pipeline["⛓️ Ingestion Pipeline"]
-        SCHED[Scheduler / Cron]
-        SCRAPE[Scraper Module]
-        PARSE[TraceAlchemy Parser]
-        EXTRACT[Structured Fact Extractor]
-    end
-
-    subgraph Storage["💾 Storage Layer"]
-        CHROMA[(ChromaDB\nVector Store)]
-        SQLITE[(SQLite\nStructured Store)]
-    end
-
-    subgraph Inference["🧠 Inference Layer"]
-        LLAMA[llama-server\nOpenAI-compatible API]
-        MIDDLE[FastAPI Middleware\nQuery Router & Augmenter]
-    end
-
-    subgraph User["👤 User"]
-        Q[Question / Query]
-        A[Grounded Answer]
-    end
-
-    SEC --> SCRAPE
-    YF --> SCRAPE
-    FRED --> SCRAPE
-    GDELT --> SCRAPE
-    EARN --> SCRAPE
-    IR --> SCRAPE
-
-    SCRAPE --> PARSE
-    PARSE --> EXTRACT
-    PARSE --> CHROMA
-    EXTRACT --> SQLITE
-
-    SCHED --> SCRAPE
-
-    Q --> MIDDLE
-    MIDDLE --> CHROMA
-    MIDDLE --> SQLITE
-    MIDDLE --> LLAMA
-    LLAMA --> A
-```
+Built on top of
+[trjxter/TraceAlchemy-Gemma-4-E4B-Finance-IT-gguf](https://huggingface.co/trjxter/TraceAlchemy-Gemma-4-E4B-Finance-IT-gguf),
+a finance-specialized GGUF model. The model server runs on **Windows + AMD
+RDNA3** (gfx1101) via a TurboQuant build of `llama.cpp`. The FastAPI middleware
+and ingestion pipeline are cross-platform (Windows/Linux).
 
 ---
 
-## 1. Fine-Tuned Model — TraceAlchemy
+## What it does
 
-The core reasoning engine is [TraceAlchemy-Gemma-4-E4B-Finance-IT-gguf](https://huggingface.co/trjxter/TraceAlchemy-Gemma-4-E4B-Finance-IT-gguf), a finance-specialized GGUF quant of Google's **Gemma 4 E4B** (2.6B activated / ~9B total parameters, MoE architecture).
-
-**Why this model:**
-- Fine-tuned specifically for **financial reasoning** — understands earnings calls, SEC filings, valuation metrics, sector dynamics
-- Runs locally via `llama-server` — no API costs, no data leaves your machine
-- 128K context window — can process entire filings in one pass
-- Multimodal native (text + image + audio) — can parse financial charts and PDFs
-
-The model serves as both the **reasoning engine** (answering questions) and the **data parser** (digesting raw information into structured facts during ingestion).
-
-```
-llama-server -m TraceAlchemy-Gemma-4-E4B-Finance-IT.gguf \
-  --port 8080 \
-  --ctx-size 32768 \
-  --n-gpu-layers 99
-```
+1. **Ingests** financial data from six sources (SEC EDGAR filings, Yahoo
+   Finance, FRED macro indicators, GDELT global news, earnings-call
+   transcripts, and company investor-relations pages).
+2. **Stores** it in two complementary backends:
+   - **SQLite** — structured facts, filing index, cache freshness, ingestion
+     audit log, and a dead-letter queue.
+   - **ChromaDB** — document embeddings produced by the TraceAlchemy
+     `/v1/embeddings` endpoint (cosine similarity).
+3. **Answers** questions through a FastAPI middleware that parses intent, runs
+   hybrid retrieval (facts + documents), augments a prompt, and calls the model
+   for a grounded, cited answer. When the model is unavailable it returns a
+   **degraded** answer built from the raw retrieved data.
 
 ---
 
-## 2. Data Sources — The Source of Truth
+## Quick Start
 
-The system ingests from free, authoritative sources to build a trustworthy knowledge base:
+### 1. Clone and create a virtual environment
 
-| Source | API / Method | Data Type | Update Cadence |
-|--------|-------------|-----------|----------------|
-| **SEC EDGAR** | `sec-api` / direct EDGAR RSS | 10-K, 10-Q, 8-K filings, proxy statements | Real-time on filing |
-| **Yahoo Finance** | `yfinance` Python lib | Price data, fundamentals, ratios, news | Daily / on-demand |
-| **FRED** (St. Louis Fed) | `fredapi` | GDP, CPI, interest rates, unemployment, yield curves | Varies (daily to quarterly) |
-| **GDELT** | `gdelt` Python lib | Global financial news with geo-tags, entities, tone scores | Every 15 minutes |
-| **Earnings Transcripts** | Seeking Alpha / Fool.com scraping | Full call transcripts, Q&A | Quarterly |
-| **Company IR Pages** | RSS feeds / scraping | Press releases, investor presentations | On-demand |
-
-```mermaid
-flowchart LR
-    subgraph Sources["Data Sources"]
-        SEC
-        YF
-        FRED
-        GDELT
-        EA[Earnings Transcripts]
-        IR
-    end
-
-    subgraph Collectors["Collectors"]
-        SC1[SEC Collector]
-        SC2[YF Collector]
-        SC3[FRED Collector]
-        SC4[GDELT Collector]
-        SC5[Transcript Collector]
-        SC6[IR Collector]
-    end
-
-    subgraph Queue["Staging"]
-        RAW1[(Raw Filing\nJSON)]
-        RAW2[(Raw News\nJSON)]
-        RAW3[(Raw Financials\nCSV)]
-    end
-
-    SEC --> SC1
-    YF --> SC2
-    FRED --> SC3
-    GDELT --> SC4
-    EA --> SC5
-    IR --> SC6
-
-    SC1 --> RAW1
-    SC2 --> RAW3
-    SC3 --> RAW3
-    SC4 --> RAW2
-    SC5 --> RAW1
-    SC6 --> RAW1
-```
-
----
-
-## 3. Ingestion Pipeline — Model-as-Parser
-
-The key innovation: **your fine-tuned model doesn't just answer questions — it reads and digests data before storage**. This is what separates this system from naive chunk-and-embed RAG.
-
-```mermaid
-sequenceDiagram
-    participant C as Collector
-    participant Q as Queue / Staging
-    participant P as TraceAlchemy Parser
-    participant V as ChromaDB
-    participant S as SQLite
-
-    C->>Q: Raw SEC Filing (10-Q PDF)
-    Note over Q: Raw document arrives
-    Q->>P: Send to parser
-    
-    Note over P: Model reads & distills
-    P->>P: Extract: ticker, revenue, EPS, segment breakdown
-    P->>P: Extract: management tone, risk factors, forward guidance
-    P->>P: Generate embedding for semantic retrieval
-    
-    P->>S: INSERT structured_facts ({ticker, metric, value, period, source_url})
-    P->>V: Store document embedding + metadata ({ticker, date, doc_type, source})
-    
-    Note over S,V: Data is now queryable both ways
-```
-
-**The parser is a prompt sent to `llama-server` that instructs the model to:**
-1. Read the raw document
-2. Extract structured facts (ticker, metric, value, date, confidence)
-3. Generate a summary embedding
-4. Output the extracted facts as structured JSON → stored in SQLite
-5. Store the embedding + metadata → stored in ChromaDB
-
-This means every document is **finance-understood**, not just statistically chunked.
-
----
-
-## 4. Storage Layer — Hybrid Two-Tier
-
-```mermaid
-graph TB
-    subgraph Chroma["ChromaDB — Vector Store"]
-        V1["Document Embedding 1"]
-        V2["Document Embedding 2"]
-        V3["Document Embedding N"]
-        V1 --- M1["Metadata: ticker, date, source, doc_type"]
-        V2 --- M2["Metadata: ticker, date, source, doc_type"]
-    end
-
-    subgraph SQLite["SQLite — Structured Store"]
-        subgraph Facts["facts table"]
-            F1["ticker · metric · value · period · source_url"]
-            F2["NVDA · revenue_q1 · 26.0B · 2026-Q1 · edgar/…"]
-        end
-        subgraph Cache["cache_meta table"]
-            C1["ticker · last_updated · source · status"]
-        end
-        subgraph Filings["filing_index table"]
-            FI1["ticker · filing_type · filing_date · form · accession"]
-        end
-    end
-
-    Chroma ---|semantic search| Middleware
-    SQLite ---|structured queries| Middleware
-```
-
-**SQLite Schema (conceptual):**
-
-```sql
--- Structured financial facts
-CREATE TABLE facts (
-    id INTEGER PRIMARY KEY,
-    ticker TEXT NOT NULL,
-    metric TEXT NOT NULL,       -- e.g., 'revenue_q1', 'pe_ratio', 'eps_ttm'
-    value REAL,
-    period TEXT,                -- e.g., '2026-Q1', '2025-FY'
-    source_url TEXT,
-    source_type TEXT,           -- 'sec', 'yahoo', 'fred'
-    ingested_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    UNIQUE(ticker, metric, period)
-);
-
--- Cache freshness tracking
-CREATE TABLE cache_meta (
-    ticker TEXT PRIMARY KEY,
-    last_updated TIMESTAMP,
-    next_update TIMESTAMP,
-    source TEXT,
-    status TEXT                 -- 'fresh', 'stale', 'fetching'
-);
-
--- Filing index for structured lookup
-CREATE TABLE filing_index (
-    id INTEGER PRIMARY KEY,
-    ticker TEXT NOT NULL,
-    filing_type TEXT,           -- '10-K', '10-Q', '8-K'
-    filing_date DATE,
-    form TEXT,
-    accession TEXT UNIQUE,
-    source_url TEXT
-);
-```
-
-**Split logic:**
-- Vector search → find **relevant documents** semantically
-- SQL query → find **precise facts** by ticker, metric, date, source
-
----
-
-## 5. Query & Augmentation — The Middleware
-
-When you ask a question, the FastAPI middleware routes it through the retrieval pipeline:
-
-```mermaid
-sequenceDiagram
-    participant U as You
-    participant M as FastAPI Middleware
-    participant V as ChromaDB
-    participant S as SQLite
-    participant L as llama-server (TraceAlchemy)
-
-    U->>M: "What's NVDA's latest revenue and market outlook?"
-    
-    Note over M: Step 1: Parse intent
-    M->>M: Detect tickers, metrics, timeframes
-    M->>M: Extract: ticker=NVDA, metric=revenue, intent=semantic+specific
-    
-    par Structured Query
-        M->>S: SELECT value FROM facts WHERE ticker='NVDA' AND metric='revenue_q1'
-        S-->>M: 26.0B (Q1 2026)
-    and Semantic Search
-        M->>V: Find docs about "NVDA datacenter revenue outlook"
-        V-->>M: 3 news articles + earnings call excerpt
-    end
-    
-    Note over M: Step 2: Build augmented prompt
-    M->>M: Compose prompt with:
-    M->>M:   - Latest revenue: $26.0B
-    M->>M:   - Datacenter revenue up 42% YoY
-    M->>M:   - Analyst consensus: $28.5B next quarter
-    
-    M->>L: Send augmented prompt
-    
-    Note over L: Model generates grounded answer
-    L-->>M: "NVDA reported $26.0B in Q1 2026 revenue..."
-    L-->>M: "...with datacenter growing 42% YoY..."
-    L-->>M: "...next quarter consensus at $28.5B."
-    
-    M-->>U: Return grounded answer with source citations
-```
-
-The middleware does **three things**:
-1. **Intent parsing** — extract tickers, metrics, timeframes, question type
-2. **Dual retrieval** — hit SQLite for numbers + ChromaDB for context
-3. **Prompt augmentation** — merge retrieved facts into a structured prompt with source citations
-
----
-
-## 6. Scheduled Updates — Staying Fresh
-
-```mermaid
-graph TB
-    subgraph Daily["🕐 Daily Schedule"]
-        OPEN[Market Open<br/>9:30 AM ET] --> YF_UPDATE[Fetch Yahoo Finance]
-        YF_UPDATE --> FRED_UPDATE[Check FRED Updates]
-        FRED_UPDATE --> SEC_CHECK[Check SEC Filings<br/>Last 24h]
-        SEC_CHECK --> NEWS_CHECK[GDELT News<br/>Last 24h Roundup]
-        NEWS_CHECK --> PARSE[Parse All New Data<br/>→ SQLite + ChromaDB]
-    end
-
-    subgraph Weekly["📅 Weekly"]
-        WEEKEND[Saturday Morning] --> TRANSCRIPTS[Process Earnings<br/>Transcripts]
-        TRANSCRIPTS --> FILINGS[Deeper Filing Analysis]
-        FILINGS --> CACHE_REFRESH[Refresh Stale Cache Entries]
-    end
-
-    subgraph Event["⚡ Event-Driven"]
-        SEC_FILING[New SEC Filing<br/>Detected] --> IMMEDIATE[Immediate Parse & Store]
-        IR_PRESS[Company Press<br/>Release] --> IMMEDIATE
-    end
-
-    subgraph OnDemand["🎯 On-Demand"]
-        USER_QUERY[User Asks<br/>About a Stock] --> CACHE_CHECK{Cached Data<br/>Still Fresh?}
-        CACHE_CHECK -->|Stale| FETCH[Fetch Latest Data]
-        CACHE_CHECK -->|Fresh| SKIP[Use Cache]
-        FETCH --> PARSE2[Parse & Store<br/>Before Answering]
-        PARSE2 --> ANSWER[Answer with<br/>Fresh Data]
-        SKIP --> ANSWER
-    end
-
-    Daily --> SQLITE
-    Weekly --> SQLITE
-    Event --> SQLITE
-    OnDemand --> SQLITE
-```
-
-**Update strategies:**
-- **Market days** — morning fetch of fundamentals, overnight filings, pre-market news
-- **Real-time** — SEC filing RSS feed triggers immediate ingestion
-- **On-demand via staleness** — querying an unfamiliar ticker triggers a freshness check first; if cached data is >24h old, fetch before answering
-- **Weekend batch** — deep dives into earnings transcripts, full document analysis
-
----
-
-## 7. Running Locally — The Full Stack
-
-The entire system runs locally on your machine (Mac Mini M4 32GB):
-
-```
-┌─────────────────────────────────────────────────────────┐
-│                    Your Machine                         │
-│                                                         │
-│  ┌─────────────┐    ┌──────────────┐    ┌───────────┐  │
-│  │  llama-server │    │  FastAPI      │    │  Cron/Sched│  │
-│  │  (TraceAlchemy) │    │  Middleware    │    │  (Hermes) │  │
-│  │  :8080       │    │  :8000        │    │           │  │
-│  └──────┬──────┘    └──────┬───────┘    └─────┬─────┘  │
-│         │                  │                  │         │
-│         ▼                  ▼                  ▼         │
-│  ┌───────────┐    ┌──────────────┐    ┌───────────┐  │
-│  │ ChromaDB  │    │   SQLite     │    │ Data Queue │  │
-│  │ ./chroma/ │    │ ./finance.db │    │ ./staging/ │  │
-│  └───────────┘    └──────────────┘    └───────────┘  │
-│                                                         │
-└─────────────────────────────────────────────────────────┘
-```
-
-**Starting the stack:**
 ```bash
-# 1. Serve the model
-llama-server -m TraceAlchemy-Gemma-4-E4B-Finance-IT.gguf \
-  --port 8080 --ctx-size 32768 --n-gpu-layers 99
+git clone <repo-url> Gemma-E4B-Finance-RAG
+cd Gemma-E4B-Finance-RAG
+python -m venv .venv
+```
 
-# 2. Start the middleware
-uvicorn middleware.main:app --port 8000
+Activate it:
 
-# 3. Setup cron jobs (via Hermes or systemd timers)
-hermes cron create \
-  --name "finance-daily-ingest" \
-  --schedule "0 9 * * 1-5" \
-  --script "scripts/daily_ingest.py"
+```powershell
+# Windows (PowerShell)
+.\.venv\Scripts\activate
+```
 
-# 4. Query!
-curl localhost:8000/query \
-  -d '{"question": "What is NVDA doing with its Blackwell architecture?"}'
+```bash
+# macOS / Linux
+source .venv/bin/activate
+```
+
+### 2. Install dependencies
+
+```bash
+pip install -r requirements.txt
+```
+
+### 3. Configure environment variables
+
+Create a `.env` file in the project root with:
+
+```
+FRED_API_KEY=your_fred_api_key_here
+SEC_EDGAR_USER_AGENT=Your Name your.email@example.com
+```
+
+- `FRED_API_KEY` — required for FRED macro ingestion. Get one free at
+  <https://fred.stlouisfed.org/docs/api/api_key.html>.
+- `SEC_EDGAR_USER_AGENT` — SEC EDGAR requires a descriptive User-Agent that
+  identifies the requester (name + contact email). See
+  [docs/CONFIGURATION.md](docs/CONFIGURATION.md) for the full resolution order.
+
+### 4. Start the model server (`llama-server`) on port 8087
+
+The middleware expects an OpenAI-compatible `llama-server` on
+`http://127.0.0.1:8087` with **embeddings enabled** (the same server provides
+both chat completions and embeddings).
+
+On Windows + AMD RDNA3, use the provided wrapper:
+
+```powershell
+.\scripts\serve_model.ps1 start
+```
+
+Or start it manually (any platform):
+
+```bash
+llama-server -m /path/to/gemma-4-E4B-it.Q8_0.gguf \
+    --host 127.0.0.1 --port 8087 \
+    -c 131072 -ngl 99 \
+    --embeddings --pooling mean
+```
+
+> The `--embeddings` and `--pooling mean` flags are required — the
+> `ChromaStore` embedding function posts to `/v1/embeddings` and expects
+> mean-pooled vectors.
+
+### 5. Start the middleware on port 8000
+
+```powershell
+# Windows: starts the FastAPI middleware (assumes llama-server is already up)
+.\scripts\start_stack.ps1
+```
+
+```bash
+# macOS / Linux (also starts llama-server if a model is found)
+./scripts/start_stack.sh
+```
+
+Or run `uvicorn` directly:
+
+```bash
+uvicorn src.middleware.app:app --host 0.0.0.0 --port 8000
+```
+
+Interactive API docs are then available at <http://127.0.0.1:8000/docs>.
+
+### 6. Ingest data
+
+Run the unified scheduler to populate the stores. `daily` runs Yahoo Finance,
+FRED, SEC filing discovery, and IR pages; `--force` skips the freshness checks:
+
+```bash
+python -m src.scheduler daily --force
+```
+
+Other modes: `hourly` (GDELT news), `weekly` (earnings transcripts + full SEC
+pipeline), `all` (everything that is stale), and `status` (freshness report).
+
+### 7. Ask a question
+
+```bash
+curl -X POST http://127.0.0.1:8000/query \
+  -H "Content-Type: application/json" \
+  -d '{"question": "What was NVDA revenue last quarter?"}'
+```
+
+### Interactive chat (recommended)
+
+For a single, centralized entry point, use the interactive client. It
+**auto-starts the middleware** if it isn't already running, gives you a chat
+loop over `/query`, and supports slash commands to run ingestion jobs:
+
+```bash
+python scripts/chat.py
+```
+
+```
+you> What was NVDA revenue last quarter?
+NVDA revenue is 253,491,003,392.00 usd (2026-Q2) [Source: yfinance/NVDA].
+  ticker=NVDA intent=fact_lookup facts=10 docs=0 model_available=True latency=3803.2ms
+
+you> /refresh            # run ALL ingestion jobs (scheduler all --force)
+you> /refresh NVDA       # refresh a single ticker via the API
+you> /refresh daily      # run a specific scheduler mode
+you> /health             # middleware + freshness summary
+you> /ticker NVDA        # pin a ticker for following questions
+you> /help               # full command list
+you> /quit               # stops the middleware if this script started it
+```
+
+It still requires `llama-server` on `:8087`; it warns and falls back to
+degraded answers if the model is unreachable.
+
+---
+
+## Architecture
+
+```
+                          6 data sources
+   SEC EDGAR · Yahoo Finance · FRED · GDELT · Earnings transcripts · IR pages
+                               │
+                       Ingestion pipeline
+                  (UnifiedScheduler, resilience layer)
+                               │
+                ┌──────────────┴──────────────┐
+                ▼                              ▼
+          SQLite (fundamentals,          ChromaDB
+          filings, cache_meta,           (document embeddings,
+          ingestion_log,                  cosine similarity)
+          dead_letter)
+                └──────────────┬──────────────┘
+                               ▼
+                   FastAPI middleware (:8000)
+        intent parsing → hybrid retrieval → prompt augmentation
+                               │
+                               ▼
+              llama-server (:8087) — TraceAlchemy
+              Gemma 4 E4B (chat + embeddings)
+```
+
+See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the full breakdown of
+components, the storage schema, the query flow, and failure-mode handling.
+
+---
+
+## Project Structure
+
+```
+Gemma-E4B-Finance-RAG/
+├── configs/                  # YAML configuration (see docs/CONFIGURATION.md)
+│   ├── storage.yaml          # SQLite + ChromaDB + embedding + SEC settings
+│   ├── middleware.yaml       # Endpoints, model name, retrieval top-k
+│   ├── watchlist.yaml        # Tracked tickers + per-source TTL schedule
+│   ├── fred.yaml             # FRED indicators + request settings
+│   ├── gdelt.yaml            # GDELT query/domain/topic filters
+│   ├── ir.yaml               # Company IR-page ingestion settings
+│   └── model.yaml            # TraceAlchemy model + llama-server settings
+├── docs/                     # Documentation (this README links here)
+│   ├── ARCHITECTURE.md
+│   ├── CONFIGURATION.md
+│   └── API.md
+├── scripts/                  # Operational + smoke-test scripts
+│   ├── serve_model.ps1 / .sh # Launch llama-server (TraceAlchemy)
+│   ├── start_stack.ps1 / .sh # Launch the middleware (+ model on Unix)
+│   ├── stop_stack.ps1 / .sh
+│   ├── seed_test_data.py     # Seed demo data into the stores
+│   └── validate_setup.py     # Environment / dependency sanity check
+├── src/
+│   ├── storage/              # Dual storage layer
+│   │   ├── store.py          # Store facade over SQLite + ChromaDB
+│   │   ├── sqlite_store.py   # Structured facts, filings, cache, audit log
+│   │   └── chroma_store.py   # Vector store + TraceAlchemy embedding function
+│   ├── middleware/           # FastAPI query router
+│   │   ├── app.py            # Endpoints + query pipeline
+│   │   ├── config.py         # MiddlewareConfig (from middleware.yaml)
+│   │   ├── models.py         # Pydantic request/response schemas
+│   │   ├── intent_parser.py  # Ticker / metric / question-type extraction
+│   │   ├── retriever.py      # Hybrid retrieval strategy selection
+│   │   └── prompt_augmenter.py
+│   ├── scheduler/            # Unified ingestion orchestrator
+│   │   ├── __init__.py       # UnifiedScheduler (daily/hourly/weekly/all)
+│   │   └── __main__.py       # CLI: python -m src.scheduler <mode>
+│   ├── ingestion/
+│   │   └── yfinance_ingestor.py
+│   ├── macros/
+│   │   ├── fred_ingestor.py
+│   │   ├── gdelt_ingestor.py
+│   │   ├── ir_ingestor.py
+│   │   └── earnings_transcripts.py
+│   ├── sec/                  # SEC EDGAR discovery + parsing pipeline
+│   │   ├── edgar_fetcher.py
+│   │   ├── filing_parser.py
+│   │   ├── filing_processor.py
+│   │   └── scheduler.py      # FilingScheduler
+│   └── utils/
+│       ├── logging.py
+│       └── resilience.py     # retry/backoff, CircuitBreaker, DeadLetterQueue
+├── tests/                    # pytest suite
+├── data/                     # SQLite DB + ChromaDB persistence (gitignored)
+├── requirements.txt
+└── pytest.ini
 ```
 
 ---
 
-## Phase 2 — Future Evolution
+## Configuration
 
-Once Phase 1 is running solidly:
-
-```mermaid
-graph TB
-    subgraph Phase2["Phase 2 Upgrades"]
-        KG[Knowledge Graph\nEntity Relationships]
-        RERANK[Cross-Encoder\nRe-ranker]
-        CRITIQUE[Self-Critique Loop]
-        CHAT_HIST[Conversation Memory]
-    end
-
-    KG -->|NVDA → TSMC → H100 supply chain| RICH[Context]
-    RERANK -->|Improve retrieval precision| BETTER[Top-K Quality]
-    CRITIQUE -->|Model checks own answer vs sources| TRUST[Confidence Score]
-    CHAT_HIST -->|Follow-up awareness| FLOW[Conversational]
-```
-
-- **Knowledge Graph** — track entities and relationships (companies, suppliers, competitors, customers, regulators)
-- **Cross-encoder re-ranker** — boost retrieval accuracy by re-scoring ChromaDB results
-- **Self-critique** — have the model verify its own answer against retrieved sources before responding
-- **Conversation memory** — track what you've already asked this session so follow-ups have context
+All runtime configuration lives in `configs/*.yaml`, with secrets supplied via
+`.env` (`FRED_API_KEY`, `SEC_EDGAR_USER_AGENT`). Each config file and every
+field is documented in **[docs/CONFIGURATION.md](docs/CONFIGURATION.md)**.
 
 ---
 
-## Built With
+## API Reference
 
-- [TraceAlchemy-Gemma-4-E4B-Finance-IT-gguf](https://huggingface.co/trjxter/TraceAlchemy-Gemma-4-E4B-Finance-IT-gguf) — Finance fine-tuned reasoning engine
-- [llama.cpp](https://github.com/ggml-ai/llama.cpp) — Local GGUF inference via `llama-server`
-- [ChromaDB](https://www.trychroma.com/) — Vector database for semantic document retrieval
-- [SQLite](https://www.sqlite.org/) — Structured financial fact storage
-- [FastAPI](https://fastapi.tiangolo.com/) — Middleware API layer
-- [SEC EDGAR](https://www.sec.gov/edgar/searchedgar/companysearch.html) — Regulatory filings
-- [yfinance](https://github.com/ranaroussi/yfinance) — Market data
-- [GDELT](https://www.gdeltproject.org/) — Global news intelligence
-- [FRED](https://fred.stlouisfed.org/) — Economic indicators
+The middleware exposes the following endpoints (full schemas and examples in
+**[docs/API.md](docs/API.md)**):
+
+| Method | Path                   | Purpose                                          |
+|--------|------------------------|--------------------------------------------------|
+| GET    | `/`                    | Service info + links                             |
+| GET    | `/health`              | Storage, model, scheduler, freshness status      |
+| POST   | `/query`               | Full RAG pipeline — grounded, cited answer       |
+| POST   | `/search`              | Raw hybrid search (bypasses the model)           |
+| GET    | `/freshness/{ticker}`  | Per-source freshness report for a ticker         |
+| POST   | `/refresh/{ticker}`    | On-demand re-ingestion of stale sources          |
+| GET    | `/macro/snapshot`      | Key macro indicators (cached FRED data)          |
+| GET    | `/sentiment/{ticker}`  | GDELT sentiment summary                          |
+| GET    | `/guidance/{ticker}`   | Latest earnings guidance                         |
+
+---
+
+## Development & Testing
+
+Run the test suite:
+
+```bash
+pytest tests/ -v
+```
+
+With coverage:
+
+```bash
+pytest tests/ -v --cov=src --cov-report=term-missing
+```
+
+Tests that hit the live SEC EDGAR network and a running `llama-server` on
+`:8087` are marked `live` (see `pytest.ini`). Skip them with:
+
+```bash
+pytest tests/ -v -m "not live"
+```
+
+Sanity-check your environment before running the stack:
+
+```bash
+python scripts/validate_setup.py
+```
+
+See **[CONTRIBUTING.md](CONTRIBUTING.md)** for code style, branch, and PR
+conventions.
+
+---
+
+## License
+
+MIT

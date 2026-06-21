@@ -14,7 +14,54 @@ Usage:
 """
 
 import logging
+import os
+from logging.handlers import RotatingFileHandler
 from typing import Any
+
+
+def setup_file_logging(log_dir: str = "logs", level: int = logging.INFO):
+    """Configure rotating file logging for the RAG system.
+
+    Adds two handlers to the root logger:
+      - ``rag-system.log`` (10 MB x 5 backups) at ``level``
+      - ``rag-errors.log`` (10 MB x 3 backups) at WARNING and above
+
+    Sensitive values (API keys, full filing text) should never be passed to
+    log calls — these handlers persist whatever is logged.
+
+    Returns:
+        (main_handler, error_handler)
+    """
+    os.makedirs(log_dir, exist_ok=True)
+
+    formatter = logging.Formatter(
+        "%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+
+    handler = RotatingFileHandler(
+        os.path.join(log_dir, "rag-system.log"),
+        maxBytes=10 * 1024 * 1024,  # 10 MB
+        backupCount=5,
+    )
+    handler.setFormatter(formatter)
+    handler.setLevel(level)
+
+    error_handler = RotatingFileHandler(
+        os.path.join(log_dir, "rag-errors.log"),
+        maxBytes=10 * 1024 * 1024,
+        backupCount=3,
+    )
+    error_handler.setFormatter(formatter)
+    error_handler.setLevel(logging.WARNING)
+
+    root = logging.getLogger()
+    root.addHandler(handler)
+    root.addHandler(error_handler)
+    if root.level > level or root.level == logging.NOTSET:
+        root.setLevel(level)
+
+    return handler, error_handler
 
 
 class IngestionLogger:

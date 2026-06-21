@@ -16,8 +16,11 @@ Usage:
     # }
 """
 
+import logging
 import re
 from typing import Optional
+
+logger = logging.getLogger(__name__)
 
 
 class IntentParser:
@@ -288,7 +291,7 @@ class IntentParser:
                 "original_question": str,
             }
         """
-        return {
+        intent = {
             "ticker": override_ticker or self._detect_ticker(question),
             "metrics": self._extract_metrics(question),
             "question_type": self._classify_question_type(question),
@@ -296,6 +299,12 @@ class IntentParser:
             "timeframe_type": self._extract_timeframe_type(question),
             "original_question": question,
         }
+        logger.debug(
+            "Parsed intent: ticker=%s type=%s metrics=%s timeframe=%s",
+            intent["ticker"], intent["question_type"],
+            intent["metrics"], intent["timeframe"],
+        )
+        return intent
 
     # ── Ticker Detection ────────────────────────────────
 

@@ -47,6 +47,7 @@ class QueryResponse(BaseModel):
     facts_used: int = 0
     documents_used: int = 0
     latency_ms: float = 0.0
+    model_available: bool = True
     freshness: dict = Field(
         default_factory=lambda: {
             "overall": "unknown",
@@ -65,6 +66,8 @@ class HealthResponse(BaseModel):
     status: str = "ok"
     storage: Optional[dict] = None
     model_available: bool = False
+    scheduler: Optional[dict] = None
+    freshness: Optional[dict] = None
     version: str = "1.0.0"
 
 

@@ -91,6 +91,7 @@ def test_search_empty(client):
 def test_query_returns_response(client):
     mock_citations = [SourceCitation(source_type="sec_10k", ticker="NVDA")]
     with patch("src.middleware.app._call_model", new_callable=AsyncMock) as mock_call, \
+            patch("src.middleware.app._check_model_health", new_callable=AsyncMock, return_value=True), \
             patch("src.middleware.app._refresh_ticker_sources", return_value=([], [])):
         mock_call.return_value = ("Test answer about NVDA.", mock_citations)
         resp = client.post("/query", json={"question": "What is NVDA revenue?"})
@@ -166,6 +167,7 @@ def test_query_with_refresh(fresh_client):
     client, store = fresh_client
     _backdate(store, "NVDA", "yfinance_news", hours_ago=48)
     with patch("src.middleware.app._call_model", new_callable=AsyncMock) as mock_call, \
+            patch("src.middleware.app._check_model_health", new_callable=AsyncMock, return_value=True), \
             patch("src.middleware.app._refresh_one_source") as mock_one:
         mock_call.return_value = ("answer", [])
         resp = client.post("/query", json={"question": "What is NVDA revenue?", "refresh": True})
@@ -179,6 +181,7 @@ def test_query_without_refresh(fresh_client):
     client, store = fresh_client
     _backdate(store, "NVDA", "yfinance_news", hours_ago=48)
     with patch("src.middleware.app._call_model", new_callable=AsyncMock) as mock_call, \
+            patch("src.middleware.app._check_model_health", new_callable=AsyncMock, return_value=True), \
             patch("src.middleware.app._refresh_one_source") as mock_one:
         mock_call.return_value = ("answer", [])
         resp = client.post("/query", json={"question": "What is NVDA revenue?", "refresh": False})

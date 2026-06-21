@@ -72,11 +72,15 @@ class TestUnifiedSchedulerInit:
     def test_init(self, scheduler):
         assert set(scheduler.SOURCES) == {
             "yfinance", "sec_filings", "fred", "gdelt", "earnings_transcripts",
+            "ir_pages",
         }
 
     def test_source_ordering(self, scheduler):
         ordered = [name for name, _ in scheduler._ordered_sources()]
-        assert ordered == ["yfinance", "sec_filings", "fred", "gdelt", "earnings_transcripts"]
+        assert ordered == [
+            "yfinance", "sec_filings", "fred", "gdelt", "earnings_transcripts",
+            "ir_pages",
+        ]
 
     def test_ttl_loading(self, scheduler):
         # Values come from configs/watchlist.yaml schedule section.
@@ -104,7 +108,7 @@ class TestUnifiedSchedulerRunModes:
         result = scheduler.run_all_stale()
         assert set(result) == set(scheduler.SOURCES)
         assert all(r["status"] == "success" for r in result.values())
-        assert m.call_count == 5
+        assert m.call_count == len(scheduler.SOURCES)
 
     def test_run_all_stale_force(self, scheduler):
         # Mark everything fresh; force=True must still run all.
@@ -114,16 +118,16 @@ class TestUnifiedSchedulerRunModes:
             )
         m = _stub_run_source(scheduler)
         result = scheduler.run_all_stale(force=True)
-        assert m.call_count == 5
+        assert m.call_count == len(scheduler.SOURCES)
         assert all(r["status"] == "success" for r in result.values())
 
     def test_run_daily(self, scheduler):
         m = _stub_run_source(scheduler)
         result = scheduler.run_daily()
-        assert set(result) == {"yfinance", "fred", "sec_filings"}
+        assert set(result) == {"yfinance", "fred", "sec_filings", "ir_pages"}
         assert "gdelt" not in result
         assert "earnings_transcripts" not in result
-        assert m.call_count == 3
+        assert m.call_count == 4
 
     def test_run_hourly(self, scheduler):
         m = _stub_run_source(scheduler)
@@ -190,8 +194,8 @@ class TestUnifiedSchedulerPartialFailure:
         _stub_run_source(sched)
         with patch("src.scheduler.time.sleep") as mock_sleep:
             sched.run_all_stale()
-        # 5 sources => 4 inter-source delays.
-        assert mock_sleep.call_count == 4
+        # N sources => N-1 inter-source delays.
+        assert mock_sleep.call_count == len(sched.SOURCES) - 1
 
 
 # ════════════════════════════════════════════════════════

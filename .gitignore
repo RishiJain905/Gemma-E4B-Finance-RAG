@@ -13,6 +13,27 @@ venv/
 __pycache__/
 *.pyc
 *.pyo
+*.egg-info/
+
+# Logs
+logs/
+*.log
+
+# Coverage / test artifacts
+.coverage
+coverage_report/
+htmlcov/
+.pytest_cache/
+.ruff_cache/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
 
 #environment variables
 .env
