@@ -52,6 +52,7 @@ config: Optional[MiddlewareConfig] = None
 store: Optional[Store] = None
 model_client: Optional[httpx.AsyncClient] = None
 _tools_supported: bool = True
+MACRO_SNAPSHOT_METRICS = ["GDP", "CPIAUCSL", "FEDFUNDS", "UNRATE", "DGS10", "T10Y2Y"]
 retriever = None  # Shared Retriever (built on startup) — Phase 2.1.2
 
 
@@ -91,6 +92,22 @@ app = FastAPI(
     version="1.0.0",
     lifespan=lifespan,
 )
+
+
+def _macro_snapshot_data() -> dict:
+    return store.get_fundamentals_batch("MACRO", metrics=MACRO_SNAPSHOT_METRICS)
+
+
+def _sentiment_data(ticker: str, days: int = 7) -> dict:
+    from src.macros.gdelt_ingestor import GDELTIngestor
+
+    return GDELTIngestor(store=store).get_sentiment_summary(ticker.upper(), days=days)
+
+
+def _guidance_data(ticker: str) -> dict:
+    from src.macros.earnings_transcripts import EarningsTranscriptIngestor
+
+    return EarningsTranscriptIngestor(store=store).get_latest_guidance(ticker.upper())
 
 
 # ── Health ─────────────────────────────────────────────
@@ -675,9 +692,7 @@ async def macro_snapshot():
     if not store:
         raise HTTPException(status_code=503, detail="Store not initialized")
 
-    macro = store.get_fundamentals_batch("MACRO", metrics=[
-        "GDP", "CPIAUCSL", "FEDFUNDS", "UNRATE", "DGS10", "T10Y2Y",
-    ])
+    macro = _macro_snapshot_data()
 
     return MacroSnapshotResponse(
         gdp=macro.get("GDP"),
@@ -703,9 +718,7 @@ async def sentiment(ticker: str, days: int = 7):
     if not store:
         raise HTTPException(status_code=503, detail="Store not initialized")
 
-    from src.macros.gdelt_ingestor import GDELTIngestor
-    ingestor = GDELTIngestor(store=store)
-    summary = ingestor.get_sentiment_summary(ticker.upper(), days=days)
+    summary = _sentiment_data(ticker, days=days)
 
     return SentimentResponse(
         ticker=summary.get("ticker", ticker.upper()),
@@ -726,9 +739,7 @@ async def guidance(ticker: str):
     if not store:
         raise HTTPException(status_code=503, detail="Store not initialized")
 
-    from src.macros.earnings_transcripts import EarningsTranscriptIngestor
-    ingestor = EarningsTranscriptIngestor(store=store)
-    guidance_data = ingestor.get_latest_guidance(ticker.upper())
+    guidance_data = _guidance_data(ticker)
 
     if not guidance_data:
         return {"ticker": ticker.upper(), "guidance": {}, "status": "not_found"}
