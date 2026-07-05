@@ -624,9 +624,13 @@ async def _call_model(prompt: str, temperature: float,
             logger.error("Model call failed: %s", e)
             return f"Error calling model: {e}", []
 
-        msg = data.get("choices", [{}])[0].get("message", {})
-        content = msg.get("content") or ""
-        tool_calls = msg.get("tool_calls") or []
+        try:
+            msg = (data.get("choices") or [{}])[0].get("message") or {}
+            content = msg.get("content") or ""
+            tool_calls = msg.get("tool_calls") or []
+        except (AttributeError, IndexError, TypeError) as e:
+            logger.error("Malformed model response in tool loop: %s", e)
+            return f"Error calling model: malformed response ({e})", []
         if iteration == 0 and not tool_calls and not content.strip():
             logger.warning("Model returned empty content with tools; disabling tools")
             _tools_supported = False

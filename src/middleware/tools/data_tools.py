@@ -25,6 +25,11 @@ def query_facts_handler(store, metric, tickers=None, order="asc", limit=10,
     known = store.sqlite.list_metrics()
     if metric not in known:
         return {"error": f"unknown metric '{metric}'", "available_metrics": known}
+    if (op is None) != (value is None):
+        return {
+            "error": "op and value must be provided together for a threshold filter",
+            "metric": metric,
+        }
 
     rows = store.sqlite.query_metric(
         metric,
@@ -122,27 +127,50 @@ def check_freshness_handler(store, ticker):
 
 
 def refresh_data_handler(store, ticker, sources=None):
-    """Refresh stale data for one ticker through the middleware refresh path."""
+    """Refresh stale data for one ticker through the middleware refresh path.
+
+    Only truly per-ticker sources are refreshable from the model: sources in
+    SCHEDULER_SOURCE_MAP (SEC filings, earnings transcripts, IR pages) run
+    watchlist-wide via the UnifiedScheduler, so the tool skips them and
+    reports them instead of triggering a scheduler-scale ingestion.
+    """
     ticker = ticker.upper()
     try:
         from src.middleware import app as middleware_app
         from src.middleware.app import (
+            SCHEDULER_SOURCE_MAP,
+            _SOURCE_ALIASES,
             _normalize_sources,
             _refresh_ticker_sources,
             _stale_source_names,
         )
         import time
 
-        logical = _normalize_sources(sources) if sources else []
-        if not logical:
+        if sources:
+            logical = _normalize_sources(sources)
+            if not logical:
+                return {
+                    "error": "no valid sources requested",
+                    "ticker": ticker,
+                    "valid_sources": sorted(set(_SOURCE_ALIASES.values())),
+                }
+        else:
             report = middleware_app.store.get_freshness_report(ticker)
             logical = _stale_source_names(report)
+
+        skipped = [s for s in logical if s in SCHEDULER_SOURCE_MAP]
+        logical = [s for s in logical if s not in SCHEDULER_SOURCE_MAP]
         if not logical:
+            note = (
+                "requested sources are scheduler-managed; run the scheduler instead"
+                if skipped else "all sources fresh"
+            )
             return {
                 "ticker": ticker,
                 "refreshed": [],
                 "errors": [],
-                "note": "all sources fresh",
+                "skipped_scheduler_managed": skipped,
+                "note": note,
             }
         logger.warning("REFRESH tool invoked: %s sources=%s", ticker, logical)
         start = time.time()
@@ -151,6 +179,7 @@ def refresh_data_handler(store, ticker, sources=None):
             "ticker": ticker,
             "refreshed": refreshed,
             "errors": errors,
+            "skipped_scheduler_managed": skipped,
             "duration_s": round(time.time() - start, 2),
         }
     except Exception as e:  # noqa: BLE001
@@ -393,7 +422,9 @@ register(
         description=(
             "Use ONLY when check_freshness shows stale or never_fetched sources and "
             "the answer needs current data. This is slow because it performs network "
-            "fetches, is rate-limited per query, and refreshes ONE ticker only."
+            "fetches, is rate-limited per query, and refreshes ONE ticker only. "
+            "Scheduler-managed sources (sec_filings, earnings_transcripts, ir_pages) "
+            "cannot be refreshed from here and are reported as skipped."
         ),
         parameters={
             "type": "object",

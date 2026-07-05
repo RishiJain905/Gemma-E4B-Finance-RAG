@@ -161,9 +161,14 @@ Registered tools:
 | `refresh_data` | Yes | Refresh stale or never-fetched sources for one ticker. |
 
 `refresh_data` is intentionally narrow: source aliases are normalized through
-`_normalize_sources()` and unknown names are dropped, so inputs such as `"all"`
-do not open a scheduler-wide path. The handler refreshes only the requested
-ticker and logical sources through `_refresh_ticker_sources()`.
+`_normalize_sources()`, and an explicitly invalid request (e.g. `"all"`)
+returns a structured error rather than falling back to a broader refresh.
+Scheduler-managed sources (`sec_filings`, `earnings_transcripts`, `ir_pages`)
+run watchlist-wide via the `UnifiedScheduler`, so the tool skips them and
+reports them in `skipped_scheduler_managed`; only truly per-ticker sources
+(yfinance fundamentals/news, GDELT) are refreshed through
+`_refresh_ticker_sources()`. The human-facing `/refresh` endpoint keeps its
+original wider behavior.
 
 ---
 

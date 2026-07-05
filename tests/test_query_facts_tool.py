@@ -179,3 +179,15 @@ def test_tools_registered_write_false():
 def test_tools_appear_in_openai_schema():
     names = {entry["function"]["name"] for entry in openai_schema()}
     assert {"list_metrics", "query_facts"} <= names
+
+
+def test_query_facts_op_without_value(store):
+    _seed_forward_pe(store, "NVDA", 16.5)
+
+    result = query_facts_handler(store, metric="forward_pe", op="lt")
+
+    assert "error" in result and "op and value" in result["error"]
+
+    result = query_facts_handler(store, metric="forward_pe", value=20)
+
+    assert "error" in result and "op and value" in result["error"]

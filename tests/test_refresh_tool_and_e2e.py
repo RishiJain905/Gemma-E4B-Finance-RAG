@@ -168,6 +168,8 @@ def test_refresh_cannot_trigger_full_scheduler(tmp_store, monkeypatch):
     monkeypatch.setattr("src.scheduler.UnifiedScheduler", scheduler_cls)
     _mark_only_gdelt_stale(tmp_store)
 
+    # Explicitly invalid sources (e.g. "all") are a structured error, not a
+    # fallback into refreshing everything stale.
     result = dispatch_tool(
         {
             "function": {
@@ -178,9 +180,42 @@ def test_refresh_cannot_trigger_full_scheduler(tmp_store, monkeypatch):
         tmp_store,
         ToolContext(allow_write=True, max_refreshes=2),
     )
+    assert "error" in result
+    assert "valid_sources" in result
+    called.assert_not_called()
 
+    # Scheduler-managed sources are skipped (never routed to the
+    # watchlist-wide UnifiedScheduler runners); per-ticker ones refresh.
+    result = dispatch_tool(
+        {
+            "function": {
+                "name": "refresh_data",
+                "arguments": '{"ticker":"NVDA","sources":["sec","gdelt"]}',
+            }
+        },
+        tmp_store,
+        ToolContext(allow_write=True, max_refreshes=2),
+    )
     assert result["refreshed"] == ["gdelt_news"]
+    assert result["skipped_scheduler_managed"] == ["sec_filings"]
     called.assert_called_once_with("NVDA", ["gdelt_news"])
+
+    # Only scheduler-managed sources requested -> nothing is refreshed.
+    result = dispatch_tool(
+        {
+            "function": {
+                "name": "refresh_data",
+                "arguments": '{"ticker":"NVDA","sources":["sec","earnings","ir"]}',
+            }
+        },
+        tmp_store,
+        ToolContext(allow_write=True, max_refreshes=5),
+    )
+    assert result["refreshed"] == []
+    assert result["skipped_scheduler_managed"] == [
+        "sec_filings", "earnings_transcripts", "ir_pages",
+    ]
+    called.assert_called_once()  # unchanged — no second refresh happened
     scheduler_refresh.assert_not_called()
     scheduler_cls.assert_not_called()
 

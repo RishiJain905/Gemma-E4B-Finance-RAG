@@ -242,3 +242,37 @@ async def test_tools_unsupported_fallback(monkeypatch, mode):
     assert middleware_app._tools_supported is False
     assert client.post.await_count == 2
     assert "tools" not in client.post.await_args_list[-1].kwargs["json"]
+
+
+@pytest.mark.asyncio
+async def test_malformed_200_fails_soft(monkeypatch):
+    """A 200 with empty/malformed choices must not raise out of _call_model."""
+    register(
+        Tool(
+            name="query_facts",
+            description="Query facts",
+            parameters={"type": "object", "properties": {}, "required": []},
+            handler=lambda _store: {"ok": True},
+        )
+    )
+
+    # Non-empty content in a well-formed first response keeps tools enabled;
+    # the malformed shape arrives on the second iteration.
+    first = _response(
+        "",
+        [{"id": "c1", "type": "function",
+          "function": {"name": "query_facts", "arguments": "{}"}}],
+    )
+    malformed = MagicMock()
+    malformed.raise_for_status.return_value = None
+    malformed.json.return_value = {"choices": ["not-a-dict"]}
+
+    client = SimpleNamespace(post=AsyncMock(side_effect=[first, malformed]))
+    monkeypatch.setattr(middleware_app, "model_client", client)
+    monkeypatch.setattr(middleware_app, "config", _config())
+    monkeypatch.setattr(middleware_app, "store", object())
+
+    answer, citations = await middleware_app._call_model("prompt", 0.1, 100)
+
+    assert answer.startswith("Error calling model: malformed response")
+    assert citations == []
