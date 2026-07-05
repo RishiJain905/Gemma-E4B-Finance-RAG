@@ -74,7 +74,20 @@ SEC_EDGAR_USER_AGENT=Your Name your.email@example.com
   identifies the requester (name + contact email). See
   [docs/CONFIGURATION.md](docs/CONFIGURATION.md) for the full resolution order.
 
-### 4. Start the model server (`llama-server`) on port 8087
+### 4. Configure model paths (for `serve_model` scripts)
+
+Copy the template and set paths for your machine:
+
+```powershell
+copy configs\model.example.yaml configs\model.local.yaml
+```
+
+Edit `configs/model.local.yaml` — at minimum set `paths.main_model`,
+`paths.build_dir`, and (if using MTP) `speculative_decoding.draft_model_path`.
+This file is gitignored. Alternatively, export `MAIN_MODEL_PATH`,
+`LLAMA_BUILD_DIR`, and `DRAFT_MODEL_PATH` in your environment.
+
+### 5. Start the model server (`llama-server`) on port 8087
 
 The middleware expects an OpenAI-compatible `llama-server` on
 `http://127.0.0.1:8087` with **embeddings enabled** (the same server provides
@@ -99,7 +112,7 @@ llama-server -m /path/to/gemma-4-E4B-it.Q8_0.gguf \
 > `ChromaStore` embedding function posts to `/v1/embeddings` and expects
 > mean-pooled vectors.
 
-### 5. Start the middleware on port 8000
+### 6. Start the middleware on port 8000
 
 ```powershell
 # Windows: starts the FastAPI middleware (assumes llama-server is already up)
@@ -119,7 +132,7 @@ uvicorn src.middleware.app:app --host 0.0.0.0 --port 8000
 
 Interactive API docs are then available at <http://127.0.0.1:8000/docs>.
 
-### 6. Ingest data
+### 7. Ingest data
 
 Run the unified scheduler to populate the stores. `daily` runs Yahoo Finance,
 FRED, SEC filing discovery, and IR pages; `--force` skips the freshness checks:
@@ -131,7 +144,7 @@ python -m src.scheduler daily --force
 Other modes: `hourly` (GDELT news), `weekly` (earnings transcripts + full SEC
 pipeline), `all` (everything that is stale), and `status` (freshness report).
 
-### 7. Ask a question
+### 8. Ask a question
 
 ```bash
 curl -X POST http://127.0.0.1:8000/query \

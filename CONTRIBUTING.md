@@ -55,9 +55,14 @@ setup, code style, testing, and the pull-request process.
    SEC_EDGAR_USER_AGENT=Your Name your.email@example.com
    ```
 
+5. **Configure model paths** — copy `configs/model.example.yaml` to
+   `configs/model.local.yaml` and set `paths.main_model`, `paths.build_dir`, and
+   (if using MTP) `speculative_decoding.draft_model_path`. This file is
+   gitignored.
+
    See [docs/CONFIGURATION.md](docs/CONFIGURATION.md) for details.
 
-5. **Sanity-check the environment:**
+6. **Sanity-check the environment:**
 
    ```bash
    python scripts/validate_setup.py
@@ -172,4 +177,4 @@ pytest tests/ --live                   # include opt-in live model/SEC tests
    any related task, and note how you tested it.
 
 5. **Keep the PR scoped** — avoid mixing unrelated changes. Do not commit
-   secrets, the `.env` file, or generated data under `data/`.
+   secrets, the `.env` file, `configs/model.local.yaml`, or generated data under `data/`.

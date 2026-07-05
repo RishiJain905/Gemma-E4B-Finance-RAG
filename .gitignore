@@ -47,3 +47,6 @@ Thumbs.db
 .env.development
 .env.test
 .env.production
+
+# Machine-specific model paths (copy from configs/model.example.yaml)
+configs/model.local.yaml

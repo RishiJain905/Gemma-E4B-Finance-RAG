@@ -1,16 +1,37 @@
 # scripts/serve_model.ps1 — TraceAlchemy llama-server Wrapper
-# For Windows + AMD RDNA3
-# Usage: .\scripts\serve_model.ps1 [start|stop|status]
+# Paths and build settings come from configs/model.yaml + configs/model.local.yaml
+# (copy configs/model.example.yaml to model.local.yaml on first setup).
+# Usage: .\scripts\serve_model.ps1 [start|stop|status] [-Port 8087]
 
 param(
     [string]$Action = "start",
-    [int]$Port = 8087
+    [int]$Port = 0
 )
 
-$BuildDir   = "F:\Personal\TQ-Optimizer-Test\atomic-llama-cpp-turboquant\build-rdna3-gfx1101"
-$ServerExe  = "$BuildDir\bin\llama-server.exe"
-$MainModel  = "D:\LOCAL-MODELS\trjxter\TraceAlchemy-Gemma-4-E4B-Finance-IT-gguf\gemma-4-E4B-it.Q8_0.gguf"
-$DraftModel = "D:\LOCAL-MODELS\AtomicChat\gemma-4-E4B-it-assistant-GGUF\gemma-4-E4B-it-assistant.F16.gguf"
+$ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+$ProjectDir = Split-Path -Parent $ScriptDir
+Set-Location $ProjectDir
+
+$python = Join-Path $ProjectDir ".venv\Scripts\python.exe"
+if (-not (Test-Path $python)) { $python = "python" }
+
+function Get-ServeConfig {
+    $json = & $python (Join-Path $ScriptDir "resolve_model_paths.py") 2>&1
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host $json
+        Write-Host ""
+        Write-Host "Setup: copy configs\model.example.yaml to configs\model.local.yaml and set your paths."
+        exit 1
+    }
+    return ($json | ConvertFrom-Json)
+}
+
+$cfg = Get-ServeConfig
+if ($Port -le 0) { $Port = [int]$cfg.port }
+
+$ServerExe  = $cfg.server_exe
+$MainModel  = $cfg.main_model
+$DraftModel = $cfg.draft_model
 $LogFile    = "$env:USERPROFILE\models\tracealchemy\logs\server.log"
 $PidFile    = "$env:USERPROFILE\models\tracealchemy\logs\server.pid"
 
@@ -25,26 +46,47 @@ function Start-Server {
         }
     }
 
+    if (-not (Test-Path $ServerExe)) {
+        Write-Host "ERROR: llama-server not found: $ServerExe"
+        Write-Host "       Set paths.build_dir and paths.binary in configs\model.local.yaml"
+        exit 1
+    }
+    if (-not (Test-Path $MainModel)) {
+        Write-Host "ERROR: Main model not found: $MainModel"
+        Write-Host "       Set paths.main_model in configs\model.local.yaml"
+        exit 1
+    }
+
     Write-Host "Starting TraceAlchemy on port $Port ..."
-    Write-Host "   GPU: AMD RDNA3 (gfx1101) | Quant: Q8_0 | Context: 131072"
+    Write-Host "   GPU: $($cfg.gpu_arch) | Quant: $($cfg.quantization) | Context: $($cfg.max_context)"
 
     $args = @(
         "-m", "`"$MainModel`"",
-        "--mtp-head", "`"$DraftModel`"",
-        "--spec-type", "mtp",
-        "--draft-block-size", "3",
         "--host", "127.0.0.1",
         "--port", "$Port",
-        "-c", "131072",
-        "-ngl", "99",
+        "-c", "$($cfg.max_context)",
+        "-ngl", "$($cfg.gpu_layers)",
         "-np", "1",
         "-fa", "on",
-        "-ctk", "q8_0",
-        "-ctv", "turbo4",
-        "-t", "8",
+        "-ctk", "$($cfg.cache_type_key)",
+        "-ctv", "$($cfg.cache_type_value)",
+        "-t", "$($cfg.cpu_threads)",
         "--embeddings",
         "--pooling", "mean"
     )
+
+    if ($cfg.speculative_enabled) {
+        if (-not (Test-Path $DraftModel)) {
+            Write-Host "ERROR: Draft model not found: $DraftModel"
+            Write-Host "       Set speculative_decoding.draft_model_path in configs\model.local.yaml"
+            exit 1
+        }
+        $args += @(
+            "--mtp-head", "`"$DraftModel`"",
+            "--spec-type", "mtp",
+            "--draft-block-size", "$($cfg.draft_block_size)"
+        )
+    }
 
     $proc = Start-Process -FilePath $ServerExe -ArgumentList $args -NoNewWindow -RedirectStandardOutput $LogFile -RedirectStandardError "$LogFile.err" -PassThru
     $proc.Id | Out-File -FilePath $PidFile -Encoding ascii

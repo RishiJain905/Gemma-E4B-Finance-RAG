@@ -12,9 +12,9 @@ enable_citations: true
 
 # Phase 2.1.4 — structured analytical tooling.
 # Disabled by default until concrete tools are registered and validated.
-enable_tools: false
+enable_tools: true
 max_tool_iterations: 3
-allow_write_tools: false
+allow_write_tools: true
 max_refreshes_per_query: 2
 
 # Phase 2.1.2 — hybrid retrieval & re-ranking.

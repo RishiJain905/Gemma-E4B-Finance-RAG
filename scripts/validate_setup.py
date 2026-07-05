@@ -28,8 +28,31 @@ check((PROJECT / "data").is_dir(), "data/ directory missing")
 
 # 2. Config files
 for cfg in ["storage.yaml", "middleware.yaml", "watchlist.yaml",
-            "fred.yaml", "gdelt.yaml", "ir.yaml"]:
+            "fred.yaml", "gdelt.yaml", "ir.yaml", "model.yaml"]:
     check((PROJECT / "configs" / cfg).exists(), f"configs/{cfg} missing")
+
+check((PROJECT / "configs" / "model.example.yaml").exists(),
+      "configs/model.example.yaml missing")
+
+# 3b. Model paths (for serve_model scripts)
+try:
+    sys.path.insert(0, str(PROJECT))
+    from src.utils.model_config import get_serve_settings
+    settings = get_serve_settings()
+    check(Path(settings["main_model"]).exists(),
+          f"Main model not found: {settings['main_model']} "
+          "(set paths in configs/model.local.yaml)")
+    check(Path(settings["server_exe"]).exists(),
+          f"llama-server not found: {settings['server_exe']} "
+          "(set paths.build_dir in configs/model.local.yaml)")
+    print("OK   Model paths resolved from config")
+except ValueError as e:
+    warnings.append(
+        f"Model paths not configured: {e}. "
+        "Copy configs/model.example.yaml to configs/model.local.yaml."
+    )
+except Exception as e:  # noqa: BLE001
+    warnings.append(f"Model config check failed: {e}")
 
 # 3. Python dependencies
 try:

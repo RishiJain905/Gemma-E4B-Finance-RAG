@@ -229,11 +229,17 @@ max_items_per_ticker: 20
 
 ---
 
-## `configs/model.yaml`
+## `configs/model.yaml` + `configs/model.local.yaml`
 
-TraceAlchemy model + `llama-server` settings (Windows + AMD RDNA3). Consumed by
-the model-serving scripts; the middleware reads its endpoints from
-`middleware.yaml`.
+TraceAlchemy model + `llama-server` settings. Committed defaults live in
+`configs/model.yaml`; machine-specific paths belong in
+`configs/model.local.yaml` (gitignored — copy from `configs/model.example.yaml`).
+The `serve_model.ps1` / `serve_model.sh` wrappers load and merge these files.
+
+Resolution order: `model.yaml` → deep-merge `model.local.yaml` → substitute
+`${ENV_VAR}` placeholders (`MAIN_MODEL_PATH`, `LLAMA_BUILD_DIR`,
+`DRAFT_MODEL_PATH`). The middleware reads its endpoints from
+`middleware.yaml`, not these files.
 
 ```yaml
 model:
@@ -294,9 +300,9 @@ model:
     pooling: "mean"
 
   paths:
-    main_model:  "D:\\LOCAL-MODELS\\...\\gemma-4-E4B-it.Q8_0.gguf"
-    build_dir:   "F:\\Personal\\TQ-Optimizer-Test\\...\\build-rdna3-gfx1101"
-    binary:      "bin\\llama-server.exe"
+    main_model: "${MAIN_MODEL_PATH}"   # override in model.local.yaml
+    build_dir: "${LLAMA_BUILD_DIR}"
+    binary: "bin/llama-server.exe"
 ```
 
 | Section | Meaning |
@@ -304,7 +310,7 @@ model:
 | `name` / `id` / `backend` | Display name, API model id (`tracealchemy`), and serving backend. |
 | `host` / `port` / `base_url` / `platform` | Network location of the model server. |
 | `family` / `architecture` / `parameters_*` / `quantization` | Gemma 4 E4B MoE, ~9B total / ~2.6B active params, Q8_0. |
-| `gpu_*` | AMD RDNA3 (gfx1101); `gpu_layers: 99` offloads all layers; `gpu_memory` is a hint (adjust to actual VRAM). |
+| `gpu_*` | GPU hints (`gpu_layers: 99` offloads all layers; adjust for your hardware). |
 | `max_context` / `max_tokens_*` / `supported_modes` | 131072-token context; chat, completion, and embedding modes from one server. |
 | `speculative_decoding` | Multi-Token Prediction (MTP) with an F16 draft head, block size 3. |
 | `cache.type_key` / `type_value` | KV-cache quantization (`q8_0` keys / `turbo4` values). |
@@ -312,7 +318,7 @@ model:
 | `endpoints` | OpenAI-compatible paths exposed by llama-server. |
 | `defaults` / `tasks` | Default sampling params and per-task overrides. |
 | `embedding.dimension` | `2560` — the TraceAlchemy embedding output dimension (informational; not enforced by code). |
-| `paths` | Local model/build/binary paths (Windows). |
+| `paths` | Model/build/binary paths — set in `model.local.yaml`, not committed. |
 
 > **Note on embedding dimension:** the served TraceAlchemy model emits
 > **2560-dimensional** embeddings (verified against the running server).
