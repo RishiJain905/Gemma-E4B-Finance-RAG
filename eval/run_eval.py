@@ -63,6 +63,7 @@ _SOURCE_ALIASES = {
     "yfinance": "yfinance",
     "yfinance_fundamentals": "yfinance",
     "yfinance_news": "yfinance",
+    "estimates": "yfinance",
     "sqlite": "yfinance",
     "news": "yfinance",
     "analysis": "yfinance",

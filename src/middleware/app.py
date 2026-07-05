@@ -16,6 +16,7 @@ import json
 import logging
 import time
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import Optional
 
 import httpx
@@ -68,6 +69,7 @@ store: Optional[Store] = None
 model_client: Optional[httpx.AsyncClient] = None
 _tools_supported: bool = True
 MACRO_SNAPSHOT_METRICS = ["GDP", "CPIAUCSL", "FEDFUNDS", "UNRATE", "DGS10", "T10Y2Y"]
+_MODEL_TASKS_CACHE: Optional[dict] = None
 retriever = None  # Shared Retriever (built on startup) — Phase 2.1.2
 
 
@@ -107,6 +109,38 @@ app = FastAPI(
     version="1.0.0",
     lifespan=lifespan,
 )
+
+
+def _find_tasks_block(node) -> dict:
+    if not isinstance(node, dict):
+        return {}
+    tasks = node.get("tasks")
+    if isinstance(tasks, dict):
+        return tasks
+    for value in node.values():
+        found = _find_tasks_block(value)
+        if found:
+            return found
+    return {}
+
+
+def _task_params(task_name) -> dict:
+    """Return model task params from configs/model.yaml; fail soft."""
+    global _MODEL_TASKS_CACHE
+    try:
+        if _MODEL_TASKS_CACHE is None:
+            import yaml
+
+            path = Path(__file__).resolve().parents[2] / "configs" / "model.yaml"
+            with open(path, encoding="utf-8") as f:
+                loaded = yaml.safe_load(f) or {}
+            _MODEL_TASKS_CACHE = _find_tasks_block(loaded)
+        task = _MODEL_TASKS_CACHE.get(str(task_name), {})
+        return task if isinstance(task, dict) else {}
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Failed to load model task params: %s", exc)
+        _MODEL_TASKS_CACHE = {}
+        return {}
 
 
 def _macro_snapshot_data() -> dict:
@@ -246,11 +280,16 @@ async def query(request: QueryRequest):
     # Step 4: Call the model — or degrade gracefully when it is unavailable.
     model_available = await _check_model_health()
     if model_available:
+        task = _task_params("analysis") if intent.get("question_type") == "projection" else {}
         answer_text, citations = await _call_model(
             prompt=augmented_prompt,
-            temperature=request.temperature or config.default_temperature,
-            max_tokens=request.max_tokens or config.max_tokens,
+            temperature=request.temperature or task.get("temperature") or config.default_temperature,
+            max_tokens=request.max_tokens or task.get("max_tokens") or config.max_tokens,
         )
+        if intent.get("question_type") == "projection":
+            from .guardrails import apply_projection_guardrail
+
+            answer_text, _flagged = apply_projection_guardrail(answer_text, augmented_prompt)
     else:
         logger.warning("Model unavailable — returning degraded answer")
         answer_text = _format_degraded_answer(retrieval, intent)
@@ -322,6 +361,7 @@ _SOURCE_ALIASES = {
     "earnings_transcripts": "earnings_transcripts",
     "ir": "ir_pages",
     "ir_pages": "ir_pages",
+    "estimates": "estimates",
 }
 
 
@@ -435,6 +475,18 @@ def _refresh_one_source_direct(ticker: str, logical: str) -> None:
     elif logical == "ir_pages":
         from src.macros.ir_ingestor import IRIngestor
         IRIngestor(store=store).fetch_for_ticker(ticker)
+        store.mark_source_fresh(ticker, cache_source, ttl)
+    elif logical == "estimates":
+        from src.macros.estimates_ingestor import EstimatesIngestor
+        result = EstimatesIngestor(store=store).fetch_for_ticker(ticker)
+        status = result.get("status")
+        if status not in ("success", "no_data"):
+            raise RuntimeError(
+                f"estimates refresh failed for {ticker}: {status} "
+                f"{result.get('errors') or []}"
+            )
+        # no_data still marks fresh: lack of analyst coverage (e.g. ETFs)
+        # shouldn't trigger a refetch on every stale check.
         store.mark_source_fresh(ticker, cache_source, ttl)
     else:
         raise ValueError(f"Unknown source: {logical}")

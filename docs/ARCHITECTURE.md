@@ -1,13 +1,13 @@
 # Architecture
 
 Gemma-E4B-Finance-RAG is a hybrid RAG system. Structured facts and free-text
-documents are ingested from six sources into two storage backends, then served
+documents are ingested from seven sources into two storage backends, then served
 to a fine-tuned Gemma 4 E4B model through a FastAPI middleware that performs
 intent parsing, hybrid retrieval, and prompt augmentation.
 
 ```
-                          6 data sources
-   SEC EDGAR · Yahoo Finance · FRED · GDELT · Earnings transcripts · IR pages
+                          7 data sources
+   SEC EDGAR · Yahoo Finance · FRED · GDELT · Earnings transcripts · IR pages · Estimates
                                │
                        Ingestion pipeline
                   (UnifiedScheduler, resilience layer)
@@ -182,10 +182,34 @@ original wider behavior.
 | GDELT global news | `src/macros/gdelt_ingestor.py` | ChromaDB + sentiment facts | hourly | 6 |
 | Earnings transcripts | `src/macros/earnings_transcripts.py` | ChromaDB + guidance | weekly | 168 |
 | Company IR pages | `src/macros/ir_ingestor.py` | ChromaDB | daily | 24 |
+| Analyst estimates and price targets | `src/macros/estimates_ingestor.py` | SQLite (forward-dated facts) | daily | 24 |
 
 TTLs are read from the `schedule` block in `configs/watchlist.yaml` and fall
 back to built-in defaults in `Store._DEFAULT_TTLS` and
 `UnifiedScheduler._load_ttls`.
+
+### Forward-looking estimate facts
+
+Analyst consensus data is stored in the same `fundamentals` table as realized
+facts, but every row uses `source_type="estimates"` and
+`period_type="estimate"`. Forecast periods carry an `E` suffix:
+
+| Metric family | Period format | Example |
+|---------------|---------------|---------|
+| Quarterly revenue/EPS estimates | `YYYY-QnE` | `2026-Q3E` |
+| Fiscal-year revenue/EPS estimates | `FY{year}E` | `FY2027E` |
+| Price targets, analyst counts, recommendation mean | `YYYY-MME` | `2027-07E` |
+
+The horizon is encoded in the metric name, for example
+`estimate_revenue_current_q`, `estimate_revenue_next_y`, and
+`price_target_mean`. This avoids mixing horizons under one metric, which is
+important because latest-fact reads use string-sortable `MAX(period)` semantics.
+The `E` suffix and distinct metric names keep analyst forecasts separate from
+realized historical facts.
+
+Quarter and year estimate periods are derived from the current calendar date.
+That is a practical approximation for companies whose fiscal calendar differs
+from the calendar year; source rows remain clearly labeled as estimates.
 
 ---
 

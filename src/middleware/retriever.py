@@ -26,6 +26,27 @@ from .lexical_index import LexicalIndex
 
 logger = logging.getLogger(__name__)
 
+ESTIMATE_METRICS = [
+    "estimate_revenue_current_q",
+    "estimate_revenue_next_q",
+    "estimate_revenue_current_y",
+    "estimate_revenue_next_y",
+    "estimate_eps_current_q",
+    "estimate_eps_next_q",
+    "estimate_eps_current_y",
+    "estimate_eps_next_y",
+]
+
+PRICE_TARGET_METRICS = [
+    "price_target_mean",
+    "price_target_high",
+    "price_target_low",
+    "num_analysts",
+    "recommendation_mean",
+]
+
+PROJECTION_METRICS = ESTIMATE_METRICS + PRICE_TARGET_METRICS
+
 
 def rrf_fuse(vector_hits: list[dict], lexical_hits: list[dict],
              k: int = 60) -> list[tuple[str, float]]:
@@ -195,6 +216,9 @@ class Retriever:
             documents = self._retrieve_documents(query, ticker=None, n_results=top_k_documents)
             facts = self._retrieve_all_facts(top_k_facts)
 
+        if question_type == "projection" and ticker:
+            facts = self._merge_projection_facts(ticker, facts)
+
         logger.info(
             "Retrieval strategy=%s ticker=%s: %d facts, %d documents",
             strategy, ticker, len(facts), len(documents),
@@ -215,6 +239,8 @@ class Retriever:
         """Select the retrieval strategy based on intent."""
         if question_type == "comparison":
             return "comparison"
+        if question_type == "projection":
+            return "hybrid" if ticker else "broad"
         if question_type in ("sentiment", "news"):
             return "documents_only"
         if question_type == "risk":
@@ -283,6 +309,28 @@ class Retriever:
                     facts.append(dict(r))
 
         return facts[:limit]
+
+    def _merge_projection_facts(self, ticker: str, facts: list[dict]) -> list[dict]:
+        """Add full estimate rows for projection queries, failing per metric."""
+        by_metric = {
+            fact.get("metric"): dict(fact)
+            for fact in facts
+            if fact.get("metric")
+        }
+        for metric in PROJECTION_METRICS:
+            try:
+                row = self.store.get_fundamental(ticker, metric)
+            except Exception as e:  # noqa: BLE001
+                logger.warning(
+                    "Projection fact lookup failed for %s %s: %s",
+                    ticker,
+                    metric,
+                    e,
+                )
+                continue
+            if row and row.get("source_type") == "estimates":
+                by_metric[metric] = dict(row)
+        return list(by_metric.values())
 
     def _retrieve_macro_facts(self, limit: int = 15) -> list[dict]:
         """Retrieve macro-economic facts from FRED data in SQLite."""

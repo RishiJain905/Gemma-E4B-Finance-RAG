@@ -38,14 +38,24 @@ def store(mock_chroma, tmp_path: Path):
     return Store(db_path=tmp_path / "read_tools.db", chroma_path=tmp_path / "chroma")
 
 
-def _seed_metric(store, ticker, metric, value, period="2026-Q1", unit="ratio"):
+def _seed_metric(
+    store,
+    ticker,
+    metric,
+    value,
+    period="2026-Q1",
+    unit="ratio",
+    period_type="quarterly",
+    source_type="test",
+):
     store.sqlite.upsert_fundamental(
         ticker=ticker,
         metric=metric,
         value=value,
         unit=unit,
         period=period,
-        source_type="test",
+        period_type=period_type,
+        source_type=source_type,
     )
 
 
@@ -136,6 +146,85 @@ def test_get_guidance_not_found(store, monkeypatch):
     assert result == {"ticker": "NVDA", "guidance": {}, "status": "not_found"}
 
 
+def test_get_estimates_returns_estimate_facts_and_growth(store):
+    _seed_metric(
+        store,
+        "NVDA",
+        "estimate_revenue_next_y",
+        120.0,
+        period="FY2027E",
+        unit="usd",
+        period_type="estimate",
+        source_type="estimates",
+    )
+    _seed_metric(
+        store,
+        "NVDA",
+        "estimate_eps_next_y",
+        6.0,
+        period="FY2027E",
+        unit="usd",
+        period_type="estimate",
+        source_type="estimates",
+    )
+    _seed_metric(
+        store,
+        "NVDA",
+        "estimate_revenue_current_q",
+        25.0,
+        period="2026-Q3E",
+        unit="usd",
+        period_type="estimate",
+        source_type="other",
+    )
+    _seed_metric(store, "NVDA", "total_revenue", 100.0, period="FY2026", unit="usd")
+    _seed_metric(store, "NVDA", "eps_diluted", 5.0, period="FY2026", unit="usd")
+
+    result = data_tools.get_estimates_handler(store, ticker="nvda", horizon="year")
+
+    assert result["ticker"] == "NVDA"
+    assert result["horizon"] == "year"
+    assert result["estimates"] == {
+        "estimate_revenue_next_y": {"value": 120.0, "period": "FY2027E"},
+        "estimate_eps_next_y": {"value": 6.0, "period": "FY2027E"},
+    }
+    assert result["growth_vs_realized"] == {
+        "estimate_revenue_next_y": 0.2,
+        "estimate_eps_next_y": 0.2,
+    }
+
+
+def test_get_price_targets_returns_estimate_facts_with_periods(store):
+    for metric, value in {
+        "price_target_mean": 185.0,
+        "price_target_high": 220.0,
+        "price_target_low": 150.0,
+        "num_analysts": 42.0,
+        "recommendation_mean": 1.8,
+    }.items():
+        _seed_metric(
+            store,
+            "NVDA",
+            metric,
+            value,
+            period="2027-07E",
+            unit="usd",
+            period_type="estimate",
+            source_type="estimates",
+        )
+
+    result = data_tools.get_price_targets_handler(store, ticker="nvda")
+
+    assert result["ticker"] == "NVDA"
+    assert result["price_targets"] == {
+        "price_target_mean": {"value": 185.0, "period": "2027-07E"},
+        "price_target_high": {"value": 220.0, "period": "2027-07E"},
+        "price_target_low": {"value": 150.0, "period": "2027-07E"},
+        "num_analysts": {"value": 42.0, "period": "2027-07E"},
+        "recommendation_mean": {"value": 1.8, "period": "2027-07E"},
+    }
+
+
 def test_check_freshness(store):
     store.mark_source_fresh("NVDA", "yfinance_fundamentals", 24)
 
@@ -157,6 +246,8 @@ def test_all_read_tools_registered_write_false():
         "get_macro_snapshot",
         "get_sentiment",
         "get_guidance",
+        "get_estimates",
+        "get_price_targets",
         "check_freshness",
     }
 
