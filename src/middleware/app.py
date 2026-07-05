@@ -148,6 +148,25 @@ async def health():
     )
 
 
+@app.get("/tools")
+async def tools():
+    """List model-callable middleware tools and tool-gating state."""
+    from .tools import REGISTRY
+
+    return {
+        "enabled": bool(config.enable_tools) if config else False,
+        "allow_write_tools": bool(config.allow_write_tools) if config else False,
+        "tools": [
+            {
+                "name": tool.name,
+                "description": tool.description,
+                "write": tool.write,
+            }
+            for tool in REGISTRY.values()
+        ],
+    }
+
+
 async def _check_model_health() -> bool:
     """Ping the llama-server to check if the model is available."""
     if not config or not model_client:
@@ -301,6 +320,14 @@ def _normalize_sources(sources: Optional[list[str]]) -> list[str]:
         if logical and logical not in out:
             out.append(logical)
     return out
+
+
+def _stale_source_names(report: dict) -> list[str]:
+    """Return logical source names that are stale or have never been fetched."""
+    return [
+        name for name, info in report.get("sources", {}).items()
+        if info.get("status") in ("stale", "never_fetched")
+    ]
 
 
 # Logical sources that have a scheduler-managed ingestion pipeline. Refreshing
@@ -497,10 +524,7 @@ async def refresh_ticker(ticker: str, body: Optional[RefreshRequest] = None):
     sources_provided = bool(body and body.sources)
     requested = _normalize_sources(body.sources if body else None)
     report = store.get_freshness_report(ticker)
-    stale = [
-        name for name, info in report.get("sources", {}).items()
-        if info.get("status") in ("stale", "never_fetched")
-    ]
+    stale = _stale_source_names(report)
 
     if sources_provided:
         to_refresh = requested

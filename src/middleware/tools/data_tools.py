@@ -1,6 +1,6 @@
 """
 src/middleware/tools/data_tools.py
-Read-only analytical tools (`list_metrics`, `query_facts`) over the `fundamentals` table.
+Analytical tools over middleware data sources.
 """
 
 import logging
@@ -121,12 +121,50 @@ def check_freshness_handler(store, ticker):
         return {"error": str(e), "ticker": ticker}
 
 
+def refresh_data_handler(store, ticker, sources=None):
+    """Refresh stale data for one ticker through the middleware refresh path."""
+    ticker = ticker.upper()
+    try:
+        from src.middleware import app as middleware_app
+        from src.middleware.app import (
+            _normalize_sources,
+            _refresh_ticker_sources,
+            _stale_source_names,
+        )
+        import time
+
+        logical = _normalize_sources(sources) if sources else []
+        if not logical:
+            report = middleware_app.store.get_freshness_report(ticker)
+            logical = _stale_source_names(report)
+        if not logical:
+            return {
+                "ticker": ticker,
+                "refreshed": [],
+                "errors": [],
+                "note": "all sources fresh",
+            }
+        logger.warning("REFRESH tool invoked: %s sources=%s", ticker, logical)
+        start = time.time()
+        refreshed, errors = _refresh_ticker_sources(ticker, logical)
+        return {
+            "ticker": ticker,
+            "refreshed": refreshed,
+            "errors": errors,
+            "duration_s": round(time.time() - start, 2),
+        }
+    except Exception as e:  # noqa: BLE001
+        logger.exception("refresh_data failed for %s", ticker)
+        return {"error": str(e), "ticker": ticker}
+
+
 get_fundamentals = get_fundamentals_handler
 search_documents = search_documents_handler
 get_macro_snapshot = get_macro_snapshot_handler
 get_sentiment = get_sentiment_handler
 get_guidance = get_guidance_handler
 check_freshness = check_freshness_handler
+refresh_data = refresh_data_handler
 
 
 register(
@@ -346,5 +384,37 @@ register(
         },
         handler=query_facts_handler,
         write=False,
+    )
+)
+
+register(
+    Tool(
+        name="refresh_data",
+        description=(
+            "Use ONLY when check_freshness shows stale or never_fetched sources and "
+            "the answer needs current data. This is slow because it performs network "
+            "fetches, is rate-limited per query, and refreshes ONE ticker only."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "ticker": {
+                    "type": "string",
+                    "description": "Ticker to refresh, e.g. 'NVDA'.",
+                },
+                "sources": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": (
+                        "Optional logical source names, e.g. yfinance_fundamentals "
+                        "or gdelt_news. Invalid names are dropped; omit to refresh "
+                        "all stale sources."
+                    ),
+                },
+            },
+            "required": ["ticker"],
+        },
+        handler=refresh_data_handler,
+        write=True,
     )
 )

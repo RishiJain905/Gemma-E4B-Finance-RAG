@@ -104,6 +104,69 @@ and the retriever falls back to vector-only — the query still succeeds.
 
 ---
 
+## Analytical Tool Calling (Phase 2.1.4)
+
+Tool definitions live in `src/middleware/tools/`:
+
+- `base.py` owns `Tool`, `REGISTRY`, `register()`, `openai_schema()`, and
+  `dispatch_tool()`.
+- `data_tools.py` registers the model-facing data tools. Read tools query
+  cached SQLite/Chroma-backed data; the single write tool, `refresh_data`,
+  reuses the middleware per-ticker refresh path.
+
+`_call_model()` in `src/middleware/app.py` runs a bounded tool loop when
+`config.enable_tools` is true:
+
+```
+prompt + tool schema
+  |
+  v
+model response
+  |
+  +-- no tool_calls --> final answer
+  |
+  +-- tool_calls ----> dispatch_tool(call, store, ToolContext)
+                         |
+                         v
+                      append role=tool JSON result
+                         |
+                         v
+                      next model round-trip
+```
+
+The loop is capped by `max_tool_iterations`. Each query gets a fresh
+`ToolContext` containing `allow_write_tools`, `max_refreshes_per_query`, and
+the current refresh count. `dispatch_tool()` centrally enforces write gating
+and the refresh budget before a write handler can run, so individual handlers
+do not duplicate those checks.
+
+The session-level `_tools_supported` flag prevents repeated bad tool attempts
+against model backends that do not support tool calling. If the first tool
+request returns an HTTP error mentioning tools, or the first tool-enabled
+response has neither content nor tool calls, the middleware disables tools for
+the session and falls back to the plain pre-tool payload shape.
+
+Registered tools:
+
+| Tool | Write? | Purpose |
+|------|--------|---------|
+| `list_metrics` | No | List available metric names and tickers. |
+| `query_facts` | No | Rank, filter, or threshold fundamentals across tickers. |
+| `get_fundamentals` | No | Return selected fundamentals for one ticker. |
+| `search_documents` | No | Search qualitative document chunks. |
+| `get_macro_snapshot` | No | Return cached macro indicators. |
+| `get_sentiment` | No | Return recent GDELT sentiment for one ticker. |
+| `get_guidance` | No | Return latest extracted earnings guidance. |
+| `check_freshness` | No | Report per-source freshness for one ticker. |
+| `refresh_data` | Yes | Refresh stale or never-fetched sources for one ticker. |
+
+`refresh_data` is intentionally narrow: source aliases are normalized through
+`_normalize_sources()` and unknown names are dropped, so inputs such as `"all"`
+do not open a scheduler-wide path. The handler refreshes only the requested
+ticker and logical sources through `_refresh_ticker_sources()`.
+
+---
+
 ## Data Sources
 
 | Source | Module | Storage target | Scheduler cadence | TTL (hours) |
