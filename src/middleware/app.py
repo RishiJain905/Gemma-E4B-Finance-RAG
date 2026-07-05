@@ -46,6 +46,18 @@ SYSTEM_PROMPT = (
     "Cite sources inline using [Source: type/ticker] notation."
 )
 
+# Appended to SYSTEM_PROMPT only when tool-calling is enabled — the base
+# prompt's "ONLY the provided context" rule would otherwise make the model
+# refuse instead of calling a tool. Tools-off requests never include this.
+TOOLS_SYSTEM_ADDENDUM = (
+    " You also have callable tools. When the provided context is missing or "
+    "insufficient — especially for ranking, filtering, aggregating across "
+    "stocks, or checking data freshness — call an appropriate tool to fetch "
+    "the data instead of refusing. Prefer query_facts for any lowest/highest/"
+    "top-N comparison. After using tools, answer from their results and cite "
+    "them as [Source: tool/name]."
+)
+
 # ── Global state (set during lifespan) ─────────────────
 
 config: Optional[MiddlewareConfig] = None
@@ -579,6 +591,12 @@ async def _call_model(prompt: str, temperature: float,
 
     from .tools import ToolContext, dispatch_tool, openai_schema
 
+    # The tool loop keeps its own messages list so every fallback to
+    # _post_and_parse(base_payload) still sends the exact pre-tools prompt.
+    messages = [
+        {"role": "system", "content": SYSTEM_PROMPT + TOOLS_SYSTEM_ADDENDUM},
+        {"role": "user", "content": prompt},
+    ]
     schema = openai_schema()
     ctx = ToolContext(
         allow_write=config.allow_write_tools,

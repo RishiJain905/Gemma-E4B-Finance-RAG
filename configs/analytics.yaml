@@ -1,6 +1,8 @@
 # configs/analytics.yaml — Phase 2.1.4.2 data-sanity rules for analytical tools.
-# Symbols excluded from equity-only metric rankings (ETFs/bonds/commodities).
-excluded_symbols: [TLT, GLD, SPY, QQQ, DIA, IWM, VTI, AGG, HYG, LQD]
+# Symbols excluded from equity-only metric rankings (ETFs/bonds/commodities,
+# plus stray non-watchlist tickers ingested by ticker-detection false
+# positives — e.g. "E"/Eni, which is not tracked but has yfinance rows).
+excluded_symbols: [TLT, GLD, SPY, QQQ, DIA, IWM, VTI, AGG, HYG, LQD, E]
 # Metrics that only make sense for individual equities (exclusions apply).
 equity_only_metrics: [forward_pe, pe_ratio_ttm, price_to_book, dividend_yield, eps_ttm]
 # Plausible value ranges per metric; rows outside are dropped as junk.
