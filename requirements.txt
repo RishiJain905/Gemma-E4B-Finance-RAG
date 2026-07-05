@@ -28,3 +28,7 @@ lxml>=5.0.0             # Fast XML/HTML parser backend
 # ── Testing ───────────────────────────────────────────
 pytest>=8.0.0
 pytest-cov>=4.1.0       # Coverage reporting
+
+# ── Retrieval (Phase 2.1.2) ──────────────────────────
+rank_bm25>=0.2.2        # BM25 lexical retrieval channel (2.1.2.1)
+sentence-transformers>=3.0.0  # Cross-encoder re-ranker (2.1.2.2); pulls torch

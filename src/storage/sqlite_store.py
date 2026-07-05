@@ -322,6 +322,90 @@ CREATE INDEX IF NOT EXISTS idx_ingestion_log_run ON ingestion_log(run_id);
 
     # ── Query Support (for middleware) ─────────────────
 
+    def list_metrics(self, ticker: Optional[str] = None) -> list[str]:
+        """Return the distinct metric names present in `fundamentals`, optionally scoped to a ticker."""
+        if ticker:
+            sql = "SELECT DISTINCT metric FROM fundamentals WHERE ticker=? ORDER BY metric"
+            params = (ticker,)
+        else:
+            sql = "SELECT DISTINCT metric FROM fundamentals ORDER BY metric"
+            params = ()
+        with self._connect() as conn:
+            rows = conn.execute(sql, params).fetchall()
+            return [row["metric"] for row in rows]
+
+    def list_tickers(self) -> list[str]:
+        """Return the distinct tickers present in `fundamentals`."""
+        sql = "SELECT DISTINCT ticker FROM fundamentals ORDER BY ticker"
+        with self._connect() as conn:
+            rows = conn.execute(sql).fetchall()
+            return [row["ticker"] for row in rows]
+
+    _ORDER_SQL = {"asc": "ASC", "desc": "DESC"}
+    _OP_SQL = {"lt": "<", "lte": "<=", "gt": ">", "gte": ">=", "eq": "=", "ne": "!="}
+
+    def query_metric(self, metric: str, tickers: Optional[list[str]] = None,
+                     order: str = "asc", limit: int = 10, op: Optional[str] = None,
+                     value: Optional[float] = None, latest_only: bool = True,
+                     exclude: Optional[list[str]] = None,
+                     sane_range: Optional[tuple] = None) -> list[dict]:
+        """Rank/filter `fundamentals` rows for one metric via parameterized SQL.
+
+        `order` and `op` are only ever used to select whitelisted SQL fragments
+        (`_ORDER_SQL` / `_OP_SQL`) — caller-supplied strings are never
+        interpolated directly into the query.
+        """
+        order_sql = self._ORDER_SQL.get(order, "ASC")
+        limit = max(1, min(int(limit), 100))
+
+        conditions = ["f_outer.metric=?"]
+        params: list = [metric]
+
+        if latest_only:
+            conditions.append(
+                "f_outer.period = (SELECT MAX(f_inner.period) FROM fundamentals AS f_inner "
+                "WHERE f_inner.ticker=f_outer.ticker AND f_inner.metric=f_outer.metric)"
+            )
+
+        if tickers:
+            placeholders = ",".join("?" for _ in tickers)
+            conditions.append(f"f_outer.ticker IN ({placeholders})")
+            params.extend(t.upper() for t in tickers)
+
+        if exclude:
+            placeholders = ",".join("?" for _ in exclude)
+            conditions.append(f"f_outer.ticker NOT IN ({placeholders})")
+            params.extend(exclude)
+
+        op_sql = self._OP_SQL.get(op) if op else None
+        if op_sql and value is not None:
+            conditions.append(f"f_outer.value {op_sql} ?")
+            params.append(value)
+
+        if sane_range:
+            low, high = sane_range
+            if low is not None:
+                conditions.append("f_outer.value >= ?")
+                params.append(low)
+            if high is not None:
+                conditions.append("f_outer.value <= ?")
+                params.append(high)
+
+        conditions.append("f_outer.value IS NOT NULL")
+
+        sql = f"""
+            SELECT f_outer.ticker, f_outer.value, f_outer.period, f_outer.unit
+            FROM fundamentals AS f_outer
+            WHERE {' AND '.join(conditions)}
+            ORDER BY f_outer.value {order_sql}
+            LIMIT ?
+        """
+        params.append(limit)
+
+        with self._connect() as conn:
+            rows = conn.execute(sql, params).fetchall()
+            return [dict(r) for r in rows]
+
     def search_facts(self, ticker: str = None, metric: str = None,
                      source: str = None, limit: int = 10) -> list[dict]:
         """Flexible fact search — used by the middleware."""

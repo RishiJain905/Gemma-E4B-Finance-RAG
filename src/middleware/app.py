@@ -11,6 +11,8 @@ Usage:
     uvicorn src.middleware.app:app --host 0.0.0.0 --port 8000 --reload
 """
 
+import asyncio
+import json
 import logging
 import time
 from contextlib import asynccontextmanager
@@ -37,17 +39,42 @@ from .models import (
 
 logger = logging.getLogger(__name__)
 
+SYSTEM_PROMPT = (
+    "You are a financial research assistant. Answer the user's "
+    "question using ONLY the provided context. If the context "
+    "doesn't contain enough information, say so. "
+    "Cite sources inline using [Source: type/ticker] notation."
+)
+
+# Used instead of SYSTEM_PROMPT when tool-calling is enabled. The base
+# prompt's "ONLY the provided context ... say so" rule contradicts tool use
+# and makes the model refuse instead of calling a tool, so the tools-mode
+# prompt replaces (not appends to) it. Tools-off requests never see this.
+TOOLS_SYSTEM_PROMPT = (
+    "You are a financial research assistant with callable tools. Answer using "
+    "the provided context and your tools. When the context does not already "
+    "contain the answer — especially for ranking, filtering, or aggregating "
+    "across stocks (use query_facts), targeted lookups (get_fundamentals), or "
+    "data freshness (check_freshness) — call the appropriate tool rather than "
+    "refusing. Only say the data is unavailable if the context and your tools "
+    "cannot provide it. Answer strictly from context and tool results; never "
+    "invent numbers. Cite sources inline using [Source: type/ticker] notation."
+)
+
 # ── Global state (set during lifespan) ─────────────────
 
 config: Optional[MiddlewareConfig] = None
 store: Optional[Store] = None
 model_client: Optional[httpx.AsyncClient] = None
+_tools_supported: bool = True
+MACRO_SNAPSHOT_METRICS = ["GDP", "CPIAUCSL", "FEDFUNDS", "UNRATE", "DGS10", "T10Y2Y"]
+retriever = None  # Shared Retriever (built on startup) — Phase 2.1.2
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Startup and shutdown lifecycle."""
-    global config, store, model_client
+    global config, store, model_client, retriever
 
     logger.info("Starting middleware...")
     from src.utils.env import load_env
@@ -57,6 +84,13 @@ async def lifespan(app: FastAPI):
         embedding_endpoint=config.embedding_endpoint,
     )
     model_client = httpx.AsyncClient(timeout=60)
+
+    # Shared retriever so the BM25 lexical index is built once and reused
+    # across requests (Phase 2.1.2). Warm it eagerly on startup.
+    from .retriever import Retriever
+    retriever = Retriever(store=store, config=config)
+    if config.enable_lexical:
+        retriever.warm_lexical_index()
 
     yield  # App runs here
 
@@ -73,6 +107,22 @@ app = FastAPI(
     version="1.0.0",
     lifespan=lifespan,
 )
+
+
+def _macro_snapshot_data() -> dict:
+    return store.get_fundamentals_batch("MACRO", metrics=MACRO_SNAPSHOT_METRICS)
+
+
+def _sentiment_data(ticker: str, days: int = 7) -> dict:
+    from src.macros.gdelt_ingestor import GDELTIngestor
+
+    return GDELTIngestor(store=store).get_sentiment_summary(ticker.upper(), days=days)
+
+
+def _guidance_data(ticker: str) -> dict:
+    from src.macros.earnings_transcripts import EarningsTranscriptIngestor
+
+    return EarningsTranscriptIngestor(store=store).get_latest_guidance(ticker.upper())
 
 
 # ── Health ─────────────────────────────────────────────
@@ -111,6 +161,25 @@ async def health():
         scheduler=scheduler_status,
         freshness=freshness_summary,
     )
+
+
+@app.get("/tools")
+async def tools():
+    """List model-callable middleware tools and tool-gating state."""
+    from .tools import REGISTRY
+
+    return {
+        "enabled": bool(config.enable_tools) if config else False,
+        "allow_write_tools": bool(config.allow_write_tools) if config else False,
+        "tools": [
+            {
+                "name": tool.name,
+                "description": tool.description,
+                "write": tool.write,
+            }
+            for tool in REGISTRY.values()
+        ],
+    }
 
 
 async def _check_model_health() -> bool:
@@ -154,10 +223,11 @@ async def query(request: QueryRequest):
     # Step 1b: Staleness-aware freshness check (Phase 1.7.4)
     freshness_meta = _evaluate_and_refresh(intent.get("ticker"), request.refresh)
 
-    # Step 2: Dual retrieval (delegated to 1.5.3)
+    # Step 2: Dual retrieval (delegated to 1.5.3). Uses the shared retriever
+    # built on startup so the BM25 index is reused (Phase 2.1.2).
     from .retriever import Retriever
-    retriever = Retriever(store=store, config=config)
-    retrieval = retriever.retrieve(
+    r = retriever or Retriever(store=store, config=config)
+    retrieval = r.retrieve(
         query=request.question,
         intent=intent,
         top_k_documents=config.top_k_documents,
@@ -198,6 +268,7 @@ async def query(request: QueryRequest):
         latency_ms=elapsed_ms,
         model_available=model_available,
         freshness=freshness_meta,
+        retrieval_strategy=retrieval.get("retrieval_strategy"),
     )
 
 
@@ -264,6 +335,14 @@ def _normalize_sources(sources: Optional[list[str]]) -> list[str]:
         if logical and logical not in out:
             out.append(logical)
     return out
+
+
+def _stale_source_names(report: dict) -> list[str]:
+    """Return logical source names that are stale or have never been fetched."""
+    return [
+        name for name, info in report.get("sources", {}).items()
+        if info.get("status") in ("stale", "never_fetched")
+    ]
 
 
 # Logical sources that have a scheduler-managed ingestion pipeline. Refreshing
@@ -460,10 +539,7 @@ async def refresh_ticker(ticker: str, body: Optional[RefreshRequest] = None):
     sources_provided = bool(body and body.sources)
     requested = _normalize_sources(body.sources if body else None)
     report = store.get_freshness_report(ticker)
-    stale = [
-        name for name, info in report.get("sources", {}).items()
-        if info.get("status") in ("stale", "never_fetched")
-    ]
+    stale = _stale_source_names(report)
 
     if sources_provided:
         to_refresh = requested
@@ -473,6 +549,13 @@ async def refresh_ticker(ticker: str, body: Optional[RefreshRequest] = None):
         skipped = [s for s in report.get("sources", {}) if s not in stale]
 
     refreshed, errors = _refresh_ticker_sources(ticker, to_refresh)
+
+    # Keep the BM25 lexical index fresh after ingestion (Phase 2.1.2.3).
+    if retriever is not None:
+        try:
+            retriever.refresh_lexical_index()
+        except Exception as e:  # noqa: BLE001 - never fail the refresh response
+            logger.warning("Lexical index refresh failed: %s", e)
 
     return RefreshResponse(
         ticker=ticker,
@@ -486,27 +569,91 @@ async def refresh_ticker(ticker: str, body: Optional[RefreshRequest] = None):
 async def _call_model(prompt: str, temperature: float,
                       max_tokens: int) -> tuple[str, list[SourceCitation]]:
     """Send the augmented prompt to TraceAlchemy and parse the response."""
+    global _tools_supported
+
     if not model_client or not config:
         return "Model unavailable. Please ensure llama-server is running.", []
 
-    payload = {
+    messages = [
+        {
+            "role": "system",
+            "content": SYSTEM_PROMPT,
+        },
+        {"role": "user", "content": prompt},
+    ]
+    base_payload = {
         "model": config.model_name,
-        "messages": [
-            {
-                "role": "system",
-                "content": (
-                    "You are a financial research assistant. Answer the user's "
-                    "question using ONLY the provided context. If the context "
-                    "doesn't contain enough information, say so. "
-                    "Cite sources inline using [Source: type/ticker] notation."
-                ),
-            },
-            {"role": "user", "content": prompt},
-        ],
+        "messages": messages,
         "temperature": temperature,
         "max_tokens": max_tokens,
     }
 
+    tools_on = bool(getattr(config, "enable_tools", False)) and _tools_supported
+    if not tools_on:
+        return await _post_and_parse(base_payload)
+
+    from .tools import ToolContext, dispatch_tool, openai_schema
+
+    # The tool loop keeps its own messages list so every fallback to
+    # _post_and_parse(base_payload) still sends the exact pre-tools prompt.
+    messages = [
+        {"role": "system", "content": TOOLS_SYSTEM_PROMPT},
+        {"role": "user", "content": prompt},
+    ]
+    schema = openai_schema()
+    ctx = ToolContext(
+        allow_write=config.allow_write_tools,
+        max_refreshes=config.max_refreshes_per_query,
+    )
+    for iteration in range(config.max_tool_iterations):
+        payload = {**base_payload, "messages": messages, "tools": schema}
+        try:
+            resp = await model_client.post(config.llama_endpoint, json=payload)
+            resp.raise_for_status()
+            data = resp.json()
+        except httpx.HTTPStatusError as e:
+            body = e.response.text if e.response is not None else ""
+            status = e.response.status_code if e.response is not None else None
+            if status in (400, 404, 500) and "tool" in body.lower():
+                logger.warning("Model tools unsupported; falling back to plain calls")
+                _tools_supported = False
+                return await _post_and_parse(base_payload)
+            logger.error("Model call failed: %s", e)
+            return f"Error calling model: {e}", []
+        except Exception as e:  # noqa: BLE001
+            logger.error("Model call failed: %s", e)
+            return f"Error calling model: {e}", []
+
+        try:
+            msg = (data.get("choices") or [{}])[0].get("message") or {}
+            content = msg.get("content") or ""
+            tool_calls = msg.get("tool_calls") or []
+        except (AttributeError, IndexError, TypeError) as e:
+            logger.error("Malformed model response in tool loop: %s", e)
+            return f"Error calling model: malformed response ({e})", []
+        if iteration == 0 and not tool_calls and not content.strip():
+            logger.warning("Model returned empty content with tools; disabling tools")
+            _tools_supported = False
+            return await _post_and_parse(base_payload)
+        if not tool_calls:
+            return content, _extract_citations(content)
+
+        messages.append(msg)
+        for call in tool_calls:
+            result = await asyncio.to_thread(dispatch_tool, call, store, ctx)
+            messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": call.get("id", ""),
+                    "content": json.dumps(result),
+                }
+            )
+
+    return await _post_and_parse({**base_payload, "messages": messages})
+
+
+async def _post_and_parse(payload: dict) -> tuple[str, list[SourceCitation]]:
+    """POST a chat payload and parse content plus inline citations."""
     try:
         resp = await model_client.post(config.llama_endpoint, json=payload)
         resp.raise_for_status()
@@ -541,25 +688,45 @@ def _extract_citations(text: str) -> list[SourceCitation]:
 
 @app.post("/search", response_model=SearchResponse)
 async def search(request: SearchRequest):
-    """Raw hybrid search — returns retrieved data without model inference."""
+    """Raw hybrid search — returns retrieved data without model inference.
+
+    Documents come through the shared retriever's hybrid path (vector + BM25 +
+    re-rank, per config) so ``fusion_score`` / ``rerank_score`` are exposed for
+    inspecting ranking quality (Phase 2.1.2.3).
+    """
     if not store:
         raise HTTPException(status_code=503, detail="Store not initialized")
 
+    from .retriever import Retriever
+    r = retriever or Retriever(store=store, config=config)
+
+    documents: list[dict] = []
+    facts: list[dict] = []
+    ticker_out = request.ticker
     try:
-        results = store.search(
+        facts_results = store.search(
             query=request.query,
             n_results=request.n_results,
             ticker=request.ticker,
         )
-    except Exception as e:
-        logger.warning("Search failed (embedding server may be down): %s", e)
-        # Return empty results gracefully when embedding server is unavailable
-        results = {"documents": [], "facts": [], "ticker": request.ticker}
+        facts = facts_results.get("facts", [])
+        ticker_out = facts_results.get("ticker") or request.ticker
+    except Exception as e:  # noqa: BLE001
+        logger.warning("Search facts failed (embedding server may be down): %s", e)
+
+    try:
+        documents = r.retrieve_documents(
+            query=request.query,
+            ticker=request.ticker,
+            n_results=request.n_results,
+        )
+    except Exception as e:  # noqa: BLE001
+        logger.warning("Search documents failed: %s", e)
 
     return SearchResponse(
-        documents=results.get("documents", []),
-        facts=results.get("facts", []),
-        ticker=results.get("ticker"),
+        documents=documents,
+        facts=facts,
+        ticker=ticker_out,
     )
 
 
@@ -574,9 +741,7 @@ async def macro_snapshot():
     if not store:
         raise HTTPException(status_code=503, detail="Store not initialized")
 
-    macro = store.get_fundamentals_batch("MACRO", metrics=[
-        "GDP", "CPIAUCSL", "FEDFUNDS", "UNRATE", "DGS10", "T10Y2Y",
-    ])
+    macro = _macro_snapshot_data()
 
     return MacroSnapshotResponse(
         gdp=macro.get("GDP"),
@@ -602,9 +767,7 @@ async def sentiment(ticker: str, days: int = 7):
     if not store:
         raise HTTPException(status_code=503, detail="Store not initialized")
 
-    from src.macros.gdelt_ingestor import GDELTIngestor
-    ingestor = GDELTIngestor(store=store)
-    summary = ingestor.get_sentiment_summary(ticker.upper(), days=days)
+    summary = _sentiment_data(ticker, days=days)
 
     return SentimentResponse(
         ticker=summary.get("ticker", ticker.upper()),
@@ -625,9 +788,7 @@ async def guidance(ticker: str):
     if not store:
         raise HTTPException(status_code=503, detail="Store not initialized")
 
-    from src.macros.earnings_transcripts import EarningsTranscriptIngestor
-    ingestor = EarningsTranscriptIngestor(store=store)
-    guidance_data = ingestor.get_latest_guidance(ticker.upper())
+    guidance_data = _guidance_data(ticker)
 
     if not guidance_data:
         return {"ticker": ticker.upper(), "guidance": {}, "status": "not_found"}

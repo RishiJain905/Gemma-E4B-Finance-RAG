@@ -26,6 +26,9 @@ htmlcov/
 .pytest_cache/
 .ruff_cache/
 
+# Eval harness — per-run artifacts (the golden set IS committed)
+eval/runs/
+
 # IDE
 .vscode/
 .idea/

@@ -9,3 +9,23 @@ max_tokens: 2048
 top_k_documents: 5
 top_k_facts: 10
 enable_citations: true
+
+# Phase 2.1.4 — structured analytical tooling.
+# Disabled by default until concrete tools are registered and validated.
+enable_tools: false
+max_tool_iterations: 3
+allow_write_tools: false
+max_refreshes_per_query: 2
+
+# Phase 2.1.2 — hybrid retrieval & re-ranking.
+# Lexical (BM25) channel + RRF fusion (2.1.2.1). Low-risk; on by default.
+enable_lexical: true
+rrf_k: 60
+# Cross-encoder re-ranker (2.1.2.2). Opt-in — the cross-encoder backend
+# downloads a HuggingFace model on first use. Backend "llm" reuses the
+# TraceAlchemy model on :8087 to score (query, doc) pairs (no download).
+enable_reranker: false
+reranker_backend: "cross-encoder"   # "cross-encoder" | "llm"
+reranker_model: "cross-encoder/ms-marco-MiniLM-L-6-v2"
+rerank_candidates: 30               # broad retrieve, then re-rank
+rerank_top_n: 5                     # final docs after re-rank (= top_k_documents)

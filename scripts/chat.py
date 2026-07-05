@@ -35,8 +35,14 @@ if os.name == "nt":
 
 
 class C:
-    R = "\033[0m"; B = "\033[1m"; DIM = "\033[2m"
-    CY = "\033[36m"; GR = "\033[32m"; YE = "\033[33m"; RE = "\033[31m"; MA = "\033[35m"
+    R = "\033[0m"
+    B = "\033[1m"
+    DIM = "\033[2m"
+    CY = "\033[36m"
+    GR = "\033[32m"
+    YE = "\033[33m"
+    RE = "\033[31m"
+    MA = "\033[35m"
 
 
 def col(s: str, c: str) -> str:
@@ -186,6 +192,24 @@ def do_health(base: str):
               f"docs={storage.get('chroma_doc_count')}", C.DIM))
 
 
+def do_tools(base: str):
+    try:
+        data = httpx.get(f"{base}/tools", timeout=10).json()
+    except Exception as e:
+        print(col(f"  tools request failed: {e}", C.RE))
+        return
+
+    enabled = data.get("enabled")
+    allow_write = data.get("allow_write_tools")
+    print(col(f"  enabled={enabled} allow_write_tools={allow_write}", C.GR))
+    for tool in data.get("tools", []):
+        mode = "W" if tool.get("write") else "R"
+        desc = (tool.get("description") or "").replace("\n", " ")
+        if len(desc) > 70:
+            desc = desc[:67].rstrip() + "..."
+        print(col(f"  {tool.get('name', ''):<22} {mode}  {desc}", C.DIM))
+
+
 HELP = f"""
 {C.B}Commands{C.R}
   {C.CY}<just type a question>{C.R}   ask the RAG (POST /query)
@@ -196,6 +220,7 @@ HELP = f"""
   {C.CY}/ticker clear{C.R}            clear the pinned ticker
   {C.CY}/autorefresh on|off{C.R}      toggle auto-refresh of stale data per query
   {C.CY}/health{C.R}                  show middleware health summary
+  {C.CY}/tools{C.R}                   show model-callable tools
   {C.CY}/help{C.R}                    show this help
   {C.CY}/quit{C.R} or {C.CY}/exit{C.R}            leave (stops the middleware if this script started it)
 """
@@ -255,6 +280,8 @@ def main():
                     print(HELP)
                 elif cmd == "health":
                     do_health(base)
+                elif cmd == "tools":
+                    do_tools(base)
                 elif cmd == "refresh":
                     do_refresh(base, rest)
                 elif cmd == "ticker":

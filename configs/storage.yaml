@@ -21,6 +21,16 @@ cache:
   filing_ttl_hours: 168
   earnings_ttl_hours: 336
 
+# Document chunking (Phase 2.1.3). "structural" splits on SEC section markers /
+# markdown headings and packs sentences up to max_chars (no mid-sentence cuts,
+# sentence-based overlap). "fixed" reproduces the legacy ~max_chars sliding
+# window with char overlap.
+chunking:
+  strategy: "structural"      # structural | fixed
+  max_chars: 1000
+  overlap_sentences: 1        # structural: sentences carried into the next chunk
+  fixed_overlap_chars: 150    # fixed: char overlap (legacy DEFAULT_CHUNK_OVERLAP)
+
 sec:
   # SEC EDGAR requires a descriptive User-Agent identifying the requester.
   # Resolution order in SECEdgarFilingFetcher: constructor param >

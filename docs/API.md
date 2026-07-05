@@ -69,11 +69,46 @@ Returns **503** if the store is not initialized.
 
 ---
 
+## GET `/tools`
+
+Lists model-callable tools registered in the middleware and the current
+tool-gating state.
+
+**Response (200):**
+
+| Field | Type | Meaning |
+|-------|------|---------|
+| `enabled` | bool | Whether `/query` is configured to advertise tools to the model. |
+| `allow_write_tools` | bool | Whether state-changing tools may run. |
+| `tools` | array | Registered tools with `name`, `description`, and `write` flag. |
+
+**Example:**
+
+```bash
+curl http://127.0.0.1:8000/tools
+```
+
+```json
+{
+  "enabled": true,
+  "allow_write_tools": false,
+  "tools": [
+    { "name": "query_facts", "description": "Rank, filter...", "write": false },
+    { "name": "refresh_data", "description": "Use ONLY...", "write": true }
+  ]
+}
+```
+
+---
+
 ## POST `/query`
 
 Full RAG pipeline: parse intent → check/refresh freshness → hybrid retrieval →
 prompt augmentation → model call. If the model server is down, returns a
 **degraded** answer built from raw retrieved data (`model_available: false`).
+When `enable_tools` is on, `/query` may advertise registered tools to the model
+and perform extra model round-trips before the final answer. Write tools are
+additionally gated by `allow_write_tools` and per-query refresh limits.
 
 **Request (`QueryRequest`):**
 

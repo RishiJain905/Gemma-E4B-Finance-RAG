@@ -1,0 +1,1 @@
+"""Evaluation harness for the Gemma-E4B-Finance-RAG query pipeline (Phase 2.1.1)."""

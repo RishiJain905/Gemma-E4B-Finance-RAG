@@ -325,7 +325,14 @@ def test_add_document_short_unchanged(chroma_store):
 
 
 def test_add_document_chunks_long_text(chroma_store):
-    long_text = " ".join(f"token{i:04d}" for i in range(400))  # ~3600 chars
+    # Sentence-punctuated long text: the structural chunker packs sentences into
+    # chunks <= max_chars (no mid-sentence cuts). Repeats to exceed chunk_chars.
+    base = ("NVIDIA reported strong revenue growth this quarter. "
+            "Datacenter sales surged across all regions. "
+            "Gross margins improved meaningfully year over year. "
+            "Free cash flow reached a record high. "
+            "The company guided next quarter above consensus. ")
+    long_text = base * 20  # ~4000 chars, ~100 sentences
     chroma_store.add_document(
         document_id="sec/NVDA/10-Q-2026-Q1",
         text=long_text,
