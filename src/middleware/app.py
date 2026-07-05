@@ -46,16 +46,19 @@ SYSTEM_PROMPT = (
     "Cite sources inline using [Source: type/ticker] notation."
 )
 
-# Appended to SYSTEM_PROMPT only when tool-calling is enabled — the base
-# prompt's "ONLY the provided context" rule would otherwise make the model
-# refuse instead of calling a tool. Tools-off requests never include this.
-TOOLS_SYSTEM_ADDENDUM = (
-    " You also have callable tools. When the provided context is missing or "
-    "insufficient — especially for ranking, filtering, aggregating across "
-    "stocks, or checking data freshness — call an appropriate tool to fetch "
-    "the data instead of refusing. Prefer query_facts for any lowest/highest/"
-    "top-N comparison. After using tools, answer from their results and cite "
-    "them as [Source: tool/name]."
+# Used instead of SYSTEM_PROMPT when tool-calling is enabled. The base
+# prompt's "ONLY the provided context ... say so" rule contradicts tool use
+# and makes the model refuse instead of calling a tool, so the tools-mode
+# prompt replaces (not appends to) it. Tools-off requests never see this.
+TOOLS_SYSTEM_PROMPT = (
+    "You are a financial research assistant with callable tools. Answer using "
+    "the provided context and your tools. When the context does not already "
+    "contain the answer — especially for ranking, filtering, or aggregating "
+    "across stocks (use query_facts), targeted lookups (get_fundamentals), or "
+    "data freshness (check_freshness) — call the appropriate tool rather than "
+    "refusing. Only say the data is unavailable if the context and your tools "
+    "cannot provide it. Answer strictly from context and tool results; never "
+    "invent numbers. Cite sources inline using [Source: type/ticker] notation."
 )
 
 # ── Global state (set during lifespan) ─────────────────
@@ -594,7 +597,7 @@ async def _call_model(prompt: str, temperature: float,
     # The tool loop keeps its own messages list so every fallback to
     # _post_and_parse(base_payload) still sends the exact pre-tools prompt.
     messages = [
-        {"role": "system", "content": SYSTEM_PROMPT + TOOLS_SYSTEM_ADDENDUM},
+        {"role": "system", "content": TOOLS_SYSTEM_PROMPT},
         {"role": "user", "content": prompt},
     ]
     schema = openai_schema()
