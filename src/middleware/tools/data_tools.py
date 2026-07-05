@@ -10,6 +10,30 @@ from .base import Tool, register
 
 logger = logging.getLogger(__name__)
 
+QUARTER_ESTIMATE_METRICS = [
+    "estimate_revenue_current_q",
+    "estimate_revenue_next_q",
+    "estimate_eps_current_q",
+    "estimate_eps_next_q",
+]
+
+YEAR_ESTIMATE_METRICS = [
+    "estimate_revenue_current_y",
+    "estimate_revenue_next_y",
+    "estimate_eps_current_y",
+    "estimate_eps_next_y",
+]
+
+ESTIMATE_METRICS = QUARTER_ESTIMATE_METRICS + YEAR_ESTIMATE_METRICS
+
+PRICE_TARGET_METRICS = [
+    "price_target_mean",
+    "price_target_high",
+    "price_target_low",
+    "num_analysts",
+    "recommendation_mean",
+]
+
 
 def list_metrics_handler(store, ticker=None):
     """Return the metrics and tickers available in `fundamentals`, so the model never invents one."""
@@ -116,6 +140,85 @@ def get_guidance_handler(store, ticker):
         return {"error": str(e), "ticker": ticker}
 
 
+def _estimate_metrics_for_horizon(horizon):
+    if horizon is None:
+        return ESTIMATE_METRICS
+    horizon = str(horizon).lower()
+    if horizon == "quarter":
+        return QUARTER_ESTIMATE_METRICS
+    if horizon == "year":
+        return YEAR_ESTIMATE_METRICS
+    raise ValueError("horizon must be one of: quarter, year")
+
+
+def _estimate_fact(row):
+    if not row or row.get("source_type") != "estimates":
+        return None
+    if row.get("value") is None or not row.get("period"):
+        return None
+    return {"value": row.get("value"), "period": row.get("period")}
+
+
+def _growth_vs_realized(estimate_value, realized_value):
+    if estimate_value is None or realized_value in (None, 0):
+        return None
+    return round((float(estimate_value) - float(realized_value)) / float(realized_value), 10)
+
+
+def get_estimates_handler(store, ticker, horizon=None):
+    """Return forward-looking analyst estimate facts for one ticker."""
+    ticker = ticker.upper()
+    try:
+        normalized_horizon = None if horizon is None else str(horizon).lower()
+        metrics = _estimate_metrics_for_horizon(normalized_horizon)
+        estimates = {}
+        for metric in metrics:
+            fact = _estimate_fact(store.get_fundamental(ticker, metric))
+            if fact:
+                estimates[metric] = fact
+
+        growth = {}
+        realized_revenue = store.get_fundamental(ticker, "total_revenue")
+        realized_eps = store.get_fundamental(ticker, "eps_diluted")
+        realized_revenue_value = realized_revenue.get("value") if realized_revenue else None
+        realized_eps_value = realized_eps.get("value") if realized_eps else None
+
+        for metric, fact in estimates.items():
+            realized_value = (
+                realized_revenue_value
+                if metric.startswith("estimate_revenue_")
+                else realized_eps_value
+            )
+            metric_growth = _growth_vs_realized(fact["value"], realized_value)
+            if metric_growth is not None:
+                growth[metric] = metric_growth
+
+        return {
+            "ticker": ticker,
+            "horizon": normalized_horizon,
+            "estimates": estimates,
+            "growth_vs_realized": growth,
+        }
+    except Exception as e:  # noqa: BLE001
+        logger.exception("get_estimates failed for %s", ticker)
+        return {"error": str(e), "ticker": ticker}
+
+
+def get_price_targets_handler(store, ticker):
+    """Return forward-looking analyst price target facts for one ticker."""
+    ticker = ticker.upper()
+    try:
+        price_targets = {}
+        for metric in PRICE_TARGET_METRICS:
+            fact = _estimate_fact(store.get_fundamental(ticker, metric))
+            if fact:
+                price_targets[metric] = fact
+        return {"ticker": ticker, "price_targets": price_targets}
+    except Exception as e:  # noqa: BLE001
+        logger.exception("get_price_targets failed for %s", ticker)
+        return {"error": str(e), "ticker": ticker}
+
+
 def check_freshness_handler(store, ticker):
     """Return freshness status for one ticker."""
     ticker = ticker.upper()
@@ -192,6 +295,8 @@ search_documents = search_documents_handler
 get_macro_snapshot = get_macro_snapshot_handler
 get_sentiment = get_sentiment_handler
 get_guidance = get_guidance_handler
+get_estimates = get_estimates_handler
+get_price_targets = get_price_targets_handler
 check_freshness = check_freshness_handler
 refresh_data = refresh_data_handler
 
@@ -337,6 +442,57 @@ register(
             "required": ["ticker"],
         },
         handler=get_guidance_handler,
+        write=False,
+    )
+)
+
+register(
+    Tool(
+        name="get_estimates",
+        description=(
+            "Use for forward-looking analyst consensus on next-quarter or next-year "
+            "expectations for one ticker, including revenue and EPS estimates. "
+            "Values are estimates, not realized results."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "ticker": {
+                    "type": "string",
+                    "description": "Ticker to retrieve estimates for, e.g. 'NVDA'.",
+                },
+                "horizon": {
+                    "type": "string",
+                    "enum": ["quarter", "year"],
+                    "description": "Optional estimate horizon to retrieve.",
+                },
+            },
+            "required": ["ticker"],
+        },
+        handler=get_estimates_handler,
+        write=False,
+    )
+)
+
+register(
+    Tool(
+        name="get_price_targets",
+        description=(
+            "Use for forward-looking analyst consensus price targets for one ticker, "
+            "including mean, high, low, analyst count, and recommendation mean. "
+            "Use for price targets; values are estimates, not realized results."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "ticker": {
+                    "type": "string",
+                    "description": "Ticker to retrieve price targets for, e.g. 'NVDA'.",
+                },
+            },
+            "required": ["ticker"],
+        },
+        handler=get_price_targets_handler,
         write=False,
     )
 )

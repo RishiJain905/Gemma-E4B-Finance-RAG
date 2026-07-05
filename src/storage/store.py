@@ -275,11 +275,12 @@ class Store:
         "gdelt_news":            {"cache_source": "gdelt_news",            "ttl_key": "gdelt_news"},
         "earnings_transcripts":  {"cache_source": "earnings_transcripts",  "ttl_key": "transcripts"},
         "ir_pages":              {"cache_source": "ir_pages",              "ttl_key": "ir_pages"},
+        "estimates":             {"cache_source": "estimates",             "ttl_key": "estimates"},
     }
 
     _DEFAULT_TTLS = {
         "fundamentals": 24, "news": 6, "macro": 24, "sec_filings": 12,
-        "gdelt_news": 6, "transcripts": 168, "ir_pages": 24,
+        "gdelt_news": 6, "transcripts": 168, "ir_pages": 24, "estimates": 24,
     }
 
     def _schedule_ttls(self) -> dict:

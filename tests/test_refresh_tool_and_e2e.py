@@ -235,7 +235,7 @@ def test_tools_endpoint(monkeypatch):
     assert data["allow_write_tools"] is True
     tools = {tool["name"]: tool for tool in data["tools"]}
     assert set(tools) == set(REGISTRY)
-    assert len(tools) == 9
+    assert len(tools) == 11
     assert tools["refresh_data"]["write"] is True
     assert all(not tool["write"] for name, tool in tools.items() if name != "refresh_data")
 

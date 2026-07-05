@@ -73,6 +73,7 @@ class TestIntentParser:
         ("ROE and ROA for AMD", ["roe", "roa"]),
         ("Market cap and enterprise value", ["market_cap", "enterprise_value"]),
         ("What is the dividend yield?", ["dividend_yield"]),
+        ("What's the price target for NVDA?", ["price_target_mean"]),
     ])
     def test_metric_extraction(self, question, expected_metrics):
         """Financial metrics are extracted from the question."""
@@ -104,6 +105,10 @@ class TestIntentParser:
         ("Explain NVDA's competitive advantage", "explanation"),
         ("What is the market sentiment on AMD?", "sentiment"),
         ("Analyst outlook for META", "sentiment"),
+        ("what's the price target for NVDA", "projection"),
+        ("what should I expect next quarter", "projection"),
+        ("What will NVIDIA's revenue be next year?", "projection"),
+        ("What's the consensus outlook for NVDA next quarter?", "projection"),
         ("Any news on CRWD?", "news"),
         ("What happened with Palantir?", "news"),
         ("What are the risks for NVDA?", "risk"),

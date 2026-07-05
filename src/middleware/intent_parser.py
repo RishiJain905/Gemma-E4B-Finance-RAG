@@ -127,6 +127,7 @@ class IntentParser:
         (r"\bcash flow\b", "operating_cash_flow"),
 
         # Valuation
+        (r"\bprice target\b", "price_target_mean"),
         (r"\bpe ratio\b", "pe_ratio"),
         (r"\bprice to earnings\b", "pe_ratio"),
         (r"\bp/e\b", "pe_ratio"),
@@ -198,6 +199,17 @@ class IntentParser:
             r"\bwhat (causes|drives|impacts|affects)\b",
             r"\breason\b",
         ],
+        "projection": [
+            r"\bprice target\b",
+            r"\bprojection[s]?\b",
+            r"\bconsensus\b",
+            r"\bnext (quarter|year)\b",
+            r"\bforecast\b",
+            r"\bexpect(s|ed|ation|ations)?\b",
+            r"\bguidance\b",
+            r"\bestimate[ds]?\b",
+            r"\bwill .* (grow|reach|hit)\b",
+        ],
         "sentiment": [
             r"\bsentiment\b",
             r"\bmarket (mood|feeling|attitude)\b",
@@ -228,6 +240,7 @@ class IntentParser:
         "comparison",
         "trend",
         "explanation",
+        "projection",
         "sentiment",
         "news",
         "risk",

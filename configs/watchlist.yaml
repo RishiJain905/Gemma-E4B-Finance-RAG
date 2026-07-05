@@ -37,3 +37,4 @@ schedule:
   gdelt_news: 6       # GDELT global news every 6 hours
   transcripts: 168    # Earnings transcripts weekly (7 days)
   ir_pages: 24        # Company IR pages (press releases / presentations) daily
+  estimates: 24       # Analyst estimates & price targets daily
