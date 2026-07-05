@@ -13,8 +13,7 @@ from .base import (
     validate_args,
 )
 
-# Future Phase 2.1.4 tasks register concrete tools here.
-# from . import data_tools
+from . import data_tools  # noqa: F401
 
 __all__ = [
     "REGISTRY",
