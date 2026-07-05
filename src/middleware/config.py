@@ -26,6 +26,12 @@ class MiddlewareConfig:
         self.top_k_facts: int = 10
         self.enable_citations: bool = True
 
+        # Phase 2.1.4 — analytical tool-calling controls.
+        self.enable_tools: bool = False
+        self.max_tool_iterations: int = 3
+        self.allow_write_tools: bool = False
+        self.max_refreshes_per_query: int = 2
+
         # Phase 2.1.2 — hybrid retrieval & re-ranking.
         # Lexical (BM25) channel + RRF fusion (2.1.2.1).
         self.enable_lexical: bool = True
@@ -77,3 +83,7 @@ class MiddlewareConfig:
         _str("RERANKER_MODEL", "reranker_model")
         _int("RERANK_CANDIDATES", "rerank_candidates")
         _int("RERANK_TOP_N", "rerank_top_n")
+        _bool("ENABLE_TOOLS", "enable_tools")
+        _int("MAX_TOOL_ITERATIONS", "max_tool_iterations")
+        _bool("ALLOW_WRITE_TOOLS", "allow_write_tools")
+        _int("MAX_REFRESHES_PER_QUERY", "max_refreshes_per_query")

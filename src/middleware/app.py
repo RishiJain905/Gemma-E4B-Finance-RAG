@@ -11,6 +11,8 @@ Usage:
     uvicorn src.middleware.app:app --host 0.0.0.0 --port 8000 --reload
 """
 
+import asyncio
+import json
 import logging
 import time
 from contextlib import asynccontextmanager
@@ -37,11 +39,19 @@ from .models import (
 
 logger = logging.getLogger(__name__)
 
+SYSTEM_PROMPT = (
+    "You are a financial research assistant. Answer the user's "
+    "question using ONLY the provided context. If the context "
+    "doesn't contain enough information, say so. "
+    "Cite sources inline using [Source: type/ticker] notation."
+)
+
 # ── Global state (set during lifespan) ─────────────────
 
 config: Optional[MiddlewareConfig] = None
 store: Optional[Store] = None
 model_client: Optional[httpx.AsyncClient] = None
+_tools_supported: bool = True
 retriever = None  # Shared Retriever (built on startup) — Phase 2.1.2
 
 
@@ -503,27 +513,81 @@ async def refresh_ticker(ticker: str, body: Optional[RefreshRequest] = None):
 async def _call_model(prompt: str, temperature: float,
                       max_tokens: int) -> tuple[str, list[SourceCitation]]:
     """Send the augmented prompt to TraceAlchemy and parse the response."""
+    global _tools_supported
+
     if not model_client or not config:
         return "Model unavailable. Please ensure llama-server is running.", []
 
-    payload = {
+    messages = [
+        {
+            "role": "system",
+            "content": SYSTEM_PROMPT,
+        },
+        {"role": "user", "content": prompt},
+    ]
+    base_payload = {
         "model": config.model_name,
-        "messages": [
-            {
-                "role": "system",
-                "content": (
-                    "You are a financial research assistant. Answer the user's "
-                    "question using ONLY the provided context. If the context "
-                    "doesn't contain enough information, say so. "
-                    "Cite sources inline using [Source: type/ticker] notation."
-                ),
-            },
-            {"role": "user", "content": prompt},
-        ],
+        "messages": messages,
         "temperature": temperature,
         "max_tokens": max_tokens,
     }
 
+    tools_on = bool(getattr(config, "enable_tools", False)) and _tools_supported
+    if not tools_on:
+        return await _post_and_parse(base_payload)
+
+    from .tools import ToolContext, dispatch_tool, openai_schema
+
+    schema = openai_schema()
+    ctx = ToolContext(
+        allow_write=config.allow_write_tools,
+        max_refreshes=config.max_refreshes_per_query,
+    )
+    for iteration in range(config.max_tool_iterations):
+        payload = {**base_payload, "messages": messages, "tools": schema}
+        try:
+            resp = await model_client.post(config.llama_endpoint, json=payload)
+            resp.raise_for_status()
+            data = resp.json()
+        except httpx.HTTPStatusError as e:
+            body = e.response.text if e.response is not None else ""
+            status = e.response.status_code if e.response is not None else None
+            if status in (400, 404, 500) and "tool" in body.lower():
+                logger.warning("Model tools unsupported; falling back to plain calls")
+                _tools_supported = False
+                return await _post_and_parse(base_payload)
+            logger.error("Model call failed: %s", e)
+            return f"Error calling model: {e}", []
+        except Exception as e:  # noqa: BLE001
+            logger.error("Model call failed: %s", e)
+            return f"Error calling model: {e}", []
+
+        msg = data.get("choices", [{}])[0].get("message", {})
+        content = msg.get("content") or ""
+        tool_calls = msg.get("tool_calls") or []
+        if iteration == 0 and not tool_calls and not content.strip():
+            logger.warning("Model returned empty content with tools; disabling tools")
+            _tools_supported = False
+            return await _post_and_parse(base_payload)
+        if not tool_calls:
+            return content, _extract_citations(content)
+
+        messages.append(msg)
+        for call in tool_calls:
+            result = await asyncio.to_thread(dispatch_tool, call, store, ctx)
+            messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": call.get("id", ""),
+                    "content": json.dumps(result),
+                }
+            )
+
+    return await _post_and_parse({**base_payload, "messages": messages})
+
+
+async def _post_and_parse(payload: dict) -> tuple[str, list[SourceCitation]]:
+    """POST a chat payload and parse content plus inline citations."""
     try:
         resp = await model_client.post(config.llama_endpoint, json=payload)
         resp.raise_for_status()

@@ -10,6 +10,13 @@ top_k_documents: 5
 top_k_facts: 10
 enable_citations: true
 
+# Phase 2.1.4 — structured analytical tooling.
+# Disabled by default until concrete tools are registered and validated.
+enable_tools: false
+max_tool_iterations: 3
+allow_write_tools: false
+max_refreshes_per_query: 2
+
 # Phase 2.1.2 — hybrid retrieval & re-ranking.
 # Lexical (BM25) channel + RRF fusion (2.1.2.1). Low-risk; on by default.
 enable_lexical: true

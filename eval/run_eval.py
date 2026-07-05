@@ -311,14 +311,12 @@ def _model_reachable(llama_endpoint: str, timeout: float = 5.0) -> bool:
 def _call_model_sync(config, prompt: str) -> str:
     """Call the model synchronously via the OpenAI-compatible chat endpoint."""
     import httpx
+    from src.middleware.app import SYSTEM_PROMPT
+
     payload = {
         "model": config.model_name,
         "messages": [
-            {"role": "system", "content": (
-                "You are a financial research assistant. Answer the user's "
-                "question using ONLY the provided context. If the context "
-                "doesn't contain enough information, say so. "
-                "Cite sources inline using [Source: type/ticker] notation.")},
+            {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": prompt},
         ],
         "temperature": config.default_temperature,
