@@ -55,6 +55,7 @@ class QueryResponse(BaseModel):
             "overall": "unknown",
             "refreshed_during_query": [],
             "stale_sources_used": [],
+            "fetched_on_miss": [],
             "warning": None,
         },
         description="Freshness metadata for the data used in the answer",
