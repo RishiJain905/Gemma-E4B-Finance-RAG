@@ -159,13 +159,33 @@ class SymbolResolver:
         except Exception:
             return NO_MATCH
 
+        normalized = _normalize(text)
         try:
             match = process.extractOne(
-                _normalize(text),
+                normalized,
                 self._catalog_names,
                 scorer=fuzz.token_set_ratio,
                 score_cutoff=self.fuzzy_threshold * 100,
             )
+            # Whole-query matching misses a typo'd name embedded in a longer
+            # question ("what is blackbarry forward pe"): token_set_ratio
+            # needs an exact token overlap and the full-string ratio is
+            # diluted by the other words. Second pass: match each substantial
+            # token on plain fuzz.ratio, which (unlike token_set_ratio) does
+            # not score 100 when one side is a token subset of the other
+            # ("forward" vs "forward industries").
+            if not match:
+                for token in re.findall(r"[a-z]+", normalized):
+                    if len(token) < 5:
+                        continue
+                    token_match = process.extractOne(
+                        token,
+                        self._catalog_names,
+                        scorer=fuzz.ratio,
+                        score_cutoff=self.fuzzy_threshold * 100,
+                    )
+                    if token_match and (not match or token_match[1] > match[1]):
+                        match = token_match
         except Exception:
             return NO_MATCH
 
@@ -259,14 +279,21 @@ class SymbolResolver:
         from .intent_parser import IntentParser
 
         # Catalog symbols include English words (ARE, ALL, IT, CAN, ...);
-        # never treat those as tickers when they appear inside prose.
+        # never treat those as tickers when they appear inside prose. Single
+        # letters are also excluded — "P/E", "Q4" etc. collide with the many
+        # one-letter symbols (P, E, F, T, ...); those companies still resolve
+        # by name. Longest-first keeps multi-candidate queries deterministic.
         stopwords = IntentParser.COMMON_QUERY_WORDS
-        candidates = set(re.findall(r"\b[A-Z]{1,5}\b", text))
+        candidates = sorted(set(re.findall(r"\b[A-Z]{2,5}\b", text)), key=lambda c: (-len(c), c))
         for candidate in candidates:
             if candidate in self._ticker_lookup and candidate not in stopwords:
                 return candidate
         normalized = _normalize(text).upper()
-        if normalized in self._ticker_lookup and normalized not in stopwords:
+        if (
+            len(normalized) >= 2
+            and normalized in self._ticker_lookup
+            and normalized not in stopwords
+        ):
             return normalized
         return None
 

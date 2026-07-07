@@ -19,6 +19,8 @@ def _write_catalog(tmp_path):
                     {"ticker": "NVDA", "name": "NVIDIA Corp", "cik": "0001045810"},
                     {"ticker": "ARE", "name": "Alexandria Real Estate Equities", "cik": "0001035443"},
                     {"ticker": "TGT", "name": "Target Corp", "cik": "0000027419"},
+                    {"ticker": "P", "name": "Everpure, Inc.", "cik": "0000099999"},
+                    {"ticker": "E", "name": "Eni S.p.A.", "cik": "0000098888"},
                 ],
             }
         ),
@@ -68,6 +70,28 @@ class TestSymbolResolver:
         assert result.ticker == "BB", "Expected blackbarry typo to resolve BB"
         assert result.confidence >= 0.86, "Expected fuzzy confidence above threshold"
         assert result.source == "fuzzy", "Expected fuzzy source for typo"
+
+    def test_single_letter_tickers_never_match_prose(self, tmp_path):
+        """'P/E' in a question must resolve BB, never single-letter tickers P/E."""
+        from src.middleware.symbol_resolver import SymbolResolver
+
+        resolver = SymbolResolver(catalog_path=_write_catalog(tmp_path))
+        result = resolver.resolve("What is BB's forward P/E?")
+
+        assert result.ticker == "BB", (
+            f"Expected BB from the ticker candidates, got {result.ticker}"
+        )
+        assert result.source == "catalog_exact", "Expected exact catalog source"
+
+    def test_fuzzy_typo_inside_question(self, tmp_path):
+        """A typo'd name embedded in a longer question still resolves."""
+        from src.middleware.symbol_resolver import SymbolResolver
+
+        resolver = SymbolResolver(catalog_path=_write_catalog(tmp_path))
+        result = resolver.resolve("what is blackbarry forward pe")
+
+        assert result.ticker == "BB", "Expected embedded blackbarry typo to resolve BB"
+        assert result.source == "fuzzy", "Expected fuzzy source for embedded typo"
 
     def test_below_threshold_returns_none(self, tmp_path):
         """Unrelated gibberish returns the shared no-match response."""
