@@ -32,6 +32,11 @@ class MiddlewareConfig:
         self.allow_write_tools: bool = False
         self.max_refreshes_per_query: int = 2
 
+        # Phase 2.1.6 — fetch-on-miss ingestion controls.
+        self.enable_fetch_on_miss: bool = True
+        self.fetch_on_miss_timeout_s: float = 10.0
+        self.fetch_on_miss_per_query: int = 1
+
         # Phase 2.1.2 — hybrid retrieval & re-ranking.
         # Lexical (BM25) channel + RRF fusion (2.1.2.1).
         self.enable_lexical: bool = True
@@ -77,6 +82,14 @@ class MiddlewareConfig:
                 except ValueError:
                     pass
 
+        def _float(env_key: str, attr: str):
+            v = os.environ.get(env_key)
+            if v is not None:
+                try:
+                    setattr(self, attr, float(v))
+                except ValueError:
+                    pass
+
         _bool("ENABLE_LEXICAL", "enable_lexical")
         _bool("ENABLE_RERANKER", "enable_reranker")
         _str("RERANKER_BACKEND", "reranker_backend")
@@ -87,3 +100,6 @@ class MiddlewareConfig:
         _int("MAX_TOOL_ITERATIONS", "max_tool_iterations")
         _bool("ALLOW_WRITE_TOOLS", "allow_write_tools")
         _int("MAX_REFRESHES_PER_QUERY", "max_refreshes_per_query")
+        _bool("ENABLE_FETCH_ON_MISS", "enable_fetch_on_miss")
+        _float("FETCH_ON_MISS_TIMEOUT_S", "fetch_on_miss_timeout_s")
+        _int("FETCH_ON_MISS_PER_QUERY", "fetch_on_miss_per_query")

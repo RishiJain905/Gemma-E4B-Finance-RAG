@@ -70,6 +70,7 @@ model_client: Optional[httpx.AsyncClient] = None
 _tools_supported: bool = True
 MACRO_SNAPSHOT_METRICS = ["GDP", "CPIAUCSL", "FEDFUNDS", "UNRATE", "DGS10", "T10Y2Y"]
 _MODEL_TASKS_CACHE: Optional[dict] = None
+FETCH_ON_MISS_MIN_CONFIDENCE = 0.9
 retriever = None  # Shared Retriever (built on startup) — Phase 2.1.2
 
 
@@ -232,6 +233,30 @@ async def _check_model_health() -> bool:
 
 # ── Query (Full Pipeline) ──────────────────────────────
 
+async def _maybe_fetch_on_miss(ticker: str) -> dict:
+    """Run fetch-on-miss ingestion off the event loop with a hard timeout."""
+    from .on_demand import fetch_ticker_on_miss
+
+    # Validate config BEFORE starting any work: once the to_thread task is
+    # created the fetch runs (with network I/O) even if wait_for errors out.
+    # Strict type check on purpose — mock/partial configs must not trigger
+    # a live network fetch.
+    timeout = getattr(config, "fetch_on_miss_timeout_s", None)
+    if not isinstance(timeout, (int, float)) or isinstance(timeout, bool) or timeout <= 0:
+        logger.debug("Fetch-on-miss skipped for %s: invalid timeout config", ticker)
+        return {"fetched": False, "ticker": ticker, "sources": [], "error": "invalid_config"}
+
+    try:
+        task = asyncio.create_task(asyncio.to_thread(fetch_ticker_on_miss, store, ticker))
+        return await asyncio.wait_for(task, timeout=timeout)
+    except asyncio.TimeoutError:
+        logger.warning("Fetch-on-miss timed out for %s", ticker)
+        return {"fetched": False, "ticker": ticker, "sources": [], "error": "timeout"}
+    except Exception as e:  # noqa: BLE001 - never let fetch-on-miss crash a query
+        logger.warning("Fetch-on-miss failed unexpectedly for %s: %s", ticker, e)
+        return {"fetched": False, "ticker": ticker, "sources": [], "error": str(e)}
+
+
 @app.post("/query", response_model=QueryResponse)
 async def query(request: QueryRequest):
     """
@@ -256,6 +281,23 @@ async def query(request: QueryRequest):
 
     # Step 1b: Staleness-aware freshness check (Phase 1.7.4)
     freshness_meta = _evaluate_and_refresh(intent.get("ticker"), request.refresh)
+    ticker = intent.get("ticker")
+    # fetch_on_miss_per_query is the cap to enforce if another call site appears.
+    if (
+        getattr(config, "enable_fetch_on_miss", True)
+        and ticker
+        and freshness_meta.get("overall") == "never_fetched"
+        and intent.get("ticker_confidence", 0.0) >= FETCH_ON_MISS_MIN_CONFIDENCE
+    ):
+        res = await _maybe_fetch_on_miss(ticker)
+        if res.get("fetched"):
+            freshness_meta.setdefault("fetched_on_miss", []).append(ticker)
+            freshness_meta["overall"] = "fresh"
+        else:
+            warning = f"Couldn't fetch live data for {ticker} right now."
+            if res.get("error"):
+                warning = f"{warning} Reason: {res['error']}"
+            freshness_meta["warning"] = warning
 
     # Step 2: Dual retrieval (delegated to 1.5.3). Uses the shared retriever
     # built on startup so the BM25 index is reused (Phase 2.1.2).
@@ -525,6 +567,7 @@ def _evaluate_and_refresh(ticker: Optional[str], do_refresh: bool) -> dict:
         "overall": "unknown",
         "refreshed_during_query": [],
         "stale_sources_used": [],
+        "fetched_on_miss": [],
         "warning": None,
     }
     if not ticker or not store:
