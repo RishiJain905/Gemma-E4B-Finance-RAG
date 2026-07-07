@@ -9,7 +9,6 @@ migration logic is tested deterministically. A live re-embed exercise is marked
 
 from __future__ import annotations
 
-from pathlib import Path
 from unittest.mock import patch
 
 import pytest

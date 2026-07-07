@@ -63,6 +63,24 @@ class TestIntentParser:
         result = parser.parse("What is revenue?", override_ticker="CRWD")
         assert result["ticker"] == "CRWD"
 
+    def test_intent_parser_uses_resolver(self):
+        """Injected resolver can resolve companies absent from the local map."""
+        from src.middleware.intent_parser import IntentParser
+        from src.middleware.symbol_resolver import Resolution
+
+        class StubResolver:
+            def resolve(self, text: str) -> Resolution:
+                assert text == "What is BlackBerry revenue?"
+                return Resolution("BB", 0.95, "BlackBerry", "catalog_exact")
+
+        parser = IntentParser(resolver=StubResolver())
+        result = parser.parse("What is BlackBerry revenue?")
+
+        assert result["ticker"] == "BB"
+        assert result["ticker_confidence"] == 0.95
+        assert result["resolved_name"] == "BlackBerry"
+        assert result["ticker_source"] == "catalog_exact"
+
     # ── Metric Extraction ──────────────────────────────
 
     @pytest.mark.parametrize("question,expected_metrics", [

@@ -7,7 +7,6 @@ import logging
 from pathlib import Path
 from typing import Optional
 import httpx
-import numpy as np
 import chromadb
 from chromadb import Documents, EmbeddingFunction, Embeddings
 

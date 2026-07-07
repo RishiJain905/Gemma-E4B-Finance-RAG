@@ -17,7 +17,6 @@ from urllib.parse import urlparse
 
 import httpx
 import pytest
-import yaml
 
 from src.sec import FilingScheduler
 from src.storage.store import Store

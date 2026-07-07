@@ -10,7 +10,6 @@ down.
 """
 
 import json
-import sys
 from pathlib import Path
 
 import pytest
@@ -54,7 +53,11 @@ def _write_run(tmp_path: Path, rows: list[dict], name: str = "run.jsonl") -> Pat
 
 class TestGoldenDataset:
     def test_golden_dataset_valid(self):
-        lines = [l for l in GOLDEN.read_text(encoding="utf-8").splitlines() if l.strip()]
+        lines = [
+            line
+            for line in GOLDEN.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
         assert len(lines) >= 30, f"expected >=30 cases, got {len(lines)}"
         ids = []
         for i, line in enumerate(lines, 1):
@@ -415,7 +418,7 @@ class TestScoreCLI:
     def test_set_baseline_writes_tolerances(self, tmp_path):
         """set_baseline writes a baseline file with tolerances + metrics (tmp path)."""
         rows = [_row(cid="a")]
-        run_path = _write_run(tmp_path, rows)
+        _write_run(tmp_path, rows)
         summary = M.score_all(rows, run_judge=False)
         base_path = tmp_path / "baseline.json"
         out = score.set_baseline(summary, path=base_path)

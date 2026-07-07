@@ -34,7 +34,10 @@ import shutil
 import sys
 import time
 from pathlib import Path
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
+
+if TYPE_CHECKING:
+    from src.storage.chroma_store import ChromaStore
 
 _REPO = Path(__file__).resolve().parent.parent
 if str(_REPO) not in sys.path:
@@ -45,7 +48,7 @@ if str(_REPO) not in sys.path:
 _CHUNK_META_KEYS = ("parent_id", "chunk_index", "chunk_count", "section")
 
 
-def _load_store() -> "ChromaStore":  # type: ignore[name-defined]
+def _load_store() -> "ChromaStore":
     """Build a ChromaStore using the configured (storage.yaml) chunking params."""
     from src.storage.chroma_store import ChromaStore
     return ChromaStore()

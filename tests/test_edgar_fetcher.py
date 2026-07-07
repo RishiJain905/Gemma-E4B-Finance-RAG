@@ -17,10 +17,12 @@ Covers:
 """
 
 import re
+from unittest.mock import MagicMock, patch
 
 import pytest
 
 from src.sec import SECEdgarFilingFetcher
+from src.sec.edgar_fetcher import fetch_sec_company_tickers
 from src.storage.store import Store
 
 
@@ -155,3 +157,27 @@ def test_derive_period_10q_january():
 def test_derive_period_empty():
     """Empty filing date returns an empty period."""
     assert SECEdgarFilingFetcher._derive_period("", "10-K") == ""
+
+
+@patch("src.sec.edgar_fetcher.requests.get")
+def test_fetch_sec_company_tickers_parses_rows(mock_get):
+    """SEC company_tickers.json rows are normalized for catalog reuse."""
+    mock_resp = MagicMock()
+    mock_resp.json.return_value = {
+        "0": {"ticker": "aapl", "cik_str": 320193, "title": "Apple Inc."},
+        "1": {"ticker": "NVDA", "cik_str": "1045810", "title": "NVIDIA CORP"},
+    }
+    mock_resp.raise_for_status = MagicMock()
+    mock_get.return_value = mock_resp
+
+    rows = fetch_sec_company_tickers("Test User test@example.com")
+
+    assert rows == [
+        {"ticker": "AAPL", "cik": "0000320193", "title": "Apple Inc."},
+        {"ticker": "NVDA", "cik": "0001045810", "title": "NVIDIA CORP"},
+    ]
+    mock_get.assert_called_once_with(
+        "https://www.sec.gov/files/company_tickers.json",
+        headers={"User-Agent": "Test User test@example.com"},
+        timeout=30,
+    )

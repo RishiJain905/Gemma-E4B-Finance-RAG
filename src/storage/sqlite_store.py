@@ -6,7 +6,6 @@ SQLite storage layer for structured financial data.
 import logging
 import sqlite3
 import uuid
-from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
 
