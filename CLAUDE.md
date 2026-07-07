@@ -38,6 +38,17 @@ When Using Plan mode:
 - The objective is to visualize the plan prior to implementation so that its easier to optimize the plan before any code is written. 
 - All subagents launched in Plan Mode will use `'model: 'sonnet 5'`. Effort level can be your choice based on complexity of task given to the model. This includes `Explore` Agents. The only Exception is the `plan` Agent who can use the `Model: 'Opus 4.8'` as the plan-agent default when specs are detailed and exploration ran first; `Model: 'Fable 5'` for open-ended or high ambigutiy design.
 
+### Loops: which primitive to trigger
+
+A loop = repeated work cycles until a stop condition (full guide + starter prompts: `how-to-loop.md`). The deterministic stop condition for all code loops in this repo is the verify gate — `scripts\verify.ps1` / `scripts/verify.sh`, final line `VERIFY: PASS|FAIL` — governed by the project skill `verify-rag-change`. Use that skill before claiming any code change done, in or out of a loop.
+
+Route by task size; never a bigger loop than the task needs:
+
+- **Short** (one file / obvious fix, ~≤3 turns): plain turn-based work. No /goal, no subagents, no background jobs. Run the gate once before reporting done; read only the verdict + failures.
+- **Medium** (multi-file feature/bugfix with a checkable done-state): best run as `/goal <task>. Done when scripts\verify.ps1 prints VERIFY: PASS. Stop after 4 tries.` Iterate on the scoped gate (`-TestPath tests\test_x.py`) while fixing; the full gate is the exit check. Bulk/mechanical diffs → gpt-5.5 via `/codex:rescue` (table above); close with `/codex:review --background` for a fresh-context review. If a medium task arrives as a plain prompt, still enforce the gate, and put the ready-to-paste /goal one-liner in the final summary so the next run can be hands-off.
+- **Long** (multi-phase, hours, or waiting on external systems): plan mode first (rules above), then each phase runs as its own medium /goal loop with its own PASS exit — never one giant loop. Watching external state (CI, PR reviews) → `/loop` with the interval matched to how fast the target changes (~4m for active CI; ≥20m for idle watching — avoid ~5m, it's the worst cache breakpoint), or interval-free `/loop` so Claude self-paces. Recurring repo upkeep (ingestion/scheduler health) → `/schedule` routine, not a live session.
+- **Every size**: deterministic steps go in scripts, not reasoning; the same failure surviving two fix attempts means stop patching — change approach or escalate the model; pilot one slice before any fan-out; audit burn with `/usage` and `/goal` (no args).
+
 ## What this is
 
 Hybrid finance RAG system: six data sources (SEC EDGAR, Yahoo Finance, FRED, GDELT, earnings transcripts, IR pages) are ingested into dual stores — SQLite (`data/finance.db`, structured facts/filings/freshness) and ChromaDB (`data/chroma`, document embeddings) — and served through a FastAPI middleware (`:8000`) that does intent parsing → hybrid retrieval → prompt augmentation → a locally-served fine-tuned Gemma model ("TraceAlchemy") on `llama-server` (`:8087`, chat + embeddings from the same server).
