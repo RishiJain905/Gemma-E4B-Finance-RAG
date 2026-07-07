@@ -162,3 +162,86 @@ class TestSymbolResolver:
         second = resolver.resolve("qzxwvut jklmno")
 
         assert second == NO_MATCH, "Expected second miss to use negative cache"
+
+    def test_negative_cache_expires(self, tmp_path):
+        """After the negative TTL elapses, the resolution chain runs again."""
+        import time
+
+        from src.middleware.symbol_resolver import NO_MATCH, SymbolResolver
+
+        resolver = SymbolResolver(catalog_path=_write_catalog(tmp_path), negative_ttl_s=0.01)
+        calls = []
+        original_fuzzy = resolver._fuzzy
+
+        def counting_fuzzy(text):
+            calls.append(text)
+            return original_fuzzy(text)
+
+        resolver._fuzzy = counting_fuzzy
+
+        assert resolver.resolve("qzxwvut jklmno") == NO_MATCH
+        assert len(calls) == 1, "Expected first miss to run the full chain"
+        resolver.resolve("qzxwvut jklmno")
+        assert len(calls) == 1, "Expected cached miss to skip the chain"
+
+        time.sleep(0.02)
+        resolver.resolve("qzxwvut jklmno")
+        assert len(calls) == 2, "Expected expired negative entry to re-run the chain"
+
+    def test_malformed_catalog_degrades(self, tmp_path):
+        """Corrupt catalog JSON never raises; local resolution still works."""
+        from src.middleware.symbol_resolver import NO_MATCH, SymbolResolver
+
+        bad_path = tmp_path / "symbol_catalog.json"
+        bad_path.write_text("{not valid json", encoding="utf-8")
+
+        resolver = SymbolResolver(catalog_path=bad_path)
+        assert resolver.resolve("nvidia").ticker == "NVDA", (
+            "Expected local map to survive a corrupt catalog"
+        )
+        assert resolver.resolve("BlackBerry") == NO_MATCH, (
+            "Expected catalog lookups to miss cleanly with a corrupt catalog"
+        )
+
+    def test_resolve_never_touches_network(self, tmp_path, monkeypatch):
+        """resolve() must work with all requests/urllib entry points disabled."""
+        import requests
+
+        from src.middleware.symbol_resolver import SymbolResolver
+
+        def no_network(*_args, **_kwargs):
+            raise AssertionError("resolve() must not perform network I/O")
+
+        monkeypatch.setattr(requests, "get", no_network)
+        monkeypatch.setattr(requests, "request", no_network)
+        monkeypatch.setattr("urllib.request.urlopen", no_network)
+
+        resolver = SymbolResolver(catalog_path=_write_catalog(tmp_path))
+        assert resolver.resolve("nvidia").ticker == "NVDA"
+        assert resolver.resolve("BlackBerry").ticker == "BB"
+        assert resolver.resolve("blackbarry").ticker == "BB"
+        assert resolver.resolve("qzxwvut jklmno").ticker is None
+
+    def test_concurrent_first_load_is_consistent(self, tmp_path):
+        """Parallel first-time resolutions never see a partially-loaded catalog."""
+        import threading
+
+        from src.middleware.symbol_resolver import SymbolResolver
+
+        resolver = SymbolResolver(catalog_path=_write_catalog(tmp_path))
+        results: list = []
+        barrier = threading.Barrier(8)
+
+        def worker():
+            barrier.wait()
+            results.append(resolver.resolve("BlackBerry").ticker)
+
+        threads = [threading.Thread(target=worker) for _ in range(8)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        assert results == ["BB"] * 8, (
+            f"Expected every concurrent resolve to return BB, got {results}"
+        )

@@ -9,6 +9,7 @@ import json
 import logging
 import os
 import re
+import threading
 import time
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -36,6 +37,8 @@ _AMBIGUOUS_ALIASES = {
     "american",
     "general",
     "global",
+    "shell",  # "shell company"
+    "box",    # "box spread", "box office"
 }
 
 _LEGAL_SUFFIXES = {
@@ -78,6 +81,7 @@ class SymbolResolver:
         self.fuzzy_threshold = fuzzy_threshold
         self.negative_ttl_s = negative_ttl_s
         self._negative_cache: dict[str, float] = {}
+        self._catalog_lock = threading.Lock()
         self._catalog_loaded = False
         self._name_lookup: dict[str, tuple[str, str]] = {}
         self._ticker_lookup: dict[str, str] = {}
@@ -175,8 +179,17 @@ class SymbolResolver:
     def _ensure_catalog_loaded(self) -> None:
         if self._catalog_loaded:
             return
-        self._catalog_loaded = True
+        with self._catalog_lock:
+            if self._catalog_loaded:
+                return
+            try:
+                self._load_catalog()
+            finally:
+                # Set last so concurrent resolvers never observe the flag
+                # while the lookups are still being built.
+                self._catalog_loaded = True
 
+    def _load_catalog(self) -> None:
         try:
             raw = self.catalog_path.read_text(encoding="utf-8")
             data = json.loads(raw)
@@ -194,6 +207,12 @@ class SymbolResolver:
             logger.warning("Symbol catalog %s has invalid entries", self.catalog_path)
             return
 
+        # Build into locals and publish atomically at the end.
+        name_lookup: dict[str, tuple[str, str]] = {}
+        ticker_lookup: dict[str, str] = {}
+        catalog_names: list[str] = []
+        name_to_entry: dict[str, tuple[str, str]] = {}
+
         for entry in entries:
             if not isinstance(entry, dict):
                 continue
@@ -202,17 +221,22 @@ class SymbolResolver:
             if not ticker or not name:
                 continue
 
-            self._ticker_lookup[ticker] = name
+            ticker_lookup[ticker] = name
             for alias in _catalog_aliases(name):
-                self._name_lookup.setdefault(alias, (ticker, name))
+                name_lookup.setdefault(alias, (ticker, name))
                 # Ambiguous single-word aliases stay out of the fuzzy pool:
                 # token_set_ratio scores 100 for any query merely containing
                 # the word ("price target ..." → Target Corp).
                 if alias in _AMBIGUOUS_ALIASES:
                     continue
-                if alias not in self._catalog_name_to_entry:
-                    self._catalog_names.append(alias)
-                    self._catalog_name_to_entry[alias] = (ticker, name)
+                if alias not in name_to_entry:
+                    catalog_names.append(alias)
+                    name_to_entry[alias] = (ticker, name)
+
+        self._name_lookup = name_lookup
+        self._ticker_lookup = ticker_lookup
+        self._catalog_names = catalog_names
+        self._catalog_name_to_entry = name_to_entry
 
     def _warn_if_catalog_expired(self, data: dict) -> None:
         try:
@@ -274,20 +298,26 @@ class SymbolResolver:
 
 
 _DEFAULT_RESOLVER: Optional[SymbolResolver] = None
+_DEFAULT_RESOLVER_LOCK = threading.Lock()
 
 
 def get_default_resolver() -> SymbolResolver:
     """Return a process-wide default resolver singleton."""
     global _DEFAULT_RESOLVER
     if _DEFAULT_RESOLVER is None:
-        threshold = _DEFAULT_FUZZY_THRESHOLD
-        raw_threshold = os.environ.get("RESOLVER_FUZZY_THRESHOLD")
-        if raw_threshold:
-            try:
-                threshold = float(raw_threshold)
-            except ValueError:
-                logger.warning("Invalid RESOLVER_FUZZY_THRESHOLD=%r; using default", raw_threshold)
-        _DEFAULT_RESOLVER = SymbolResolver(fuzzy_threshold=threshold)
+        with _DEFAULT_RESOLVER_LOCK:
+            if _DEFAULT_RESOLVER is None:
+                threshold = _DEFAULT_FUZZY_THRESHOLD
+                raw_threshold = os.environ.get("RESOLVER_FUZZY_THRESHOLD")
+                if raw_threshold:
+                    try:
+                        threshold = float(raw_threshold)
+                    except ValueError:
+                        logger.warning(
+                            "Invalid RESOLVER_FUZZY_THRESHOLD=%r; using default",
+                            raw_threshold,
+                        )
+                _DEFAULT_RESOLVER = SymbolResolver(fuzzy_threshold=threshold)
     return _DEFAULT_RESOLVER
 
 
