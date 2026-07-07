@@ -2,6 +2,8 @@
 
 # Data files (generated, not committed)
 data/
+data/symbol_catalog.json
+data/tracked_dynamic.json
 *.db
 *.sqlite
 

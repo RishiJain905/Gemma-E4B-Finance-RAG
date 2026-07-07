@@ -26,6 +26,25 @@ SEC_EDGAR_USER_AGENT=Your Name your.email@example.com
 
 ---
 
+## Symbol Catalog
+
+`SymbolResolver` reads `data/symbol_catalog.json` when present. The file is a
+generated cache with `generated_at`, `ttl_hours`, and SEC-backed entries. If the
+catalog is missing, corrupt, or expired, query parsing still works from the
+local ticker map; expired catalogs log a warning but remain usable.
+
+Refresh the catalog with:
+
+```bash
+python scripts/refresh_symbol_catalog.py
+```
+
+The refresh command uses `SEC_EDGAR_USER_AGENT` first, then `sec.user_agent` in
+`configs/storage.yaml`, then the built-in SEC fallback. Override fuzzy matching
+with `RESOLVER_FUZZY_THRESHOLD=0.90` when stricter matching is desired.
+
+---
+
 ## `configs/storage.yaml`
 
 Storage layer configuration (SQLite, ChromaDB, embeddings, cache TTLs, SEC).

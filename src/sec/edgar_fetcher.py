@@ -27,6 +27,34 @@ from src.storage.store import Store
 
 logger = logging.getLogger(__name__)
 
+COMPANY_TICKERS_URL = "https://www.sec.gov/files/company_tickers.json"
+
+
+def fetch_sec_company_tickers(user_agent: str) -> list[dict]:
+    """Download SEC company_tickers.json rows normalized for symbol catalogs."""
+    resp = requests.get(
+        COMPANY_TICKERS_URL,
+        headers={"User-Agent": user_agent},
+        timeout=30,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+
+    rows = []
+    for entry in data.values():
+        symbol = str(entry.get("ticker", "")).upper()
+        cik_raw = entry.get("cik_str", "")
+        title = str(entry.get("title", "")).strip()
+        if symbol and cik_raw != "":
+            rows.append(
+                {
+                    "ticker": symbol,
+                    "cik": str(cik_raw).zfill(10),
+                    "title": title,
+                }
+            )
+    return rows
+
 
 class SECEdgarFilingFetcher:
     """Discovers and downloads SEC EDGAR filings for tracked tickers.
@@ -46,7 +74,7 @@ class SECEdgarFilingFetcher:
     FINANCIAL_FILING_TYPES = ["10-K", "10-Q", "8-K"]
 
     # SEC endpoints not covered by sec-edgar-api
-    _COMPANY_TICKERS_URL = "https://www.sec.gov/files/company_tickers.json"
+    _COMPANY_TICKERS_URL = COMPANY_TICKERS_URL
     _ARCHIVES_BASE = "https://www.sec.gov/Archives/edgar/data"
 
     # Fallback when no user_agent is configured anywhere.
@@ -268,24 +296,18 @@ class SECEdgarFilingFetcher:
     def _load_ticker_cik_map(self) -> dict:
         """Download and parse company_tickers.json into a ticker -> CIK map."""
         try:
-            resp = requests.get(
-                self._COMPANY_TICKERS_URL,
-                headers={"User-Agent": self._user_agent},
-                timeout=30,
-            )
-            resp.raise_for_status()
+            rows = fetch_sec_company_tickers(self._user_agent)
             self._respect_rate_limit()
-            data = resp.json()
         except Exception as e:
             logger.error("Failed to load SEC company_tickers.json: %s", e)
             return {}
 
         mapping = {}
-        for entry in data.values():
-            symbol = str(entry.get("ticker", "")).upper()
-            cik_raw = entry.get("cik_str", "")
-            if symbol and cik_raw != "":
-                mapping[symbol] = str(cik_raw).zfill(10)
+        for entry in rows:
+            symbol = entry.get("ticker", "")
+            cik = entry.get("cik", "")
+            if symbol and cik:
+                mapping[symbol] = cik
         return mapping
 
     def _parse_submissions(
@@ -475,7 +497,6 @@ class SECEdgarFilingFetcher:
         elif filing_type == "10-Q":
             # 10-Q for quarter N is filed in quarter N+1
             q = (dt.month - 1) // 3  # 0-indexed quarter of filing date
-            prev_q = q - 1 if q > 0 else 0
             # Filing in Q2 means it covers Q1, etc.
             if q == 0:
                 # Filed in January-March, covers previous year Q4
