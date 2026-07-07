@@ -77,6 +77,9 @@ def _query_with_intent(tmp_store, monkeypatch, intent, freshness, cfg=None):
     parser_cls = MagicMock(return_value=parser)
 
     monkeypatch.setattr("src.middleware.intent_parser.IntentParser", parser_cls)
+    # conftest raises the gate threshold to inf for the rest of the suite;
+    # gate tests need the real production threshold.
+    monkeypatch.setattr(middleware_app, "FETCH_ON_MISS_MIN_CONFIDENCE", 0.9)
 
     with TestClient(app) as client:
         monkeypatch.setattr(middleware_app, "store", tmp_store)
@@ -120,6 +123,74 @@ def test_untracked_valid_ticker_triggers_fetch(tmp_store, tmp_path, monkeypatch)
     assert tmp_store.get_cache_status("BB", "yfinance_fundamentals")["status"] == "fresh"
     assert tmp_store.get_cache_status("BB", "yfinance_news")["status"] == "fresh"
     assert read_dynamic_tracked() == ["BB"]
+
+
+def test_gate_fires_for_untracked_high_confidence(tmp_store, monkeypatch):
+    """The /query gate calls fetch-on-miss and reports it in freshness."""
+    fetch = AsyncMock(
+        return_value={
+            "fetched": True,
+            "ticker": "BB",
+            "sources": ["yfinance_fundamentals", "yfinance_news"],
+            "error": None,
+        }
+    )
+    monkeypatch.setattr(middleware_app, "_maybe_fetch_on_miss", fetch)
+
+    response = _query_with_intent(
+        tmp_store,
+        monkeypatch,
+        {
+            "ticker": "BB",
+            "ticker_confidence": 0.95,
+            "question_type": "fact_lookup",
+            "metrics": ["forward_pe"],
+        },
+        {
+            "overall": "never_fetched",
+            "refreshed_during_query": [],
+            "stale_sources_used": [],
+            "fetched_on_miss": [],
+            "warning": None,
+        },
+    )
+
+    assert response.status_code == 200
+    fetch.assert_awaited_once_with("BB")
+    freshness = response.json()["freshness"]
+    assert freshness["fetched_on_miss"] == ["BB"]
+    assert freshness["overall"] == "fresh"
+
+
+def test_gate_reports_failure_warning(tmp_store, monkeypatch):
+    """A failed fetch leaves an honest warning and never crashes the query."""
+    fetch = AsyncMock(
+        return_value={"fetched": False, "ticker": "BB", "sources": [], "error": "timeout"}
+    )
+    monkeypatch.setattr(middleware_app, "_maybe_fetch_on_miss", fetch)
+
+    response = _query_with_intent(
+        tmp_store,
+        monkeypatch,
+        {
+            "ticker": "BB",
+            "ticker_confidence": 0.95,
+            "question_type": "fact_lookup",
+            "metrics": ["forward_pe"],
+        },
+        {
+            "overall": "never_fetched",
+            "refreshed_during_query": [],
+            "stale_sources_used": [],
+            "fetched_on_miss": [],
+            "warning": None,
+        },
+    )
+
+    assert response.status_code == 200
+    freshness = response.json()["freshness"]
+    assert freshness["fetched_on_miss"] == []
+    assert "Couldn't fetch live data for BB" in freshness["warning"]
 
 
 def test_tracked_ticker_no_fetch(tmp_store, monkeypatch):
@@ -259,6 +330,23 @@ def test_only_cheap_sources(tmp_store, tmp_path, monkeypatch):
     transcripts.assert_not_called()
     ir.assert_not_called()
     estimates.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_invalid_timeout_config_never_starts_fetch(tmp_store, monkeypatch):
+    """A non-numeric timeout (e.g. a MagicMock config) skips the fetch entirely."""
+    from src.middleware.app import _maybe_fetch_on_miss
+
+    fetch = MagicMock()
+    monkeypatch.setattr(middleware_app, "store", tmp_store)
+    monkeypatch.setattr(middleware_app, "config", _config(fetch_on_miss_timeout_s=MagicMock()))
+    monkeypatch.setattr("src.middleware.on_demand.fetch_ticker_on_miss", fetch)
+
+    result = await _maybe_fetch_on_miss("BB")
+
+    assert result["fetched"] is False
+    assert result["error"] == "invalid_config"
+    fetch.assert_not_called()
 
 
 @pytest.mark.asyncio

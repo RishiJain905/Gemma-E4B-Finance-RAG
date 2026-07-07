@@ -260,6 +260,7 @@ def test_projection_uses_analysis_params(store, monkeypatch):
     middleware_app.config.max_tokens = 512
     middleware_app.config.enable_lexical = False
     middleware_app.config.enable_reranker = False
+    middleware_app.config.enable_fetch_on_miss = False  # keep this test offline
     monkeypatch.setattr(middleware_app, "_task_params", lambda task: {"temperature": 0.5, "max_tokens": 2048})
     monkeypatch.setattr(middleware_app, "_check_model_health", AsyncMock(return_value=True))
 

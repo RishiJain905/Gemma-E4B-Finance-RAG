@@ -22,6 +22,21 @@ def pytest_collection_modifyitems(config, items):
             item.add_marker(skip_live)
 
 
+# ── Offline safety (2.1.6.2) ──────────────────────────
+
+@pytest.fixture(autouse=True)
+def _no_fetch_on_miss_by_default(monkeypatch):
+    """Keep the offline suite offline: the fetch-on-miss gate can never fire.
+
+    Any test that exercises /query with a real config and an empty store would
+    otherwise trigger a live yfinance fetch. Fetch-on-miss tests re-set
+    FETCH_ON_MISS_MIN_CONFIDENCE to a real threshold explicitly.
+    """
+    monkeypatch.setattr(
+        "src.middleware.app.FETCH_ON_MISS_MIN_CONFIDENCE", float("inf"), raising=False
+    )
+
+
 # ── Shared store fixtures (1.8.3) ──────────────────────
 
 @pytest.fixture

@@ -237,15 +237,24 @@ async def _maybe_fetch_on_miss(ticker: str) -> dict:
     """Run fetch-on-miss ingestion off the event loop with a hard timeout."""
     from .on_demand import fetch_ticker_on_miss
 
+    # Validate config BEFORE starting any work: once the to_thread task is
+    # created the fetch runs (with network I/O) even if wait_for errors out.
+    # Strict type check on purpose — mock/partial configs must not trigger
+    # a live network fetch.
+    timeout = getattr(config, "fetch_on_miss_timeout_s", None)
+    if not isinstance(timeout, (int, float)) or isinstance(timeout, bool) or timeout <= 0:
+        logger.debug("Fetch-on-miss skipped for %s: invalid timeout config", ticker)
+        return {"fetched": False, "ticker": ticker, "sources": [], "error": "invalid_config"}
+
     try:
         task = asyncio.create_task(asyncio.to_thread(fetch_ticker_on_miss, store, ticker))
-        return await asyncio.wait_for(
-            task,
-            timeout=config.fetch_on_miss_timeout_s,
-        )
+        return await asyncio.wait_for(task, timeout=timeout)
     except asyncio.TimeoutError:
         logger.warning("Fetch-on-miss timed out for %s", ticker)
         return {"fetched": False, "ticker": ticker, "sources": [], "error": "timeout"}
+    except Exception as e:  # noqa: BLE001 - never let fetch-on-miss crash a query
+        logger.warning("Fetch-on-miss failed unexpectedly for %s: %s", ticker, e)
+        return {"fetched": False, "ticker": ticker, "sources": [], "error": str(e)}
 
 
 @app.post("/query", response_model=QueryResponse)
