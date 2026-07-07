@@ -5,8 +5,6 @@ Phase 2.1.3.1 — structure & sentence-aware chunker (pure-function tests, no ne
 
 from __future__ import annotations
 
-import pytest
-
 from src.storage.chunking import chunk_document, _split_sentences, _split_sections
 
 

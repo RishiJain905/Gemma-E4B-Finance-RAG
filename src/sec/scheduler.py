@@ -15,8 +15,6 @@ import logging
 from datetime import datetime, timezone
 from typing import Optional
 
-from .edgar_fetcher import SECEdgarFilingFetcher
-from .filing_parser import TraceAlchemyFilingParser
 from .filing_processor import FilingProcessor
 from src.storage.store import Store
 

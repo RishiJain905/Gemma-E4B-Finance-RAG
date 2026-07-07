@@ -30,7 +30,9 @@ class FakeChroma:
         for did, text, meta in self._docs:
             if where and not all(meta.get(k) == v for k, v in where.items()):
                 continue
-            ids.append(did); texts.append(text); metas.append(meta)
+            ids.append(did)
+            texts.append(text)
+            metas.append(meta)
         if limit is not None:
             ids, texts, metas = ids[:limit], texts[:limit], metas[:limit]
         return ids, texts, metas
@@ -110,8 +112,8 @@ def test_lexical_search_result_shape():
 def test_rrf_orders_by_combined_rank():
     # 'b' and 'a' appear in both channels → beat 'c'/'d' which appear once.
     v = [{"id": "a"}, {"id": "b"}, {"id": "c"}]
-    l = [{"id": "b"}, {"id": "d"}, {"id": "a"}]
-    fused = rrf_fuse(v, l, k=60)
+    lexical = [{"id": "b"}, {"id": "d"}, {"id": "a"}]
+    fused = rrf_fuse(v, lexical, k=60)
     ids = [i for i, _ in fused]
     assert ids[:2] == ["b", "a"]   # both-channels rank above single-channel
     # b is rank-1 in lexical and rank-2 in vector; a is rank-1 in vector and
@@ -121,8 +123,8 @@ def test_rrf_orders_by_combined_rank():
 
 def test_rrf_handles_disjoint_lists():
     v = [{"id": "x"}, {"id": "y"}]
-    l = [{"id": "z"}, {"id": "w"}]
-    fused = dict(rrf_fuse(v, l, k=60))
+    lexical = [{"id": "z"}, {"id": "w"}]
+    fused = dict(rrf_fuse(v, lexical, k=60))
     assert {"x", "y", "z", "w"} <= set(fused)   # all unique ids appear
 
 
