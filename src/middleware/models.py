@@ -4,7 +4,7 @@ Pydantic models for request/response schemas.
 """
 
 from datetime import datetime
-from typing import Optional
+from typing import Literal, Optional
 
 from pydantic import BaseModel, Field
 
@@ -46,6 +46,10 @@ class QueryResponse(BaseModel):
     detected_intent: Optional[str] = None
     facts_used: int = 0
     documents_used: int = 0
+    grounding: Literal["grounded", "partial", "general", "refused"] = Field(
+        "refused",
+        description="Answer grounding mode used: grounded|partial|general|refused",
+    )
     latency_ms: float = 0.0
     model_available: bool = True
     retrieval_strategy: Optional[str] = Field(

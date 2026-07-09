@@ -62,6 +62,13 @@ TOOLS_SYSTEM_PROMPT = (
     "invent numbers. Cite sources inline using [Source: type/ticker] notation."
 )
 
+GENERAL_FALLBACK_PREFIX = "Not from your data - general knowledge:"
+GENERAL_FALLBACK_CAVEAT = "Please verify against a primary source before relying on it."
+NO_GENERAL_FALLBACK_MESSAGE = (
+    "I don't have enough data in my knowledge base to answer this. "
+    "General-knowledge fallback is disabled for this deployment."
+)
+
 # ── Global state (set during lifespan) ─────────────────
 
 config: Optional[MiddlewareConfig] = None
@@ -72,6 +79,176 @@ MACRO_SNAPSHOT_METRICS = ["GDP", "CPIAUCSL", "FEDFUNDS", "UNRATE", "DGS10", "T10
 _MODEL_TASKS_CACHE: Optional[dict] = None
 FETCH_ON_MISS_MIN_CONFIDENCE = 0.9
 retriever = None  # Shared Retriever (built on startup) — Phase 2.1.2
+
+
+def _grounding_level(retrieval: dict) -> str:
+    """Return the graded grounding level from retrieved facts/documents."""
+    n = len(retrieval.get("facts", [])) + len(retrieval.get("documents", []))
+    return "grounded" if n >= 3 else "partial" if n >= 1 else "none"
+
+
+def _answer_policy() -> str:
+    """Return the configured answer policy with a safe default."""
+    policy = str(getattr(config, "answer_policy", "graded") or "graded").lower()
+    return "strict" if policy == "strict" else "graded"
+
+
+def _allow_general_fallback() -> bool:
+    """Return whether no-context general fallback answers are allowed."""
+    return bool(getattr(config, "allow_general_fallback", True))
+
+
+def _graded_system_prompt(
+    intent: Optional[dict],
+    grounding_level: str,
+    tools_enabled: bool = False,
+) -> str:
+    """Build the intent-aware graded answer-policy system prompt."""
+    question_type = (intent or {}).get("question_type", "general")
+    mode_guidance = {
+        "grounded": (
+            "Mode: grounded. Answer using ONLY the retrieved facts/documents — "
+            "every factual claim must come from them. Cite sourced claims "
+            "inline using [Source: type/ticker]. Do not add outside knowledge "
+            "and do not use the 'Not from your data' prefix."
+        ),
+        "partial": (
+            "Mode: partial. Answer only the parts supported by retrieved data, "
+            "explicitly name what is missing, and do not fill the gaps with "
+            "outside knowledge or the 'Not from your data' prefix."
+        ),
+        "none": (
+            "Mode: general fallback. No relevant stored facts/documents were "
+            "retrieved. If the request is answerable from stable background "
+            "knowledge, prefix the answer exactly with 'Not from your data - "
+            "general knowledge:' and include a caveat to verify against a "
+            "primary source. Refuse if the request is unsafe or genuinely "
+            "unknowable."
+        ),
+    }
+    if grounding_level == "none" and not _allow_general_fallback():
+        mode_guidance["none"] = (
+            "Mode: refuse. No relevant stored facts/documents were retrieved "
+            "and general fallback is disabled. Say you do not have enough data "
+            "instead of using background knowledge."
+        )
+
+    tool_guidance = ""
+    if tools_enabled:
+        tool_guidance = (
+            "\n- Tools are available. Prefer calling the appropriate tool for "
+            "targeted facts, ranking/filtering, or freshness before refusing."
+        )
+
+    return (
+        "You are a financial research assistant.\n\n"
+        "## Answer policy\n"
+        "Choose one response mode from the grounding level provided.\n"
+        "- Grounded: sufficient facts/docs -> answer and cite [Source: ...].\n"
+        "- Partial: some relevant data -> answer what is supported and state "
+        "what is missing.\n"
+        "- General fallback: no relevant data -> clearly label general "
+        "knowledge and include a primary-source verification caveat.\n"
+        "- Refuse: only for genuinely unknowable or unsafe asks.\n\n"
+        "Hard rule in every mode: never invent specific numbers such as "
+        "prices, P/E, targets, revenue, margins, growth rates, dates, or "
+        "counts. Specific figures must come from context or tools.\n"
+        "The 'Not from your data - general knowledge:' prefix is reserved for "
+        "the general-fallback mode only — never use it when any relevant data "
+        "was retrieved.\n\n"
+        f"Intent: {question_type}\n"
+        f"Grounding level: {grounding_level}\n"
+        f"{mode_guidance.get(grounding_level, mode_guidance['none'])}"
+        f"{tool_guidance}"
+    )
+
+
+def _system_prompt_for_request(
+    intent: Optional[dict],
+    grounding_level: str,
+    tools_enabled: bool = False,
+) -> str:
+    """Return the strict regression prompt or graded policy prompt."""
+    if _answer_policy() == "strict":
+        return TOOLS_SYSTEM_PROMPT if tools_enabled else SYSTEM_PROMPT
+    return _graded_system_prompt(intent, grounding_level, tools_enabled)
+
+
+def _is_declined_answer(answer: str) -> bool:
+    """Heuristically detect model refusals/unsafe declines."""
+    text = (answer or "").strip().lower()
+    if not text:
+        return True
+    decline_markers = (
+        "i don't have enough data",
+        "i do not have enough data",
+        "i can't answer",
+        "i cannot answer",
+        "i'm unable to answer",
+        "i am unable to answer",
+        "cannot provide",
+        "can't provide",
+        "unsafe",
+        "not enough information",
+        "data is unavailable",
+    )
+    return any(marker in text for marker in decline_markers)
+
+
+def _apply_answer_policy(answer: str, grounding_level: str) -> str:
+    """Enforce deterministic labels/refusals that should not depend on sampling."""
+    if _answer_policy() == "strict":
+        return answer
+    if not answer or answer.startswith(("Error calling model:", "Model unavailable.")):
+        return answer
+    if grounding_level != "none":
+        return answer
+    if not _allow_general_fallback():
+        return NO_GENERAL_FALLBACK_MESSAGE
+    if _is_declined_answer(answer):
+        return answer
+
+    labeled = answer.strip()
+    if not labeled.lower().startswith(GENERAL_FALLBACK_PREFIX.lower()):
+        labeled = f"{GENERAL_FALLBACK_PREFIX} {labeled}"
+    if "verify against a primary source" not in labeled.lower():
+        labeled = f"{labeled}\n\n{GENERAL_FALLBACK_CAVEAT}"
+    return labeled
+
+
+def _response_grounding(answer: str, grounding_level: str) -> str:
+    """Map the actual answer path to response metadata."""
+    if _is_declined_answer(answer):
+        return "refused"
+    if grounding_level == "grounded":
+        return "grounded"
+    if grounding_level == "partial":
+        return "partial"
+    if grounding_level == "none" and _allow_general_fallback():
+        return "general"
+    return "refused"
+
+
+async def _invoke_model(
+    prompt: str,
+    temperature: float,
+    max_tokens: int,
+    intent: dict,
+    grounding_level: str,
+) -> tuple[str, list[SourceCitation]]:
+    """Call _call_model while preserving old-signature test monkeypatches."""
+    import inspect
+
+    params = inspect.signature(_call_model).parameters
+    if "intent" not in params:
+        return await _call_model(prompt, temperature, max_tokens)
+    return await _call_model(
+        prompt=prompt,
+        temperature=temperature,
+        max_tokens=max_tokens,
+        intent=intent,
+        grounding_level=grounding_level,
+    )
 
 
 @asynccontextmanager
@@ -309,6 +486,7 @@ async def query(request: QueryRequest):
         top_k_documents=config.top_k_documents,
         top_k_facts=config.top_k_facts,
     )
+    grounding_level = _grounding_level(retrieval)
 
     # Step 3: Prompt augmentation (delegated to 1.5.4)
     from .prompt_augmenter import PromptAugmenter
@@ -317,16 +495,19 @@ async def query(request: QueryRequest):
         question=request.question,
         intent=intent,
         retrieval=retrieval,
+        grounding_level=grounding_level,
     )
 
     # Step 4: Call the model — or degrade gracefully when it is unavailable.
     model_available = await _check_model_health()
     if model_available:
         task = _task_params("analysis") if intent.get("question_type") == "projection" else {}
-        answer_text, citations = await _call_model(
+        answer_text, citations = await _invoke_model(
             prompt=augmented_prompt,
             temperature=request.temperature or task.get("temperature") or config.default_temperature,
             max_tokens=request.max_tokens or task.get("max_tokens") or config.max_tokens,
+            intent=intent,
+            grounding_level=grounding_level,
         )
         if intent.get("question_type") == "projection":
             from .guardrails import apply_projection_guardrail
@@ -346,6 +527,7 @@ async def query(request: QueryRequest):
         detected_intent=intent.get("question_type"),
         facts_used=len(retrieval.get("facts", [])),
         documents_used=len(retrieval.get("documents", [])),
+        grounding=_response_grounding(answer_text, grounding_level),
         latency_ms=elapsed_ms,
         model_available=model_available,
         freshness=freshness_meta,
@@ -661,18 +843,28 @@ async def refresh_ticker(ticker: str, body: Optional[RefreshRequest] = None):
     )
 
 
-async def _call_model(prompt: str, temperature: float,
-                      max_tokens: int) -> tuple[str, list[SourceCitation]]:
+async def _call_model(
+    prompt: str,
+    temperature: float,
+    max_tokens: int,
+    intent: Optional[dict] = None,
+    grounding_level: str = "grounded",
+) -> tuple[str, list[SourceCitation]]:
     """Send the augmented prompt to TraceAlchemy and parse the response."""
     global _tools_supported
 
     if not model_client or not config:
         return "Model unavailable. Please ensure llama-server is running.", []
 
+    tools_on = bool(getattr(config, "enable_tools", False)) and _tools_supported
     messages = [
         {
             "role": "system",
-            "content": SYSTEM_PROMPT,
+            "content": _system_prompt_for_request(
+                intent=intent,
+                grounding_level=grounding_level,
+                tools_enabled=False,
+            ),
         },
         {"role": "user", "content": prompt},
     ]
@@ -683,16 +875,23 @@ async def _call_model(prompt: str, temperature: float,
         "max_tokens": max_tokens,
     }
 
-    tools_on = bool(getattr(config, "enable_tools", False)) and _tools_supported
     if not tools_on:
-        return await _post_and_parse(base_payload)
+        answer, citations = await _post_and_parse(base_payload)
+        return _apply_answer_policy(answer, grounding_level), citations
 
     from .tools import ToolContext, dispatch_tool, openai_schema
 
     # The tool loop keeps its own messages list so every fallback to
     # _post_and_parse(base_payload) still sends the exact pre-tools prompt.
     messages = [
-        {"role": "system", "content": TOOLS_SYSTEM_PROMPT},
+        {
+            "role": "system",
+            "content": _system_prompt_for_request(
+                intent=intent,
+                grounding_level=grounding_level,
+                tools_enabled=True,
+            ),
+        },
         {"role": "user", "content": prompt},
     ]
     schema = openai_schema()
@@ -712,7 +911,8 @@ async def _call_model(prompt: str, temperature: float,
             if status in (400, 404, 500) and "tool" in body.lower():
                 logger.warning("Model tools unsupported; falling back to plain calls")
                 _tools_supported = False
-                return await _post_and_parse(base_payload)
+                answer, citations = await _post_and_parse(base_payload)
+                return _apply_answer_policy(answer, grounding_level), citations
             logger.error("Model call failed: %s", e)
             return f"Error calling model: {e}", []
         except Exception as e:  # noqa: BLE001
@@ -729,9 +929,11 @@ async def _call_model(prompt: str, temperature: float,
         if iteration == 0 and not tool_calls and not content.strip():
             logger.warning("Model returned empty content with tools; disabling tools")
             _tools_supported = False
-            return await _post_and_parse(base_payload)
+            answer, citations = await _post_and_parse(base_payload)
+            return _apply_answer_policy(answer, grounding_level), citations
         if not tool_calls:
-            return content, _extract_citations(content)
+            answer = _apply_answer_policy(content, grounding_level)
+            return answer, _extract_citations(answer)
 
         messages.append(msg)
         for call in tool_calls:
@@ -744,7 +946,8 @@ async def _call_model(prompt: str, temperature: float,
                 }
             )
 
-    return await _post_and_parse({**base_payload, "messages": messages})
+    answer, citations = await _post_and_parse({**base_payload, "messages": messages})
+    return _apply_answer_policy(answer, grounding_level), citations
 
 
 async def _post_and_parse(payload: dict) -> tuple[str, list[SourceCitation]]:

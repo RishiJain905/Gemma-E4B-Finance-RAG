@@ -136,6 +136,25 @@ class TestRunner:
         assert row["answer"] == ""
         assert row["retrieved_sources"] == []
 
+    def test_format_context_includes_document_body(self):
+        """Retriever documents carry their body under "document" (Chroma
+        naming) — the judge context must include it, not an empty excerpt
+        (regression: 2.1.7.1 found doc bodies silently dropped)."""
+        retrieval = {
+            "facts": [],
+            "documents": [{
+                "id": "news/AMD/1",
+                "document": "AMD beat revenue estimates for Q3 2026.",
+                "metadata": {"source": "yfinance_news", "ticker": "AMD"},
+            }],
+        }
+        ctx = R._format_context(retrieval, intent={})
+        assert "AMD beat revenue estimates" in ctx
+        # Older/injected shapes still work.
+        retrieval["documents"][0] = {"id": "d", "text": "TEXT BODY",
+                                     "metadata": {"source": "sec", "ticker": "N"}}
+        assert "TEXT BODY" in R._format_context(retrieval, intent={})
+
     def test_runner_citation_sources_normalized(self):
         """Citation source types are normalized to canonical names."""
         def fake_endpoint(case):
@@ -267,6 +286,24 @@ class TestJudge:
         assert res["score"] is None
         assert res["model_available"] is False
         assert res["n_skipped"] == 1
+
+    def test_faithfulness_skips_labeled_general_fallback(self):
+        """2.1.7.1: labeled general-knowledge answers claim no grounding, so
+        they are excluded from groundedness instead of mis-scored as
+        hallucination. Relevance still judges them."""
+        rows = [
+            _row(cid="a", answer="Not from your data - general knowledge: "
+                                 "buybacks reduce share count.", context=""),
+            _row(cid="b", answer="Revenue was 26B [Source: yfinance/NVDA]",
+                 context="Facts:\n- revenue: 26"),
+        ]
+        res = M.faithfulness(rows, judge=lambda p: "Score: 1.0")
+        assert res["n_scored"] == 1
+        assert res["n_skipped"] == 1
+        skipped = [pc for pc in res["per_case"] if pc["id"] == "a"][0]
+        assert "general-knowledge fallback" in skipped["reason"]
+        rel = M.answer_relevance(rows, judge=lambda p: "Score: 0.8")
+        assert rel["n_scored"] == 2
 
     def test_relevance_mocked(self):
         rows = [_row(cid="a"), _row(cid="b")]
