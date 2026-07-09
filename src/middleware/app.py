@@ -79,6 +79,11 @@ MACRO_SNAPSHOT_METRICS = ["GDP", "CPIAUCSL", "FEDFUNDS", "UNRATE", "DGS10", "T10
 _MODEL_TASKS_CACHE: Optional[dict] = None
 FETCH_ON_MISS_MIN_CONFIDENCE = 0.9
 retriever = None  # Shared Retriever (built on startup) — Phase 2.1.2
+_MODEL_HEALTH_TTL_S = 10.0
+_HEALTH_SUMMARY_TTL_S = 3.0
+_model_health = {"ok": False, "ts": 0.0}
+_health_cache = {"ts": 0.0, "value": None}
+_scheduler = None
 
 
 def _grounding_level(retrieval: dict) -> str:
@@ -262,6 +267,7 @@ async def lifespan(app: FastAPI):
     config = MiddlewareConfig()
     store = Store(
         embedding_endpoint=config.embedding_endpoint,
+        embedding_cache_size=config.embedding_cache_size,
     )
     model_client = httpx.AsyncClient(timeout=60)
 
@@ -347,31 +353,14 @@ async def health():
 
     storage_health = store.heartbeat()
     model_ok = await _check_model_health()
-
-    # Scheduler status (best-effort).
-    scheduler_status = None
-    try:
-        from src.scheduler import UnifiedScheduler
-        sched = UnifiedScheduler(store=store)
-        scheduler_status = sched.status_report()
-    except Exception as e:  # noqa: BLE001
-        logger.warning("Scheduler status unavailable: %s", e)
-
-    # Per-ticker freshness summary (best-effort).
-    freshness_summary: dict[str, str] = {}
-    for ticker in ["NVDA", "AMD", "AAPL", "MSFT", "META", "CRWD"]:
-        try:
-            report = store.get_freshness_report(ticker)
-            freshness_summary[ticker] = report["overall"]
-        except Exception:  # noqa: BLE001
-            freshness_summary[ticker] = "error"
+    summary = _cached_health_summary()
 
     return HealthResponse(
         status="ok" if storage_health.get("sqlite") else "degraded",
         storage=storage_health,
         model_available=model_ok,
-        scheduler=scheduler_status,
-        freshness=freshness_summary,
+        scheduler=summary.get("scheduler"),
+        freshness=summary.get("freshness"),
     )
 
 
@@ -394,17 +383,65 @@ async def tools():
     }
 
 
-async def _check_model_health() -> bool:
+def _mark_model_health(ok: bool) -> None:
+    """Refresh the in-process model-health cache."""
+    _model_health["ok"] = bool(ok)
+    _model_health["ts"] = time.monotonic()
+
+
+def _get_scheduler():
+    """Return the lazily-built scheduler used by /health."""
+    global _scheduler
+    if _scheduler is None:
+        from src.scheduler import UnifiedScheduler
+        _scheduler = UnifiedScheduler(store=store)
+    return _scheduler
+
+
+def _cached_health_summary(ttl: float = _HEALTH_SUMMARY_TTL_S) -> dict:
+    """Return cached scheduler status and ticker freshness for /health."""
+    now = time.monotonic()
+    cached = _health_cache.get("value")
+    if cached is not None and now - float(_health_cache.get("ts", 0.0)) < ttl:
+        return cached
+
+    scheduler_status = None
+    try:
+        scheduler_status = _get_scheduler().status_report()
+    except Exception as e:  # noqa: BLE001
+        logger.warning("Scheduler status unavailable: %s", e)
+
+    freshness_summary: dict[str, str] = {}
+    for ticker in ["NVDA", "AMD", "AAPL", "MSFT", "META", "CRWD"]:
+        try:
+            report = store.get_freshness_report(ticker)
+            freshness_summary[ticker] = report["overall"]
+        except Exception:  # noqa: BLE001
+            freshness_summary[ticker] = "error"
+
+    value = {"scheduler": scheduler_status, "freshness": freshness_summary}
+    _health_cache["value"] = value
+    _health_cache["ts"] = now
+    return value
+
+
+async def _check_model_health(ttl: float = _MODEL_HEALTH_TTL_S) -> bool:
     """Ping the llama-server to check if the model is available."""
     if not config or not model_client:
         return False
+    now = time.monotonic()
+    if now - float(_model_health.get("ts", 0.0)) < ttl:
+        return bool(_model_health.get("ok", False))
     try:
         resp = await model_client.get(
             config.llama_endpoint.replace("/v1/chat/completions", "/health"),
             timeout=5,
         )
-        return resp.status_code == 200
+        ok = resp.status_code == 200
+        _mark_model_health(ok)
+        return ok
     except Exception:
+        _mark_model_health(False)
         return False
 
 
@@ -447,16 +484,25 @@ async def query(request: QueryRequest):
       5. Return grounded answer with citations
     """
     start = time.time()
+    timings: dict[str, object] = {}
+
+    def _stage(name: str, stage_start: float) -> float:
+        elapsed = round((time.perf_counter() - stage_start) * 1000, 1)
+        timings[name] = elapsed
+        return elapsed
 
     if not store:
         raise HTTPException(status_code=503, detail="Store not initialized")
 
     # Step 1: Intent parsing (delegated to 1.5.2)
+    stage_start = time.perf_counter()
     from .intent_parser import IntentParser
     parser = IntentParser()
     intent = parser.parse(request.question, override_ticker=request.ticker)
+    _stage("intent_parse", stage_start)
 
     # Step 1b: Staleness-aware freshness check (Phase 1.7.4)
+    stage_start = time.perf_counter()
     freshness_meta = _evaluate_and_refresh(intent.get("ticker"), request.refresh)
     ticker = intent.get("ticker")
     # fetch_on_miss_per_query is the cap to enforce if another call site appears.
@@ -475,9 +521,11 @@ async def query(request: QueryRequest):
             if res.get("error"):
                 warning = f"{warning} Reason: {res['error']}"
             freshness_meta["warning"] = warning
+    _stage("freshness_check", stage_start)
 
     # Step 2: Dual retrieval (delegated to 1.5.3). Uses the shared retriever
     # built on startup so the BM25 index is reused (Phase 2.1.2).
+    stage_start = time.perf_counter()
     from .retriever import Retriever
     r = retriever or Retriever(store=store, config=config)
     retrieval = r.retrieve(
@@ -486,9 +534,18 @@ async def query(request: QueryRequest):
         top_k_documents=config.top_k_documents,
         top_k_facts=config.top_k_facts,
     )
+    retrieval_ms = _stage("retrieval", stage_start)
+    retrieval_timings = retrieval.get("timings", {}) if isinstance(retrieval, dict) else {}
+    timings["retrieval"] = {
+        "total": retrieval_ms,
+        "embedding": round(float(retrieval_timings.get("embedding", 0.0) or 0.0), 1),
+        "chroma": round(float(retrieval_timings.get("chroma", 0.0) or 0.0), 1),
+        "sqlite": round(float(retrieval_timings.get("sqlite", 0.0) or 0.0), 1),
+    }
     grounding_level = _grounding_level(retrieval)
 
     # Step 3: Prompt augmentation (delegated to 1.5.4)
+    stage_start = time.perf_counter()
     from .prompt_augmenter import PromptAugmenter
     augmenter = PromptAugmenter(config=config)
     augmented_prompt = augmenter.build_prompt(
@@ -497,8 +554,10 @@ async def query(request: QueryRequest):
         retrieval=retrieval,
         grounding_level=grounding_level,
     )
+    _stage("prompt_build", stage_start)
 
     # Step 4: Call the model — or degrade gracefully when it is unavailable.
+    stage_start = time.perf_counter()
     model_available = await _check_model_health()
     if model_available:
         task = _task_params("analysis") if intent.get("question_type") == "projection" else {}
@@ -509,6 +568,8 @@ async def query(request: QueryRequest):
             intent=intent,
             grounding_level=grounding_level,
         )
+        if not answer_text.startswith("Error calling model:"):
+            _mark_model_health(True)
         if intent.get("question_type") == "projection":
             from .guardrails import apply_projection_guardrail
 
@@ -517,8 +578,12 @@ async def query(request: QueryRequest):
         logger.warning("Model unavailable — returning degraded answer")
         answer_text = _format_degraded_answer(retrieval, intent)
         citations = []
+    _stage("model_call", stage_start)
 
     elapsed_ms = round((time.time() - start) * 1000, 1)
+    return_timings = getattr(config, "return_timings", True)
+    if not isinstance(return_timings, bool):
+        return_timings = True
 
     return QueryResponse(
         answer=answer_text,
@@ -529,6 +594,7 @@ async def query(request: QueryRequest):
         documents_used=len(retrieval.get("documents", [])),
         grounding=_response_grounding(answer_text, grounding_level),
         latency_ms=elapsed_ms,
+        timings=timings if return_timings else None,
         model_available=model_available,
         freshness=freshness_meta,
         retrieval_strategy=retrieval.get("retrieval_strategy"),
@@ -904,6 +970,7 @@ async def _call_model(
         try:
             resp = await model_client.post(config.llama_endpoint, json=payload)
             resp.raise_for_status()
+            _mark_model_health(True)
             data = resp.json()
         except httpx.HTTPStatusError as e:
             body = e.response.text if e.response is not None else ""
@@ -955,6 +1022,7 @@ async def _post_and_parse(payload: dict) -> tuple[str, list[SourceCitation]]:
     try:
         resp = await model_client.post(config.llama_endpoint, json=payload)
         resp.raise_for_status()
+        _mark_model_health(True)
         data = resp.json()
         content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
 

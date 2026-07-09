@@ -11,6 +11,8 @@ top_k_facts: 10
 enable_citations: true
 answer_policy: "graded"          # "graded" | "strict"
 allow_general_fallback: true
+return_timings: true
+embedding_cache_size: 256
 
 # Phase 2.1.4 — structured analytical tooling.
 # Disabled by default until concrete tools are registered and validated.

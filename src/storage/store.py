@@ -37,13 +37,15 @@ class Store:
                  db_path: Optional[Path] = None,
                  chroma_path: Optional[Path] = None,
                  collection_name: str = "tracealchemy_docs",
-                 embedding_endpoint: str = "http://127.0.0.1:8087/v1/embeddings"):
+                 embedding_endpoint: str = "http://127.0.0.1:8087/v1/embeddings",
+                 embedding_cache_size: int = 256):
 
         self.sqlite = SQLiteStore(db_path=db_path)
         self.chroma = ChromaStore(
             persist_directory=chroma_path,
             collection_name=collection_name,
             embedding_endpoint=embedding_endpoint,
+            embedding_cache_size=embedding_cache_size,
         )
 
     # ── Health ─────────────────────────────────────────

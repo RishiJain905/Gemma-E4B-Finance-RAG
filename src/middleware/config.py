@@ -27,6 +27,8 @@ class MiddlewareConfig:
         self.enable_citations: bool = True
         self.answer_policy: str = "graded"
         self.allow_general_fallback: bool = True
+        self.return_timings: bool = True
+        self.embedding_cache_size: int = 256
 
         # Phase 2.1.4 — analytical tool-calling controls.
         self.enable_tools: bool = False
@@ -107,3 +109,5 @@ class MiddlewareConfig:
         _int("FETCH_ON_MISS_PER_QUERY", "fetch_on_miss_per_query")
         _str("ANSWER_POLICY", "answer_policy")
         _bool("ALLOW_GENERAL_FALLBACK", "allow_general_fallback")
+        _bool("RETURN_TIMINGS", "return_timings")
+        _int("EMBEDDING_CACHE_SIZE", "embedding_cache_size")

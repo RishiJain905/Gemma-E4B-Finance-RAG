@@ -51,6 +51,10 @@ class QueryResponse(BaseModel):
         description="Answer grounding mode used: grounded|partial|general|refused",
     )
     latency_ms: float = 0.0
+    timings: Optional[dict] = Field(
+        None,
+        description="Optional per-stage latency breakdown in milliseconds",
+    )
     model_available: bool = True
     retrieval_strategy: Optional[str] = Field(
         None, description="Document retrieval path used: vector|hybrid|hybrid+rerank")
