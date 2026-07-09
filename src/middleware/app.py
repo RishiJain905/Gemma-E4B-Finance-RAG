@@ -12,6 +12,7 @@ Usage:
 """
 
 import asyncio
+import contextvars
 import json
 import logging
 import time
@@ -86,6 +87,18 @@ _model_health = {"ok": False, "ts": 0.0}
 _health_cache = {"ts": 0.0, "value": None}
 _scheduler = None
 
+# Per-request state (Phase 2.1.8.3). Each incoming request runs in its own
+# asyncio Task, which copies the context at creation time, so these never
+# leak between concurrent requests as long as they're reset at the top of
+# _build_query_context — the single entry point shared by /query and
+# /query/stream.
+_tools_used_var: contextvars.ContextVar[Optional[list[str]]] = contextvars.ContextVar(
+    "tools_used", default=None
+)
+_answer_policy_override_var: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar(
+    "answer_policy_override", default=None
+)
+
 
 def _grounding_level(retrieval: dict) -> str:
     """Return the graded grounding level from retrieved facts/documents."""
@@ -94,9 +107,45 @@ def _grounding_level(retrieval: dict) -> str:
 
 
 def _answer_policy() -> str:
-    """Return the configured answer policy with a safe default."""
+    """Return the effective answer policy: per-request override, else configured default."""
+    override = _answer_policy_override_var.get()
+    if override in ("strict", "graded"):
+        return override
     policy = str(getattr(config, "answer_policy", "graded") or "graded").lower()
     return "strict" if policy == "strict" else "graded"
+
+
+def _reset_request_scoped_state(answer_policy: Optional[str]) -> None:
+    """Reset per-request contextvars: tool-call log and answer-policy override."""
+    _tools_used_var.set([])
+    normalized = str(answer_policy or "").strip().lower()
+    _answer_policy_override_var.set(normalized if normalized in ("strict", "graded") else None)
+
+
+def _record_tool_used(name: str) -> None:
+    """Append a dispatched tool name to the current request's tool-call log."""
+    used = _tools_used_var.get()
+    if used is not None and name and name not in used:
+        used.append(name)
+
+
+def _get_tools_used() -> Optional[list[str]]:
+    """Return the current request's dispatched tool names, or None if empty."""
+    used = _tools_used_var.get()
+    return list(used) if used else None
+
+
+def _resolved_ticker_field(intent: dict) -> Optional[dict]:
+    """Return {'name','source'} when the resolver mapped a non-exact ticker.
+
+    Omitted for exact matches (known_ticker/override) so the field only
+    fires for name lookups and typo-corrected fuzzy matches.
+    """
+    source = intent.get("ticker_source")
+    name = intent.get("resolved_name")
+    if not source or not name or source in ("known_ticker", "override"):
+        return None
+    return {"name": name, "source": source}
 
 
 def _allow_general_fallback() -> bool:
@@ -356,12 +405,21 @@ async def health():
     model_ok = await _check_model_health()
     summary = _cached_health_summary()
 
+    capabilities = None
+    if config:
+        capabilities = {
+            "tools": bool(config.enable_tools),
+            "streaming": bool(getattr(config, "enable_streaming", True)),
+            "answer_policy": str(getattr(config, "answer_policy", "graded") or "graded").lower(),
+        }
+
     return HealthResponse(
         status="ok" if storage_health.get("sqlite") else "degraded",
         storage=storage_health,
         model_available=model_ok,
         scheduler=summary.get("scheduler"),
         freshness=summary.get("freshness"),
+        capabilities=capabilities,
     )
 
 
@@ -492,6 +550,7 @@ async def _build_query_context(request: QueryRequest) -> dict:
 
     start = time.time()
     timings: dict[str, object] = {}
+    _reset_request_scoped_state(request.answer_policy)
 
     stage_start = time.perf_counter()
     from .intent_parser import IntentParser
@@ -596,6 +655,8 @@ def _build_query_response(
         model_available=model_available,
         freshness=context["freshness"],
         retrieval_strategy=retrieval.get("retrieval_strategy"),
+        tools_used=_get_tools_used(),
+        resolved_ticker=_resolved_ticker_field(intent),
     )
 
 
@@ -1193,6 +1254,9 @@ async def _call_model(
 
         messages.append(msg)
         for call in tool_calls:
+            tool_name = (call.get("function") or {}).get("name")
+            if tool_name:
+                _record_tool_used(tool_name)
             result = await asyncio.to_thread(dispatch_tool, call, store, ctx)
             messages.append(
                 {

@@ -71,4 +71,25 @@ Gate: `VERIFY: PASS` (777 passed; includes `tests/test_chat_client.py`).
 
 ## 2.1.8.3 — TUI integration
 
-_Pending._
+- One defensive renderer (`_render_metadata`) shared by the streaming and
+  non-streaming paths: colored grounding tag (TTY-only), `used: <tools>`,
+  retrieval strategy, fetched-on-miss notice, resolved-ticker confirmation,
+  staleness warnings, `/verbose` timings. A minimal old-server response
+  renders without KeyErrors; the dead pre-ChatSession `do_query()` was removed.
+- Middleware additions (all optional/additive): `QueryResponse.tools_used`
+  (per-request ContextVar filled by the tool loop — `_call_model` signature
+  untouched), `QueryResponse.resolved_ticker` (only for non-exact
+  resolutions), `HealthResponse.capabilities` (tools/streaming/answer_policy),
+  and `QueryRequest.answer_policy` per-request override backing `/grounding`.
+- New commands: `/grounding strict|graded|clear`, `/eval [N]`, hardened
+  `/tools`; `/help` updated; startup prints active capabilities from `/health`.
+- Docs: README chat section refreshed; `scripts/CHAT.md` created.
+
+Manual end-to-end check (live stack, tools on → streaming falls back):
+- Analytical: "Which tracked stock has the lowest forward P/E?" → tool-driven
+  answer (`used: query_facts`), `[GROUNDED]` tag, strategy shown.
+- Projection: "consensus outlook for NVDA next quarter" → grounded analyst
+  consensus (revenue + EPS estimates, 40 analysts) with caveat and staleness
+  warning rendered.
+
+Gate: `VERIFY: PASS` (786 passed; +9 tests in `tests/test_chat_client.py`).

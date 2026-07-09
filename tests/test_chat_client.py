@@ -10,6 +10,7 @@ from fastapi.testclient import TestClient
 
 from scripts import chat
 from src.middleware import app as middleware_app
+from src.middleware.tools import REGISTRY, Tool
 
 
 class FakeResponse:
@@ -282,3 +283,192 @@ def test_query_stream_endpoint_emits_tokens_and_terminal_metadata_includes_groun
     assert "event: metadata" in text
     assert '"grounding": "grounded"' in text
     assert '"retrieval_strategy": "vector"' in text
+
+
+# ── 2.1.8.3: answer-renderer coverage ──────────────────
+
+def test_renders_grounding_tag(capsys):
+    data = _query_data()
+    data["grounding"] = "partial"
+    chat._render_metadata(data, verbose=False)
+    out = capsys.readouterr().out
+    assert "[PARTIAL]" in out
+    assert "grounding=partial" in out
+
+
+def test_renders_tools_used(capsys):
+    data = _query_data()
+    data["tools_used"] = ["query_facts", "get_price_targets"]
+    chat._render_metadata(data, verbose=False)
+    out = capsys.readouterr().out
+    assert "used: query_facts, get_price_targets" in out
+
+
+def test_renders_fetched_on_miss(capsys):
+    data = _query_data()
+    data["freshness"] = {"overall": "fresh", "fetched_on_miss": ["BB"]}
+    chat._render_metadata(data, verbose=False)
+    out = capsys.readouterr().out
+    assert "fetched live data for BB" in out
+
+
+def test_resolved_ticker_confirmation(capsys):
+    data = _query_data()
+    data["detected_ticker"] = "BB"
+    data["resolved_ticker"] = {"name": "BlackBerry Limited", "source": "fuzzy"}
+    chat._render_metadata(data, verbose=False)
+    out = capsys.readouterr().out
+    assert "interpreting as BlackBerry Limited / BB" in out
+
+
+def test_defensive_against_missing_fields(capsys):
+    """A minimal (old-server) response must render without KeyErrors."""
+    chat._render_metadata({"answer": "hi"}, verbose=True)
+    out = capsys.readouterr().out
+    assert "ticker=None" in out
+    assert "grounding=None" in out
+
+
+def test_tools_command(capsys):
+    class FakeClient:
+        def get(self, path):
+            assert path == "/tools"
+            return FakeResponse(data={
+                "enabled": True,
+                "allow_write_tools": False,
+                "tools": [
+                    {"name": "query_facts", "description": "Query stored facts", "write": False},
+                ],
+            })
+
+    chat.do_tools(FakeClient())
+    out = capsys.readouterr().out
+    assert "enabled=True" in out
+    assert "query_facts" in out
+
+
+def test_help_lists_new_commands():
+    assert "/tools" in chat.HELP
+    assert "/grounding" in chat.HELP
+    assert "/eval" in chat.HELP
+
+
+def test_query_reports_tools_used(monkeypatch):
+    """/query surfaces the tool names dispatched during the tool loop."""
+    snapshot = dict(REGISTRY)
+    REGISTRY.clear()
+    REGISTRY["query_facts"] = Tool(
+        name="query_facts",
+        description="Query stored facts",
+        parameters={"type": "object", "properties": {}, "required": []},
+        handler=lambda _store: {"ok": True},
+    )
+    middleware_app._tools_supported = True
+
+    config = SimpleNamespace(
+        model_name="tracealchemy",
+        llama_endpoint="http://test/v1/chat/completions",
+        default_temperature=0.3,
+        max_tokens=256,
+        top_k_documents=5,
+        top_k_facts=10,
+        enable_tools=True,
+        allow_write_tools=False,
+        max_refreshes_per_query=2,
+        max_tool_iterations=3,
+        enable_streaming=True,
+        enable_fetch_on_miss=False,
+        answer_policy="graded",
+        allow_general_fallback=True,
+        return_timings=True,
+    )
+    parser = MagicMock()
+    parser.parse.return_value = {
+        "ticker": "NVDA",
+        "ticker_confidence": 1.0,
+        "question_type": "fact_lookup",
+        "metrics": ["total_revenue"],
+        "resolved_name": "NVDA",
+        "ticker_source": "known_ticker",
+    }
+    monkeypatch.setattr("src.middleware.intent_parser.IntentParser", MagicMock(return_value=parser))
+    monkeypatch.setattr(middleware_app, "config", config)
+    monkeypatch.setattr(middleware_app, "store", object())
+    monkeypatch.setattr(
+        middleware_app,
+        "retriever",
+        SimpleNamespace(
+            retrieve=lambda **_kwargs: {
+                "facts": [{"metric": "total_revenue", "value": 26.0}],
+                "documents": [],
+                "retrieval_strategy": "vector",
+                "timings": {},
+            }
+        ),
+    )
+    monkeypatch.setattr(
+        middleware_app,
+        "_evaluate_and_refresh",
+        MagicMock(return_value={"overall": "fresh", "fetched_on_miss": []}),
+    )
+    monkeypatch.setattr(middleware_app, "_check_model_health", AsyncMock(return_value=True))
+    monkeypatch.setattr(middleware_app, "_task_params", lambda _task: {})
+
+    tool_call = {
+        "id": "call_1",
+        "type": "function",
+        "function": {"name": "query_facts", "arguments": "{}"},
+    }
+    first = MagicMock()
+    first.raise_for_status.return_value = None
+    first.json.return_value = {
+        "choices": [{"message": {"role": "assistant", "content": "", "tool_calls": [tool_call]}}]
+    }
+    final = MagicMock()
+    final.raise_for_status.return_value = None
+    final.json.return_value = {
+        "choices": [{
+            "message": {
+                "role": "assistant",
+                "content": "NVDA revenue is 26 [Source: sqlite/NVDA]",
+                "tool_calls": None,
+            }
+        }]
+    }
+    model_client = SimpleNamespace(post=AsyncMock(side_effect=[first, final]))
+    monkeypatch.setattr(middleware_app, "model_client", model_client)
+
+    try:
+        client = TestClient(middleware_app.app)
+        response = client.post("/query", json={"question": "What is NVDA revenue?"})
+    finally:
+        REGISTRY.clear()
+        REGISTRY.update(snapshot)
+        middleware_app._tools_supported = True
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["tools_used"] == ["query_facts"]
+
+
+def test_health_reports_capabilities(monkeypatch):
+    config = SimpleNamespace(
+        enable_tools=True,
+        enable_streaming=False,
+        answer_policy="strict",
+    )
+    monkeypatch.setattr(middleware_app, "config", config)
+    monkeypatch.setattr(
+        middleware_app, "store", SimpleNamespace(heartbeat=lambda: {"sqlite": True, "chroma": True})
+    )
+    monkeypatch.setattr(middleware_app, "_check_model_health", AsyncMock(return_value=True))
+    monkeypatch.setattr(
+        middleware_app, "_cached_health_summary", lambda: {"scheduler": None, "freshness": {}}
+    )
+
+    client = TestClient(middleware_app.app)
+    response = client.get("/health")
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["capabilities"] == {"tools": True, "streaming": False, "answer_policy": "strict"}

@@ -156,28 +156,41 @@ curl -X POST http://127.0.0.1:8000/query \
 
 For a single, centralized entry point, use the interactive client. It
 **auto-starts the middleware** if it isn't already running, gives you a chat
-loop over `/query`, and supports slash commands to run ingestion jobs:
+loop over `/query` (streamed by default), and surfaces every Phase 2.1
+feature — grounding mode, tool calls, retrieval strategy, fetch-on-miss, and
+resolved-ticker confirmation — in one consistent answer renderer:
 
 ```bash
 python scripts/chat.py
 ```
 
 ```
-you> What was NVDA revenue last quarter?
-NVDA revenue is 253,491,003,392.00 usd (2026-Q2) [Source: yfinance/NVDA].
-  ticker=NVDA intent=fact_lookup facts=10 docs=0 model_available=True latency=3803.2ms
+Capabilities: tools=on streaming=off answer_policy=graded
+
+you> What was BB revenue last quarter?
+  interpreting as BlackBerry Limited / BB
+
+BlackBerry revenue is 143,000,000.00 usd (2026-Q1) [Source: yfinance/BB].
+  [GROUNDED]
+  ticker=BB intent=fact_lookup facts=10 docs=0 model_available=True latency=3803.2ms retrieval=hybrid
+  used: query_facts
 
 you> /refresh            # run ALL ingestion jobs (scheduler all --force)
 you> /refresh NVDA       # refresh a single ticker via the API
 you> /refresh daily      # run a specific scheduler mode
 you> /health             # middleware + freshness summary
+you> /tools              # list model-callable tools
+you> /grounding strict   # force the strict answer policy for this session
+you> /eval 10            # run the eval harness (10 cases) against this server
 you> /ticker NVDA        # pin a ticker for following questions
 you> /help               # full command list
 you> /quit               # stops the middleware if this script started it
 ```
 
 It still requires `llama-server` on `:8087`; it warns and falls back to
-degraded answers if the model is unreachable.
+degraded answers if the model is unreachable. See
+[`scripts/CHAT.md`](scripts/CHAT.md) for every command and metadata tag the
+renderer can show.
 
 ---
 
