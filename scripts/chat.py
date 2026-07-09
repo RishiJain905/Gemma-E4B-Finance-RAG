@@ -17,9 +17,12 @@ enabled. The script warns if it is unreachable (answers degrade gracefully).
 """
 
 import argparse
+import itertools
+import json
 import os
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -49,11 +52,214 @@ def col(s: str, c: str) -> str:
     return f"{c}{s}{C.R}"
 
 
+class _ElapsedSpinner:
+    """Lightweight elapsed-time spinner for interactive non-streaming waits."""
+
+    def __init__(self, label: str = "waiting") -> None:
+        self.label = label
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def start(self) -> None:
+        if not sys.stdout.isatty():
+            return
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        if self._thread is None:
+            return
+        self._stop.set()
+        self._thread.join(timeout=1)
+        sys.stdout.write("\r" + (" " * 40) + "\r")
+        sys.stdout.flush()
+
+    def _run(self) -> None:
+        started = time.perf_counter()
+        for frame in itertools.cycle("|/-\\"):
+            if self._stop.is_set():
+                return
+            elapsed = time.perf_counter() - started
+            sys.stdout.write(f"\r  {frame} {self.label} {elapsed:0.1f}s")
+            sys.stdout.flush()
+            time.sleep(0.1)
+
+
+def _payload(question: str, ticker: str | None, refresh: bool) -> dict:
+    payload = {"question": question, "refresh": refresh}
+    if ticker:
+        payload["ticker"] = ticker
+    return payload
+
+
+def _iter_sse_events(lines) -> object:
+    event = "message"
+    data_parts: list[str] = []
+    for raw in lines:
+        line = raw.decode("utf-8") if isinstance(raw, bytes) else str(raw)
+        if not line:
+            if data_parts:
+                yield event, "\n".join(data_parts)
+            event = "message"
+            data_parts = []
+            continue
+        if line.startswith("event:"):
+            event = line.removeprefix("event:").strip()
+        elif line.startswith("data:"):
+            data_parts.append(line.removeprefix("data:").strip())
+    if data_parts:
+        yield event, "\n".join(data_parts)
+
+
+def _format_timings(timings: dict | None) -> str:
+    if not timings:
+        return ""
+    parts: list[str] = []
+    for key, value in timings.items():
+        if isinstance(value, dict):
+            for sub_key, sub_value in value.items():
+                parts.append(f"{key}.{sub_key}={sub_value}ms")
+        else:
+            parts.append(f"{key}={value}ms")
+    return "  timings: " + " ".join(parts)
+
+
+def _print_metadata(data: dict, *, verbose: bool) -> None:
+    meta = (
+        f"  ticker={data.get('detected_ticker')} "
+        f"intent={data.get('detected_intent')} "
+        f"grounding={data.get('grounding')} "
+        f"facts={data.get('facts_used')} docs={data.get('documents_used')} "
+        f"model_available={data.get('model_available')} "
+        f"latency={data.get('latency_ms')}ms "
+        f"retrieval={data.get('retrieval_strategy')}"
+    )
+    print(col(meta, C.DIM))
+    if verbose:
+        timings = _format_timings(data.get("timings"))
+        if timings:
+            print(col(timings, C.DIM))
+
+
+def _print_freshness(data: dict) -> None:
+    fresh = data.get("freshness") or {}
+    if fresh.get("warning"):
+        print(col(f"  warning: {fresh['warning']}", C.YE))
+    if fresh.get("refreshed_during_query"):
+        print(col(f"  refreshed: {', '.join(fresh['refreshed_during_query'])}", C.CY))
+
+
+class ChatSession:
+    """Persistent HTTP session for middleware chat operations."""
+
+    def __init__(
+        self,
+        base_url: str,
+        *,
+        timeout: float = 240,
+        stream_enabled: bool = True,
+    ) -> None:
+        limits = httpx.Limits(max_connections=10, max_keepalive_connections=5)
+        self.client = httpx.Client(base_url=base_url, timeout=timeout, limits=limits)
+        self.stream_enabled = stream_enabled
+        self.stream_unavailable = not stream_enabled
+        self.verbose = False
+
+    def close(self) -> None:
+        self.client.close()
+
+    def middleware_up(self) -> bool:
+        try:
+            return self.client.get("/health").status_code == 200
+        except Exception:
+            return False
+
+    def query(self, question: str, ticker: str | None, refresh: bool) -> None:
+        payload = _payload(question, ticker, refresh)
+        if self.stream_enabled and not self.stream_unavailable:
+            if self._query_stream(payload):
+                return
+            self.stream_unavailable = True
+        self._query_non_stream(payload)
+
+    def refresh(self, arg: str) -> None:
+        do_refresh(self.client, arg)
+
+    def health(self) -> None:
+        do_health(self.client)
+
+    def tools(self) -> None:
+        do_tools(self.client)
+
+    def _query_stream(self, payload: dict) -> bool:
+        metadata: dict | None = None
+        printed_token = False
+        try:
+            with self.client.stream("POST", "/query/stream", json=payload) as resp:
+                if resp.status_code != 200:
+                    return False
+                print()
+                for event, raw_data in _iter_sse_events(resp.iter_lines()):
+                    if event == "token":
+                        data = json.loads(raw_data)
+                        token = data.get("token") or ""
+                        if token:
+                            printed_token = True
+                            print(token, end="", flush=True)
+                    elif event == "metadata":
+                        metadata = json.loads(raw_data)
+                    elif event == "error":
+                        return printed_token
+        except Exception as e:
+            if printed_token:
+                print(col(f"\n  stream ended early: {e}", C.YE))
+                return True
+            return False
+
+        if printed_token:
+            print()
+        if metadata is not None:
+            _print_metadata(metadata, verbose=self.verbose)
+            _print_freshness(metadata)
+            print()
+            return True
+        return False
+
+    def _query_non_stream(self, payload: dict) -> None:
+        spinner = _ElapsedSpinner()
+        spinner.start()
+        try:
+            resp = self.client.post("/query", json=payload)
+        except Exception as e:
+            spinner.stop()
+            print(col(f"  request failed: {e}", C.RE))
+            return
+        finally:
+            spinner.stop()
+
+        if resp.status_code != 200:
+            print(col(f"  HTTP {resp.status_code}: {resp.text[:200]}", C.RE))
+            return
+
+        data = resp.json()
+        answer = (data.get("answer") or "").strip()
+        print()
+        if answer:
+            print(col(answer, C.B))
+        else:
+            print(col("(model returned an empty completion)", C.YE))
+
+        _print_metadata(data, verbose=self.verbose)
+        _print_freshness(data)
+        print()
+
+
 # ── Middleware lifecycle ───────────────────────────────
 
 def middleware_up(base: str) -> bool:
     try:
-        return httpx.get(f"{base}/health", timeout=3).status_code == 200
+        with httpx.Client(base_url=base, timeout=3) as client:
+            return client.get("/health").status_code == 200
     except Exception:
         return False
 
@@ -82,9 +288,9 @@ def start_middleware(port: int):
     return proc
 
 
-def check_model():
+def check_model(client: httpx.Client) -> None:
     try:
-        ok = httpx.get(MODEL_HEALTH_URL, timeout=3).status_code == 200
+        ok = client.get(MODEL_HEALTH_URL).status_code == 200
     except Exception:
         ok = False
     if ok:
@@ -97,12 +303,12 @@ def check_model():
 
 # ── Actions ────────────────────────────────────────────
 
-def do_query(base: str, question: str, ticker, refresh: bool):
+def do_query(client: httpx.Client, question: str, ticker: str | None, refresh: bool) -> None:
     payload = {"question": question, "refresh": refresh}
     if ticker:
         payload["ticker"] = ticker
     try:
-        resp = httpx.post(f"{base}/query", json=payload, timeout=240)
+        resp = client.post("/query", json=payload)
     except Exception as e:
         print(col(f"  request failed: {e}", C.RE))
         return
@@ -136,7 +342,7 @@ def do_query(base: str, question: str, ticker, refresh: bool):
     print()
 
 
-def do_refresh(base: str, arg: str):
+def do_refresh(client: httpx.Client, arg: str) -> None:
     """Bare/mode arg -> run the scheduler; a ticker -> hit /refresh/{ticker}."""
     arg = (arg or "").strip()
     mode = arg.lower() if arg else "all"
@@ -148,7 +354,7 @@ def do_refresh(base: str, arg: str):
     ticker = arg.upper()
     print(col(f"Refreshing {ticker} via API ...", C.DIM))
     try:
-        resp = httpx.post(f"{base}/refresh/{ticker}", json={}, timeout=600)
+        resp = client.post(f"/refresh/{ticker}", json={}, timeout=600)
         data = resp.json()
         print(col(f"  refreshed: {data.get('refreshed')}", C.GR))
         if data.get("errors"):
@@ -178,9 +384,9 @@ def run_scheduler(mode: str):
         print(col(f"  scheduler failed: {e}", C.RE))
 
 
-def do_health(base: str):
+def do_health(client: httpx.Client) -> None:
     try:
-        data = httpx.get(f"{base}/health", timeout=10).json()
+        data = client.get("/health").json()
     except Exception as e:
         print(col(f"  health request failed: {e}", C.RE))
         return
@@ -193,9 +399,9 @@ def do_health(base: str):
               f"docs={storage.get('chroma_doc_count')}", C.DIM))
 
 
-def do_tools(base: str):
+def do_tools(client: httpx.Client) -> None:
     try:
-        data = httpx.get(f"{base}/tools", timeout=10).json()
+        data = client.get("/tools").json()
     except Exception as e:
         print(col(f"  tools request failed: {e}", C.RE))
         return
@@ -220,6 +426,7 @@ HELP = f"""
   {C.CY}/ticker NVDA{C.R}             pin a ticker override for following questions
   {C.CY}/ticker clear{C.R}            clear the pinned ticker
   {C.CY}/autorefresh on|off{C.R}      toggle auto-refresh of stale data per query
+  {C.CY}/verbose on|off{C.R}          toggle server timings under answers
   {C.CY}/health{C.R}                  show middleware health summary
   {C.CY}/tools{C.R}                   show model-callable tools
   {C.CY}/help{C.R}                    show this help
@@ -234,26 +441,40 @@ def main():
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--no-start", action="store_true",
                         help="Do not auto-start the middleware")
+    parser.add_argument("--timeout", type=float, default=240,
+                        help="HTTP request timeout in seconds")
+    parser.add_argument("--no-stream", action="store_true",
+                        help="Disable streaming and use POST /query")
     args = parser.parse_args()
 
     base = f"http://127.0.0.1:{args.port}"
     started_proc = None
+    session = ChatSession(
+        base,
+        timeout=args.timeout,
+        stream_enabled=not args.no_stream,
+    )
+    model_health_client = httpx.Client(timeout=3)
 
     print(col("\n=== Gemma-E4B-Finance-RAG chat ===", C.B))
-    check_model()
+    check_model(model_health_client)
 
-    if middleware_up(base):
+    if session.middleware_up():
         print(col(f"Middleware already running on :{args.port}.", C.GR))
     elif args.no_start:
         print(col(f"Middleware not running on :{args.port} and --no-start set. "
                   f"Start it first.", C.RE))
+        session.close()
+        model_health_client.close()
         return
     else:
         started_proc = start_middleware(args.port)
-        if not middleware_up(base):
+        if not session.middleware_up():
             print(col("Could not reach the middleware; exiting.", C.RE))
             if started_proc:
                 started_proc.terminate()
+            session.close()
+            model_health_client.close()
             return
 
     ticker = None
@@ -280,11 +501,11 @@ def main():
                 elif cmd == "help":
                     print(HELP)
                 elif cmd == "health":
-                    do_health(base)
+                    session.health()
                 elif cmd == "tools":
-                    do_tools(base)
+                    session.tools()
                 elif cmd == "refresh":
-                    do_refresh(base, rest)
+                    session.refresh(rest)
                 elif cmd == "ticker":
                     if rest.lower() in ("", "clear", "none"):
                         ticker = None
@@ -295,11 +516,14 @@ def main():
                 elif cmd == "autorefresh":
                     autorefresh = rest.lower() in ("on", "true", "1", "yes")
                     print(col(f"  autorefresh = {autorefresh}", C.DIM))
+                elif cmd == "verbose":
+                    session.verbose = rest.lower() in ("on", "true", "1", "yes")
+                    print(col(f"  verbose = {session.verbose}", C.DIM))
                 else:
                     print(col(f"  unknown command: /{cmd} (try /help)", C.YE))
                 continue
 
-            do_query(base, line, ticker, autorefresh)
+            session.query(line, ticker, autorefresh)
     except KeyboardInterrupt:
         print()
     finally:
@@ -310,6 +534,8 @@ def main():
                 started_proc.wait(timeout=10)
             except Exception:
                 started_proc.kill()
+        session.close()
+        model_health_client.close()
         print(col("Bye.", C.B))
 
 

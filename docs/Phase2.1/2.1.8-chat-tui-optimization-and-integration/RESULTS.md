@@ -45,7 +45,29 @@ Gate: `VERIFY: PASS` (772 passed; includes `tests/test_latency_optimizations.py`
 
 ## 2.1.8.2 — Chat client performance & streaming
 
-_Pending._
+- `scripts/chat.py` now uses one persistent `httpx.Client` (`ChatSession`) for
+  `/query`, `/refresh`, `/health`, `/tools`; `--timeout` / `--no-stream` flags
+  and a `/verbose` toggle (prints the server `timings` block).
+- New `/query/stream` SSE endpoint (behind `enable_streaming`, default on):
+  shares `_build_query_context` with `/query` (refactored so the two paths
+  cannot drift), streams llama-server token deltas as `token` events, then one
+  terminal `metadata` event (grounding, citations, timings, counts, strategy).
+  Server-side it falls back to the non-streaming answer if the stream errors
+  mid-flight; it returns 404 when streaming is disabled, the model is down, or
+  **tools are enabled** (the 2.1.4 tool loop is multi-turn and cannot stream) —
+  the client detects 404 once and uses the non-streaming path with an
+  elapsed-time spinner (TTY-only).
+- Note: this deployment's `configs/middleware.yaml` has `enable_tools: true`,
+  so streaming only activates with tools off (e.g. `ENABLE_TOOLS=false`).
+  2.1.8.3 surfaces active capabilities at TUI startup so this is visible.
+
+Live smoke test (tools off, model on :8087): HTTP 200, 163 token events, then
+metadata (`grounding=grounded`, 4 citations, full timings). First token at
+35.5s of a 43.5s generation — first-token latency is dominated by llama-server
+prompt prefill (model-side), but tokens render ~8s before the full answer and
+the TUI no longer looks hung.
+
+Gate: `VERIFY: PASS` (777 passed; includes `tests/test_chat_client.py`).
 
 ## 2.1.8.3 — TUI integration
 

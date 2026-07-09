@@ -12,6 +12,7 @@ enable_citations: true
 answer_policy: "graded"          # "graded" | "strict"
 allow_general_fallback: true
 return_timings: true
+enable_streaming: true
 embedding_cache_size: 256
 
 # Phase 2.1.4 — structured analytical tooling.

@@ -21,6 +21,7 @@ from typing import Optional
 
 import httpx
 from fastapi import FastAPI, HTTPException
+from fastapi.responses import StreamingResponse
 
 from src.storage.store import Store
 from .config import MiddlewareConfig
@@ -471,41 +472,37 @@ async def _maybe_fetch_on_miss(ticker: str) -> dict:
         return {"fetched": False, "ticker": ticker, "sources": [], "error": str(e)}
 
 
-@app.post("/query", response_model=QueryResponse)
-async def query(request: QueryRequest):
-    """
-    Ask a financial question.
+def _stage_timing(timings: dict[str, object], name: str, stage_start: float) -> float:
+    """Record and return a stage duration in milliseconds."""
+    elapsed = round((time.perf_counter() - stage_start) * 1000, 1)
+    timings[name] = elapsed
+    return elapsed
 
-    Full pipeline:
-      1. Parse intent (ticker, metrics, question type)
-      2. Dual retrieval (SQLite facts + ChromaDB documents)
-      3. Build augmented prompt
-      4. Call TraceAlchemy model
-      5. Return grounded answer with citations
-    """
-    start = time.time()
-    timings: dict[str, object] = {}
 
-    def _stage(name: str, stage_start: float) -> float:
-        elapsed = round((time.perf_counter() - stage_start) * 1000, 1)
-        timings[name] = elapsed
-        return elapsed
+def _return_timings_enabled() -> bool:
+    """Return whether response timing metadata should be included."""
+    return_timings = getattr(config, "return_timings", True)
+    return return_timings if isinstance(return_timings, bool) else True
 
+
+async def _build_query_context(request: QueryRequest) -> dict:
+    """Run the shared query pipeline up to the augmented prompt."""
     if not store:
         raise HTTPException(status_code=503, detail="Store not initialized")
 
-    # Step 1: Intent parsing (delegated to 1.5.2)
+    start = time.time()
+    timings: dict[str, object] = {}
+
     stage_start = time.perf_counter()
     from .intent_parser import IntentParser
+
     parser = IntentParser()
     intent = parser.parse(request.question, override_ticker=request.ticker)
-    _stage("intent_parse", stage_start)
+    _stage_timing(timings, "intent_parse", stage_start)
 
-    # Step 1b: Staleness-aware freshness check (Phase 1.7.4)
     stage_start = time.perf_counter()
     freshness_meta = _evaluate_and_refresh(intent.get("ticker"), request.refresh)
     ticker = intent.get("ticker")
-    # fetch_on_miss_per_query is the cap to enforce if another call site appears.
     if (
         getattr(config, "enable_fetch_on_miss", True)
         and ticker
@@ -521,12 +518,11 @@ async def query(request: QueryRequest):
             if res.get("error"):
                 warning = f"{warning} Reason: {res['error']}"
             freshness_meta["warning"] = warning
-    _stage("freshness_check", stage_start)
+    _stage_timing(timings, "freshness_check", stage_start)
 
-    # Step 2: Dual retrieval (delegated to 1.5.3). Uses the shared retriever
-    # built on startup so the BM25 index is reused (Phase 2.1.2).
     stage_start = time.perf_counter()
     from .retriever import Retriever
+
     r = retriever or Retriever(store=store, config=config)
     retrieval = r.retrieve(
         query=request.question,
@@ -534,7 +530,7 @@ async def query(request: QueryRequest):
         top_k_documents=config.top_k_documents,
         top_k_facts=config.top_k_facts,
     )
-    retrieval_ms = _stage("retrieval", stage_start)
+    retrieval_ms = _stage_timing(timings, "retrieval", stage_start)
     retrieval_timings = retrieval.get("timings", {}) if isinstance(retrieval, dict) else {}
     timings["retrieval"] = {
         "total": retrieval_ms,
@@ -544,9 +540,9 @@ async def query(request: QueryRequest):
     }
     grounding_level = _grounding_level(retrieval)
 
-    # Step 3: Prompt augmentation (delegated to 1.5.4)
     stage_start = time.perf_counter()
     from .prompt_augmenter import PromptAugmenter
+
     augmenter = PromptAugmenter(config=config)
     augmented_prompt = augmenter.build_prompt(
         question=request.question,
@@ -554,36 +550,38 @@ async def query(request: QueryRequest):
         retrieval=retrieval,
         grounding_level=grounding_level,
     )
-    _stage("prompt_build", stage_start)
+    _stage_timing(timings, "prompt_build", stage_start)
 
-    # Step 4: Call the model — or degrade gracefully when it is unavailable.
-    stage_start = time.perf_counter()
-    model_available = await _check_model_health()
-    if model_available:
-        task = _task_params("analysis") if intent.get("question_type") == "projection" else {}
-        answer_text, citations = await _invoke_model(
-            prompt=augmented_prompt,
-            temperature=request.temperature or task.get("temperature") or config.default_temperature,
-            max_tokens=request.max_tokens or task.get("max_tokens") or config.max_tokens,
-            intent=intent,
-            grounding_level=grounding_level,
-        )
-        if not answer_text.startswith("Error calling model:"):
-            _mark_model_health(True)
-        if intent.get("question_type") == "projection":
-            from .guardrails import apply_projection_guardrail
+    return {
+        "start": start,
+        "timings": timings,
+        "intent": intent,
+        "freshness": freshness_meta,
+        "retrieval": retrieval,
+        "grounding_level": grounding_level,
+        "augmented_prompt": augmented_prompt,
+    }
 
-            answer_text, _flagged = apply_projection_guardrail(answer_text, augmented_prompt)
-    else:
-        logger.warning("Model unavailable — returning degraded answer")
-        answer_text = _format_degraded_answer(retrieval, intent)
-        citations = []
-    _stage("model_call", stage_start)
 
-    elapsed_ms = round((time.time() - start) * 1000, 1)
-    return_timings = getattr(config, "return_timings", True)
-    if not isinstance(return_timings, bool):
-        return_timings = True
+def _task_settings(request: QueryRequest, intent: dict) -> tuple[float, int]:
+    """Return temperature and max_tokens for this request."""
+    task = _task_params("analysis") if intent.get("question_type") == "projection" else {}
+    temperature = request.temperature or task.get("temperature") or config.default_temperature
+    max_tokens = request.max_tokens or task.get("max_tokens") or config.max_tokens
+    return temperature, max_tokens
+
+
+def _build_query_response(
+    *,
+    context: dict,
+    answer_text: str,
+    citations: list[SourceCitation],
+    model_available: bool,
+) -> QueryResponse:
+    """Build a QueryResponse from shared query context and model output."""
+    intent = context["intent"]
+    retrieval = context["retrieval"]
+    elapsed_ms = round((time.time() - context["start"]) * 1000, 1)
 
     return QueryResponse(
         answer=answer_text,
@@ -592,13 +590,204 @@ async def query(request: QueryRequest):
         detected_intent=intent.get("question_type"),
         facts_used=len(retrieval.get("facts", [])),
         documents_used=len(retrieval.get("documents", [])),
-        grounding=_response_grounding(answer_text, grounding_level),
+        grounding=_response_grounding(answer_text, context["grounding_level"]),
         latency_ms=elapsed_ms,
-        timings=timings if return_timings else None,
+        timings=context["timings"] if _return_timings_enabled() else None,
         model_available=model_available,
-        freshness=freshness_meta,
+        freshness=context["freshness"],
         retrieval_strategy=retrieval.get("retrieval_strategy"),
     )
+
+
+async def _answer_query_context(request: QueryRequest, context: dict) -> QueryResponse:
+    """Complete a prepared query context through the non-streaming model path."""
+    intent = context["intent"]
+    retrieval = context["retrieval"]
+    grounding_level = context["grounding_level"]
+    stage_start = time.perf_counter()
+    model_available = await _check_model_health()
+    if model_available:
+        temperature, max_tokens = _task_settings(request, intent)
+        answer_text, citations = await _invoke_model(
+            prompt=context["augmented_prompt"],
+            temperature=temperature,
+            max_tokens=max_tokens,
+            intent=intent,
+            grounding_level=grounding_level,
+        )
+        if not answer_text.startswith("Error calling model:"):
+            _mark_model_health(True)
+        if intent.get("question_type") == "projection":
+            from .guardrails import apply_projection_guardrail
+
+            answer_text, _flagged = apply_projection_guardrail(
+                answer_text,
+                context["augmented_prompt"],
+            )
+    else:
+        logger.warning("Model unavailable - returning degraded answer")
+        answer_text = _format_degraded_answer(retrieval, intent)
+        citations = []
+    _stage_timing(context["timings"], "model_call", stage_start)
+
+    return _build_query_response(
+        context=context,
+        answer_text=answer_text,
+        citations=citations,
+        model_available=model_available,
+    )
+
+
+@app.post("/query", response_model=QueryResponse)
+async def query(request: QueryRequest):
+    """
+    Ask a financial question.
+
+    Full pipeline:
+      1. Parse intent (ticker, metrics, question type)
+      2. Dual retrieval (SQLite facts + ChromaDB documents)
+      3. Build augmented prompt
+      4. Call TraceAlchemy model
+      5. Return grounded answer with citations
+
+    Shares `_build_query_context` / `_answer_query_context` with
+    `/query/stream` so the two paths cannot drift.
+    """
+    context = await _build_query_context(request)
+    return await _answer_query_context(request, context)
+
+
+def _response_to_dict(response: QueryResponse) -> dict:
+    """Return a pydantic model as a JSON-serializable dict."""
+    if hasattr(response, "model_dump"):
+        return response.model_dump()
+    return response.dict()
+
+
+def _sse(event: str, data: dict) -> str:
+    """Format one server-sent event."""
+    return f"event: {event}\ndata: {json.dumps(data, default=str)}\n\n"
+
+
+async def _stream_model_tokens(
+    *,
+    prompt: str,
+    temperature: float,
+    max_tokens: int,
+    intent: dict,
+    grounding_level: str,
+):
+    """Yield token deltas from llama-server's OpenAI-compatible stream."""
+    if not model_client or not config:
+        raise RuntimeError("model client unavailable")
+
+    payload = {
+        "model": config.model_name,
+        "messages": [
+            {
+                "role": "system",
+                "content": _system_prompt_for_request(
+                    intent=intent,
+                    grounding_level=grounding_level,
+                    tools_enabled=False,
+                ),
+            },
+            {"role": "user", "content": prompt},
+        ],
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+        "stream": True,
+    }
+
+    async with model_client.stream("POST", config.llama_endpoint, json=payload) as resp:
+        if hasattr(resp, "raise_for_status"):
+            resp.raise_for_status()
+        async for line in resp.aiter_lines():
+            line = (line or "").strip()
+            if not line:
+                continue
+            if line.startswith("data:"):
+                line = line.removeprefix("data:").strip()
+            if line == "[DONE]":
+                break
+            try:
+                data = json.loads(line)
+            except json.JSONDecodeError:
+                logger.debug("Ignoring malformed model stream line: %s", line[:120])
+                continue
+            choice = (data.get("choices") or [{}])[0]
+            delta = choice.get("delta") or {}
+            token = delta.get("content")
+            if token is None:
+                token = (choice.get("message") or {}).get("content")
+            if token:
+                yield token
+    _mark_model_health(True)
+
+
+@app.post("/query/stream")
+async def query_stream(request: QueryRequest):
+    """Stream token deltas as SSE, followed by terminal query metadata."""
+    if not bool(getattr(config, "enable_streaming", True)):
+        raise HTTPException(status_code=404, detail="Streaming disabled")
+    if bool(getattr(config, "enable_tools", False)):
+        raise HTTPException(status_code=404, detail="Streaming disabled while tools are enabled")
+
+    context = await _build_query_context(request)
+    model_available = await _check_model_health()
+    if not model_available:
+        raise HTTPException(status_code=404, detail="Streaming unavailable when model is unavailable")
+
+    async def events():
+        stage_start = time.perf_counter()
+        answer_parts: list[str] = []
+        citations: list[SourceCitation] = []
+        try:
+            temperature, max_tokens = _task_settings(request, context["intent"])
+            async for token in _stream_model_tokens(
+                prompt=context["augmented_prompt"],
+                temperature=temperature,
+                max_tokens=max_tokens,
+                intent=context["intent"],
+                grounding_level=context["grounding_level"],
+            ):
+                answer_parts.append(token)
+                yield _sse("token", {"token": token})
+
+            answer_text = _apply_answer_policy(
+                "".join(answer_parts),
+                context["grounding_level"],
+            )
+            citations = _extract_citations(answer_text)
+            if context["intent"].get("question_type") == "projection":
+                from .guardrails import apply_projection_guardrail
+
+                answer_text, _flagged = apply_projection_guardrail(
+                    answer_text,
+                    context["augmented_prompt"],
+                )
+        except Exception as exc:  # noqa: BLE001 - streaming must never fail a query
+            logger.warning("Streaming model call failed; falling back server-side: %s", exc)
+            fallback = await _answer_query_context(request, context)
+            if fallback.answer:
+                yield _sse("token", {"token": fallback.answer})
+            metadata = _response_to_dict(fallback)
+            metadata.pop("answer", None)
+            yield _sse("metadata", metadata)
+            return
+
+        _stage_timing(context["timings"], "model_call", stage_start)
+        response = _build_query_response(
+            context=context,
+            answer_text=answer_text,
+            citations=citations,
+            model_available=True,
+        )
+        metadata = _response_to_dict(response)
+        metadata.pop("answer", None)
+        yield _sse("metadata", metadata)
+
+    return StreamingResponse(events(), media_type="text/event-stream")
 
 
 def _format_degraded_answer(retrieval: dict, intent: dict) -> str:

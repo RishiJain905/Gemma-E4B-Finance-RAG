@@ -28,6 +28,7 @@ class MiddlewareConfig:
         self.answer_policy: str = "graded"
         self.allow_general_fallback: bool = True
         self.return_timings: bool = True
+        self.enable_streaming: bool = True
         self.embedding_cache_size: int = 256
 
         # Phase 2.1.4 — analytical tool-calling controls.
@@ -110,4 +111,5 @@ class MiddlewareConfig:
         _str("ANSWER_POLICY", "answer_policy")
         _bool("ALLOW_GENERAL_FALLBACK", "allow_general_fallback")
         _bool("RETURN_TIMINGS", "return_timings")
+        _bool("ENABLE_STREAMING", "enable_streaming")
         _int("EMBEDDING_CACHE_SIZE", "embedding_cache_size")
