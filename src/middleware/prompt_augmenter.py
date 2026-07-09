@@ -62,8 +62,13 @@ class PromptAugmenter:
 
     # ── Public API ─────────────────────────────────────
 
-    def build_prompt(self, question: str, intent: dict,
-                     retrieval: dict) -> str:
+    def build_prompt(
+        self,
+        question: str,
+        intent: dict,
+        retrieval: dict,
+        grounding_level: Optional[str] = None,
+    ) -> str:
         """
         Build the full augmented prompt.
 
@@ -79,6 +84,9 @@ class PromptAugmenter:
         ticker = intent.get("ticker")
         facts = retrieval.get("facts", [])
         documents = retrieval.get("documents", [])
+        if grounding_level is None:
+            n = len(facts) + len(documents)
+            grounding_level = "grounded" if n >= 3 else "partial" if n >= 1 else "none"
         estimate_facts = facts if question_type == "projection" else []
         realized_facts = facts
         if question_type == "projection":
@@ -87,7 +95,7 @@ class PromptAugmenter:
         sections = []
 
         # 1. System instruction
-        sections.append(self._build_system_instruction(question_type))
+        sections.append(self._build_system_instruction(question_type, grounding_level))
 
         # 2. Projection context (if any)
         projection_section = self._format_projection_section(estimate_facts)
@@ -124,7 +132,7 @@ class PromptAugmenter:
 
     # ── System Instruction ─────────────────────────────
 
-    def _build_system_instruction(self, question_type: str) -> str:
+    def _build_system_instruction(self, question_type: str, grounding_level: str) -> str:
         """Build the system-level instruction for the model."""
         base = (
             "You are a financial research assistant powered by the TraceAlchemy model. "
@@ -140,6 +148,31 @@ class PromptAugmenter:
             "If a metric is not found in the context, state that it's unavailable.",
             "Be concise but thorough. Prioritize accuracy over verbosity.",
         ]
+
+        if getattr(self.config, "answer_policy", "graded") != "strict":
+            general_rule = (
+                "If no relevant data was retrieved, you may use general knowledge "
+                "only when clearly prefixed with 'Not from your data - general "
+                "knowledge:' and paired with a primary-source verification caveat."
+            )
+            if not getattr(self.config, "allow_general_fallback", True):
+                general_rule = (
+                    "If no relevant data was retrieved, do not use general knowledge; "
+                    "say the knowledge base does not have enough data."
+                )
+            rules = [
+                f"Intent: {question_type}. Grounding level: {grounding_level}.",
+                "Answer using ONLY the provided context when grounding level is grounded.",
+                "When grounding level is partial, answer supported parts, state what is "
+                "missing, and do not fill the gaps with outside knowledge.",
+                "The 'Not from your data - general knowledge:' prefix is reserved for "
+                "answers with no retrieved data.",
+                general_rule,
+                "Refuse only for genuinely unknowable or unsafe asks.",
+                "Never invent specific numbers. Specific figures must come from context or tools.",
+                "Cite sources inline using [Source: type/ticker] notation for retrieved facts.",
+                "Be concise but thorough. Prioritize accuracy over verbosity.",
+            ]
 
         type_specific = {
             "fact_lookup": (
@@ -390,6 +423,18 @@ class PromptAugmenter:
 
     def _build_output_format(self, question_type: str) -> str:
         """Build the output format instruction."""
+        if getattr(self.config, "answer_policy", "graded") != "strict":
+            return (
+                "## Output Format\n\n"
+                "Provide your answer in plain text. Use inline citations like "
+                "[Source: sec_10k/NVDA] or [Source: yfinance/NVDA] for each "
+                "retrieved fact you reference. If you use multiple sources, cite "
+                "each one.\n\n"
+                "For general fallback answers, start with: "
+                '"Not from your data - general knowledge:" and include a '
+                "primary-source verification caveat. If you refuse, briefly say "
+                "why the request cannot be answered."
+            )
         return (
             "## Output Format\n\n"
             "Provide your answer in plain text. Use inline citations like "

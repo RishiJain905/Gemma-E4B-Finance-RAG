@@ -40,7 +40,7 @@ When Using Plan mode:
 
 ### Loops: which primitive to trigger
 
-A loop = repeated work cycles until a stop condition (full guide + starter prompts: `how-to-loop.md`). The deterministic stop condition for all code loops in this repo is the verify gate — `scripts\verify.ps1` / `scripts/verify.sh`, final line `VERIFY: PASS|FAIL` — governed by the project skill `verify-rag-change`. Use that skill before claiming any code change done, in or out of a loop.
+A loop = repeated work cycles until a stop condition. The deterministic stop condition for all code loops in this repo is the verify gate — `scripts\verify.ps1` / `scripts/verify.sh`, final line `VERIFY: PASS|FAIL` — governed by the project skill `verify-rag-change`. Use that skill before claiming any code change done, in or out of a loop.
 
 Route by task size; never a bigger loop than the task needs:
 

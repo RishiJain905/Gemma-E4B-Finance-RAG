@@ -238,7 +238,9 @@ def _format_context(retrieval: dict, intent: dict, max_facts: int = 8,
         parts.append("\nDocuments:")
         for d in docs[:max_docs]:
             meta = d.get("metadata", {}) or {}
-            text = (d.get("text") or d.get("content") or "").strip()
+            # Retriever documents carry the body under "document" (Chroma
+            # naming); "text"/"content" cover older/injected shapes.
+            text = (d.get("text") or d.get("content") or d.get("document") or "").strip()
             text = text[:doc_chars] + ("…" if len(text) > doc_chars else "")
             parts.append(f"- [{meta.get('source', d.get('source', '?'))}/"
                          f"{meta.get('ticker', '?')}] {text}")

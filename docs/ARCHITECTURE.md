@@ -172,6 +172,39 @@ original wider behavior.
 
 ---
 
+## Answer Policy
+
+The middleware uses a graded grounding policy for `/query` answers. Retrieval
+counts determine the grounding hint passed to the model: three or more combined
+facts/documents is `grounded`, one or two is `partial`, and zero is `none`.
+
+The model prompt then selects one of four response modes:
+
+| Mode | When used | Required behavior |
+|------|-----------|-------------------|
+| `grounded` | Sufficient retrieved facts/documents are present | Answer from the retrieved data and cite sourced claims with `[Source: ...]`. |
+| `partial` | Some relevant data is present | Answer only what the retrieved data supports and explicitly state what is missing. |
+| `general` | No relevant data is present and `allow_general_fallback=true` | Use stable background knowledge only when clearly prefixed with `Not from your data - general knowledge:` and include a caveat to verify against a primary source. |
+| `refused` | The ask is genuinely unknowable/unsafe, or no data is present while general fallback is disabled | Decline briefly instead of guessing. |
+
+Hard rule across every mode: never invent specific numbers such as prices,
+P/E ratios, targets, revenue, margins, growth rates, dates, or counts. Specific
+figures must come from retrieved context or model-callable tools.
+
+The policy is configurable in `configs/middleware.yaml` and environment
+overrides:
+
+- `answer_policy: graded|strict` controls whether the graded prompt is used.
+  `strict` preserves the previous context-only system prompt for rollback and
+  regression comparison.
+- `allow_general_fallback: bool` lets deployments disable general-knowledge
+  fallback while still allowing partial grounded answers.
+
+The `/query` response reports the actual answer path as `grounding`:
+`grounded`, `partial`, `general`, or `refused`.
+
+---
+
 ## Data Sources
 
 | Source | Module | Storage target | Scheduler cadence | TTL (hours) |

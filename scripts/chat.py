@@ -122,6 +122,7 @@ def do_query(base: str, question: str, ticker, refresh: bool):
 
     meta = (f"  ticker={data.get('detected_ticker')} "
             f"intent={data.get('detected_intent')} "
+            f"grounding={data.get('grounding')} "
             f"facts={data.get('facts_used')} docs={data.get('documents_used')} "
             f"model_available={data.get('model_available')} "
             f"latency={data.get('latency_ms')}ms")

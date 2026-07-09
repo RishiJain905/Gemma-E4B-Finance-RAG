@@ -228,8 +228,13 @@ def default_judge(prompt: str, *, endpoint: str = DEFAULT_MODEL_ENDPOINT,
 
 
 def _judge_scores(rows: list[dict], *, build_prompt: Callable, judge: Optional[Callable],
-                  endpoint: str, timeout: float, need_context: bool) -> dict:
-    """Shared driver for faithfulness / answer_relevance judging."""
+                  endpoint: str, timeout: float, need_context: bool,
+                  skip_fn: Optional[Callable] = None) -> dict:
+    """Shared driver for faithfulness / answer_relevance judging.
+
+    ``skip_fn(row) -> Optional[str]`` lets a metric exclude rows it cannot
+    meaningfully judge (returns the skip reason); skipped rows get a None score.
+    """
     j = judge or (lambda p: default_judge(p, endpoint=endpoint, timeout=timeout))
     scores: list[float] = []
     per_case: list[dict] = []
@@ -241,6 +246,10 @@ def _judge_scores(rows: list[dict], *, build_prompt: Callable, judge: Optional[C
         cid = r.get("id")
         if not ans.strip():
             per_case.append({"id": cid, "score": None, "reason": "empty answer"})
+            continue
+        skip_reason = skip_fn(r) if skip_fn else None
+        if skip_reason:
+            per_case.append({"id": cid, "score": None, "reason": skip_reason})
             continue
         ctx = r.get("context") or ""
         # NOTE: empty context is NOT skipped — the faithfulness rubric handles it
@@ -266,6 +275,20 @@ def _judge_scores(rows: list[dict], *, build_prompt: Callable, judge: Optional[C
     }
 
 
+# Answers carrying the graded-policy general-knowledge label (2.1.7.1) claim
+# no grounding in retrieved context, so groundedness cannot be judged against
+# it; honesty is enforced by the label + never-fabricate-numbers rule instead.
+GENERAL_FALLBACK_MARKER = "not from your data"
+
+
+def _skip_labeled_general(row: dict) -> Optional[str]:
+    """Skip reason for answers explicitly labeled as general-knowledge fallback."""
+    ans = (row.get("answer") or "").strip().lower()
+    if ans.startswith(GENERAL_FALLBACK_MARKER):
+        return "labeled general-knowledge fallback (no groundedness claim)"
+    return None
+
+
 def faithfulness(rows: list[dict], *, judge: Optional[Callable] = None,
                  endpoint: str = DEFAULT_MODEL_ENDPOINT,
                  timeout: float = 120.0) -> dict:
@@ -273,6 +296,7 @@ def faithfulness(rows: list[dict], *, judge: Optional[Callable] = None,
     return _judge_scores(
         rows, build_prompt=judge_prompts.faithfulness_prompt, judge=judge,
         endpoint=endpoint, timeout=timeout, need_context=True,
+        skip_fn=_skip_labeled_general,
     )
 
 

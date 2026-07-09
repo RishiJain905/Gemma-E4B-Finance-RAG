@@ -25,6 +25,8 @@ class MiddlewareConfig:
         self.top_k_documents: int = 5
         self.top_k_facts: int = 10
         self.enable_citations: bool = True
+        self.answer_policy: str = "graded"
+        self.allow_general_fallback: bool = True
 
         # Phase 2.1.4 — analytical tool-calling controls.
         self.enable_tools: bool = False
@@ -103,3 +105,5 @@ class MiddlewareConfig:
         _bool("ENABLE_FETCH_ON_MISS", "enable_fetch_on_miss")
         _float("FETCH_ON_MISS_TIMEOUT_S", "fetch_on_miss_timeout_s")
         _int("FETCH_ON_MISS_PER_QUERY", "fetch_on_miss_per_query")
+        _str("ANSWER_POLICY", "answer_policy")
+        _bool("ALLOW_GENERAL_FALLBACK", "allow_general_fallback")
