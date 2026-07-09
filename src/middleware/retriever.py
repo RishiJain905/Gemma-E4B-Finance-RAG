@@ -18,6 +18,7 @@ Usage:
 """
 
 import logging
+import time
 from typing import Optional
 
 from src.storage.store import Store
@@ -103,6 +104,7 @@ class Retriever:
         # Tracks the document-retrieval path actually used for a retrieve() call
         # ("vector" | "hybrid" | "hybrid+rerank") — surfaced in the /query response.
         self._doc_retrieval_strategy = "vector"
+        self._timings = {"embedding": 0.0, "chroma": 0.0, "sqlite": 0.0}
 
     @property
     def lexical(self) -> LexicalIndex:
@@ -165,6 +167,7 @@ class Retriever:
             }
         """
         self._doc_retrieval_strategy = "vector"  # reset; upgraded by hybrid path
+        self._timings = {"embedding": 0.0, "chroma": 0.0, "sqlite": 0.0}
         ticker = intent.get("ticker")
         metrics = intent.get("metrics", [])
         question_type = intent.get("question_type", "general")
@@ -184,29 +187,37 @@ class Retriever:
         documents = []
 
         if strategy == "facts_only":
-            facts = self._retrieve_facts(ticker, metrics, timeframe, top_k_facts)
+            facts = self._time_sqlite(
+                self._retrieve_facts, ticker, metrics, timeframe, top_k_facts,
+            )
 
         elif strategy == "documents_only":
             documents = self._retrieve_documents(query, ticker, top_k_documents)
 
         elif strategy == "macro":
-            facts = self._retrieve_macro_facts(top_k_facts)
+            facts = self._time_sqlite(self._retrieve_macro_facts, top_k_facts)
             documents = self._retrieve_documents(query, ticker=None, n_results=top_k_documents)
 
         elif strategy == "macro_hybrid":
-            facts = self._retrieve_facts(ticker, metrics, timeframe, top_k_facts)
-            facts.extend(self._retrieve_macro_facts(top_k_facts))
+            facts = self._time_sqlite(
+                self._retrieve_facts, ticker, metrics, timeframe, top_k_facts,
+            )
+            facts.extend(self._time_sqlite(self._retrieve_macro_facts, top_k_facts))
             documents = self._retrieve_documents(query, ticker, top_k_documents)
 
         elif strategy == "hybrid":
-            facts = self._retrieve_facts(ticker, metrics, timeframe, top_k_facts)
+            facts = self._time_sqlite(
+                self._retrieve_facts, ticker, metrics, timeframe, top_k_facts,
+            )
             documents = self._retrieve_documents(query, ticker, top_k_documents)
 
         elif strategy == "comparison":
             # Multi-ticker: extract all tickers from query
             tickers = self._extract_all_tickers(query)
             for t in tickers:
-                t_facts = self._retrieve_facts(t, metrics, timeframe, top_k_facts // len(tickers))
+                t_facts = self._time_sqlite(
+                    self._retrieve_facts, t, metrics, timeframe, top_k_facts // len(tickers),
+                )
                 facts.extend(t_facts)
                 t_docs = self._retrieve_documents(query, t, top_k_documents // len(tickers))
                 documents.extend(t_docs)
@@ -214,10 +225,10 @@ class Retriever:
         elif strategy == "broad":
             # No ticker detected — search everything
             documents = self._retrieve_documents(query, ticker=None, n_results=top_k_documents)
-            facts = self._retrieve_all_facts(top_k_facts)
+            facts = self._time_sqlite(self._retrieve_all_facts, top_k_facts)
 
         if question_type == "projection" and ticker:
-            facts = self._merge_projection_facts(ticker, facts)
+            facts = self._time_sqlite(self._merge_projection_facts, ticker, facts)
 
         logger.info(
             "Retrieval strategy=%s ticker=%s: %d facts, %d documents",
@@ -230,7 +241,30 @@ class Retriever:
             "ticker": ticker,
             "strategy": strategy,
             "retrieval_strategy": self._doc_retrieval_strategy,
+            "timings": {k: round(v, 1) for k, v in self._timings.items()},
         }
+
+    def _time_sqlite(self, func, *args, **kwargs):
+        """Run a SQLite-backed retrieval function and accumulate elapsed time."""
+        start = time.perf_counter()
+        try:
+            return func(*args, **kwargs)
+        finally:
+            self._timings["sqlite"] += (time.perf_counter() - start) * 1000
+
+    def _search_chroma(self, *args, **kwargs) -> list[dict]:
+        """Run Chroma search and accumulate embedding/vector-store timings."""
+        start = time.perf_counter()
+        results = self.store.chroma.search(*args, **kwargs)
+        elapsed_ms = (time.perf_counter() - start) * 1000
+        search_timings = getattr(self.store.chroma, "last_search_timings", {}) or {}
+        embedding_ms = float(search_timings.get("embedding", 0.0) or 0.0)
+        chroma_ms = float(search_timings.get("chroma", 0.0) or 0.0)
+        if embedding_ms == 0.0 and chroma_ms == 0.0:
+            chroma_ms = elapsed_ms
+        self._timings["embedding"] += embedding_ms
+        self._timings["chroma"] += chroma_ms
+        return results
 
     # ── Strategy Selection ────────────────────────────
 
@@ -394,8 +428,14 @@ class Retriever:
         ``n_results``.
         """
         if not self.config.enable_lexical:
+            start = time.perf_counter()
             results = self.store.search(query=query, n_results=n_results,
                                         ticker=ticker)
+            elapsed_ms = (time.perf_counter() - start) * 1000
+            chroma = getattr(self.store, "chroma", None)
+            search_timings = getattr(chroma, "last_search_timings", {}) or {}
+            self._timings["embedding"] += float(search_timings.get("embedding", 0.0) or 0.0)
+            self._timings["chroma"] += float(search_timings.get("chroma", elapsed_ms) or 0.0)
             return results.get("documents", [])
         return self._retrieve_documents_hybrid(query, ticker, n_results)
 
@@ -409,13 +449,13 @@ class Retriever:
         # 1. Vector channel (ranked by cosine). Mirror store.search: ticker-
         #    filtered first, then a broad (unfiltered) pass appended (deduped)
         #    so false-positive tickers (e.g. "P", "GDP") still surface docs.
-        vector_hits = self.store.chroma.search(
+        vector_hits = self._search_chroma(
             query=query, n_results=candidates, filter_dict=vfilter,
         )
         if ticker:
             seen = {h["id"] for h in vector_hits}
-            for h in self.store.chroma.search(query=query, n_results=broad_n,
-                                              filter_dict=None):
+            for h in self._search_chroma(query=query, n_results=broad_n,
+                                         filter_dict=None):
                 if h["id"] not in seen:
                     vector_hits.append(h)
                     seen.add(h["id"])

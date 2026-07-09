@@ -4,6 +4,8 @@ ChromaDB vector store for document embeddings.
 """
 
 import logging
+import time
+from collections import OrderedDict
 from pathlib import Path
 from typing import Optional
 import httpx
@@ -24,11 +26,15 @@ class TraceAlchemyEmbeddingFunction(EmbeddingFunction):
     def __init__(self, endpoint: str = "http://127.0.0.1:8087/v1/embeddings",
                  model: str = "tracealchemy",
                  batch_size: int = 10,
-                 timeout: int = 60):
+                 timeout: int = 60,
+                 embedding_cache_size: int = 256):
         self.endpoint = endpoint
         self.model = model
         self.batch_size = batch_size
         self.timeout = timeout
+        self.embedding_cache_size = max(0, int(embedding_cache_size or 0))
+        self._embedding_cache: OrderedDict[str, list[float]] = OrderedDict()
+        self.last_call_timing_ms = 0.0
         self._client = httpx.Client(timeout=timeout)
 
     def __call__(self, input: Documents) -> Embeddings:
@@ -36,11 +42,21 @@ class TraceAlchemyEmbeddingFunction(EmbeddingFunction):
         ChromaDB calls this with a list of text documents.
         Returns a list of embedding vectors (list of floats).
         """
-        # Process in batches to avoid overloading the server
-        all_embeddings = []
+        start = time.perf_counter()
+        all_embeddings: list[Optional[list[float]]] = [None] * len(input)
+        misses: list[tuple[int, str]] = []
 
-        for i in range(0, len(input), self.batch_size):
-            batch = input[i:i + self.batch_size]
+        for idx, text in enumerate(input):
+            cached = self._cache_get(text)
+            if cached is not None:
+                all_embeddings[idx] = cached
+            else:
+                misses.append((idx, text))
+
+        # Process cache misses in batches to avoid overloading the server.
+        for i in range(0, len(misses), self.batch_size):
+            batch_pairs = misses[i:i + self.batch_size]
+            batch = [text for _idx, text in batch_pairs]
 
             payload = {
                 "input": batch if len(batch) > 1 else batch[0],
@@ -53,10 +69,39 @@ class TraceAlchemyEmbeddingFunction(EmbeddingFunction):
             data = response.json()
 
             # llama-server returns: {"data": [{"embedding": [...], ...}, ...]}
-            for item in data["data"]:
-                all_embeddings.append(item["embedding"])
+            for (idx, text), item in zip(batch_pairs, data["data"]):
+                embedding = item["embedding"]
+                all_embeddings[idx] = embedding
+                self._cache_set(text, embedding)
 
-        return all_embeddings
+        self.last_call_timing_ms = round((time.perf_counter() - start) * 1000, 1)
+        return [embedding if embedding is not None else [] for embedding in all_embeddings]
+
+    @staticmethod
+    def _cache_key(text: str) -> str:
+        """Normalize embedding text for in-process cache lookup."""
+        return " ".join((text or "").split()).lower()
+
+    def _cache_get(self, text: str) -> Optional[list[float]]:
+        """Return a cached embedding and update LRU order."""
+        if self.embedding_cache_size <= 0:
+            return None
+        key = self._cache_key(text)
+        embedding = self._embedding_cache.get(key)
+        if embedding is None:
+            return None
+        self._embedding_cache.move_to_end(key)
+        return list(embedding)
+
+    def _cache_set(self, text: str, embedding: list[float]) -> None:
+        """Store an embedding and evict the least recently used item if needed."""
+        if self.embedding_cache_size <= 0:
+            return
+        key = self._cache_key(text)
+        self._embedding_cache[key] = list(embedding)
+        self._embedding_cache.move_to_end(key)
+        while len(self._embedding_cache) > self.embedding_cache_size:
+            self._embedding_cache.popitem(last=False)
 
     def __del__(self):
         if hasattr(self, "_client"):
@@ -101,6 +146,7 @@ class ChromaStore:
                  persist_directory: Optional[Path] = None,
                  collection_name: str = "tracealchemy_docs",
                  embedding_endpoint: str = "http://127.0.0.1:8087/v1/embeddings",
+                 embedding_cache_size: int = 256,
                  chunk_chars: Optional[int] = None,
                  chunk_overlap: Optional[int] = None,
                  chunk_strategy: Optional[str] = None,
@@ -119,8 +165,10 @@ class ChromaStore:
 
         # Create embedding function
         self.embedding_fn = TraceAlchemyEmbeddingFunction(
-            endpoint=embedding_endpoint
+            endpoint=embedding_endpoint,
+            embedding_cache_size=embedding_cache_size,
         )
+        self.last_search_timings = {"embedding": 0.0, "chroma": 0.0}
 
         # Initialize ChromaDB with persistent storage
         self.client = chromadb.PersistentClient(
@@ -278,11 +326,20 @@ class ChromaStore:
         Returns:
             List of dicts with: id, document, metadata, distance
         """
+        if hasattr(self.embedding_fn, "last_call_timing_ms"):
+            self.embedding_fn.last_call_timing_ms = 0.0
+        start = time.perf_counter()
         results = self.collection.query(
             query_texts=[query],
             n_results=n_results,
             where=filter_dict
         )
+        elapsed_ms = round((time.perf_counter() - start) * 1000, 1)
+        embedding_ms = float(getattr(self.embedding_fn, "last_call_timing_ms", 0.0) or 0.0)
+        self.last_search_timings = {
+            "embedding": round(embedding_ms, 1),
+            "chroma": round(max(0.0, elapsed_ms - embedding_ms), 1),
+        }
 
         # Format results into a cleaner structure
         formatted = []
