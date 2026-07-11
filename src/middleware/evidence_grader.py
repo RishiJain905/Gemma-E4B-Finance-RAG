@@ -114,12 +114,17 @@ _OPERATION_MAP = {
     "news": "summarize_news",
     "sentiment": "summarize_sentiment",
 }
+# Alias values include the ingestors' real store keys (e.g. yfinance
+# fundamentals use ``revenue_ttm``/``gross_margin_ttm``/``eps_ttm``) so an
+# obligation named by the user-facing metric can be satisfied by stored rows.
 _METRIC_ALIASES = {
-    "revenue": frozenset({"total_revenue", "revenues", "sales"}),
-    "total_revenue": frozenset({"revenue", "revenues", "sales"}),
-    "gross_margin": frozenset({"gross_profit_margin", "gross_margin_pct"}),
+    "revenue": frozenset({"total_revenue", "revenues", "sales", "revenue_ttm"}),
+    "total_revenue": frozenset({"revenue", "revenues", "sales", "revenue_ttm"}),
+    "gross_margin": frozenset({"gross_profit_margin", "gross_margin_pct", "gross_margin_ttm"}),
     "net_income": frozenset({"net_earnings", "profit"}),
-    "eps": frozenset({"earnings_per_share", "diluted_eps"}),
+    "eps": frozenset({"earnings_per_share", "diluted_eps", "eps_ttm"}),
+    "pe_ratio": frozenset({"pe", "price_to_earnings", "pe_ratio_ttm"}),
+    "market_cap": frozenset({"market_capitalization", "marketcap"}),
 }
 _STALE = frozenset({"stale", "expired", "never_fetched"})
 
