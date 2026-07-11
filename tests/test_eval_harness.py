@@ -1093,3 +1093,58 @@ class TestPhase22Gate:
         s.update(self._passing())
         summary.write_text(json.dumps(s), encoding="utf-8")
         assert gate.main(["--summary", str(summary), "--baseline", str(baseline)]) == 0
+
+
+# ── 2.2.2.2: compiled query + carried slots on run rows ────────────────────
+
+class TestCarriedSlotCapture:
+    """A conversation turn's compiled query and resolved slots are captured on
+    the run row from the endpoint response, and drive the carryover metric."""
+
+    def _endpoint_data(self):
+        return {
+            "answer": "NVDA revenue grew. [Source: yfinance/NVDA]",
+            "detected_ticker": "NVDA",
+            "detected_intent": "explanation",
+            "facts_used": 1,
+            "documents_used": 0,
+            "model_available": True,
+            "grounding": "grounded",
+            "evidence_trace": _trace(
+                raw_question="Why did it grow?",
+                retrieval_query="NVDA total revenue FY2025",
+            ),
+            # 2.2.2.2 response metadata:
+            "retrieval_query": "NVDA total revenue FY2025",
+            "carried_context": {
+                "entities": ["NVDA"], "metrics": ["total_revenue"],
+                "timeframe": "fy2025", "topic_reset": False,
+                "ambiguous_slots": [], "resolution_sources": ["history"],
+            },
+            "resolved_tickers": ["NVDA"],
+            "resolved_metrics": ["total_revenue"],
+            "resolved_timeframe": "fy2025",
+        }
+
+    def test_row_captures_compiled_query_and_resolved_slots(self):
+        case = {"id": "conv#1", "question": "Why did it grow?",
+                "expected_carryover": {"ticker": "NVDA", "metrics": ["total_revenue"]}}
+        row = R._row_from_endpoint(
+            case, self._endpoint_data(), 0.1, dataset_digest="d",
+            ctx={"conversation_id": "conv", "turn_index": 1, "history_sent": 2})
+        # Raw question and compiled retrieval query are distinct fields.
+        assert row["raw_question"] == "Why did it grow?"
+        assert row["retrieval_query"] == "NVDA total revenue FY2025"
+        assert row["resolved_tickers"] == ["NVDA"]
+        assert row["resolved_metrics"] == ["total_revenue"]
+
+    def test_captured_slots_score_carryover(self):
+        case = {"id": "conv#1", "question": "Why did it grow?",
+                "expected_carryover": {"ticker": "NVDA", "metrics": ["total_revenue"]}}
+        row = R._row_from_endpoint(
+            case, self._endpoint_data(), 0.1, dataset_digest="d",
+            ctx={"conversation_id": "conv", "turn_index": 1, "history_sent": 2})
+        ent = M.entity_carryover_accuracy([row])
+        met = M.metric_carryover_accuracy([row])
+        assert ent["n_eligible"] == 1 and ent["score"] == 1.0
+        assert met["n_eligible"] == 1 and met["score"] == 1.0

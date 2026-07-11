@@ -152,6 +152,33 @@ class QueryResponse(BaseModel):
                     "topic_reset}. Present only when the request carried history; "
                     "omitted (null) for single-turn requests.",
     )
+    retrieval_query: Optional[str] = Field(
+        None,
+        description="Compiled standalone retrieval query (2.2.2.2). Distinct from the "
+                    "raw question — retrieval input only, never the user's wording. "
+                    "Present only when follow-up rewriting ran (flag on + history).",
+    )
+    carried_context: Optional[dict] = Field(
+        None,
+        description="Follow-up carryover metadata (2.2.2.2): {entities, metrics, "
+                    "timeframe, topic_reset, ambiguous_slots, resolution_sources}. "
+                    "Only the slots actually carried from history. Present only when "
+                    "rewriting ran.",
+    )
+    resolved_tickers: Optional[list[str]] = Field(
+        None,
+        description="Effective tickers used for retrieval after carryover (2.2.2.2). "
+                    "Explicit signal for conversational eval; present only when "
+                    "rewriting ran.",
+    )
+    resolved_metrics: Optional[list[str]] = Field(
+        None,
+        description="Effective metrics used for retrieval after carryover (2.2.2.2).",
+    )
+    resolved_timeframe: Optional[str] = Field(
+        None,
+        description="Effective timeframe used for retrieval after carryover (2.2.2.2).",
+    )
     freshness: dict = Field(
         default_factory=lambda: {
             "overall": "unknown",

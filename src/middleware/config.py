@@ -60,6 +60,16 @@ class MiddlewareConfig:
         self.conversation_max_history_chars: int = 8000
         self.conversation_max_question_chars: int = 16000
 
+        # Phase 2.2.2.2 — follow-up rewriting & entity carryover. When
+        # enable_conversation_rewrite is on and history is present, the current
+        # turn + bounded history are compiled into a separate retrieval query
+        # (the raw question is never changed). Off by default so behavior is
+        # unchanged until the conversational gates pass. The LLM ambiguity
+        # fallback is a further opt-in and makes at most one bounded model call.
+        self.enable_conversation_rewrite: bool = False
+        self.enable_llm_rewrite_fallback: bool = False
+        self.conversation_rewrite_timeout_s: float = 15.0
+
         # Phase 2.1.2 — hybrid retrieval & re-ranking.
         # Lexical (BM25) channel + RRF fusion (2.1.2.1).
         self.enable_lexical: bool = True
@@ -135,6 +145,9 @@ class MiddlewareConfig:
         _int("CONVERSATION_MAX_TURNS", "conversation_max_turns")
         _int("CONVERSATION_MAX_HISTORY_CHARS", "conversation_max_history_chars")
         _int("CONVERSATION_MAX_QUESTION_CHARS", "conversation_max_question_chars")
+        _bool("ENABLE_CONVERSATION_REWRITE", "enable_conversation_rewrite")
+        _bool("ENABLE_LLM_REWRITE_FALLBACK", "enable_llm_rewrite_fallback")
+        _float("CONVERSATION_REWRITE_TIMEOUT_S", "conversation_rewrite_timeout_s")
 
     def _clamp_conversation_limits(self) -> None:
         """Clamp conversation budgets to documented safe maxima (2.2.2.1).

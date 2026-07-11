@@ -1,15 +1,23 @@
 """
 tests/test_conversation.py
-Offline tests for bounded client-owned history selection (2.2.2.1).
+Offline tests for bounded client-owned history selection (2.2.2.1) and
+deterministic follow-up rewriting / entity carryover (2.2.2.2).
 
-Covers src/middleware/conversation.select_history and the ChatTurn/QueryRequest
-validation contract. No FastAPI/Chroma/model startup — pure model + helper.
+Covers src/middleware/conversation.select_history, ConversationState,
+compile_question, and the ChatTurn/QueryRequest validation contract. No
+FastAPI/Chroma/model startup — pure model + helpers, no network.
 """
 
 import pytest
 from pydantic import ValidationError
 
-from src.middleware.conversation import HistorySelection, select_history
+from src.middleware.conversation import (
+    CompiledQuestion,
+    ConversationState,
+    HistorySelection,
+    compile_question,
+    select_history,
+)
 from src.middleware.models import ChatTurn, QueryRequest
 
 
@@ -115,3 +123,118 @@ def test_selection_does_not_mutate_input_turns():
     select_history(turns, max_turns=8, max_chars=8000)
     # model_copy is used for sanitization; the caller's turns are untouched.
     assert turns[0].context == ctx
+
+
+# ── Follow-up rewriting & entity carryover (2.2.2.2) ───────────────────────
+
+def _history(user_q, *, ticker="NVDA", grounding="grounded",
+             timeframe=None, intent=None):
+    """A one-round (user, grounded-assistant) history for carryover tests."""
+    ctx = {"grounding": grounding}
+    if ticker:
+        ctx["ticker"] = ticker
+    if timeframe:
+        ctx["timeframe"] = timeframe
+    if intent:
+        ctx["intent"] = intent
+    return [
+        ChatTurn(role="user", content=user_q),
+        ChatTurn(role="assistant", content="an answer", context=ctx),
+    ]
+
+
+def test_state_from_grounded_turn_recovers_slots():
+    state = ConversationState.from_history(
+        _history("Show NVDA revenue for FY2025"))
+    assert state.active_tickers == ["NVDA"]
+    assert "total_revenue" in state.active_metrics
+    assert state.active_timeframe == "fy2025"
+    assert state.primary_entity == "NVDA"
+
+
+def test_state_ignores_ungrounded_prior_answer():
+    # A refused prior answer is not authoritative evidence — no active slots.
+    state = ConversationState.from_history(
+        _history("Show NVDA revenue for FY2025", grounding="refused"))
+    assert state.active_tickers == []
+    assert state.active_metrics == []
+    assert state.primary_entity is None
+
+
+def test_entity_substitution_what_about():
+    history = _history("Show NVDA revenue for FY2025")
+    compiled = compile_question("What about AMD?", history)
+    assert isinstance(compiled, CompiledQuestion)
+    assert compiled.entity == "AMD"
+    assert compiled.carried_metrics == ["total_revenue"]
+    assert compiled.carried_timeframe == "fy2025"
+    assert compiled.topic_reset is False
+    # Compact standalone query from validated slots + untouched turn.
+    assert compiled.retrieval_query == "AMD total revenue FY2025"
+
+
+def test_timeframe_only_carry_same_period():
+    history = _history("Show NVDA gross margin for FY2025")
+    compiled = compile_question("same period", history)
+    assert compiled.carried_timeframe == "fy2025"
+    # "same period" carries only the named slot — not the metric.
+    assert compiled.carried_metrics == []
+    assert compiled.metrics == []
+
+
+def test_metric_only_carry_same_metric():
+    history = _history("Show NVDA revenue for FY2025")
+    compiled = compile_question("same metric", history)
+    assert compiled.carried_metrics == ["total_revenue"]
+    # "same metric" carries only the named slot — not the timeframe.
+    assert compiled.carried_timeframe is None
+
+
+def test_pronoun_carries_single_active_entity():
+    history = _history("Show NVDA revenue for FY2025")
+    compiled = compile_question("Why did it grow?", history)
+    assert compiled.carried_entities == ["NVDA"]
+    assert compiled.entity == "NVDA"
+    assert "entity" not in compiled.ambiguous_slots
+
+
+def test_pronoun_refused_with_multiple_active_entities():
+    history = _history("Compare NVDA and AMD revenue")
+    compiled = compile_question("Why did it grow?", history)
+    assert compiled.carried_entities == []
+    assert compiled.entity is None
+    assert "entity" in compiled.ambiguous_slots
+
+
+def test_topic_shift_clears_incompatible_slots():
+    history = _history("Show NVDA revenue for FY2025")
+    compiled = compile_question("What are Apple's main risk factors?", history)
+    assert compiled.entity == "AAPL"
+    assert compiled.topic_reset is True
+    assert compiled.carried_metrics == []
+    assert compiled.carried_timeframe is None
+
+
+def test_ticker_override_outranks_history():
+    history = _history("Show NVDA revenue for FY2025")
+    compiled = compile_question("What is the revenue?", history,
+                                override_ticker="AMD")
+    assert compiled.entity == "AMD"
+    assert "override" in compiled.resolution_sources
+    assert "NVDA" not in (compiled.carried_entities + [compiled.entity])
+
+
+def test_raw_question_is_unchanged():
+    raw = "What about AMD?"
+    compiled = compile_question(raw, _history("Show NVDA revenue for FY2025"))
+    assert compiled.raw_question == raw
+
+
+def test_no_history_is_single_turn_query():
+    compiled = compile_question("What is NVDA revenue for FY2025?", [])
+    # No carry, no reset — the retrieval query is built from the current turn.
+    assert compiled.carried_entities == []
+    assert compiled.carried_metrics == []
+    assert compiled.carried_timeframe is None
+    assert compiled.topic_reset is False
+    assert "NVDA" in compiled.retrieval_query

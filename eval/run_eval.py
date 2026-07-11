@@ -402,6 +402,14 @@ def _row_from_endpoint(case: dict, data: dict, latency_s: float,
 
     answer_policy = (trace or {}).get("answer_policy") if isinstance(trace, dict) else None
 
+    # 2.2.2.2: prefer the endpoint's compiled retrieval_query (distinct from the
+    # raw question) — response field first, then the evidence trace — so run rows
+    # capture both the raw and compiled query. Falls back to the question when no
+    # rewrite ran.
+    retrieval_query = data.get("retrieval_query") or (
+        trace.get("retrieval_query") if isinstance(trace, dict) else None
+    )
+
     return _row(
         case,
         answer=data.get("answer", ""),
@@ -419,6 +427,7 @@ def _row_from_endpoint(case: dict, data: dict, latency_s: float,
         latency_ms=latency_s * 1000,
         model_available=model_available,
         error=error,
+        retrieval_query=retrieval_query,
         **_ctx_kwargs(ctx, data, trace),
     )
 
