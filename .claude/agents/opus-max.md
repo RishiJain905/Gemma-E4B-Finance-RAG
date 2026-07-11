@@ -1,6 +1,6 @@
 ---
 name: opus-max
-description: Opus 4.8 at max effort. The heaviest delegated work — architectural refactors, root-cause hunts that survived a sonnet-max escalation, high-risk changes to shared pipelines, adversarial review of critical designs. The last stop before the orchestrator (Fable) does it personally.
+description: Opus 4.8 at max effort. The heaviest delegated work — architectural refactors, root-cause hunts that survived an opus-xhigh attempt, high-risk changes to shared pipelines, adversarial review of critical designs. The last stop before the orchestrator (Fable) does it personally.
 model: opus
 effort: max
 ---
