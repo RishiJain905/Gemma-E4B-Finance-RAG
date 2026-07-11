@@ -39,6 +39,14 @@ class EvidenceTrace:
     facts: list[dict] = field(default_factory=list)
     documents: list[dict] = field(default_factory=list)
     tool_results: list[dict] = field(default_factory=list)
+    # ── Adaptive orchestration extensions (2.2.3.4) ──
+    # Schema-additive: every field defaults to None/empty, so a legacy
+    # (non-adaptive) trace is byte-compatible with the 2.2.1.2 shape and
+    # SCHEMA_VERSION stays 1. Populated only when the adaptive path ran and a
+    # trace was requested. ``orchestration`` records only what actually
+    # happened (the successful answer path): a rejected planner attempt shows
+    # up as a reason code, never as evidence.
+    orchestration: Optional[dict] = None
     schema_version: int = SCHEMA_VERSION
 
     def to_dict(self) -> dict:
@@ -87,6 +95,20 @@ class EvidenceTraceCollector:
         self._system_prompt: Optional[str] = None
         self._user_prompt: Optional[str] = None
         self._tool_results: list[dict] = []
+        self._orchestration: Optional[dict] = None
+
+    def record_orchestration(self, orchestration: Optional[dict]) -> None:
+        """Attach the adaptive route trace (2.2.3.4) for this request.
+
+        ``orchestration`` is a JSON-serializable dict describing only what the
+        successful answer path actually did: the validated query plan, selected
+        lane and reason codes, executed subqueries/rounds, deterministic tool +
+        calculation results, the re-rank decision + fallback reason, and the
+        final selected/dropped evidence ids under the context budget. No-op when
+        ``orchestration`` is falsy (the legacy path never records one).
+        """
+        if orchestration:
+            self._orchestration = dict(orchestration)
 
     def record_prompt(self, *, system_prompt: str, user_prompt: str) -> None:
         """Record the exact system/user messages for the successful answer path."""
@@ -126,4 +148,5 @@ class EvidenceTraceCollector:
             facts=list(self._facts),
             documents=list(self._documents),
             tool_results=list(self._tool_results),
+            orchestration=dict(self._orchestration) if self._orchestration else None,
         )

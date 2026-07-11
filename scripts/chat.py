@@ -370,6 +370,27 @@ def _render_metadata(data: dict, *, verbose: bool) -> None:
 
     _render_conversation_state(data, verbose=verbose)
 
+    # Adaptive-RAG route (2.2.3.4). A fallback is always worth surfacing (the
+    # adaptive layer demoted to the legacy path); the full lane/budget line is
+    # verbose-only to keep normal output restrained.
+    orch = data.get("orchestration") or {}
+    fallback = orch.get("fallback_reason")
+    if fallback:
+        print(col(f"  adaptive fallback: {fallback}", C.YE))
+    if verbose and orch:
+        lane = orch.get("lane")
+        line = (
+            f"  lane={lane} "
+            f"subqueries={orch.get('subqueries_executed')} "
+            f"rounds={orch.get('retrieval_rounds')} "
+            f"rerank={orch.get('reranker_calls')} "
+            f"planning={orch.get('planning_calls')}"
+        )
+        tools = orch.get("deterministic_tools") or []
+        if tools:
+            line += f" tools={', '.join(tools)}"
+        print(col(line, C.DIM))
+
     if verbose:
         timings = _format_timings(data.get("timings"))
         if timings:

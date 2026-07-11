@@ -134,7 +134,10 @@ class QueryPlan:
             reasons.append("blank_retrieval_query")
 
         tickers = [entity.ticker for entity in self.entities]
-        if any(t != t.upper() for t in tickers):
+        # Type-guard before .upper() so a malformed (None / non-str) ticker
+        # becomes a QueryPlanError, not an AttributeError that escapes the
+        # fail-soft boundary (2.2.3.4 review finding 4).
+        if any(not isinstance(t, str) or t != t.upper() for t in tickers):
             reasons.append("entity_not_uppercase")
         if len(tickers) != len(set(tickers)):
             reasons.append("entity_duplicate")

@@ -209,6 +209,29 @@ def _doc_key(doc: dict) -> tuple:
     return ("body", parent, chunk, document_body(doc))
 
 
+def _doc_identities(doc: dict) -> list[tuple]:
+    """All independent de-dup identities a doc carries (2.2.3.4 review I).
+
+    A stable id and a (parent_id, chunk_index) pair are INDEPENDENT identities:
+    the same physical chunk can surface once keyed by id and once keyed by its
+    parent+chunk position, and either match means duplicate. A doc is a duplicate
+    when ANY of its identities was already seen. Bodyless-and-idless docs fall
+    back to their rendered body.
+    """
+    meta = doc.get("metadata") or {}
+    identities: list[tuple] = []
+    doc_id = doc.get("id") or meta.get("id")
+    if doc_id is not None:
+        identities.append(("id", doc_id))
+    parent = meta.get("parent_id") or doc.get("parent_id")
+    chunk = meta.get("chunk_index", meta.get("chunk"))
+    if parent is not None and chunk is not None:
+        identities.append(("chunk", parent, chunk))
+    if not identities:
+        identities.append(("body", document_body(doc)))
+    return identities
+
+
 def _doc_score(doc: dict) -> float:
     score = doc.get("rerank_score")
     if score is None:
@@ -260,12 +283,28 @@ class ContextBudget:
 
         requested_entities = set(plan.tickers)
         requested_metrics = set(plan.metrics)
+        requested_periods = set(plan.periods)
 
-        # ── Facts: exact matches first, never cut mid-record ──
+        # ── Facts: an EXACT slot matches entity AND metric AND (when the plan
+        # requested periods) period, so a same-metric row from the wrong period
+        # is not treated as the answer (2.2.3.4 review B). ──
         def _is_exact(f: dict) -> bool:
             metric_ok = (not requested_metrics) or f.get("metric") in requested_metrics
             entity_ok = (not requested_entities) or f.get("ticker") in requested_entities
-            return bool(metric_ok and entity_ok)
+            period_ok = (not requested_periods) or f.get("period") in requested_periods
+            return bool(metric_ok and entity_ok and period_ok)
+
+        def _pack_fact(f: dict) -> bool:
+            nonlocal used
+            cost = _fact_chars(f)
+            if used + cost <= cap:
+                sel.facts.append(f)
+                used += cost
+                return True
+            sel.dropped_facts += 1
+            if "context_dropped_over_budget" not in sel.reason_codes:
+                sel.reason_codes.append("context_dropped_over_budget")
+            return False
 
         usable_fact_rows = [
             f for f in facts
@@ -276,18 +315,11 @@ class ContextBudget:
         exact_facts = [f for f in usable_fact_rows if _is_exact(f)]
         other_facts = [f for f in usable_fact_rows if not _is_exact(f)]
 
-        for bucket in (exact_facts, other_facts):
-            for f in bucket:
-                cost = _fact_chars(f)
-                if used + cost <= cap:
-                    sel.facts.append(f)
-                    used += cost
-                else:
-                    sel.dropped_facts += 1
-                    if "context_dropped_over_budget" not in sel.reason_codes:
-                        sel.reason_codes.append("context_dropped_over_budget")
+        # 1. Exact facts / tool results first (never cut mid-record).
+        for f in exact_facts:
+            _pack_fact(f)
 
-        # ── Documents: dedupe, drop blanks, order by coverage then score ──
+        # ── Documents: dedupe (any independent identity), drop blanks ──
         seen: set = set()
         deduped: list[dict] = []
         for d in documents:
@@ -298,20 +330,29 @@ class ContextBudget:
                 if "context_dropped_blank_body" not in sel.reason_codes:
                     sel.reason_codes.append("context_dropped_blank_body")
                 continue
-            key = _doc_key(d)
-            if key in seen:
+            idents = _doc_identities(d)
+            if any(i in seen for i in idents):
                 sel.dropped_documents += 1
                 if "context_dropped_duplicate" not in sel.reason_codes:
                     sel.reason_codes.append("context_dropped_duplicate")
                 continue
-            seen.add(key)
+            seen.update(idents)
             deduped.append(d)
 
-        # Coverage bucket: one best non-blank doc per uncovered entity.
-        covered_entities = {f.get("ticker") for f in sel.facts}
-        primary_docs: list[dict] = []
-        remaining_docs: list[dict] = []
         by_score = sorted(deduped, key=lambda d: (-_doc_score(d), str(d.get("id"))))
+
+        # 2. Coverage documents are RESERVED before non-exact facts (review B):
+        # one best doc per plan entity whose obligation isn't already satisfied,
+        # so a qualitative obligation's only document can't be starved by extra
+        # same-entity facts. When the plan carries a qualitative/document intent,
+        # NO entity is treated as fact-covered — a document is required even if a
+        # fact exists (the previous "any fact = covered" rule dropped the only
+        # document for a why/risk/news obligation). For a purely numeric plan, an
+        # EXACT fact covers the entity and no document is force-reserved.
+        plan_needs_documents = bool(set(plan.intents) & _QUALITATIVE_INTENTS)
+        covered_entities = set() if plan_needs_documents else {
+            f.get("ticker") for f in sel.facts
+        }
         claimed: set = set()
         for entity in [e for e in plan.tickers if e not in covered_entities]:
             best = next(
@@ -322,15 +363,28 @@ class ContextBudget:
                 ),
                 None,
             )
-            if best is not None:
-                claimed.add(id(best))
-                primary_docs.append(best)
+            if best is None:
+                continue
+            claimed.add(id(best))
+            cost = _doc_chars(best)
+            if used + cost <= cap:
+                sel.documents.append(best)
+                used += cost
+            else:
+                sel.dropped_documents += 1
+                if "context_dropped_over_budget" not in sel.reason_codes:
+                    sel.reason_codes.append("context_dropped_over_budget")
+
+        # 3. Non-exact facts next (after coverage is reserved).
+        for f in other_facts:
+            _pack_fact(f)
+
+        # 4. Remaining documents by score, low-authority/stale last.
         low_authority = [d for d in by_score if id(d) not in claimed and _is_low_authority(d)]
         remaining_docs = [
             d for d in by_score if id(d) not in claimed and not _is_low_authority(d)
         ]
-
-        ordered_docs = primary_docs + remaining_docs + low_authority
+        ordered_docs = remaining_docs + low_authority
         overflow: list[dict] = []
         for d in ordered_docs:
             cost = _doc_chars(d)
@@ -447,6 +501,40 @@ def orchestrate(
     if not getattr(config, "enable_adaptive_rag", False):
         return _fallback(plan, retriever, store, config, reason="feature_disabled")
 
+    # One outer fail-soft boundary (2.2.3.4 review C): budget construction, lane
+    # selection, and context finalization all sit inside it, so ANY raise —
+    # including from ExecutionBudget.from_config or the context budgeter — demotes
+    # to the single-query fallback instead of escaping. The fallback's own
+    # budgeter call is made re-entrancy-safe by _apply_context_budget, which can
+    # never re-raise, so the last resort cannot loop back into a failing stage.
+    try:
+        return _run_adaptive(
+            plan, store, config,
+            retriever=retriever, available_metrics=available_metrics,
+            planning_client=planning_client, decompose=decompose,
+            corrective_retry=corrective_retry, route_fn=route_fn, execute_fn=execute_fn,
+        )
+    except Exception:  # noqa: BLE001 - orchestrate() must never raise into /query
+        logger.exception("Adaptive orchestration failed; falling back to retrieve()")
+        return _fallback(plan, retriever, store, config, reason="adaptive_error")
+
+
+def _run_adaptive(
+    plan: QueryPlan,
+    store: Any,
+    config: "MiddlewareConfig",
+    *,
+    retriever: Optional["Retriever"],
+    available_metrics: Iterable[str],
+    planning_client: Optional[PlanningClient],
+    decompose: Optional[DecomposeFn],
+    corrective_retry: Optional[CorrectiveFn],
+    route_fn: Optional[RouteFn],
+    execute_fn: Optional[ExecuteFn],
+) -> OrchestrationResult:
+    """Adaptive body under one shared budget. Wrapped by :func:`orchestrate`'s
+    fail-soft boundary; the inner lane try/except keeps the specific
+    ``adaptive_error`` demotion for a lane-stage failure."""
     route_fn = route_fn or dr.route
     execute_fn = execute_fn or dr.execute_route
     budget = ExecutionBudget.from_config(config)
@@ -465,7 +553,7 @@ def orchestrate(
     try:
         if lane is Lane.FAST:
             fell_back = _execute_fast(
-                result, plan, decision, store, config, budget, execute_fn
+                result, plan, decision, store, config, budget, execute_fn, retriever
             )
             if fell_back is not None:
                 return fell_back
@@ -494,13 +582,22 @@ def _select_lane(
     plan: QueryPlan, decision: "RouteDecision", config: "MiddlewareConfig"
 ) -> tuple[Lane, list[str]]:
     """Pick the cheapest sufficient lane; return (lane, stable reason codes)."""
-    # Fast: a complete deterministic route with no qualitative doc obligation.
-    if decision.matched and decision.complete and not decision.requires_documents:
+    complex_reasons = _complex_reasons(plan)
+
+    # Fast: a complete deterministic route with no qualitative doc obligation AND
+    # no independent multi-obligation signal in the plan. The `not complex_reasons`
+    # clause is defense in depth against a router that overclaims completeness
+    # (2.2.3.4 review A): a plan with multiple entities / periods / mixed
+    # modalities never skips document retrieval via the fast lane, even if the
+    # deterministic route reported complete.
+    if (
+        decision.matched and decision.complete
+        and not decision.requires_documents and not complex_reasons
+    ):
         reasons = ["lane_fast", "fast_complete_route"]
         reasons.extend(decision.reason_codes)
         return Lane.FAST, _dedup(reasons)
 
-    complex_reasons = _complex_reasons(plan)
     if complex_reasons:
         return Lane.COMPLEX, _dedup(["lane_complex", *complex_reasons])
 
@@ -541,6 +638,7 @@ def _execute_fast(
     config: "MiddlewareConfig",
     budget: ExecutionBudget,
     execute_fn: ExecuteFn,
+    retriever: Optional["Retriever"] = None,
 ) -> Optional[OrchestrationResult]:
     """Deterministic SQLite/tools/calculations only. No Chroma/BM25/rerank/plan.
 
@@ -569,8 +667,11 @@ def _execute_fast(
 
     if execution.error:
         result.add_reason("deterministic_route_error")
+        # Reuse the caller's shared Retriever (review E) rather than constructing
+        # a fresh one, and note that the single fallback retrieve() is
+        # intentionally NOT metered by the ExecutionBudget.
         return _fallback(
-            plan, None, store, config, reason="deterministic_route_error"
+            plan, retriever, store, config, reason="deterministic_route_error"
         )
 
     result.deterministic_answer = execution.answer
@@ -656,30 +757,36 @@ def _execute_complex(
         result, decision, store, config, budget, execute_fn
     )
 
-    # Bounded subquery set for the round (sq0 + optional derived), capped by budget.
-    subqueries: list[QuerySubquery] = list(active_plan.subqueries) or [_synthetic_sq0(active_plan)]
+    # Only sq0 is actually retrieved this task: the single retrieval round below
+    # runs the whole plan's retrieval_query, not per-subquery text. Selective
+    # decomposition into independently-retrieved subqueries is 2.2.4.2 — a
+    # reserved but INACTIVE seam here. A decompose() that yields derived
+    # subqueries is recorded as deferred, never counted or reported as executed,
+    # so subqueries_executed never claims a subquery that wasn't retrieved
+    # (2.2.3.4 review H).
+    sq0 = active_plan.subqueries[0] if active_plan.subqueries else _synthetic_sq0(active_plan)
+    executed: list[QuerySubquery] = []
+    if budget.consume(SUBQUERY):
+        executed.append(sq0)
+    else:
+        result.add_reason("subquery_budget_exhausted")
+
     if decompose is not None:
         try:
-            extra = decompose(active_plan) or []
+            extra = [s for s in (decompose(active_plan) or []) if s.id != "sq0"]
         except Exception:  # noqa: BLE001 - decomposition is a best-effort hook
             logger.warning("Subquery decomposition failed; using rule plan", exc_info=True)
             extra = []
-        subqueries = subqueries + [s for s in extra if s.id != "sq0"]
+        if extra:
+            result.add_reason("subquery_decomposition_deferred")
 
-    executed: list[QuerySubquery] = []
-    for sq in subqueries:
-        if budget.consume(SUBQUERY):
-            executed.append(sq)
-        else:
-            result.add_reason("subquery_budget_exhausted")
-            break
     result.subqueries_executed = [sq.id for sq in executed]
 
     r = _get_retriever(retriever, store, config)
     facts: list[dict] = []
     docs: list[dict] = []
 
-    # All subqueries execute as ONE bounded retrieval round.
+    # All executed subqueries run as ONE bounded retrieval round.
     if executed and budget.consume(RETRIEVAL_ROUND):
         result.retrieval_rounds_used += 1
         rf, rd = _retrieve_round(r, active_plan, config, budget, Lane.COMPLEX, result)
@@ -820,13 +927,21 @@ def _conditional_rerank(
 
     try:
         reranked = r.reranker.rerank(plan.retrieval_query, pool, top_n=top_k)
-        result.rerank_ran = True
-        result.add_reason("rerank_applied")
-        return list(reranked)
-    except Exception:  # noqa: BLE001 - reranker must fail soft to RRF order
+    except Exception:  # noqa: BLE001 - defensive: reranker should not raise
         logger.warning("Conditional rerank failed; keeping RRF order", exc_info=True)
         result.add_reason("rerank_fallback")
         return pool[:top_k]
+
+    # Reranker.rerank NEVER raises: on an internal load/score failure it silently
+    # returns the RRF order with rerank_score=None on every doc. Detect that so
+    # we report rerank_fallback, not rerank_applied (2.2.3.4 review G).
+    if reranked and all(d.get("rerank_score") is None for d in reranked):
+        result.add_reason("rerank_fallback")
+        return list(reranked)
+
+    result.rerank_ran = True
+    result.add_reason("rerank_applied")
+    return list(reranked)
 
 
 # Two top-3 fusion scores within this spread count as "tightly clustered".
@@ -942,6 +1057,11 @@ def _fallback(
     Produces a standard-lane result whose ``merged_facts``/``merged_documents``
     and ``retrieval`` mirror ``retrieve()`` byte-for-byte, so a feature-disabled
     or failed adaptive request is indistinguishable from the current pipeline.
+
+    The single ``retrieve()`` here is intentionally NOT metered by the
+    :class:`ExecutionBudget` (2.2.3.4 review E): it is the legacy fallback path,
+    not an additional adaptive retrieval round, so it must run even when the
+    adaptive budget is already exhausted.
     """
     result = OrchestrationResult(lane=Lane.STANDARD, plan=plan, fallback_reason=reason)
     result.add_reason(f"fallback_{reason}")
@@ -971,9 +1091,16 @@ def _fallback(
 def _apply_context_budget(
     result: OrchestrationResult, plan: QueryPlan, config: "MiddlewareConfig", lane: Lane
 ) -> None:
-    selection = ContextBudget(config).select(
-        plan, result.merged_facts, result.merged_documents, lane
-    )
+    # Never raises (2.2.3.4 review C): a budgeter failure yields an empty
+    # selection with a reason code, so even the last-resort fallback that calls
+    # this cannot re-enter a raising budgeter and loop/escape.
+    try:
+        selection = ContextBudget(config).select(
+            plan, result.merged_facts, result.merged_documents, lane
+        )
+    except Exception:  # noqa: BLE001 - budgeter must fail soft to empty selection
+        logger.exception("Context budgeting failed; using empty selection")
+        selection = ContextSelection(reason_codes=["context_budget_error"])
     result.context = selection
     result.context_size = selection.context_chars
     result.estimated_tokens = selection.estimated_tokens
@@ -1047,16 +1174,16 @@ def _merge_facts(primary: list[dict], secondary: list[dict]) -> list[dict]:
 
 
 def _dedupe_docs(docs: list[dict]) -> list[dict]:
-    """De-duplicate documents by stable id / parent+chunk identity."""
+    """De-duplicate documents by ANY independent identity (id OR parent+chunk)."""
     out: list[dict] = []
     seen: set = set()
     for d in docs:
         if not isinstance(d, dict):
             continue
-        key = _doc_key(d)
-        if key in seen:
+        idents = _doc_identities(d)
+        if any(i in seen for i in idents):
             continue
-        seen.add(key)
+        seen.update(idents)
         out.append(d)
     return out
 

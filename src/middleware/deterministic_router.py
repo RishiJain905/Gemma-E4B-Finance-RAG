@@ -64,7 +64,14 @@ ABSTAIN_AMBIGUOUS_THRESHOLD = "ambiguous_threshold"
 ABSTAIN_AMBIGUOUS_SORT = "ambiguous_sort"
 ABSTAIN_QUALITATIVE = "qualitative_evidence_required"
 ABSTAIN_WRITE_REQUIRED = "write_tool_required"
+ABSTAIN_REFRESH_REQUESTED = "refresh_requested"
 ABSTAIN_UNROUTABLE = "unroutable"
+
+# Reason codes for a matched-but-incomplete route: the safe tool ran, but the
+# plan carries obligations the single dispatched tool did not cover, so the
+# caller must NOT treat the route as a complete answer (2.2.3.4 review finding 2).
+INCOMPLETE_METRIC_COVERAGE = "partial_metric_coverage"
+INCOMPLETE_INTENT_COVERAGE = "partial_intent_coverage"
 
 # Intents whose evidence lives in documents (why / risk / news / filings), plus
 # trend which needs a time series the read tools do not return. When one of
@@ -72,6 +79,18 @@ ABSTAIN_UNROUTABLE = "unroutable"
 # incomplete + requires_documents (the compound rule).
 _DOCUMENT_INTENTS = frozenset({"explanation", "news", "risk"})
 _TIMESERIES_INTENTS = frozenset({"trend"})
+
+# Intents whose evidence a single read tool cannot supply — each needs its own
+# retrieval/tool. When a secondary such intent co-occurs with the served
+# numeric/projection core, the route stays incomplete so the whole obligation
+# isn't answered from one tool's slice (2.2.3.4 review finding 2).
+_SELF_EVIDENCE_INTENTS = frozenset(
+    {"projection", "sentiment", "explanation", "news", "risk", "trend"}
+)
+_PROJECTION_REASONS = frozenset({REASON_ESTIMATES, REASON_PRICE_TARGETS, REASON_GUIDANCE})
+_NUMERIC_REASONS = frozenset(
+    {REASON_FUNDAMENTALS, REASON_RANK, REASON_THRESHOLD, REASON_COMPARE}
+)
 
 # The single write tool must never be reachable from the router.
 _WRITE_TOOLS = frozenset({"refresh_data"})
@@ -119,6 +138,20 @@ _MACRO_RE = re.compile(
     r"\b(gdp|cpi|inflation|unemployment|treasury|interest rate|fed funds"
     r"|federal funds|yield curve|ppi|nonfarm|payroll|jobs report"
     r"|consumer confidence|retail sales)\b",
+    re.IGNORECASE,
+)
+
+# Wording that explicitly requests fresh/re-ingested data. The deterministic
+# route only ever reads cached data, so a request to refresh/update MUST NOT be
+# answered from cache and presented as current (2.2.3.4 review finding 1): the
+# router abstains and the caller runs the normal freshness-aware retrieval +
+# model path. Bare "latest"/"current" is intentionally NOT matched (it is common
+# in legitimate latest-fact lookups); only an explicit refresh verb, an
+# update/refetch/reload imperative, or a "<fetch verb> ... latest/fresh" phrase.
+_REFRESH_RE = re.compile(
+    r"\b(?:refresh|re-?fetch|refetch|reload|re-?load|update[sd]?)\b"
+    r"|\b(?:fetch|pull|grab|download|re-?pull)\s+(?:the\s+|me\s+)?"
+    r"(?:latest|newest|current|fresh|live|updated|new)\b",
     re.IGNORECASE,
 )
 
@@ -327,6 +360,12 @@ def route(plan: "QueryPlan", available_metrics: Iterable[str]) -> RouteDecision:
 
     reason_codes: list[str] = []
 
+    # Guard: an explicit refresh/update request must never be answered from the
+    # read-only cache and presented as current — abstain so the caller takes the
+    # freshness-aware retrieval + model path (2.2.3.4 review finding 1).
+    if _REFRESH_RE.search(text):
+        return _abstain(ABSTAIN_REFRESH_REQUESTED, [ABSTAIN_REFRESH_REQUESTED])
+
     # Guard: a requested metric that does not exist → abstain, no tool call.
     unknown = [m for m in metrics if m not in known]
     if unknown:
@@ -464,16 +503,32 @@ def route(plan: "QueryPlan", available_metrics: Iterable[str]) -> RouteDecision:
 
     reason_codes.insert(0, invocation.reason_code)
 
-    # Compound / partial-coverage rule: a routable numeric core plus a
-    # qualitative or time-series obligation runs the safe tool but stays
-    # incomplete so the caller retrieves documents for the rest.
-    needs_documents = bool(document_intents) or bool(timeseries_intents) or (
-        len(plan.periods) > 1
+    # Full plan-obligation coverage (review finding 2): a route is complete only
+    # when the single dispatched tool covers every requested metric AND no
+    # secondary self-evidence intent (a second projection/sentiment/qualitative
+    # obligation) is left unserved. Any gap keeps the route matched-but-incomplete
+    # so the caller retrieves the rest instead of presenting a partial slice as
+    # the whole answer. This subsumes the original document/time-series rule.
+    covered = _covered_metrics(invocation, known_metrics)
+    uncovered_metrics = [m for m in known_metrics if m not in covered]
+    served = _served_intents(invocation.reason_code)
+    uncovered_intents = sorted((intents & _SELF_EVIDENCE_INTENTS) - served)
+
+    needs_documents = (
+        bool(document_intents)
+        or bool(timeseries_intents)
+        or len(plan.periods) > 1
+        or bool(uncovered_metrics)
+        or bool(uncovered_intents)
     )
     if document_intents:
         reason_codes.append("compound_requires_documents")
     if timeseries_intents or len(plan.periods) > 1:
         reason_codes.append("timeseries_incomplete")
+    if uncovered_metrics:
+        reason_codes.append(INCOMPLETE_METRIC_COVERAGE)
+    if uncovered_intents:
+        reason_codes.append(INCOMPLETE_INTENT_COVERAGE)
 
     return RouteDecision(
         matched=True,
@@ -486,6 +541,37 @@ def route(plan: "QueryPlan", available_metrics: Iterable[str]) -> RouteDecision:
     )
 
 
+def _covered_metrics(invocation: ToolInvocation, requested: list[str]) -> set:
+    """The requested metrics the single dispatched tool actually returns.
+
+    ``get_fundamentals`` covers every metric in its ``metrics`` arg; ``query_facts``
+    covers its single ``metric``; projection tools cover only their own metric
+    family (price-target / estimate metrics), so a realized valuation metric asked
+    for alongside a price target is left uncovered.
+    """
+    args = invocation.arguments
+    if "metrics" in args:
+        return set(args.get("metrics") or [])
+    if args.get("metric") is not None:
+        return {args["metric"]}
+    if invocation.reason_code == REASON_PRICE_TARGETS:
+        return {m for m in requested if "price_target" in m}
+    if invocation.reason_code == REASON_ESTIMATES:
+        return {m for m in requested if m.startswith("estimate")}
+    return set()
+
+
+def _served_intents(reason_code: str) -> frozenset:
+    """The self-evidence intent(s) the dispatched tool satisfies."""
+    if reason_code in _PROJECTION_REASONS:
+        return frozenset({"projection"})
+    if reason_code == REASON_SENTIMENT:
+        return frozenset({"sentiment"})
+    if reason_code == REASON_MACRO:
+        return frozenset()
+    return frozenset({"fact_lookup", "comparison"})
+
+
 # ── Whitelisted calculator ────────────────────────────────
 
 _BINARY_OPERANDS: dict[str, tuple[str, str]] = {
@@ -494,7 +580,17 @@ _BINARY_OPERANDS: dict[str, tuple[str, str]] = {
     "ratio": ("numerator", "denominator"),
     "percent_change": ("old", "new"),
 }
-_UNIT_EQUAL_OPS = frozenset({"difference", "spread", "percent_change"})
+# Operations whose operands must share a unit. ``ratio`` is included (2.2.3.4
+# review finding 3): a ratio across incompatible units (e.g. usd/eur) is
+# meaningless and must error rather than silently return a bare number; a
+# same-unit ratio (P/E, debt/equity) is dimensionless and valid.
+_UNIT_EQUAL_OPS = frozenset({"difference", "spread", "percent_change", "ratio"})
+# Operations whose operands must share a reporting period. ``percent_change`` is
+# deliberately excluded — comparing an old period to a new one is its purpose —
+# and ``ratio`` is excluded (a cross-period ratio can be intentional). A
+# ``difference``/``spread`` across mismatched periods (NVDA Q2 vs AMD Q1) is a
+# silent apples-to-oranges error and must be rejected (review finding 3).
+_PERIOD_EQUAL_OPS = frozenset({"difference", "spread"})
 _SUPPORTED_OPERATIONS = frozenset(set(_BINARY_OPERANDS) | {"rank"})
 
 
@@ -590,6 +686,17 @@ def calculate(
             return _calc_error(
                 "incompatible_units",
                 f"operands must share a unit for {operation}: {sorted(units)}",
+                operation,
+                operands,
+            )
+
+    if operation in _PERIOD_EQUAL_OPS:
+        periods = {str(resolved[name]["period"]) for name in required}
+        if len(periods) != 1:
+            return _calc_error(
+                "mismatched_periods",
+                f"operands must share a reporting period for {operation}: "
+                f"{sorted(periods)}",
                 operation,
                 operands,
             )

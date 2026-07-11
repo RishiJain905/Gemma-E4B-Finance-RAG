@@ -89,6 +89,58 @@ PHASE22_THRESHOLDS = {
 }
 
 
+# Phase 2.2.3.4 adaptive-mode promotion gates (Step 5). The cross-config
+# quality/latency deltas (plan/router accuracy, complex-query correctness,
+# multi-turn Recall@10, single-turn nDCG@10, simple-query p95 latency) are
+# computed from TWO run summaries (legacy vs adaptive) in RESULTS.md — a gate
+# over a single summary can't see them. Documented here as the promotion
+# contract; the machine-checkable subset that IS single-run is the budget
+# safety invariant enforced by :func:`adaptive_safety_checks`.
+PROMOTION_GATES = {
+    "plan_router_accuracy_min": 0.90,
+    "deterministic_route_accuracy_min": 0.95,
+    "write_tool_routes_max": 0,
+    "complex_correctness_improvement_pp_min": 10.0,
+    "multiturn_recall_improvement_pp_min": 10.0,
+    "singleturn_ndcg_max_regression": 0.02,
+    "simple_p95_latency_max_regression_pct": 10.0,
+    "max_subqueries": 3,
+    "max_retrieval_rounds": 2,
+    "max_planning_calls": 1,
+    "max_rerank_calls": 1,
+}
+
+
+def adaptive_safety_checks(current: dict) -> list[str]:
+    """Single-run adaptive safety invariants (2.2.3.4 Step 5). Empty = clear.
+
+    Activated only when the summary carries an ``adaptive`` block (a labeled /
+    adaptive run). Enforces the two invariants observable within one run:
+      - zero write-tool routes (the deterministic router must never route to a
+        write tool);
+      - no request exceeded a hard budget cap (subqueries/rounds/planning/rerank).
+    The comparative promotion gates live in RESULTS.md over two summaries.
+    """
+    adaptive = current.get("adaptive")
+    if not isinstance(adaptive, dict):
+        return []
+    failures: list[str] = []
+
+    writes = adaptive.get("write_tool_routes", 0)
+    if writes:
+        failures.append(
+            f"adaptive routed to a write tool {writes} time(s) "
+            f"(required maximum {PROMOTION_GATES['write_tool_routes_max']})")
+
+    violations = adaptive.get("budget_cap_violations") or {}
+    for counter, count in violations.items():
+        if count:
+            failures.append(
+                f"adaptive budget cap exceeded for {counter} in {count} request(s) "
+                "(hard cap must never be exceeded)")
+    return failures
+
+
 def phase22_checks(current: dict) -> list[str]:
     """Phase 2.2 acceptance failures (2.2.1.3 Step 5). Empty list = all clear.
 
@@ -340,7 +392,8 @@ def main(argv: Optional[list[str]] = None) -> int:
     # Phase 2.2 acceptance thresholds (2.2.1.3). Either kind fails the gate
     # before baseline regressions are even compared.
     hard_failures = (pretrace_checks(current, baseline, policy=args.policy)
-                     + phase22_checks(current))
+                     + phase22_checks(current)
+                     + adaptive_safety_checks(current))
     if hard_failures:
         print(render_report({}, hard_failures))
         print(f"\nsummary:  {summary_path}")

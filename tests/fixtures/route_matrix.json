@@ -1,155 +1,431 @@
 {
   "available_metrics": [
-    "total_revenue", "net_income", "forward_pe", "pe_ratio", "revenue_growth",
-    "gross_margin_pct", "price_target_mean", "eps_diluted", "free_cash_flow", "roe"
+    "total_revenue",
+    "net_income",
+    "forward_pe",
+    "pe_ratio",
+    "revenue_growth",
+    "gross_margin_pct",
+    "price_target_mean",
+    "eps_diluted",
+    "free_cash_flow",
+    "roe"
   ],
   "cases": [
     {
       "name": "lowest_forward_pe_ranks",
       "question": "which stock has the lowest forward pe",
-      "entities": [], "metrics": ["forward_pe"], "intents": ["comparison"],
-      "primary_intent": "comparison", "periods": [],
-      "expect": {"matched": true, "tool": "query_facts", "complete": true, "requires_documents": false}
+      "entities": [],
+      "metrics": [
+        "forward_pe"
+      ],
+      "intents": [
+        "comparison"
+      ],
+      "primary_intent": "comparison",
+      "periods": [],
+      "expect": {
+        "matched": true,
+        "tool": "query_facts",
+        "complete": true,
+        "requires_documents": false
+      }
     },
     {
       "name": "compare_two_tickers_revenue",
       "question": "compare NVDA and AMD revenue",
-      "entities": ["NVDA", "AMD"], "metrics": ["total_revenue"], "intents": ["comparison"],
-      "primary_intent": "comparison", "periods": [],
-      "expect": {"matched": true, "tool": "query_facts", "complete": true, "requires_documents": false}
+      "entities": [
+        "NVDA",
+        "AMD"
+      ],
+      "metrics": [
+        "total_revenue"
+      ],
+      "intents": [
+        "comparison"
+      ],
+      "primary_intent": "comparison",
+      "periods": [],
+      "expect": {
+        "matched": true,
+        "tool": "query_facts",
+        "complete": true,
+        "requires_documents": false
+      }
     },
     {
       "name": "price_target_consensus",
       "question": "what is NVDA's price target",
-      "entities": ["NVDA"], "metrics": ["price_target_mean"], "intents": ["projection"],
-      "primary_intent": "projection", "periods": [],
-      "expect": {"matched": true, "tool": "get_price_targets", "complete": true, "requires_documents": false}
+      "entities": [
+        "NVDA"
+      ],
+      "metrics": [
+        "price_target_mean"
+      ],
+      "intents": [
+        "projection"
+      ],
+      "primary_intent": "projection",
+      "periods": [],
+      "expect": {
+        "matched": true,
+        "tool": "get_price_targets",
+        "complete": true,
+        "requires_documents": false
+      }
     },
     {
       "name": "numeric_plus_risk_is_compound",
       "question": "what is NVDA revenue and what are its risks",
-      "entities": ["NVDA"], "metrics": ["total_revenue"], "intents": ["risk", "fact_lookup"],
-      "primary_intent": "risk", "periods": [],
-      "expect": {"matched": true, "tool": "get_fundamentals", "complete": false, "requires_documents": true}
+      "entities": [
+        "NVDA"
+      ],
+      "metrics": [
+        "total_revenue"
+      ],
+      "intents": [
+        "risk",
+        "fact_lookup"
+      ],
+      "primary_intent": "risk",
+      "periods": [],
+      "expect": {
+        "matched": true,
+        "tool": "get_fundamentals",
+        "complete": false,
+        "requires_documents": true
+      }
     },
     {
       "name": "unknown_metric_abstains",
       "question": "what is NVDA's altman z score",
-      "entities": ["NVDA"], "metrics": ["altman_z_score"], "intents": ["fact_lookup"],
-      "primary_intent": "fact_lookup", "periods": [],
-      "expect": {"matched": false, "tool": null, "abstain": "unknown_metric"}
+      "entities": [
+        "NVDA"
+      ],
+      "metrics": [
+        "altman_z_score"
+      ],
+      "intents": [
+        "fact_lookup"
+      ],
+      "primary_intent": "fact_lookup",
+      "periods": [],
+      "expect": {
+        "matched": false,
+        "tool": null,
+        "abstain": "unknown_metric"
+      }
     },
     {
       "name": "bare_ticker_no_metric_abstains",
       "question": "refresh NVDA data now",
-      "entities": ["NVDA"], "metrics": [], "intents": ["general"],
-      "primary_intent": "general", "periods": [],
-      "expect": {"matched": false, "tool": null, "abstain": "unroutable"}
+      "entities": [
+        "NVDA"
+      ],
+      "metrics": [],
+      "intents": [
+        "general"
+      ],
+      "primary_intent": "general",
+      "periods": [],
+      "expect": {
+        "matched": false,
+        "tool": null,
+        "abstain": "refresh_requested"
+      }
     },
     {
       "name": "macro_snapshot",
       "question": "what is the current cpi and fed funds rate",
-      "entities": [], "metrics": [], "intents": ["fact_lookup"],
-      "primary_intent": "fact_lookup", "periods": [],
-      "expect": {"matched": true, "tool": "get_macro_snapshot", "complete": true, "requires_documents": false}
+      "entities": [],
+      "metrics": [],
+      "intents": [
+        "fact_lookup"
+      ],
+      "primary_intent": "fact_lookup",
+      "periods": [],
+      "expect": {
+        "matched": true,
+        "tool": "get_macro_snapshot",
+        "complete": true,
+        "requires_documents": false
+      }
     },
     {
       "name": "sentiment_summary",
       "question": "what's the news sentiment on NVDA",
-      "entities": ["NVDA"], "metrics": [], "intents": ["sentiment"],
-      "primary_intent": "sentiment", "periods": [],
-      "expect": {"matched": true, "tool": "get_sentiment", "complete": true, "requires_documents": false}
+      "entities": [
+        "NVDA"
+      ],
+      "metrics": [],
+      "intents": [
+        "sentiment"
+      ],
+      "primary_intent": "sentiment",
+      "periods": [],
+      "expect": {
+        "matched": true,
+        "tool": "get_sentiment",
+        "complete": true,
+        "requires_documents": false
+      }
     },
     {
       "name": "guidance_lookup",
       "question": "what guidance did NVDA give for next quarter",
-      "entities": ["NVDA"], "metrics": [], "intents": ["projection"],
-      "primary_intent": "projection", "periods": [],
-      "expect": {"matched": true, "tool": "get_guidance", "complete": true, "requires_documents": false}
+      "entities": [
+        "NVDA"
+      ],
+      "metrics": [],
+      "intents": [
+        "projection"
+      ],
+      "primary_intent": "projection",
+      "periods": [],
+      "expect": {
+        "matched": true,
+        "tool": "get_guidance",
+        "complete": true,
+        "requires_documents": false
+      }
     },
     {
       "name": "estimates_next_year",
       "question": "what is NVDA's consensus revenue for next year",
-      "entities": ["NVDA"], "metrics": ["total_revenue"], "intents": ["projection"],
-      "primary_intent": "projection", "periods": [],
-      "expect": {"matched": true, "tool": "get_estimates", "complete": true, "requires_documents": false}
+      "entities": [
+        "NVDA"
+      ],
+      "metrics": [
+        "total_revenue"
+      ],
+      "intents": [
+        "projection"
+      ],
+      "primary_intent": "projection",
+      "periods": [],
+      "expect": {
+        "matched": true,
+        "tool": "get_estimates",
+        "complete": true,
+        "requires_documents": false
+      }
     },
     {
       "name": "single_fundamental_lookup",
       "question": "what is NVDA's net income",
-      "entities": ["NVDA"], "metrics": ["net_income"], "intents": ["fact_lookup"],
-      "primary_intent": "fact_lookup", "periods": [],
-      "expect": {"matched": true, "tool": "get_fundamentals", "complete": true, "requires_documents": false}
+      "entities": [
+        "NVDA"
+      ],
+      "metrics": [
+        "net_income"
+      ],
+      "intents": [
+        "fact_lookup"
+      ],
+      "primary_intent": "fact_lookup",
+      "periods": [],
+      "expect": {
+        "matched": true,
+        "tool": "get_fundamentals",
+        "complete": true,
+        "requires_documents": false
+      }
     },
     {
       "name": "threshold_filter",
       "question": "which stocks have revenue growth above 20",
-      "entities": [], "metrics": ["revenue_growth"], "intents": ["comparison"],
-      "primary_intent": "comparison", "periods": [],
-      "expect": {"matched": true, "tool": "query_facts", "complete": true, "requires_documents": false}
+      "entities": [],
+      "metrics": [
+        "revenue_growth"
+      ],
+      "intents": [
+        "comparison"
+      ],
+      "primary_intent": "comparison",
+      "periods": [],
+      "expect": {
+        "matched": true,
+        "tool": "query_facts",
+        "complete": true,
+        "requires_documents": false
+      }
     },
     {
       "name": "highest_fcf_ranks_desc",
       "question": "which stock has the highest free cash flow",
-      "entities": [], "metrics": ["free_cash_flow"], "intents": ["comparison"],
-      "primary_intent": "comparison", "periods": [],
-      "expect": {"matched": true, "tool": "query_facts", "complete": true, "requires_documents": false}
+      "entities": [],
+      "metrics": [
+        "free_cash_flow"
+      ],
+      "intents": [
+        "comparison"
+      ],
+      "primary_intent": "comparison",
+      "periods": [],
+      "expect": {
+        "matched": true,
+        "tool": "query_facts",
+        "complete": true,
+        "requires_documents": false
+      }
     },
     {
       "name": "explanation_with_metric_is_compound",
       "question": "why did NVDA revenue grow",
-      "entities": ["NVDA"], "metrics": ["total_revenue"], "intents": ["explanation"],
-      "primary_intent": "explanation", "periods": [],
-      "expect": {"matched": true, "tool": "get_fundamentals", "complete": false, "requires_documents": true}
+      "entities": [
+        "NVDA"
+      ],
+      "metrics": [
+        "total_revenue"
+      ],
+      "intents": [
+        "explanation"
+      ],
+      "primary_intent": "explanation",
+      "periods": [],
+      "expect": {
+        "matched": true,
+        "tool": "get_fundamentals",
+        "complete": false,
+        "requires_documents": true
+      }
     },
     {
       "name": "pure_news_no_metric_abstains",
       "question": "what's the latest news on NVDA",
-      "entities": ["NVDA"], "metrics": [], "intents": ["news"],
-      "primary_intent": "news", "periods": [],
-      "expect": {"matched": false, "tool": null, "abstain": "qualitative_evidence_required"}
+      "entities": [
+        "NVDA"
+      ],
+      "metrics": [],
+      "intents": [
+        "news"
+      ],
+      "primary_intent": "news",
+      "periods": [],
+      "expect": {
+        "matched": false,
+        "tool": null,
+        "abstain": "qualitative_evidence_required"
+      }
     },
     {
       "name": "best_value_ambiguous_sort_abstains",
       "question": "which stock is the best value by pe ratio",
-      "entities": [], "metrics": ["pe_ratio"], "intents": ["comparison"],
-      "primary_intent": "comparison", "periods": [],
-      "expect": {"matched": false, "tool": null, "abstain": "ambiguous_sort"}
+      "entities": [],
+      "metrics": [
+        "pe_ratio"
+      ],
+      "intents": [
+        "comparison"
+      ],
+      "primary_intent": "comparison",
+      "periods": [],
+      "expect": {
+        "matched": false,
+        "tool": null,
+        "abstain": "ambiguous_sort"
+      }
     },
     {
       "name": "threshold_no_number_abstains",
       "question": "which stocks have revenue growth above the average",
-      "entities": [], "metrics": ["revenue_growth"], "intents": ["comparison"],
-      "primary_intent": "comparison", "periods": [],
-      "expect": {"matched": false, "tool": null, "abstain": "ambiguous_threshold"}
+      "entities": [],
+      "metrics": [
+        "revenue_growth"
+      ],
+      "intents": [
+        "comparison"
+      ],
+      "primary_intent": "comparison",
+      "periods": [],
+      "expect": {
+        "matched": false,
+        "tool": null,
+        "abstain": "ambiguous_threshold"
+      }
     },
     {
       "name": "compare_no_metric_abstains",
       "question": "compare NVDA and AMD",
-      "entities": ["NVDA", "AMD"], "metrics": [], "intents": ["comparison"],
-      "primary_intent": "comparison", "periods": [],
-      "expect": {"matched": false, "tool": null, "abstain": "ambiguous_metric"}
+      "entities": [
+        "NVDA",
+        "AMD"
+      ],
+      "metrics": [],
+      "intents": [
+        "comparison"
+      ],
+      "primary_intent": "comparison",
+      "periods": [],
+      "expect": {
+        "matched": false,
+        "tool": null,
+        "abstain": "ambiguous_metric"
+      }
     },
     {
       "name": "compare_multi_metric_abstains",
       "question": "compare NVDA and AMD revenue and net income",
-      "entities": ["NVDA", "AMD"], "metrics": ["total_revenue", "net_income"], "intents": ["comparison"],
-      "primary_intent": "comparison", "periods": [],
-      "expect": {"matched": false, "tool": null, "abstain": "ambiguous_metric"}
+      "entities": [
+        "NVDA",
+        "AMD"
+      ],
+      "metrics": [
+        "total_revenue",
+        "net_income"
+      ],
+      "intents": [
+        "comparison"
+      ],
+      "primary_intent": "comparison",
+      "periods": [],
+      "expect": {
+        "matched": false,
+        "tool": null,
+        "abstain": "ambiguous_metric"
+      }
     },
     {
       "name": "multi_period_lookup_incomplete",
       "question": "NVDA revenue in 2023 and 2024",
-      "entities": ["NVDA"], "metrics": ["total_revenue"], "intents": ["fact_lookup"],
-      "primary_intent": "fact_lookup", "periods": ["2023", "2024"],
-      "expect": {"matched": true, "tool": "get_fundamentals", "complete": false, "requires_documents": true}
+      "entities": [
+        "NVDA"
+      ],
+      "metrics": [
+        "total_revenue"
+      ],
+      "intents": [
+        "fact_lookup"
+      ],
+      "primary_intent": "fact_lookup",
+      "periods": [
+        "2023",
+        "2024"
+      ],
+      "expect": {
+        "matched": true,
+        "tool": "get_fundamentals",
+        "complete": false,
+        "requires_documents": true
+      }
     },
     {
       "name": "projection_no_entity_abstains",
       "question": "what are the price targets",
-      "entities": [], "metrics": ["price_target_mean"], "intents": ["projection"],
-      "primary_intent": "projection", "periods": [],
-      "expect": {"matched": false, "tool": null, "abstain": "ambiguous_entity"}
+      "entities": [],
+      "metrics": [
+        "price_target_mean"
+      ],
+      "intents": [
+        "projection"
+      ],
+      "primary_intent": "projection",
+      "periods": [],
+      "expect": {
+        "matched": false,
+        "tool": null,
+        "abstain": "ambiguous_entity"
+      }
     }
   ]
 }

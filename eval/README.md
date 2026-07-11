@@ -100,6 +100,62 @@ also fails when any of these categories has **zero eligible fixtures** (a
 missing category must never look like a pass). These run alongside — and never
 weaken — the 2.2.1.2 pre-metric checks and the baseline regression comparison.
 
+### Adaptive orchestration comparison (2.2.3.4)
+
+When a run exercises the bounded adaptive-RAG path (`ENABLE_ADAPTIVE_RAG=1`), the
+middleware attaches an `orchestration` block to every `/query` response and the
+runner copies it onto each row. `score.py` then emits a `summary["adaptive"]`
+block and a per-config `summary["config_label"]`:
+
+- `lane_distribution` — count of rows per selected lane (`fast`/`standard`/`complex`);
+- `fallback_rate` — fraction of adaptive rows that demoted to the legacy path;
+- `budget_exhaustion_rate` — fraction that hit any `*_budget_exhausted` reason code;
+- `write_tool_routes` — deterministic routes to a write tool (**must be 0**);
+- `budget_cap_violations` — per-counter count of rows that exceeded a hard cap
+  (subqueries ≤ 3, rounds ≤ 2, planning ≤ 1, rerank ≤ 1) — **must be all 0**;
+- `avg_counters` / `max_counters` — mean and max executed counters;
+- `per_lane` — per-lane `intent_accuracy`, `ticker_accuracy`, `retrieval_hit_rate`,
+  and p50/p95 latency.
+
+`gate.py::adaptive_safety_checks` fails the gate (single-run, hard) when
+`write_tool_routes > 0` or any `budget_cap_violations > 0`. The comparative
+promotion gates (`gate.PROMOTION_GATES`: plan/router accuracy ≥ 0.90,
+deterministic route accuracy ≥ 0.95, ≥ 10 pp complex-query correctness and
+multi-turn Recall@10 improvement, ≤ 0.02 single-turn nDCG@10 regression, ≤ 10 %
+simple-query p95 latency regression) are computed **across two summaries** in
+`docs/plans/phase2.2/2.2.3-adaptive-rag-orchestration/RESULTS.md`, since a gate
+over one summary cannot see a cross-config delta.
+
+**Three-configuration comparison** (run only with the GPU/model available — this
+is a separately scheduled live activity; do **not** run it while implementing
+offline behavior). Each config is a full `run → score` pass labeled with
+`--config-label`; the middleware config itself is selected via env vars before
+starting the stack on `:8000`:
+
+```bash
+# 1. Legacy Phase 2.1 path (adaptive off).
+ENABLE_ADAPTIVE_RAG=0 uvicorn src.middleware.app:app --port 8000 &
+python eval/run_eval.py --config-label legacy
+python eval/score.py                     # writes summary with config_label=legacy
+
+# 2. Adaptive lanes, deterministic tools OFF.
+ENABLE_ADAPTIVE_RAG=1 ENABLE_DETERMINISTIC_TOOL_ROUTING=0 ENABLE_RERANKER=0 \
+  uvicorn src.middleware.app:app --port 8000 &
+python eval/run_eval.py --config-label adaptive_no_tools
+python eval/score.py
+
+# 3. Adaptive lanes + deterministic tools + conditional re-ranking.
+ENABLE_ADAPTIVE_RAG=1 ENABLE_DETERMINISTIC_TOOL_ROUTING=1 ENABLE_RERANKER=1 \
+  ADAPTIVE_CONDITIONAL_RERANK=1 uvicorn src.middleware.app:app --port 8000 &
+python eval/run_eval.py --config-label adaptive_tools_rerank
+python eval/score.py
+python eval/gate.py                       # adaptive_safety_checks + baseline gate
+```
+
+`--config-label` also honours the `EVAL_CONFIG_LABEL` env var. Collect the three
+`summary` JSONs and record the per-lane metrics + promotion-gate verdicts in
+`RESULTS.md`.
+
 ### From the chat client (2.2.2.3)
 
 `scripts/chat.py` wraps this harness for convenience — it only shells out to

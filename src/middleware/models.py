@@ -179,6 +179,16 @@ class QueryResponse(BaseModel):
         None,
         description="Effective timeframe used for retrieval after carryover (2.2.2.2).",
     )
+    orchestration: Optional[dict] = Field(
+        None,
+        description="Bounded adaptive-RAG route metadata (2.2.3.4): {lane, "
+                    "reason_codes, subqueries_executed, retrieval_rounds, "
+                    "planning_calls, reranker_calls, deterministic_tools, "
+                    "context_chars, evidence_dropped, fallback_reason}. These are "
+                    "ACTUAL executed counters, not configured maxima. Present only "
+                    "when enable_adaptive_rag is on; omitted (null) on the legacy "
+                    "path so older clients are unaffected.",
+    )
     freshness: dict = Field(
         default_factory=lambda: {
             "overall": "unknown",

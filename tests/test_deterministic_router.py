@@ -54,7 +54,7 @@ FIXTURE = Path(__file__).parent / "fixtures" / "route_matrix.json"
 # Metric universe used by the standalone (non-matrix) tests.
 KNOWN_METRICS = frozenset({
     "total_revenue", "net_income", "forward_pe", "pe_ratio", "revenue_growth",
-    "price_target_mean", "free_cash_flow",
+    "price_target_mean", "free_cash_flow", "gross_margin_pct",
 })
 
 TEST_ANALYTICS_CONFIG = {
@@ -328,11 +328,13 @@ def test_calculations_use_decimal_and_keep_operands():
 
 
 def test_divide_by_zero_returns_structured_error():
+    # Same unit so the zero-denominator guard is what fires (ratio now enforces
+    # unit-equality — see test_calculator_ratio_rejects_incompatible_units).
     ratio = calculate(
         "ratio",
         {
             "numerator": {"value": 5, "unit": "x", "period": "p"},
-            "denominator": {"value": 0, "unit": "y", "period": "p"},
+            "denominator": {"value": 0, "unit": "x", "period": "p"},
         },
     )
     assert ratio["error"] == "divide_by_zero"
@@ -508,3 +510,209 @@ def test_executor_runs_calculation_with_provenance(store):
     assert result.error is False
     assert result.calculations[0]["result"] == Decimal("10")
     assert result.calculations[0]["operands"]["a"]["period"] == "2026-Q1"
+
+
+# ══════════════════════════════════════════════════════════════════════
+# 2.2.3.4 review findings — regression tests (findings 1, 2, 3, 4, 6)
+# ══════════════════════════════════════════════════════════════════════
+
+
+# ── Finding 1: refresh/update wording must not answer from cache as fresh ──
+
+def test_refresh_wording_abstains():
+    cases = [
+        "refresh NVDA data now",
+        "update AMD fundamentals and fetch latest",
+        "refresh and compare NVDA and AMD revenue",
+        "re-fetch NVDA revenue",
+        "pull the latest MSFT numbers",
+    ]
+    plans = [
+        make_plan("refresh NVDA data now", entities=["NVDA"], intents=["general"]),
+        make_plan("update AMD fundamentals and fetch latest", entities=["AMD"],
+                  metrics=["total_revenue"], intents=["fact_lookup"],
+                  primary_intent="fact_lookup"),
+        make_plan("refresh and compare NVDA and AMD revenue",
+                  entities=["NVDA", "AMD"], metrics=["total_revenue"],
+                  intents=["comparison"], primary_intent="comparison"),
+        make_plan("re-fetch NVDA revenue", entities=["NVDA"],
+                  metrics=["total_revenue"], intents=["fact_lookup"],
+                  primary_intent="fact_lookup"),
+        make_plan("pull the latest MSFT numbers", entities=["MSFT"],
+                  intents=["fact_lookup"], primary_intent="fact_lookup"),
+    ]
+    for q, plan in zip(cases, plans):
+        decision = route(plan, KNOWN_METRICS)
+        assert decision.matched is False, f"{q!r} should abstain"
+        assert decision.abstain_reason == dr.ABSTAIN_REFRESH_REQUESTED
+        assert decision.tool_invocations == []
+
+
+def test_latest_fact_lookup_still_routes():
+    # Bare "latest" (no refresh/fetch verb) is a normal latest-fact lookup and
+    # must NOT be swept up by the refresh guard.
+    plan = make_plan("what is NVDA's latest revenue", entities=["NVDA"],
+                     metrics=["total_revenue"], intents=["fact_lookup"],
+                     primary_intent="fact_lookup")
+    decision = route(plan, KNOWN_METRICS)
+    assert decision.matched is True
+    assert decision.tool_invocations[0].name == "get_fundamentals"
+
+
+# ── Finding 2: complete only when all plan obligations are covered ──
+
+def test_projection_plus_uncovered_metric_is_incomplete():
+    # Price target (projection) + forward P/E (realized valuation): one tool runs,
+    # forward_pe is uncovered, so the route must not claim complete.
+    plan = make_plan(
+        "what is NVDA price target and forward pe",
+        entities=["NVDA"], metrics=["price_target_mean", "forward_pe"],
+        intents=["projection"], primary_intent="projection",
+    )
+    decision = route(plan, KNOWN_METRICS)
+    assert decision.matched is True
+    assert decision.tool_invocations[0].name == "get_price_targets"
+    assert decision.complete is False
+    assert decision.requires_documents is True
+    assert dr.INCOMPLETE_METRIC_COVERAGE in decision.reason_codes
+
+
+def test_projection_plus_sentiment_is_incomplete():
+    plan = make_plan(
+        "what is NVDA's price target and how is sentiment",
+        entities=["NVDA"], metrics=["price_target_mean"],
+        intents=["projection", "sentiment"], primary_intent="projection",
+    )
+    decision = route(plan, KNOWN_METRICS)
+    assert decision.matched is True
+    assert decision.complete is False
+    assert dr.INCOMPLETE_INTENT_COVERAGE in decision.reason_codes
+
+
+def test_fundamentals_covering_all_metrics_stays_complete():
+    plan = make_plan(
+        "what is NVDA revenue and net income",
+        entities=["NVDA"], metrics=["total_revenue", "net_income"],
+        intents=["fact_lookup"], primary_intent="fact_lookup",
+    )
+    decision = route(plan, KNOWN_METRICS)
+    assert decision.matched is True
+    assert decision.complete is True
+    assert decision.tool_invocations[0].arguments["metrics"] == [
+        "total_revenue", "net_income"]
+
+
+# ── Finding 3: calculator unit/period integrity ──
+
+def test_calculator_ratio_rejects_incompatible_units():
+    result = calculate(
+        "ratio",
+        {
+            "numerator": {"value": 10, "unit": "usd", "period": "p"},
+            "denominator": {"value": 5, "unit": "eur", "period": "p"},
+        },
+    )
+    assert result["error"] == "incompatible_units"
+
+
+def test_calculator_ratio_same_unit_ok():
+    result = calculate(
+        "ratio",
+        {
+            "numerator": {"value": 10, "unit": "usd", "period": "p"},
+            "denominator": {"value": 5, "unit": "usd", "period": "p"},
+        },
+    )
+    assert "error" not in result
+    assert result["result"] == Decimal("2")
+
+
+def test_calculator_difference_rejects_mismatched_periods():
+    result = calculate(
+        "difference",
+        {
+            "a": {"value": 100, "unit": "usd", "period": "2026-Q2"},
+            "b": {"value": 40, "unit": "usd", "period": "2026-Q1"},
+        },
+    )
+    assert result["error"] == "mismatched_periods"
+
+
+def test_calculator_percent_change_allows_different_periods():
+    # percent_change is old-vs-new by design; different periods must be allowed.
+    result = calculate(
+        "percent_change",
+        {
+            "old": {"value": 100, "unit": "usd", "period": "2025-Q1"},
+            "new": {"value": 125, "unit": "usd", "period": "2026-Q1"},
+        },
+    )
+    assert "error" not in result
+    assert result["result"] == Decimal("25")
+
+
+def test_route_compare_across_mismatched_periods_flags_error(store):
+    # End-to-end: comparing two tickers whose latest periods differ produces a
+    # difference calc that must error (not silently diff apples-to-oranges).
+    store.sqlite.upsert_fundamental(
+        ticker="NVDA", metric="total_revenue", value=100.0,
+        unit="usd", period="2026-Q2", source_type="yfinance")
+    store.sqlite.upsert_fundamental(
+        ticker="AMD", metric="total_revenue", value=40.0,
+        unit="usd", period="2026-Q1", source_type="yfinance")
+    decision = RouteDecision(
+        matched=True, complete=True,
+        tool_invocations=[ToolInvocation(
+            "query_facts",
+            {"metric": "total_revenue", "tickers": ["NVDA", "AMD"],
+             "latest_only": True},
+            "sq0", dr.REASON_COMPARE)],
+        calculations=[CalculationSpec(
+            operation="difference",
+            operands={"a": OperandRef(0, "NVDA"), "b": OperandRef(0, "AMD")})],
+    )
+    result = execute_route(decision, store)
+    assert result.error is True
+    assert result.calculations[0]["error"] == "mismatched_periods"
+
+
+# ── Finding 4: query_plan validate() guards malformed tickers ──
+
+def test_query_plan_validate_guards_non_string_ticker():
+    from src.middleware.query_plan import (
+        QueryEntity, QueryPlan, QueryPlanError, QuerySubquery)
+
+    bad_entity = QueryEntity(
+        ticker=None, resolved_name=None, confidence=1.0,  # type: ignore[arg-type]
+        source="resolved", mention="x", start=0)
+    plan = QueryPlan(
+        original_question="q", retrieval_query="q",
+        entities=[bad_entity], intents=["general"],
+        subqueries=[QuerySubquery(id="sq0", text="q")],
+        primary_intent="general")
+    # Must raise a QueryPlanError (fail-soft boundary), not an AttributeError.
+    try:
+        plan.validate()
+        assert False, "expected QueryPlanError"
+    except QueryPlanError as e:
+        assert "entity_not_uppercase" in e.reason_codes
+
+
+# ── Finding 6: 'gross margin' resolves to one metric ──
+
+def test_gross_margin_is_single_metric():
+    from src.middleware.intent_parser import IntentParser
+    metrics = IntentParser()._extract_metrics("what is NVDA gross margin")
+    assert metrics == ["gross_margin_pct"]
+
+
+def test_gross_margin_rank_routes_not_ambiguous():
+    # With the double-match gone, a single-metric rank over gross margin routes
+    # instead of abstaining on a false ambiguous_metric.
+    plan = make_plan(
+        "which company has the highest gross margin",
+        metrics=["gross_margin_pct"], intents=["comparison"],
+        primary_intent="comparison")
+    decision = route(plan, KNOWN_METRICS)
+    assert decision.matched is True
+    assert decision.tool_invocations[0].arguments["metric"] == "gross_margin_pct"

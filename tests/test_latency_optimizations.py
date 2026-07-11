@@ -199,3 +199,54 @@ def test_health_advertises_conversation_and_multiline_capabilities(monkeypatch):
     assert caps["max_question_chars"] == 16000
     assert caps["conversation_max_turns"] == 8
     assert caps["conversation_max_history_chars"] == 8000
+
+
+# ── Phase 2.2.3.4 — adaptive path latency instrumentation ───────────────
+
+@pytest.mark.asyncio
+async def test_adaptive_path_records_plan_and_orchestration_timings(monkeypatch):
+    """The adaptive path adds `query_plan` + `orchestration` timing stages and
+    keeps the retrieval timings shape, so latency reporting never regresses."""
+    from src.middleware.config import MiddlewareConfig
+    from src.middleware import adaptive_orchestrator as ao
+    from src.middleware.adaptive_orchestrator import (
+        ContextSelection, Lane, OrchestrationResult)
+
+    cfg = MiddlewareConfig()
+    cfg.enable_adaptive_rag = True
+    cfg.enable_fetch_on_miss = False
+    cfg.enable_conversation_rewrite = False
+
+    monkeypatch.setattr(
+        middleware_app, "store",
+        SimpleNamespace(sqlite=SimpleNamespace(list_metrics=lambda: ["total_revenue"])))
+    monkeypatch.setattr(middleware_app, "config", cfg)
+    monkeypatch.setattr(middleware_app, "retriever", SimpleNamespace())
+    monkeypatch.setattr(
+        middleware_app, "_evaluate_and_refresh",
+        MagicMock(return_value={"overall": "fresh", "fetched_on_miss": []}))
+    monkeypatch.setattr(middleware_app, "_task_params", lambda _t: {})
+    monkeypatch.setattr(middleware_app, "_check_model_health", AsyncMock(return_value=True))
+    monkeypatch.setattr(
+        middleware_app, "_call_model",
+        AsyncMock(return_value=("adaptive answer", [])))
+
+    def fake_orch(plan, store, config, **kwargs):
+        ctx = ContextSelection(
+            facts=[{"metric": "total_revenue", "value": 26.0, "ticker": "NVDA"}],
+            documents=[], context_chars=120, estimated_tokens=30)
+        return OrchestrationResult(
+            lane=Lane.STANDARD, plan=plan, reason_codes=["lane_standard"],
+            merged_facts=list(ctx.facts), merged_documents=[],
+            subqueries_executed=["sq0"], retrieval_rounds_used=1,
+            retrieval_strategy="hybrid", context=ctx,
+            context_size=ctx.context_chars, estimated_tokens=ctx.estimated_tokens)
+
+    monkeypatch.setattr(ao, "orchestrate", fake_orch)
+
+    response = await middleware_app.query(QueryRequest(question="What is NVDA revenue?"))
+
+    assert response.timings is not None
+    assert "query_plan" in response.timings
+    assert "orchestration" in response.timings
+    assert response.orchestration["lane"] == "standard"

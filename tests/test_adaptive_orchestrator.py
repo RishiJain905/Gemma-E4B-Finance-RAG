@@ -226,7 +226,10 @@ def test_standard_lane_uses_existing_hybrid_once():
 # ── 3. Complex lane caps three subqueries ─────────────────
 
 
-def test_complex_lane_caps_three_subqueries():
+def test_complex_lane_decomposition_seam_is_inactive():
+    """Until 2.2.4.2, the complex lane retrieves only sq0. A decompose() that
+    yields derived subqueries is recorded as deferred and NEVER reported as
+    executed (review H) — the metadata must not claim unretrieved subqueries."""
     retriever = FakeRetriever(documents=[doc("d1")])
     plan = make_plan("compare NVDA AMD INTC margins",
                      entities=["NVDA", "AMD", "INTC"])  # >2 entities → complex
@@ -244,8 +247,19 @@ def test_complex_lane_caps_three_subqueries():
     )
 
     assert result.lane is Lane.COMPLEX
-    assert len(result.subqueries_executed) == 3  # sq0 + 2 derived, cap = 3
-    assert "subquery_budget_exhausted" in result.reason_codes
+    assert result.subqueries_executed == ["sq0"]  # only sq0 actually retrieved
+    assert "subquery_decomposition_deferred" in result.reason_codes
+    assert "subquery_budget_exhausted" not in result.reason_codes
+    # Only one subquery unit is consumed even though 5 were proposed.
+    assert retriever.retrieve_calls == 1
+
+
+def test_subquery_budget_cap_is_uncircumventable():
+    """The SUBQUERY cap itself is enforced by ExecutionBudget regardless of lane."""
+    budget = ExecutionBudget(max_subqueries=3)
+    assert [budget.consume(ao.SUBQUERY) for _ in range(4)] == [True, True, True, False]
+    assert "subquery_budget_exhausted" in budget.exhausted
+    assert budget.used(ao.SUBQUERY) == 3
 
 
 # ── 4. Retrieval-round budget stops at two ────────────────
@@ -525,3 +539,191 @@ def test_fast_lane_orchestration_overhead_is_small():
     durations.sort()
     p95 = durations[int(len(durations) * 0.95)]
     assert p95 < 250.0, f"fast-lane orchestration p95 {p95:.3f}ms exceeds 250ms"
+
+
+# ══════════════════════════════════════════════════════════════════════
+# 2.2.3.4 second review wave — regression tests (A, B, C, E, G, H, I)
+# ══════════════════════════════════════════════════════════════════════
+
+
+# ── A: fast lane rejected when the plan has complex obligations ──
+
+def test_fast_lane_rejected_for_complex_plan_even_if_route_complete():
+    # A complete numeric route on a >2-entity plan must NOT go fast (which skips
+    # document retrieval) — defense in depth against router complete-overclaim.
+    route_fn, execute_fn = complete_route()
+    retriever = FakeRetriever(documents=[doc("d1")])
+    plan = make_plan("compare NVDA AMD INTC revenue",
+                     entities=["NVDA", "AMD", "INTC"],
+                     metrics=["total_revenue"], intents=["comparison"],
+                     primary_intent="comparison")
+
+    result = orchestrate(
+        plan, store=object(), config=make_config(),
+        retriever=retriever, route_fn=route_fn, execute_fn=execute_fn,
+    )
+
+    assert result.lane is Lane.COMPLEX
+    assert "complex_multi_entity" in result.reason_codes
+    assert retriever.retrieve_calls == 1  # documents WERE retrieved
+
+
+# ── B: context budget honors period + reserves coverage before extra facts ──
+
+def test_context_budget_exact_match_requires_period():
+    config = make_config()
+    plan = make_plan("NVDA revenue 2026-Q2", entities=["NVDA"],
+                     metrics=["total_revenue"], periods=["2026-Q2"])
+    wrong_period = {"metric": "total_revenue", "value": 20.0, "ticker": "NVDA",
+                    "period": "2026-Q1", "source_type": "sqlite"}
+    right_period = {"metric": "total_revenue", "value": 26.0, "ticker": "NVDA",
+                    "period": "2026-Q2", "source_type": "sqlite"}
+
+    sel = ContextBudget(config).select(plan, [wrong_period, right_period], [], Lane.STANDARD)
+
+    # Both facts fit here, but only the exact-period row counts as coverage.
+    covered = {f["ticker"] for f in sel.facts if f.get("period") == "2026-Q2"}
+    assert "NVDA" in covered
+    assert right_period in sel.facts
+
+
+def test_context_budget_reserves_coverage_doc_over_extra_facts():
+    # A tiny cap that fits the exact fact + the coverage doc but not the pile of
+    # non-exact facts. The qualitative coverage doc must survive.
+    config = make_config(adaptive_max_context_chars=1000)
+    plan = make_plan("why did NVDA drop; explain", entities=["NVDA"],
+                     metrics=["total_revenue"], intents=["explanation"],
+                     primary_intent="explanation")
+    exact = {"metric": "total_revenue", "value": 26.0, "ticker": "NVDA",
+             "period": None, "source_type": "sqlite"}
+    filler = [{"metric": "misc", "value": i, "ticker": "OTHER", "period": None,
+               "source_type": "sqlite"} for i in range(40)]
+    cover_doc = doc("cover", body="NVDA fell on datacenter guidance " * 5, ticker="NVDA")
+
+    sel = ContextBudget(config).select(plan, [exact] + filler, [cover_doc], Lane.STANDARD)
+
+    assert any(d["id"] == "cover" for d in sel.documents)  # coverage survived
+    assert exact in sel.facts
+
+
+# ── C: budgeter / top-level failures fall soft, never raise ──
+
+def test_context_budgeter_failure_falls_soft(monkeypatch):
+    retriever = FakeRetriever(documents=[doc("d1", ticker="NVDA")])
+    plan = make_plan("why did NVDA drop", entities=["NVDA"],
+                     intents=["explanation"], primary_intent="explanation")
+
+    def boom_select(self, plan, facts, documents, lane):
+        raise RuntimeError("budgeter exploded")
+
+    monkeypatch.setattr(ContextBudget, "select", boom_select)
+
+    # Must not raise; returns a result with an empty, reason-coded selection.
+    result = orchestrate(
+        plan, store=object(), config=make_config(enable_reranker=False),
+        retriever=retriever, route_fn=lambda p, m: RouteDecision(),
+    )
+    assert result.context is not None
+    assert result.context.context_chars == 0
+    assert "context_budget_error" in result.context.reason_codes
+
+
+def test_budget_from_config_failure_falls_soft(monkeypatch):
+    retriever = FakeRetriever(documents=[doc("d1", ticker="NVDA")])
+    plan = make_plan("why did NVDA drop", entities=["NVDA"],
+                     intents=["explanation"], primary_intent="explanation")
+
+    def boom_from_config(cls, config):
+        raise RuntimeError("budget construction failed")
+
+    monkeypatch.setattr(ExecutionBudget, "from_config", classmethod(boom_from_config))
+
+    result = orchestrate(
+        plan, store=object(), config=make_config(),
+        retriever=retriever, route_fn=lambda p, m: RouteDecision(),
+    )
+    # Top-level fail-soft -> legacy fallback, never an exception.
+    assert result.fallback_reason == "adaptive_error"
+    assert retriever.retrieve_calls >= 1
+
+
+# ── E: fast-lane route error reuses the caller's retriever ──
+
+def test_fast_lane_route_error_reuses_injected_retriever():
+    sentinel = [doc("fallback-doc", ticker="NVDA")]
+    retriever = FakeRetriever(documents=sentinel)
+    decision = RouteDecision(
+        matched=True, complete=True, requires_documents=False,
+        tool_invocations=[ToolInvocation("get_fundamentals", {"ticker": "NVDA"},
+                                         "sq0", dr.REASON_FUNDAMENTALS)],
+        reason_codes=[dr.REASON_FUNDAMENTALS],
+    )
+    errored = ExecutionResult(invocations=[], error=True, answer=None)
+    plan = make_plan("what is NVDA revenue", entities=["NVDA"],
+                     metrics=["total_revenue"], intents=["fact_lookup"],
+                     primary_intent="fact_lookup")
+
+    result = orchestrate(
+        plan, store=object(), config=make_config(),
+        retriever=retriever,
+        route_fn=lambda p, m: decision, execute_fn=lambda *a, **k: errored,
+    )
+
+    assert result.fallback_reason == "deterministic_route_error"
+    # The injected retriever ran the fallback (no fresh Retriever constructed).
+    assert retriever.retrieve_calls == 1
+    assert [d["id"] for d in result.merged_documents] == ["fallback-doc"]
+
+
+# ── G: reranker's silent RRF fallback is reported as rerank_fallback ──
+
+class SilentFallbackReranker:
+    """Mimics Reranker.rerank's internal fallback: returns RRF order, no raise,
+    every doc carries rerank_score=None."""
+
+    def __init__(self):
+        self.calls = 0
+
+    def rerank(self, query, docs, top_n=5):
+        self.calls += 1
+        out = list(docs)[:top_n]
+        for d in out:
+            d["rerank_score"] = None
+        return out
+
+
+def test_silent_reranker_fallback_reported_as_fallback():
+    pool = [doc(f"d{i}", body=f"body {i}", fusion=0.5 - i * 0.01) for i in range(8)]
+    candidates = {
+        "documents": pool,
+        "vector_ids": ["d0", "d1", "d2"],
+        "lexical_ids": ["d5", "d6", "d7"],  # disagreement → rerank attempted
+        "candidate_count": len(pool),
+    }
+    reranker = SilentFallbackReranker()
+    retriever = FakeRetriever(candidates=candidates, reranker=reranker, documents=pool)
+    plan = make_plan("why did NVDA drop", entities=["NVDA"],
+                     intents=["explanation"], primary_intent="explanation")
+
+    result = orchestrate(
+        plan, store=object(),
+        config=make_config(enable_reranker=True, adaptive_conditional_rerank=True),
+        retriever=retriever, route_fn=lambda p, m: RouteDecision(),
+    )
+
+    assert reranker.calls == 1
+    assert result.rerank_ran is False           # NOT reported as applied
+    assert "rerank_fallback" in result.reason_codes
+    assert "rerank_applied" not in result.reason_codes
+
+
+# ── I: id and (parent_id, chunk_index) are independent dedup identities ──
+
+def test_dedupe_treats_id_and_parent_chunk_independently():
+    # Same physical chunk: once keyed by id, once keyed only by parent+chunk.
+    d_with_id = {"id": "doc#0", "document": "chunk body",
+                 "metadata": {"parent_id": "doc", "chunk_index": 0}}
+    d_by_chunk = {"document": "chunk body",
+                  "metadata": {"parent_id": "doc", "chunk_index": 0}}
+    out = ao._dedupe_docs([d_with_id, d_by_chunk])
+    assert len(out) == 1

@@ -1148,3 +1148,119 @@ class TestCarriedSlotCapture:
         met = M.metric_carryover_accuracy([row])
         assert ent["n_eligible"] == 1 and ent["score"] == 1.0
         assert met["n_eligible"] == 1 and met["score"] == 1.0
+
+
+# ── Phase 2.2.3.4 — adaptive orchestration eval scaffolding ─────────────
+
+def _orch_row(cid, *, lane="standard", fallback_reason=None, reason_codes=(),
+              tools=(), subqueries=1, rounds=1, planning=0, rerank=0,
+              config_label="adaptive_tools_rerank", **row_kwargs):
+    """A run row carrying an orchestration block (matches run_eval._row shape)."""
+    row = _row(cid, **row_kwargs)
+    orch = {
+        "lane": lane, "reason_codes": list(reason_codes),
+        "subqueries_executed": subqueries, "retrieval_rounds": rounds,
+        "planning_calls": planning, "reranker_calls": rerank,
+        "deterministic_tools": list(tools), "context_chars": 500,
+        "evidence_dropped": 0, "fallback_reason": fallback_reason,
+    }
+    row["orchestration"] = orch
+    row["lane"] = lane
+    row["fallback_reason"] = fallback_reason
+    row["config_label"] = config_label
+    return row
+
+
+class TestAdaptiveMetrics:
+    def test_score_all_omits_adaptive_when_absent(self):
+        s = M.score_all([_row("c1"), _row("c2")], run_judge=False)
+        assert "adaptive" not in s
+        assert "config_label" not in s
+
+    def test_adaptive_metrics_present_and_shaped(self):
+        rows = [
+            _orch_row("c1", lane="fast", tools=("get_fundamentals",),
+                      subqueries=1, rounds=0),
+            _orch_row("c2", lane="standard", subqueries=1, rounds=1),
+            _orch_row("c3", lane="complex", subqueries=3, rounds=2, rerank=1,
+                      reason_codes=("subquery_budget_exhausted",)),
+            _orch_row("c4", lane="standard", fallback_reason="adaptive_error"),
+        ]
+        s = M.score_all(rows, run_judge=False)
+
+        assert s["config_label"] == "adaptive_tools_rerank"
+        a = s["adaptive"]
+        assert a["n_adaptive"] == 4
+        assert a["lane_distribution"] == {"fast": 1, "standard": 2, "complex": 1}
+        assert a["fallback_rate"]["rate"] == 0.25
+        assert a["budget_exhaustion_rate"]["n_exhausted"] == 1
+        assert a["write_tool_routes"] == 0
+        assert a["budget_cap_violations"] == {
+            "subqueries_executed": 0, "retrieval_rounds": 0,
+            "planning_calls": 0, "reranker_calls": 0}
+        assert set(a["per_lane"]) == {"fast", "standard", "complex"}
+        assert a["max_counters"]["subqueries_executed"] == 3
+
+    def test_config_label_only_run_emits_adaptive_block(self):
+        # A labeled legacy run (no orchestration) still gets the config_label so
+        # the three-config comparison can line up the legacy baseline.
+        rows = [_row("c1"), _row("c2")]
+        for r in rows:
+            r["config_label"] = "legacy"
+        s = M.score_all(rows, run_judge=False)
+        assert s["config_label"] == "legacy"
+        assert s["adaptive"]["n_adaptive"] == 0
+
+    def test_write_tool_route_and_cap_violation_detected(self):
+        rows = [
+            _orch_row("c1", tools=("refresh_data",)),          # write route
+            _orch_row("c2", subqueries=4),                      # exceeds cap 3
+        ]
+        assert M.write_tool_route_count(rows) == 1
+        assert M.budget_cap_violations(rows)["subqueries_executed"] == 1
+
+
+class TestAdaptiveGate:
+    def test_safety_checks_pass_when_clean(self):
+        rows = [_orch_row("c1", lane="fast"), _orch_row("c2", lane="standard")]
+        summary = M.score_all(rows, run_judge=False)
+        assert gate.adaptive_safety_checks(summary) == []
+
+    def test_safety_checks_flag_write_and_budget(self):
+        rows = [
+            _orch_row("c1", tools=("refresh_data",)),
+            _orch_row("c2", rounds=3),
+        ]
+        summary = M.score_all(rows, run_judge=False)
+        failures = gate.adaptive_safety_checks(summary)
+        assert any("write tool" in f for f in failures)
+        assert any("budget cap" in f for f in failures)
+
+    def test_safety_checks_inert_without_adaptive_block(self):
+        assert gate.adaptive_safety_checks({"n_cases": 2}) == []
+
+
+class TestRunEvalOrchestrationCapture:
+    def test_row_from_endpoint_captures_orchestration(self):
+        case = {"id": "c1", "question": "What is NVDA revenue?",
+                "expected_ticker": "NVDA", "expected_intent": "fact_lookup"}
+        data = {
+            "answer": "Revenue was 26B.", "detected_ticker": "NVDA",
+            "detected_intent": "fact_lookup", "facts_used": 3,
+            "documents_used": 1, "citations": [], "model_available": True,
+            "grounding": "grounded", "evidence_trace": _trace(),
+            "orchestration": {
+                "lane": "fast", "reason_codes": ["lane_fast"],
+                "subqueries_executed": 1, "retrieval_rounds": 0,
+                "planning_calls": 0, "reranker_calls": 0,
+                "deterministic_tools": ["get_fundamentals"],
+                "context_chars": 400, "evidence_dropped": 0,
+                "fallback_reason": None},
+        }
+        row = R._row_from_endpoint(case, data, latency_s=0.05)
+
+        assert row["lane"] == "fast"
+        assert row["fallback_reason"] is None
+        assert row["orchestration"]["deterministic_tools"] == ["get_fundamentals"]
+        # config_label defaults None until main() denormalizes the run label.
+        assert row["config_label"] is None

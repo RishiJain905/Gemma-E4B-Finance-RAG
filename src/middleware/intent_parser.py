@@ -107,7 +107,11 @@ class IntentParser:
         (r"\brevenue\b", "total_revenue"),
         (r"\bsales\b", "total_revenue"),
         (r"\btop[- ]line\b", "total_revenue"),
-        (r"\bgross (profit|margin)\b", "gross_profit"),
+        # "gross profit" -> gross_profit; "gross margin" -> gross_margin_pct
+        # only (2.2.3.4 review finding 6). The old `gross (profit|margin)`
+        # alternation double-matched "gross margin" as both metrics, creating a
+        # false multi-metric ambiguity that made the router abstain.
+        (r"\bgross profit\b", "gross_profit"),
         (r"\bgross margin\b", "gross_margin_pct"),
 
         # Earnings / Profit

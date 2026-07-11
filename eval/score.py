@@ -187,6 +187,37 @@ def report_md(summary: dict, prev: Optional[dict]) -> str:
             delta = f"{d:+.2f} {arrow}"
         lines.append(f"| {name} | {_fmt(cur)} | {_fmt(prv)} | {delta} |")
     lines.append("")
+
+    # Adaptive-orchestration block (2.2.3.4) — only when the run carried one.
+    adaptive = summary.get("adaptive")
+    if isinstance(adaptive, dict):
+        label = summary.get("config_label") or "unlabeled"
+        lines.append(f"## Adaptive orchestration — config `{label}`")
+        lines.append("")
+        lines.append(f"- adaptive rows: {adaptive.get('n_adaptive', 0)}")
+        lines.append(f"- lane distribution: {adaptive.get('lane_distribution', {})}")
+        fb = adaptive.get("fallback_rate", {})
+        lines.append(f"- fallback rate: {_fmt(fb.get('rate'))} "
+                     f"({fb.get('n_fallback', 0)}/{fb.get('n_eligible', 0)})")
+        ex = adaptive.get("budget_exhaustion_rate", {})
+        lines.append(f"- budget exhaustion rate: {_fmt(ex.get('rate'))} "
+                     f"({ex.get('n_exhausted', 0)}/{ex.get('n_eligible', 0)})")
+        lines.append(f"- write-tool routes (must be 0): {adaptive.get('write_tool_routes', 0)}")
+        lines.append(f"- budget cap violations (must be 0): "
+                     f"{adaptive.get('budget_cap_violations', {})}")
+        lines.append(f"- avg counters: {adaptive.get('avg_counters', {})}")
+        per_lane = adaptive.get("per_lane") or {}
+        if per_lane:
+            lines.append("")
+            lines.append("| lane | n | intent_acc | ticker_acc | retrieval_hit | p50 ms | p95 ms |")
+            lines.append("|---|---|---|---|---|---|---|")
+            for lane, blk in per_lane.items():
+                lines.append(
+                    f"| {lane} | {blk.get('n', 0)} | {_fmt(blk.get('intent_accuracy'))} | "
+                    f"{_fmt(blk.get('ticker_accuracy'))} | {_fmt(blk.get('retrieval_hit_rate'))} | "
+                    f"{blk.get('p50_latency_ms')} | {blk.get('p95_latency_ms')} |")
+        lines.append("")
+
     if prev:
         lines.append(f"_Previous run: `{prev.get('source_run', 'n/a')}`_")
     return "\n".join(lines)

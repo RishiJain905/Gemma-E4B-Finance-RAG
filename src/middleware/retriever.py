@@ -105,11 +105,12 @@ class Retriever:
         # ("vector" | "hybrid" | "hybrid+rerank") — surfaced in the /query response.
         self._doc_retrieval_strategy = "vector"
         self._timings = {"embedding": 0.0, "chroma": 0.0, "sqlite": 0.0}
-        # Phase 2.2.3.3 — per-channel ranked ids from the most recent document
-        # fusion, so the adaptive orchestrator can score channel disagreement
-        # for its conditional-rerank decision. Reset on each fusion pass.
-        self._last_vector_ids: list[str] = []
-        self._last_lexical_ids: list[str] = []
+        # Phase 2.2.3.3 — per-channel ranked ids from a document fusion are the
+        # adaptive orchestrator's channel-disagreement signal. They are NOT kept
+        # on the instance (that cross-contaminated concurrent requests on the
+        # shared Retriever — 2.2.3.4 review D); a request-local ``channels`` dict
+        # is threaded through the doc-retrieval path and surfaced only in
+        # retrieve_candidates()' returned dict.
 
     @property
     def lexical(self) -> LexicalIndex:
@@ -185,8 +186,10 @@ class Retriever:
         unchanged for every feature-disabled caller.
         """
         result = self._run_retrieval(query, intent, top_k_documents, top_k_facts, pool=True)
-        result["vector_ids"] = list(self._last_vector_ids)
-        result["lexical_ids"] = list(self._last_lexical_ids)
+        # vector_ids / lexical_ids are produced request-locally by _run_retrieval
+        # (pool=True) — never read back off shared instance state.
+        result.setdefault("vector_ids", [])
+        result.setdefault("lexical_ids", [])
         result["candidate_count"] = len(result.get("documents", []))
         return result
 
@@ -198,8 +201,9 @@ class Retriever:
         full document candidate pool without re-rank/truncation)."""
         self._doc_retrieval_strategy = "vector"  # reset; upgraded by hybrid path
         self._timings = {"embedding": 0.0, "chroma": 0.0, "sqlite": 0.0}
-        self._last_vector_ids = []
-        self._last_lexical_ids = []
+        # Request-local channel ids (review D): the doc path writes the most
+        # recent fusion's per-channel ranked ids here, never onto self.
+        channels: dict = {"vector_ids": [], "lexical_ids": []}
         ticker = intent.get("ticker")
         metrics = intent.get("metrics", [])
         question_type = intent.get("question_type", "general")
@@ -224,25 +228,28 @@ class Retriever:
             )
 
         elif strategy == "documents_only":
-            documents = self._retrieve_documents(query, ticker, top_k_documents, pool=pool)
+            documents = self._retrieve_documents(
+                query, ticker, top_k_documents, pool=pool, channels=channels)
 
         elif strategy == "macro":
             facts = self._time_sqlite(self._retrieve_macro_facts, top_k_facts)
             documents = self._retrieve_documents(
-                query, ticker=None, n_results=top_k_documents, pool=pool)
+                query, ticker=None, n_results=top_k_documents, pool=pool, channels=channels)
 
         elif strategy == "macro_hybrid":
             facts = self._time_sqlite(
                 self._retrieve_facts, ticker, metrics, timeframe, top_k_facts,
             )
             facts.extend(self._time_sqlite(self._retrieve_macro_facts, top_k_facts))
-            documents = self._retrieve_documents(query, ticker, top_k_documents, pool=pool)
+            documents = self._retrieve_documents(
+                query, ticker, top_k_documents, pool=pool, channels=channels)
 
         elif strategy == "hybrid":
             facts = self._time_sqlite(
                 self._retrieve_facts, ticker, metrics, timeframe, top_k_facts,
             )
-            documents = self._retrieve_documents(query, ticker, top_k_documents, pool=pool)
+            documents = self._retrieve_documents(
+                query, ticker, top_k_documents, pool=pool, channels=channels)
 
         elif strategy == "comparison":
             # Multi-ticker: extract all tickers from query
@@ -253,13 +260,13 @@ class Retriever:
                 )
                 facts.extend(t_facts)
                 t_docs = self._retrieve_documents(
-                    query, t, top_k_documents // len(tickers), pool=pool)
+                    query, t, top_k_documents // len(tickers), pool=pool, channels=channels)
                 documents.extend(t_docs)
 
         elif strategy == "broad":
             # No ticker detected — search everything
             documents = self._retrieve_documents(
-                query, ticker=None, n_results=top_k_documents, pool=pool)
+                query, ticker=None, n_results=top_k_documents, pool=pool, channels=channels)
             facts = self._time_sqlite(self._retrieve_all_facts, top_k_facts)
 
         if question_type == "projection" and ticker:
@@ -270,7 +277,7 @@ class Retriever:
             strategy, ticker, len(facts), len(documents),
         )
 
-        return {
+        result = {
             "facts": facts,
             "documents": documents,
             "ticker": ticker,
@@ -278,6 +285,12 @@ class Retriever:
             "retrieval_strategy": self._doc_retrieval_strategy,
             "timings": {k: round(v, 1) for k, v in self._timings.items()},
         }
+        # Channel ids are only meaningful to the candidate (pool) consumer and
+        # are omitted from the legacy retrieve() dict so its shape is unchanged.
+        if pool:
+            result["vector_ids"] = list(channels["vector_ids"])
+            result["lexical_ids"] = list(channels["lexical_ids"])
+        return result
 
     def _time_sqlite(self, func, *args, **kwargs):
         """Run a SQLite-backed retrieval function and accumulate elapsed time."""
@@ -454,7 +467,8 @@ class Retriever:
         return self._retrieve_documents(query, ticker, n_results)
 
     def _retrieve_documents(self, query: str, ticker: Optional[str],
-                            n_results: int, *, pool: bool = False) -> list[dict]:
+                            n_results: int, *, pool: bool = False,
+                            channels: Optional[dict] = None) -> list[dict]:
         """Retrieve relevant documents — hybrid (vector+BM25+RRF, optional
         re-rank) when enabled, else the original vector-only path.
 
@@ -462,8 +476,9 @@ class Retriever:
         ``rerank_candidates`` broadly, fuses, then re-ranks / truncates to
         ``n_results``. When ``pool`` is True (2.2.3.3), the full fused candidate
         pool is returned *without* re-ranking or truncation so the adaptive
-        orchestrator owns the re-rank/context decision; per-channel ranked ids
-        are recorded on ``self._last_vector_ids`` / ``self._last_lexical_ids``.
+        orchestrator owns the re-rank/context decision. When ``channels`` is
+        given (request-local, review D), the per-channel ranked ids of the
+        fusion are written into it — never onto shared instance state.
         """
         if not self.config.enable_lexical:
             candidate_n = max(self.config.rerank_candidates, n_results) if pool else n_results
@@ -476,14 +491,16 @@ class Retriever:
             self._timings["embedding"] += float(search_timings.get("embedding", 0.0) or 0.0)
             self._timings["chroma"] += float(search_timings.get("chroma", elapsed_ms) or 0.0)
             docs = results.get("documents", [])
-            self._last_vector_ids = [d.get("id") for d in docs if d.get("id") is not None]
-            self._last_lexical_ids = []
+            if channels is not None:
+                channels["vector_ids"] = [d.get("id") for d in docs if d.get("id") is not None]
+                channels["lexical_ids"] = []
             self._doc_retrieval_strategy = "vector"
             return docs
-        return self._retrieve_documents_hybrid(query, ticker, n_results, pool=pool)
+        return self._retrieve_documents_hybrid(
+            query, ticker, n_results, pool=pool, channels=channels)
 
     def _fuse_channels(self, query: str, ticker: Optional[str],
-                       n_results: int) -> list[dict]:
+                       n_results: int, *, channels: Optional[dict] = None) -> list[dict]:
         """Vector + BM25 → RRF → hydrated fused docs (no re-rank, no truncation).
 
         Records the strategy (``hybrid`` when lexical produced hits, else
@@ -542,18 +559,20 @@ class Retriever:
         # Record the strategy actually used (vector if lexical produced nothing)
         # and the per-channel ranked ids for the conditional-rerank signal.
         self._doc_retrieval_strategy = "hybrid" if lexical_hits else "vector"
-        self._last_vector_ids = [h["id"] for h in vector_hits]
-        self._last_lexical_ids = [h["id"] for h in lexical_hits]
+        if channels is not None:
+            channels["vector_ids"] = [h["id"] for h in vector_hits]
+            channels["lexical_ids"] = [h["id"] for h in lexical_hits]
         return fused_docs
 
     def _retrieve_documents_hybrid(self, query: str, ticker: Optional[str],
-                                   n_results: int, *, pool: bool = False) -> list[dict]:
+                                   n_results: int, *, pool: bool = False,
+                                   channels: Optional[dict] = None) -> list[dict]:
         """Vector + BM25 → RRF → (optional) cross-encoder re-rank → top n.
 
         With ``pool=True`` the full fused candidate pool is returned unranked and
         untruncated (the adaptive orchestrator owns re-ranking/truncation).
         """
-        fused_docs = self._fuse_channels(query, ticker, n_results)
+        fused_docs = self._fuse_channels(query, ticker, n_results, channels=channels)
         if pool:
             return fused_docs
 
