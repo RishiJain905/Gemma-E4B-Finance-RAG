@@ -189,6 +189,14 @@ class QueryResponse(BaseModel):
                     "when enable_adaptive_rag is on; omitted (null) on the legacy "
                     "path so older clients are unaffected.",
     )
+    evidence_sufficiency: Optional[dict] = Field(
+        None,
+        exclude_if=lambda value: value is None,
+        description="Evidence sufficiency/answer-policy metadata (2.2.4.1): "
+                    "{status, reason_codes, covered_subqueries, missing_subqueries, "
+                    "corrective_action, retry_performed}. Omitted while the feature "
+                    "flag is off.",
+    )
     freshness: dict = Field(
         default_factory=lambda: {
             "overall": "unknown",

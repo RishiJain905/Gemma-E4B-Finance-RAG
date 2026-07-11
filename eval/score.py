@@ -142,6 +142,16 @@ def console_table(summary: dict) -> str:
             lines.append(f"{name:<38} {_fmt(block.get('score'))}"
                          f"   (n={block.get('n_eligible', 0)})")
 
+    sufficiency = summary.get("evidence_sufficiency")
+    if isinstance(sufficiency, dict):
+        lines.append("")
+        lines.append("=== Evidence sufficiency (Phase 2.2.4.1) ===")
+        for name in ("coverage_precision", "coverage_recall", "abstention_f1",
+                     "unnecessary_retry_rate", "unsupported_number_rate"):
+            lines.append(f"{name:<38} {_fmt(sufficiency.get(name))}")
+        lines.append(f"{'latency_ms':<38} {sufficiency.get('latency_ms', {})}")
+        lines.append(f"{'retrieval_rounds':<38} {sufficiency.get('retrieval_rounds', {})}")
+
     # Per-category table.
     per = summary.get("per_category") or {}
     if per:
@@ -193,6 +203,22 @@ def report_md(summary: dict, prev: Optional[dict]) -> str:
     if isinstance(adaptive, dict):
         label = summary.get("config_label") or "unlabeled"
         lines.append(f"## Adaptive orchestration — config `{label}`")
+        lines.append("")
+
+    sufficiency = summary.get("evidence_sufficiency")
+    if isinstance(sufficiency, dict):
+        lines.append("## Evidence sufficiency — 2.2.4.1")
+        lines.append("")
+        lines.append(f"- coverage precision/recall: "
+                     f"{_fmt(sufficiency.get('coverage_precision'))} / "
+                     f"{_fmt(sufficiency.get('coverage_recall'))}")
+        lines.append(f"- abstention F1: {_fmt(sufficiency.get('abstention_f1'))}")
+        lines.append(f"- unnecessary retry rate: "
+                     f"{_fmt(sufficiency.get('unnecessary_retry_rate'))}")
+        lines.append(f"- unsupported-number rate: "
+                     f"{_fmt(sufficiency.get('unsupported_number_rate'))}")
+        lines.append(f"- latency: {sufficiency.get('latency_ms', {})}")
+        lines.append(f"- retrieval rounds: {sufficiency.get('retrieval_rounds', {})}")
         lines.append("")
         lines.append(f"- adaptive rows: {adaptive.get('n_adaptive', 0)}")
         lines.append(f"- lane distribution: {adaptive.get('lane_distribution', {})}")

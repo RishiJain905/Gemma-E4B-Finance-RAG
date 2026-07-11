@@ -911,6 +911,79 @@ def has_adaptive_rows(rows: list[dict]) -> bool:
     return any(_orch(r) is not None for r in rows)
 
 
+# ── Evidence sufficiency metrics (2.2.4.1) ────────────────────────────────
+
+def _sufficiency(row: dict) -> Optional[dict]:
+    block = row.get("evidence_sufficiency")
+    return block if isinstance(block, dict) else None
+
+
+def evidence_sufficiency_metrics(rows: list[dict]) -> dict:
+    """Measure obligation coverage, correction cost, abstention, and support."""
+    eligible = [row for row in rows if _sufficiency(row) is not None]
+    true_positive = 0
+    predicted_total = 0
+    expected_total = 0
+    for row in eligible:
+        predicted = set((_sufficiency(row) or {}).get("covered_subqueries") or [])
+        expected = set(_case(row).get("expected_covered_subqueries") or [])
+        true_positive += len(predicted & expected)
+        predicted_total += len(predicted)
+        expected_total += len(expected)
+
+    precision = true_positive / predicted_total if predicted_total else 0.0
+    recall = true_positive / expected_total if expected_total else 0.0
+
+    simple = [row for row in eligible if str(_case(row).get("complexity", "simple")) == "simple"]
+    unnecessary = sum(
+        1 for row in simple
+        if bool((_sufficiency(row) or {}).get("retry_performed"))
+        and not bool(_case(row).get("expected_corrective_retry", False))
+    )
+
+    tp = fp = fn = 0
+    for row in eligible:
+        expected_abstain = bool(_case(row).get("should_abstain", False))
+        predicted_abstain = (_sufficiency(row) or {}).get("status") == "refused"
+        tp += int(expected_abstain and predicted_abstain)
+        fp += int(not expected_abstain and predicted_abstain)
+        fn += int(expected_abstain and not predicted_abstain)
+    abstention_precision = tp / (tp + fp) if tp + fp else 0.0
+    abstention_recall = tp / (tp + fn) if tp + fn else 0.0
+    abstention_f1 = (
+        2 * abstention_precision * abstention_recall
+        / (abstention_precision + abstention_recall)
+        if abstention_precision + abstention_recall else 0.0
+    )
+
+    unsupported = sum(int(row.get("unsupported_number_count") or 0) for row in eligible)
+    numerical = sum(int(row.get("numerical_claim_count") or 0) for row in eligible)
+    latencies = [float(row.get("latency_ms") or 0.0) for row in eligible]
+    rounds = [int((_orch(row) or {}).get("retrieval_rounds", 0) or 0) for row in eligible]
+    return {
+        "n_eligible": len(eligible),
+        "coverage_precision": round(precision, 4),
+        "coverage_recall": round(recall, 4),
+        "unnecessary_retry_rate": round(unnecessary / len(simple), 4) if simple else 0.0,
+        "abstention_f1": round(abstention_f1, 4),
+        "unsupported_number_rate": round(unsupported / numerical, 4) if numerical else 0.0,
+        "latency_ms": {
+            "mean": round(sum(latencies) / len(latencies), 1) if latencies else 0.0,
+            "p95": _pct(latencies, 0.95),
+        },
+        "retrieval_rounds": {
+            "mean": round(sum(rounds) / len(rounds), 3) if rounds else 0.0,
+            "max": max(rounds, default=0),
+            "above_two": sum(1 for value in rounds if value > 2),
+        },
+    }
+
+
+def has_evidence_sufficiency_rows(rows: list[dict]) -> bool:
+    """Whether at least one row carries 2.2.4.1 response metadata."""
+    return any(_sufficiency(row) is not None for row in rows)
+
+
 # ── Aggregator ─────────────────────────────────────────────────────────
 
 def _run_field(rows: list[dict], key: str) -> Optional[str]:
@@ -989,6 +1062,9 @@ def score_all(rows: list[dict], *, judge: Optional[Callable] = None,
     if has_adaptive_rows(rows) or label:
         summary["config_label"] = label
         summary["adaptive"] = adaptive_metrics(rows)
+
+    if has_evidence_sufficiency_rows(rows):
+        summary["evidence_sufficiency"] = evidence_sufficiency_metrics(rows)
 
     summary["per_category"] = _per_category(rows)
     return summary

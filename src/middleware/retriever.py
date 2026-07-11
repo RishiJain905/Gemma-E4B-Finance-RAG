@@ -193,6 +193,36 @@ class Retriever:
         result["candidate_count"] = len(result.get("documents", []))
         return result
 
+    def expand_parent_sections(self, documents: list[dict]) -> list[dict]:
+        """Read adjacent sibling chunks for known parents from local Chroma only.
+
+        This bounded corrective seam never invokes ingestion, HTTP, arbitrary
+        URLs, or write tools. Missing parents/siblings fail soft per item.
+        """
+        expanded: list[dict] = []
+        seen: set[str] = set()
+        for document in documents:
+            metadata = document.get("metadata") or {}
+            parent = metadata.get("parent_id") or document.get("parent_id")
+            chunk = metadata.get("chunk_index", metadata.get("chunk"))
+            if parent is None or not isinstance(chunk, int):
+                continue
+            for index in (chunk - 1, chunk + 1):
+                if index < 0:
+                    continue
+                sibling_id = f"{parent}#{index}"
+                if sibling_id in seen:
+                    continue
+                seen.add(sibling_id)
+                try:
+                    sibling = self.store.chroma.get_document(sibling_id)
+                except Exception:  # noqa: BLE001 - correction is fail-soft per item
+                    logger.debug("Adjacent chunk unavailable: %s", sibling_id, exc_info=True)
+                    continue
+                if sibling:
+                    expanded.append(dict(sibling))
+        return expanded
+
     def _run_retrieval(self, query: str, intent: dict,
                        top_k_documents: int, top_k_facts: int,
                        *, pool: bool) -> dict:

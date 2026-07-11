@@ -67,6 +67,17 @@ def _graded_mode_guidance(grounding_level: str, allow_general_fallback: bool) ->
             "primary source. Refuse if the request is unsafe or genuinely "
             "unknowable."
         ),
+        "general": (
+            "Mode: general fallback. No usable requested evidence was found and "
+            "the request needs no specific figures. Use only stable background "
+            "knowledge, prefix the answer exactly with 'Not from your data - "
+            "general knowledge:', and include a primary-source verification caveat."
+        ),
+        "refused": (
+            "Mode: refuse. Required evidence is missing, stale, or conflicting. "
+            "Briefly state the supplied missing-evidence reason and do not answer "
+            "from background knowledge."
+        ),
     }
     if grounding_level == "none" and not allow_general_fallback:
         mode_guidance["none"] = (
@@ -137,7 +148,8 @@ def build_system_prompt(
             are permitted when grounding_level is "none" (graded mode only).
         intent: parsed request intent, used for the "Intent: {question_type}"
             line in graded mode.
-        grounding_level: "grounded" | "partial" | "none".
+        grounding_level: "grounded" | "partial" | "general" | "refused";
+            ``none`` remains the legacy no-evidence alias.
         tools_enabled: whether tool-calling guidance should be included.
     """
     policy = str(answer_policy or "graded").strip().lower()

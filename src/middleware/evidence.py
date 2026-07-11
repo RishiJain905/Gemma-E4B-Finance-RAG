@@ -12,12 +12,41 @@ than open-coding the fallback chain.
 """
 
 import logging
-from typing import Optional
+from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
 
 # Canonical field first; legacy aliases only as a compatibility fallback.
 _DOCUMENT_BODY_FIELDS = ("document", "text", "content")
+
+
+def evidence_id(row: dict, *, prefix: str = "evidence") -> str:
+    """Return a stable best-effort identifier for one evidence row."""
+    if not isinstance(row, dict):
+        return prefix
+    metadata = row.get("metadata") or {}
+    explicit = row.get("evidence_id") or row.get("id") or metadata.get("id")
+    if explicit not in (None, ""):
+        return str(explicit)
+    parts = (
+        row.get("ticker") or metadata.get("ticker"),
+        row.get("metric") or metadata.get("metric"),
+        row.get("period") or metadata.get("period"),
+        row.get("source_type") or metadata.get("source_type") or metadata.get("source"),
+    )
+    rendered = ":".join(str(part) for part in parts if part not in (None, ""))
+    return f"{prefix}:{rendered}" if rendered else prefix
+
+
+def evidence_field(row: dict, name: str, default: Any = None) -> Any:
+    """Read a common evidence field from the row, then its metadata."""
+    if not isinstance(row, dict):
+        return default
+    value = row.get(name)
+    if value is not None:
+        return value
+    metadata = row.get("metadata") or {}
+    return metadata.get(name, default)
 
 
 def document_body(document: dict) -> str:

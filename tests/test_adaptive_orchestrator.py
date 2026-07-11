@@ -48,6 +48,10 @@ from src.middleware.query_plan import (  # noqa: E402
     QuerySubquery,
     normalize_question,
 )
+from src.middleware.evidence_grader import (  # noqa: E402
+    CorrectiveAction,
+    SufficiencyStatus,
+)
 
 
 # ── Builders ──────────────────────────────────────────────
@@ -128,6 +132,7 @@ class FakeRetriever:
         self.retrieve_calls = 0
         self.retrieve_candidates_calls = 0
         self.last_query = None
+        self.last_intent = None
         self._facts = facts or []
         self._documents = documents or []
         self._candidates = candidates
@@ -137,6 +142,7 @@ class FakeRetriever:
     def retrieve(self, query, intent, top_k_documents=5, top_k_facts=10):
         self.retrieve_calls += 1
         self.last_query = query
+        self.last_intent = dict(intent)
         return {
             "facts": [dict(f) for f in self._facts],
             "documents": [dict(d) for d in self._documents],
@@ -279,6 +285,212 @@ def test_retrieval_round_budget_stops_at_two():
     assert result.lane is Lane.COMPLEX
     assert result.retrieval_rounds_used == 2  # capped, no infinite loop
     assert "retrieval_round_budget_exhausted" in result.reason_codes
+
+
+class SequencedRetriever(FakeRetriever):
+    """Returns one deterministic payload per bounded retrieval call."""
+
+    def __init__(self, payloads):
+        super().__init__()
+        self.payloads = list(payloads)
+
+    def retrieve(self, query, intent, top_k_documents=5, top_k_facts=10):
+        self.retrieve_calls += 1
+        self.last_query = query
+        self.last_intent = dict(intent)
+        payload = self.payloads[min(self.retrieve_calls - 1, len(self.payloads) - 1)]
+        return {
+            "facts": [dict(f) for f in payload.get("facts", [])],
+            "documents": [dict(d) for d in payload.get("documents", [])],
+            "ticker": intent.get("ticker"),
+            "strategy": "hybrid",
+            "retrieval_strategy": "hybrid",
+        }
+
+
+def _exact_revenue(period="FY2025"):
+    return {"evidence_id": f"revenue-{period}", "ticker": "NVDA",
+            "metric": "total_revenue", "value": 26.0, "period": period,
+            "unit": "USD", "source_type": "sec_10k"}
+
+
+def test_evidence_sufficient_skips_corrective_round():
+    retriever = SequencedRetriever([{"facts": [_exact_revenue()]}])
+    plan = make_plan("NVDA revenue FY2025", entities=["NVDA"],
+                     metrics=["total_revenue"], periods=["FY2025"],
+                     intents=["fact_lookup"], primary_intent="fact_lookup")
+
+    result = orchestrate(
+        plan, store=object(),
+        config=make_config(enable_evidence_sufficiency=True,
+                           enable_corrective_retry=True),
+        retriever=retriever, route_fn=lambda p, m: RouteDecision(),
+    )
+
+    assert result.sufficiency.status is SufficiencyStatus.SUFFICIENT
+    assert result.retry_performed is False
+    assert result.retrieval_rounds_used == 1
+    assert retriever.retrieve_calls == 1
+
+
+def test_fast_projection_tool_evidence_is_graded_as_estimate():
+    plan = make_plan("NVDA EPS estimate", entities=["NVDA"],
+                     metrics=["estimate_eps_next_y"], intents=["projection"],
+                     primary_intent="projection")
+    decision = RouteDecision(
+        matched=True, complete=True, requires_documents=False,
+        tool_invocations=[ToolInvocation("get_estimates", {"ticker": "NVDA"},
+                                         "sq0", "projection")],
+    )
+    execution = ExecutionResult(invocations=[ExecutedInvocation(
+        "get_estimates", {"ticker": "NVDA"}, "sq0", "projection",
+        result={"ticker": "NVDA", "estimates": {
+            "estimate_eps_next_y": {"value": 4.2, "period": "FY2027E"},
+        }},
+    )])
+
+    result = orchestrate(
+        plan, store=object(),
+        config=make_config(enable_evidence_sufficiency=True),
+        retriever=FakeRetriever(),
+        route_fn=lambda p, m: decision,
+        execute_fn=lambda *args, **kwargs: execution,
+    )
+
+    assert result.lane is Lane.FAST
+    assert result.sufficiency.status is SufficiencyStatus.SUFFICIENT
+
+
+def test_borderline_evidence_consumes_exactly_one_final_round():
+    retriever = SequencedRetriever([
+        {"facts": [_exact_revenue("FY2024")]},
+        {"facts": [_exact_revenue("FY2025")]},
+        {"facts": [_exact_revenue("FY2026")]},
+    ])
+    plan = make_plan("NVDA revenue FY2025", entities=["NVDA"],
+                     metrics=["total_revenue"], periods=["FY2025"],
+                     intents=["fact_lookup"], primary_intent="fact_lookup")
+
+    result = orchestrate(
+        plan, store=object(),
+        config=make_config(enable_evidence_sufficiency=True,
+                           enable_corrective_retry=True,
+                           max_corrective_retries=99),
+        retriever=retriever, route_fn=lambda p, m: RouteDecision(),
+    )
+
+    assert result.retry_performed is True
+    assert result.corrective_action is CorrectiveAction.ALTERNATE_INTERNAL_MODALITY
+    assert result.retrieval_rounds_used == 2
+    assert retriever.retrieve_calls == 2
+    assert result.sufficiency.status is SufficiencyStatus.SUFFICIENT
+
+
+def test_alternate_modality_targets_the_missing_document_route():
+    retriever = SequencedRetriever([
+        {"facts": [_exact_revenue()]},
+        {"documents": [doc("why", ticker="NVDA", source_type="sec_10k")]},
+    ])
+    plan = make_plan("Why did NVDA revenue change?", entities=["NVDA"],
+                     metrics=["total_revenue"], intents=["explanation"],
+                     primary_intent="explanation")
+
+    result = orchestrate(
+        plan, store=object(),
+        config=make_config(enable_evidence_sufficiency=True,
+                           enable_corrective_retry=True),
+        retriever=retriever, route_fn=lambda p, m: RouteDecision(),
+    )
+
+    assert result.retry_performed is True
+    assert retriever.last_intent["question_type"] == "explanation"
+    assert result.sufficiency.status is SufficiencyStatus.SUFFICIENT
+
+
+def test_clearly_missing_evidence_never_retries():
+    retriever = SequencedRetriever([{"facts": [], "documents": []}])
+    plan = make_plan("NVDA revenue", entities=["NVDA"],
+                     metrics=["total_revenue"], intents=["fact_lookup"],
+                     primary_intent="fact_lookup")
+
+    result = orchestrate(
+        plan, store=object(),
+        config=make_config(enable_evidence_sufficiency=True,
+                           enable_corrective_retry=True),
+        retriever=retriever, route_fn=lambda p, m: RouteDecision(),
+    )
+
+    assert result.sufficiency.status is SufficiencyStatus.MISSING
+    assert result.corrective_action is CorrectiveAction.NONE
+    assert result.retry_performed is False
+    assert retriever.retrieve_calls == 1
+
+
+def test_enabled_gate_never_delegates_action_selection_to_callback():
+    retriever = SequencedRetriever([{"facts": [], "documents": []}])
+    chooser = MagicMock(return_value=True)
+    plan = make_plan("compare NVDA AMD INTC", entities=["NVDA", "AMD", "INTC"])
+
+    result = orchestrate(
+        plan, store=object(),
+        config=make_config(enable_evidence_sufficiency=True,
+                           enable_corrective_retry=True),
+        retriever=retriever, corrective_retry=chooser,
+        route_fn=lambda p, m: RouteDecision(),
+    )
+
+    chooser.assert_not_called()
+    assert result.retry_performed is False
+    assert result.retrieval_rounds_used == 1
+
+
+def test_second_round_insufficiency_stops_and_preserves_best_evidence():
+    retriever = SequencedRetriever([
+        {"facts": [_exact_revenue("FY2024")]},
+        {"facts": [_exact_revenue("FY2023")]},
+    ])
+    plan = make_plan("NVDA revenue FY2025", entities=["NVDA"],
+                     metrics=["total_revenue"], periods=["FY2025"],
+                     intents=["fact_lookup"], primary_intent="fact_lookup")
+
+    result = orchestrate(
+        plan, store=object(),
+        config=make_config(enable_evidence_sufficiency=True,
+                           enable_corrective_retry=True),
+        retriever=retriever, route_fn=lambda p, m: RouteDecision(),
+    )
+
+    assert result.retrieval_rounds_used == 2
+    assert result.retry_performed is True
+    assert result.sufficiency.status is SufficiencyStatus.BORDERLINE
+    assert len(result.merged_facts) == 2
+    assert "corrective_retry_exhausted" in result.reason_codes
+
+
+def test_run_derived_subqueries_is_noop_until_2_2_4_2():
+    retriever = SequencedRetriever([{"facts": [], "documents": []}])
+    plan = make_plan("NVDA revenue", entities=["NVDA"],
+                     metrics=["total_revenue"], intents=["fact_lookup"],
+                     primary_intent="fact_lookup")
+    plan.subqueries.append(QuerySubquery(
+        id="sq1", text="derived", entity_tickers=("NVDA",),
+        metrics=("total_revenue",), retrieval_modes=("facts",),
+        derived=True, parent_id="sq0",
+    ))
+    plan.validate()
+
+    result = orchestrate(
+        plan, store=object(),
+        config=make_config(enable_evidence_sufficiency=True,
+                           enable_corrective_retry=True),
+        retriever=retriever, route_fn=lambda p, m: RouteDecision(),
+    )
+
+    assert result.corrective_action is CorrectiveAction.RUN_DERIVED_SUBQUERIES
+    assert result.retry_performed is False
+    assert result.retrieval_rounds_used == 1
+    assert retriever.retrieve_calls == 1
+    assert "run_derived_subqueries_deferred_2_2_4_2" in result.reason_codes
 
 
 # ── 5. Planning-call budget stops at one ──────────────────

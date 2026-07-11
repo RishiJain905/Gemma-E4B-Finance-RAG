@@ -1240,6 +1240,86 @@ class TestAdaptiveGate:
         assert gate.adaptive_safety_checks({"n_cases": 2}) == []
 
 
+class TestEvidenceSufficiencyMetrics:
+    @staticmethod
+    def _suff_row(
+        row_id, *, expected_covered=(), covered=(), should_abstain=False,
+        status="grounded", retry=False, simple=True, unsupported=0,
+        numerical=0, rounds=1, latency=10.0,
+    ):
+        row = _row(row_id)
+        row["case"].update({
+            "expected_covered_subqueries": list(expected_covered),
+            "should_abstain": should_abstain,
+            "complexity": "simple" if simple else "complex",
+        })
+        row.update({
+            "grounding": status,
+            "latency_ms": latency,
+            "unsupported_number_count": unsupported,
+            "numerical_claim_count": numerical,
+            "evidence_sufficiency": {
+                "status": status,
+                "covered_subqueries": list(covered),
+                "missing_subqueries": [],
+                "reason_codes": [],
+                "corrective_action": "none",
+                "retry_performed": retry,
+            },
+            "orchestration": {"retrieval_rounds": rounds},
+        })
+        return row
+
+    def test_metrics_measure_coverage_retry_abstention_numbers_latency_and_rounds(self):
+        rows = [
+            self._suff_row("a", expected_covered=("sq0",), covered=("sq0",),
+                           numerical=2, latency=10, rounds=1),
+            self._suff_row("b", expected_covered=("sq0", "sq1"), covered=("sq0",),
+                           retry=True, simple=True, unsupported=1, numerical=2,
+                           latency=30, rounds=2),
+            self._suff_row("c", should_abstain=True, status="refused",
+                           simple=False, latency=20, rounds=1),
+        ]
+
+        block = M.evidence_sufficiency_metrics(rows)
+
+        assert block["coverage_precision"] == 1.0
+        assert block["coverage_recall"] == 0.6667
+        assert block["unnecessary_retry_rate"] == 0.5
+        assert block["abstention_f1"] == 1.0
+        assert block["unsupported_number_rate"] == 0.25
+        assert block["latency_ms"] == {"mean": 20.0, "p95": 30.0}
+        assert block["retrieval_rounds"] == {"mean": 1.333, "max": 2,
+                                               "above_two": 0}
+
+    def test_score_all_emits_block_only_when_feature_metadata_is_present(self):
+        assert "evidence_sufficiency" not in M.score_all([_row("legacy")], run_judge=False)
+        row = self._suff_row("enabled", expected_covered=("sq0",), covered=("sq0",))
+        assert "evidence_sufficiency" in M.score_all([row], run_judge=False)
+
+
+class TestEvidenceSufficiencyGate:
+    def test_absolute_and_relative_promotion_gates(self):
+        baseline = {"evidence_sufficiency": {"unsupported_number_rate": 0.20},
+                    "keyword_coverage": 0.90}
+        passing = {"evidence_sufficiency": {
+            "abstention_f1": 0.85,
+            "unsupported_number_rate": 0.14,
+            "unnecessary_retry_rate": 0.15,
+            "retrieval_rounds": {"above_two": 0},
+        }, "keyword_coverage": 0.88}
+        assert gate.evidence_sufficiency_checks(passing, baseline) == []
+
+        failing = {"evidence_sufficiency": {
+            "abstention_f1": 0.80,
+            "unsupported_number_rate": 0.19,
+            "unnecessary_retry_rate": 0.20,
+            "retrieval_rounds": {"above_two": 1},
+        }, "keyword_coverage": 0.85}
+        failures = gate.evidence_sufficiency_checks(failing, baseline)
+        assert len(failures) == 5
+
+
 class TestRunEvalOrchestrationCapture:
     def test_row_from_endpoint_captures_orchestration(self):
         case = {"id": "c1", "question": "What is NVDA revenue?",
@@ -1256,11 +1336,17 @@ class TestRunEvalOrchestrationCapture:
                 "deterministic_tools": ["get_fundamentals"],
                 "context_chars": 400, "evidence_dropped": 0,
                 "fallback_reason": None},
+            "evidence_sufficiency": {
+                "status": "grounded", "reason_codes": [],
+                "covered_subqueries": ["sq0"], "missing_subqueries": [],
+                "corrective_action": "none", "retry_performed": False,
+            },
         }
         row = R._row_from_endpoint(case, data, latency_s=0.05)
 
         assert row["lane"] == "fast"
         assert row["fallback_reason"] is None
         assert row["orchestration"]["deterministic_tools"] == ["get_fundamentals"]
+        assert row["evidence_sufficiency"]["covered_subqueries"] == ["sq0"]
         # config_label defaults None until main() denormalizes the run label.
         assert row["config_label"] is None

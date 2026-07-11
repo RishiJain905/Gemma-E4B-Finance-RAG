@@ -102,6 +102,23 @@ def _grounding_level(retrieval: dict) -> str:
     return "grounded" if n >= 3 else "partial" if n >= 1 else "none"
 
 
+def _answer_mode_from_sufficiency(
+    sufficiency,
+    *,
+    requires_specific_figures: bool,
+) -> str:
+    """Convert deterministic obligation coverage into one answer policy mode."""
+    from .evidence_grader import SufficiencyStatus
+
+    if sufficiency.status is SufficiencyStatus.SUFFICIENT:
+        return "grounded"
+    if any(row.covered_fields for row in sufficiency.coverage):
+        return "partial"
+    if not requires_specific_figures and _allow_general_fallback():
+        return "general"
+    return "refused"
+
+
 def _answer_policy() -> str:
     """Return the effective answer policy: per-request override, else configured default."""
     override = _answer_policy_override_var.get()
@@ -224,7 +241,9 @@ def _apply_answer_policy(answer: str, grounding_level: str) -> str:
         return answer
     if not answer or answer.startswith(("Error calling model:", "Model unavailable.")):
         return answer
-    if grounding_level != "none":
+    if grounding_level == "refused":
+        return NO_GENERAL_FALLBACK_MESSAGE
+    if grounding_level not in {"none", "general"}:
         return answer
     if not _allow_general_fallback():
         return NO_GENERAL_FALLBACK_MESSAGE
@@ -247,7 +266,7 @@ def _response_grounding(answer: str, grounding_level: str) -> str:
         return "grounded"
     if grounding_level == "partial":
         return "partial"
-    if grounding_level == "none" and _allow_general_fallback():
+    if grounding_level in {"none", "general"} and _allow_general_fallback():
         return "general"
     return "refused"
 
@@ -782,6 +801,18 @@ def _orchestration_metadata(result) -> dict:
     }
 
 
+def _sufficiency_metadata(result, answer_mode: str) -> Optional[dict]:
+    """Build optional response metadata from the same graded result."""
+    if result.sufficiency is None:
+        return None
+    metadata = result.sufficiency.to_metadata()
+    metadata["status"] = answer_mode
+    metadata.pop("sufficiency", None)
+    metadata["corrective_action"] = result.corrective_action.value
+    metadata["retry_performed"] = bool(result.retry_performed)
+    return metadata
+
+
 def _fact_trace_id(fact: dict) -> dict:
     return {
         "ticker": fact.get("ticker"),
@@ -916,7 +947,15 @@ async def _build_adaptive_query_context(shared: dict) -> dict:
         "retrieval_strategy": result.retrieval_strategy or "vector",
         "timings": {},
     }
-    grounding_level = _grounding_level(retrieval)
+    if result.sufficiency is not None:
+        specific = bool(plan.entities) or bool(plan.metrics) or bool(
+            set(plan.intents) & {"fact_lookup", "comparison", "trend", "projection"}
+        )
+        grounding_level = _answer_mode_from_sufficiency(
+            result.sufficiency, requires_specific_figures=specific)
+    else:
+        grounding_level = _grounding_level(retrieval)
+    sufficiency_meta = _sufficiency_metadata(result, grounding_level)
 
     # Evidence-trace collector (opt-in). The adaptive route trace records only
     # the successful answer path (2.2.3.4 Step 3).
@@ -945,6 +984,7 @@ async def _build_adaptive_query_context(shared: dict) -> dict:
         retrieval={},
         grounding_level=grounding_level,
         preselected={"facts": sel_facts, "documents": sel_docs},
+        evidence_sufficiency=result.sufficiency,
     )
     _stage_timing(timings, "prompt_build", stage_start)
 
@@ -962,6 +1002,7 @@ async def _build_adaptive_query_context(shared: dict) -> dict:
         "compiled": shared["compiled"],
         "retrieval_query": retrieval_query,
         "orchestration": _orchestration_metadata(result),
+        "evidence_sufficiency": sufficiency_meta,
     }
 
 
@@ -1063,6 +1104,7 @@ def _build_query_response(
         resolved_metrics=resolved_metrics,
         resolved_timeframe=resolved_timeframe,
         orchestration=context.get("orchestration"),
+        evidence_sufficiency=context.get("evidence_sufficiency"),
     )
 
 
@@ -1093,7 +1135,8 @@ async def _answer_query_context(request: QueryRequest, context: dict) -> QueryRe
             )
     else:
         logger.warning("Model unavailable - returning degraded answer")
-        answer_text = _format_degraded_answer(retrieval, intent)
+        answer_text = _format_degraded_answer(
+            retrieval, intent, context.get("evidence_sufficiency"))
         citations = []
     _stage_timing(context["timings"], "model_call", stage_start)
 
@@ -1268,7 +1311,11 @@ async def query_stream(request: QueryRequest):
     return StreamingResponse(events(), media_type="text/event-stream")
 
 
-def _format_degraded_answer(retrieval: dict, intent: dict) -> str:
+def _format_degraded_answer(
+    retrieval: dict,
+    intent: dict,
+    evidence_sufficiency: Optional[dict] = None,
+) -> str:
     """Format retrieved data as a readable answer when the model is unavailable."""
     parts = ["⚠️ Model unavailable — showing raw retrieved data:\n"]
     facts = retrieval.get("facts", [])
@@ -1296,6 +1343,17 @@ def _format_degraded_answer(retrieval: dict, intent: dict) -> str:
     if not facts and not docs:
         parts.append("No stored data found for this question.")
         parts.append("")
+
+    if evidence_sufficiency:
+        missing = evidence_sufficiency.get("missing_subqueries") or []
+        reasons = evidence_sufficiency.get("reason_codes") or []
+        if missing or reasons:
+            parts.append(
+                "Evidence status: " + str(evidence_sufficiency.get("status", "refused"))
+                + "; missing=" + (", ".join(missing) or "none")
+                + "; reasons=" + (", ".join(reasons) or "none")
+            )
+            parts.append("")
 
     parts.append("Start llama-server to get AI-grounded answers.")
     return "\n".join(parts)

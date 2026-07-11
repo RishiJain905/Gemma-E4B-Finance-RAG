@@ -13,12 +13,15 @@ Usage:
 """
 
 import logging
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 from .config import MiddlewareConfig
 from .evidence import document_body, evidence_counts, usable_documents
 
 logger = logging.getLogger(__name__)
+
+if TYPE_CHECKING:
+    from .evidence_grader import SufficiencyResult
 
 
 class PromptAugmenter:
@@ -75,6 +78,7 @@ class PromptAugmenter:
         retrieval: dict,
         grounding_level: Optional[str] = None,
         preselected: Optional[dict] = None,
+        evidence_sufficiency: Optional["SufficiencyResult"] = None,
     ) -> str:
         """
         Build the full augmented prompt.
@@ -92,6 +96,7 @@ class PromptAugmenter:
                 are rendered as-is (no re-filtering, no independent per-document
                 truncation). When ``None``, behavior is byte-for-byte identical
                 to the pre-2.2.3.3 path.
+            evidence_sufficiency: Optional deterministic obligation coverage.
 
         Returns:
             The complete prompt string ready to send to the model
@@ -122,6 +127,9 @@ class PromptAugmenter:
             realized_facts = [f for f in facts if not self._is_estimate_fact(f)]
 
         sections = []
+
+        if evidence_sufficiency is not None:
+            sections.append(self._format_evidence_coverage(evidence_sufficiency))
 
         # 1. Projection context (if any)
         projection_section = self._format_projection_section(estimate_facts)
@@ -157,6 +165,17 @@ class PromptAugmenter:
         sections.append(self._build_output_format(question_type))
 
         return "\n\n".join(sections)
+
+    def _format_evidence_coverage(self, result: "SufficiencyResult") -> str:
+        """Expose exact covered/missing obligations to the answer model."""
+        covered = [field for row in result.coverage for field in row.covered_fields]
+        missing = [field for row in result.coverage for field in row.missing_fields]
+        lines = ["## Evidence Coverage", ""]
+        lines.append("Covered obligations: " + (", ".join(covered) if covered else "none"))
+        lines.append("Missing obligations: " + (", ".join(missing) if missing else "none"))
+        lines.append("Reason codes: " + (
+            ", ".join(result.reason_codes) if result.reason_codes else "none"))
+        return "\n".join(lines)
 
     # ── Facts Section ─────────────────────────────────
 

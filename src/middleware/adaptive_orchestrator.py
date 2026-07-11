@@ -39,6 +39,13 @@ from typing import TYPE_CHECKING, Any, Callable, Iterable, Optional
 
 from . import deterministic_router as dr
 from .evidence import document_body
+from .evidence_grader import (
+    CorrectiveAction,
+    SufficiencyResult,
+    SufficiencyStatus,
+    grade_evidence,
+    validated_metric_aliases,
+)
 from .query_plan import QueryEntity, QueryPlan, QuerySubquery, normalize_question
 
 if TYPE_CHECKING:
@@ -455,6 +462,9 @@ class OrchestrationResult:
     estimated_tokens: int = 0
     fallback_reason: Optional[str] = None
     retrieval: Optional[dict] = None
+    sufficiency: Optional[SufficiencyResult] = None
+    corrective_action: CorrectiveAction = CorrectiveAction.NONE
+    retry_performed: bool = False
 
     def add_reason(self, code: str) -> None:
         if code not in self.reason_codes:
@@ -569,6 +579,9 @@ def _run_adaptive(
     except Exception:  # noqa: BLE001 - a lane failure must fall soft, never raise
         logger.exception("Adaptive lane %s failed; falling back", lane.value)
         return _fallback(plan, retriever, store, config, reason="adaptive_error")
+
+    if getattr(config, "enable_evidence_sufficiency", False):
+        _apply_evidence_sufficiency(result, plan, store, config, budget, retriever)
 
     _apply_context_budget(result, plan, config, lane)
     result.retrieval = _as_retrieval_dict(plan, result)
@@ -797,7 +810,10 @@ def _execute_complex(
 
     # Corrective second round hook (2.2.4.1). Bounded strictly by the round
     # budget: consume() returns False after the cap, so this can never loop.
-    if corrective_retry is not None:
+    if (
+        corrective_retry is not None
+        and not getattr(config, "enable_evidence_sufficiency", False)
+    ):
         while _wants_retry(corrective_retry, active_plan, facts, docs):
             if not budget.consume(RETRIEVAL_ROUND):
                 result.add_reason("retrieval_round_budget_exhausted")
@@ -820,6 +836,69 @@ def _wants_retry(
     except Exception:  # noqa: BLE001 - a broken hook must not fail the request
         logger.warning("Corrective-retry hook failed; stopping", exc_info=True)
         return False
+
+
+def _apply_evidence_sufficiency(
+    result: OrchestrationResult,
+    plan: QueryPlan,
+    store: Any,
+    config: "MiddlewareConfig",
+    budget: ExecutionBudget,
+    retriever: Optional["Retriever"],
+) -> None:
+    """Grade once and execute at most one allowlisted internal correction."""
+    retrieval = {
+        "facts": result.merged_facts,
+        "documents": result.merged_documents,
+    }
+    first = grade_evidence(plan, retrieval)
+    result.sufficiency = first
+    result.corrective_action = first.allowed_action
+    result.add_reason(f"evidence_{first.status.value}")
+    for code in first.reason_codes:
+        result.add_reason(code)
+
+    retries = max(0, min(1, int(getattr(config, "max_corrective_retries", 1))))
+    if (
+        first.status is not SufficiencyStatus.BORDERLINE
+        or first.allowed_action is CorrectiveAction.NONE
+        or not getattr(config, "enable_corrective_retry", False)
+        or retries == 0
+    ):
+        return
+
+    if first.allowed_action is CorrectiveAction.RUN_DERIVED_SUBQUERIES:
+        # Reserved seam: 2.2.4.2 will execute validated derived subqueries here.
+        result.add_reason("run_derived_subqueries_deferred_2_2_4_2")
+        return
+    if not budget.consume(RETRIEVAL_ROUND):
+        result.add_reason("retrieval_round_budget_exhausted")
+        return
+
+    result.retry_performed = True
+    result.retrieval_rounds_used += 1
+    result.add_reason("corrective_retry_round")
+    result.add_reason(f"corrective_action_{first.allowed_action.value}")
+    r = _get_retriever(retriever, store, config)
+    if first.allowed_action is CorrectiveAction.EXPAND_PARENT_SECTION:
+        facts: list[dict] = []
+        documents = r.expand_parent_sections(result.merged_documents)
+    else:
+        facts, documents = _retrieve_round(
+            r, plan, config, budget, result.lane, result,
+            corrective_action=first.allowed_action,
+            corrective_missing_fields=tuple(
+                field for row in first.coverage for field in row.missing_fields
+            ),
+        )
+    result.merged_facts = _merge_facts(result.merged_facts, facts)
+    result.merged_documents = _dedupe_docs([*result.merged_documents, *documents])
+    result.sufficiency = grade_evidence(plan, {
+        "facts": result.merged_facts,
+        "documents": result.merged_documents,
+    })
+    if result.sufficiency.status is not SufficiencyStatus.SUFFICIENT:
+        result.add_reason("corrective_retry_exhausted")
 
 
 # ── Shared retrieval + conditional rerank ─────────────────
@@ -863,6 +942,8 @@ def _retrieve_round(
     budget: ExecutionBudget,
     lane: Lane,
     result: OrchestrationResult,
+    corrective_action: CorrectiveAction = CorrectiveAction.NONE,
+    corrective_missing_fields: tuple[str, ...] = (),
 ) -> tuple[list[dict], list[dict]]:
     """Perform one bounded retrieval for ``plan`` (sq0). Uses the existing
     hybrid ``retrieve()`` unless conditional re-ranking is engaged, in which case
@@ -870,6 +951,19 @@ def _retrieve_round(
     a documented ambiguity signal."""
     query = plan.retrieval_query
     intent = plan.to_legacy_intent()
+    if corrective_action is CorrectiveAction.BROADEN_TICKER_FILTER:
+        intent["ticker"] = None
+    elif corrective_action is CorrectiveAction.APPLY_VALIDATED_ALIAS:
+        intent["metrics"] = list(validated_metric_aliases(intent.get("metrics", [])))
+    elif corrective_action is CorrectiveAction.ALTERNATE_INTERNAL_MODALITY:
+        missing_documents = any(
+            field.startswith(("document:", "news:", "filing:"))
+            for field in corrective_missing_fields
+        )
+        if missing_documents:
+            intent["question_type"] = "explanation"
+        else:
+            intent["question_type"] = "fact_lookup"
     top_k = int(getattr(config, "top_k_documents", 5))
     top_f = int(getattr(config, "top_k_facts", 10))
 
@@ -1153,7 +1247,7 @@ def _normalize_tool_facts(execution: "ExecutionResult") -> list[dict]:
                         facts.append({
                             "metric": metric, "value": fact.get("value"),
                             "period": fact.get("period"), "ticker": res.get("ticker"),
-                            "source_type": "tool",
+                            "source_type": "estimates",
                         })
     return facts
 

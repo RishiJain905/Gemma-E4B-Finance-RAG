@@ -186,6 +186,7 @@ def _row(case: dict, *, answer: str, detected_ticker, detected_intent,
          resolved_metrics: Optional[list] = None,
          resolved_timeframe: Optional[str] = None,
          orchestration: Optional[dict] = None,
+         evidence_sufficiency: Optional[dict] = None,
          config_label: Optional[str] = None) -> dict:
     """Assemble a well-formed result row (always has every RESULT_KEY)."""
     ans = answer or ""
@@ -235,6 +236,9 @@ def _row(case: dict, *, answer: str, detected_ticker, detected_intent,
         "orchestration": orch,
         "lane": (orch or {}).get("lane"),
         "fallback_reason": (orch or {}).get("fallback_reason"),
+        "evidence_sufficiency": (
+            evidence_sufficiency if isinstance(evidence_sufficiency, dict) else None
+        ),
     }
 
 
@@ -441,6 +445,7 @@ def _row_from_endpoint(case: dict, data: dict, latency_s: float,
         error=error,
         retrieval_query=retrieval_query,
         orchestration=data.get("orchestration"),
+        evidence_sufficiency=data.get("evidence_sufficiency"),
         **_ctx_kwargs(ctx, data, trace),
     )
 

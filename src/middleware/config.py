@@ -86,6 +86,13 @@ class MiddlewareConfig:
         self.adaptive_max_context_chars: int = 18000   # hard context ceiling
         self.adaptive_conditional_rerank: bool = True
 
+        # Phase 2.2.4.1 — deterministic evidence sufficiency and one bounded
+        # internal corrective round. Both switches default off so the legacy
+        # count-based answer path remains byte-identical until promotion.
+        self.enable_evidence_sufficiency: bool = False
+        self.enable_corrective_retry: bool = False
+        self.max_corrective_retries: int = 1  # hard clamp 0–1
+
         # Phase 2.1.6 — fetch-on-miss ingestion controls.
         self.enable_fetch_on_miss: bool = True
         self.fetch_on_miss_timeout_s: float = 10.0
@@ -125,6 +132,7 @@ class MiddlewareConfig:
         self._apply_env_overrides()
         self._clamp_conversation_limits()
         self._clamp_adaptive_limits()
+        self._clamp_corrective_limits()
 
     def _load_from_file(self, path: Path):
         with open(path) as f:
@@ -197,6 +205,9 @@ class MiddlewareConfig:
         _int("ADAPTIVE_MAX_PLANNING_CALLS", "adaptive_max_planning_calls")
         _int("ADAPTIVE_MAX_CONTEXT_CHARS", "adaptive_max_context_chars")
         _bool("ADAPTIVE_CONDITIONAL_RERANK", "adaptive_conditional_rerank")
+        _bool("ENABLE_EVIDENCE_SUFFICIENCY", "enable_evidence_sufficiency")
+        _bool("ENABLE_CORRECTIVE_RETRY", "enable_corrective_retry")
+        _int("MAX_CORRECTIVE_RETRIES", "max_corrective_retries")
 
     def _clamp_conversation_limits(self) -> None:
         """Clamp conversation budgets to documented safe maxima (2.2.2.1).
@@ -251,3 +262,17 @@ class MiddlewareConfig:
         if clamped:
             logger.warning(
                 "Clamped adaptive limits to safe ranges: %s", ", ".join(clamped))
+
+    def _clamp_corrective_limits(self) -> None:
+        """Hard-clamp corrective retries to the documented zero-or-one range."""
+        try:
+            value = int(self.max_corrective_retries)
+        except (TypeError, ValueError):
+            value = 1
+        bounded = max(0, min(1, value))
+        if bounded != value:
+            logger.warning(
+                "Clamped max_corrective_retries to safe range: %s->%s",
+                value, bounded,
+            )
+        self.max_corrective_retries = bounded

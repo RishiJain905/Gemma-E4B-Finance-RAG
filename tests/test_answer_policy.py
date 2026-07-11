@@ -9,7 +9,15 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from src.middleware import app as middleware_app
-from src.middleware.models import QueryRequest
+from src.middleware import prompt_policy
+from src.middleware.evidence_grader import (
+    CorrectiveAction,
+    CoverageResult,
+    SufficiencyResult,
+    SufficiencyStatus,
+)
+from src.middleware.models import QueryRequest, QueryResponse
+from src.middleware.prompt_augmenter import PromptAugmenter
 
 
 def _response(content: str):
@@ -82,6 +90,109 @@ def test_zero_value_fact_is_usable():
     assert usable[0]["metric"] == "net_income"
     assert evidence_counts(retrieval) == (1, 0)
     assert middleware_app._grounding_level(retrieval) == "partial"
+
+
+def _sufficiency(status, *, covered=(), missing=("sq0",), reasons=("missing_metric",)):
+    rows = [
+        CoverageResult(subquery_id, ("fact:NVDA",), (), ("f1",), ())
+        for subquery_id in covered
+    ]
+    rows.extend(
+        CoverageResult(subquery_id, (), ("fact:NVDA",), (), reasons)
+        for subquery_id in missing
+    )
+    return SufficiencyResult(
+        status=status, overall_score=1.0 if status is SufficiencyStatus.SUFFICIENT else 0.0,
+        reason_codes=reasons, coverage=tuple(rows), conflicts=(),
+        allowed_action=CorrectiveAction.NONE,
+    )
+
+
+def test_sufficiency_maps_to_grounded_partial_general_or_refused():
+    sufficient = _sufficiency(
+        SufficiencyStatus.SUFFICIENT, covered=("sq0",), missing=())
+    assert middleware_app._answer_mode_from_sufficiency(
+        sufficient, requires_specific_figures=True,
+    ) == "grounded"
+    partial = SufficiencyResult(
+        status=SufficiencyStatus.BORDERLINE, overall_score=0.5,
+        reason_codes=("missing_qualitative_evidence",),
+        coverage=(CoverageResult("sq0", ("fact:NVDA",), ("document:NVDA",),
+                                 ("f1",), ("missing_qualitative_evidence",)),),
+        conflicts=(), allowed_action=CorrectiveAction.ALTERNATE_INTERNAL_MODALITY,
+    )
+    assert middleware_app._answer_mode_from_sufficiency(
+        partial, requires_specific_figures=True,
+    ) == "partial"
+    missing = _sufficiency(SufficiencyStatus.MISSING)
+    assert middleware_app._answer_mode_from_sufficiency(
+        missing, requires_specific_figures=False,
+    ) == "general"
+    assert middleware_app._answer_mode_from_sufficiency(
+        missing, requires_specific_figures=True,
+    ) == "refused"
+
+
+def test_prompt_receives_covered_and_missing_obligations():
+    result = SufficiencyResult(
+        status=SufficiencyStatus.BORDERLINE, overall_score=0.5,
+        reason_codes=("missing_qualitative_evidence",),
+        coverage=(CoverageResult("sq0", ("fact:NVDA",), ("document:NVDA",),
+                                 ("f1",), ("missing_qualitative_evidence",)),),
+        conflicts=(), allowed_action=CorrectiveAction.ALTERNATE_INTERNAL_MODALITY,
+    )
+
+    prompt = PromptAugmenter(config=SimpleNamespace(answer_policy="graded")).build_prompt(
+        question="Why did revenue change?",
+        intent={"ticker": "NVDA", "question_type": "explanation"},
+        retrieval={}, grounding_level="partial",
+        preselected={"facts": [], "documents": []},
+        evidence_sufficiency=result,
+    )
+
+    assert "## Evidence Coverage" in prompt
+    assert "Covered obligations: fact:NVDA" in prompt
+    assert "Missing obligations: document:NVDA" in prompt
+    assert "missing_qualitative_evidence" in prompt
+
+
+def test_graded_prompt_supports_explicit_general_and_refused_modes():
+    general = prompt_policy.build_system_prompt(
+        answer_policy="graded", allow_general_fallback=True,
+        intent={"question_type": "general"}, grounding_level="general",
+    )
+    refused = prompt_policy.build_system_prompt(
+        answer_policy="graded", allow_general_fallback=True,
+        intent={"question_type": "fact_lookup"}, grounding_level="refused",
+    )
+
+    assert "Mode: general fallback" in general
+    assert "Mode: refuse" in refused
+
+
+def test_flag_off_response_omits_optional_sufficiency_metadata():
+    response = QueryResponse(answer="legacy")
+
+    assert "evidence_sufficiency" not in response.model_dump()
+
+
+def test_response_sufficiency_metadata_uses_answer_status_and_retry_action():
+    result = SimpleNamespace(
+        sufficiency=_sufficiency(SufficiencyStatus.MISSING),
+        corrective_action=CorrectiveAction.ALTERNATE_INTERNAL_MODALITY,
+        retry_performed=True,
+    )
+
+    metadata = middleware_app._sufficiency_metadata(result, "refused")
+
+    assert metadata == {
+        "status": "refused",
+        "reason_codes": ["missing_metric"],
+        "covered_subqueries": [],
+        "missing_subqueries": ["sq0"],
+        "corrective_action": "alternate_internal_modality",
+        "retry_performed": True,
+    }
 
 
 @pytest.mark.asyncio
