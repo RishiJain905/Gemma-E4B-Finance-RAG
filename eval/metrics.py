@@ -738,6 +738,179 @@ def conversational_metrics(rows: list[dict]) -> dict:
     }
 
 
+# ── Adaptive orchestration metrics (2.2.3.4) ───────────────────────────
+#
+# Offline, deterministic per-lane / budget metrics computed from the
+# ``orchestration`` block the middleware attaches to each response (and the
+# eval harness copies onto each row). The judge-scored quality deltas
+# (Recall@10 / nDCG@10 / faithfulness by lane) are produced from a live
+# three-config comparison; these scalar metrics are the offline scaffolding
+# that attributes the run to a config and proves the request stayed bounded.
+
+# The single write tool must never be reachable via the deterministic route.
+_WRITE_TOOLS = frozenset({"refresh_data"})
+
+# Adaptive hard caps (mirror config._ADAPTIVE_* / ExecutionBudget). Used to
+# assert no request exceeded a budget within a single run.
+ADAPTIVE_CAPS = {
+    "subqueries_executed": 3,
+    "retrieval_rounds": 2,
+    "planning_calls": 1,
+    "reranker_calls": 1,
+}
+
+
+def _orch(row: dict) -> Optional[dict]:
+    o = row.get("orchestration")
+    return o if isinstance(o, dict) else None
+
+
+def _adaptive_rows(rows: list[dict]) -> list[dict]:
+    """Rows that carried an orchestration block (i.e. the adaptive path ran)."""
+    return [r for r in rows if _orch(r) is not None]
+
+
+def _lane_of(row: dict) -> Optional[str]:
+    o = _orch(row)
+    if o and o.get("lane"):
+        return o["lane"]
+    return row.get("lane")
+
+
+def _pct(values: list[float], q: float) -> float:
+    """Nearest-rank percentile of ``values`` (q in [0,1]); 0.0 when empty."""
+    if not values:
+        return 0.0
+    ordered = sorted(values)
+    idx = min(len(ordered) - 1, int(q * len(ordered)))
+    return round(ordered[idx], 1)
+
+
+def lane_distribution(rows: list[dict]) -> dict:
+    """Count of adaptive rows per selected lane."""
+    dist: dict[str, int] = {}
+    for r in _adaptive_rows(rows):
+        lane = _lane_of(r) or "unknown"
+        dist[lane] = dist.get(lane, 0) + 1
+    return dist
+
+
+def adaptive_fallback_rate(rows: list[dict]) -> dict:
+    """Fraction of adaptive rows that demoted to the legacy retrieval path."""
+    adaptive = _adaptive_rows(rows)
+    n = len(adaptive)
+    n_fb = sum(1 for r in adaptive if (_orch(r) or {}).get("fallback_reason"))
+    return {"rate": round(n_fb / n, 3) if n else None, "n_eligible": n, "n_fallback": n_fb}
+
+
+def budget_exhaustion_rate(rows: list[dict]) -> dict:
+    """Fraction of adaptive rows that hit any *_budget_exhausted reason code."""
+    adaptive = _adaptive_rows(rows)
+    n = len(adaptive)
+    n_ex = 0
+    for r in adaptive:
+        codes = (_orch(r) or {}).get("reason_codes") or []
+        if any(str(c).endswith("_budget_exhausted") for c in codes):
+            n_ex += 1
+    return {"rate": round(n_ex / n, 3) if n else None, "n_eligible": n, "n_exhausted": n_ex}
+
+
+def write_tool_route_count(rows: list[dict]) -> int:
+    """Count deterministic-tool routes to a write tool. MUST be 0 (safety)."""
+    total = 0
+    for r in _adaptive_rows(rows):
+        tools = (_orch(r) or {}).get("deterministic_tools") or []
+        total += sum(1 for t in tools if t in _WRITE_TOOLS)
+    return total
+
+
+def budget_cap_violations(rows: list[dict]) -> dict:
+    """Per-counter count of adaptive rows that EXCEEDED a hard cap (must be 0)."""
+    violations = {k: 0 for k in ADAPTIVE_CAPS}
+    for r in _adaptive_rows(rows):
+        o = _orch(r) or {}
+        for key, cap in ADAPTIVE_CAPS.items():
+            try:
+                if int(o.get(key, 0) or 0) > cap:
+                    violations[key] += 1
+            except (TypeError, ValueError):
+                continue
+    return violations
+
+
+def per_lane_metrics(rows: list[dict]) -> dict:
+    """Per-lane breakdown of the cheap scalar metrics + latency percentiles.
+
+    Only lanes actually observed are emitted. The judge/ranking metrics for the
+    live comparison are recorded separately in RESULTS.md; here each lane gets
+    the deterministic scalars plus p50/p95 latency for the latency gate.
+    """
+    by_lane: dict[str, list[dict]] = {}
+    for r in _adaptive_rows(rows):
+        by_lane.setdefault(_lane_of(r) or "unknown", []).append(r)
+    out: dict[str, dict] = {}
+    for lane, lane_rows in by_lane.items():
+        latencies = [float(r.get("latency_ms") or 0.0) for r in lane_rows]
+        out[lane] = {
+            "n": len(lane_rows),
+            "intent_accuracy": intent_accuracy(lane_rows),
+            "ticker_accuracy": ticker_accuracy(lane_rows),
+            "retrieval_hit_rate": retrieval_hit_rate(lane_rows),
+            "p50_latency_ms": _pct(latencies, 0.50),
+            "p95_latency_ms": _pct(latencies, 0.95),
+        }
+    return out
+
+
+def _mean_counter(rows: list[dict], key: str) -> Optional[float]:
+    vals = []
+    for r in rows:
+        o = _orch(r) or {}
+        try:
+            vals.append(float(o.get(key, 0) or 0))
+        except (TypeError, ValueError):
+            continue
+    return round(sum(vals) / len(vals), 3) if vals else None
+
+
+def _max_counter(rows: list[dict], key: str) -> int:
+    best = 0
+    for r in rows:
+        o = _orch(r) or {}
+        try:
+            best = max(best, int(o.get(key, 0) or 0))
+        except (TypeError, ValueError):
+            continue
+    return best
+
+
+def adaptive_metrics(rows: list[dict]) -> dict:
+    """The full adaptive-orchestration summary block for a run (2.2.3.4).
+
+    Empty-but-present shape when no row carried orchestration, so a config
+    comparison can always read the same keys.
+    """
+    adaptive = _adaptive_rows(rows)
+    counters = ("subqueries_executed", "retrieval_rounds",
+                "planning_calls", "reranker_calls")
+    return {
+        "n_adaptive": len(adaptive),
+        "lane_distribution": lane_distribution(rows),
+        "fallback_rate": adaptive_fallback_rate(rows),
+        "budget_exhaustion_rate": budget_exhaustion_rate(rows),
+        "write_tool_routes": write_tool_route_count(rows),
+        "budget_cap_violations": budget_cap_violations(rows),
+        "avg_counters": {c: _mean_counter(adaptive, c) for c in counters},
+        "max_counters": {c: _max_counter(adaptive, c) for c in counters},
+        "per_lane": per_lane_metrics(rows),
+    }
+
+
+def has_adaptive_rows(rows: list[dict]) -> bool:
+    """True when at least one row carried an orchestration block."""
+    return any(_orch(r) is not None for r in rows)
+
+
 # ── Aggregator ─────────────────────────────────────────────────────────
 
 def _run_field(rows: list[dict], key: str) -> Optional[str]:
@@ -808,6 +981,14 @@ def score_all(rows: list[dict], *, judge: Optional[Callable] = None,
             for m in PHASE22_METRICS
         }
         summary["conversational_by_category"] = _conversational_per_category(rows)
+
+    # Adaptive-orchestration metrics (2.2.3.4) — emitted only when the run
+    # actually exercised the adaptive path or was explicitly labeled, so a
+    # legacy run's summary is byte-compatible with the pre-2.2.3.4 shape.
+    label = _run_field(rows, "config_label")
+    if has_adaptive_rows(rows) or label:
+        summary["config_label"] = label
+        summary["adaptive"] = adaptive_metrics(rows)
 
     summary["per_category"] = _per_category(rows)
     return summary

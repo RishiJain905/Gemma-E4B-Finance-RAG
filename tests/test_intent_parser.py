@@ -1,6 +1,37 @@
 """Tests for the IntentParser module (Phase 1.5.2)."""
 
+import json
+
 import pytest
+
+
+def _catalog(tmp_path, entries=()):
+    """Write a temporary symbol catalog so plan tests stay offline/deterministic.
+
+    Passing an empty ``entries`` disables catalog resolution entirely, leaving
+    only IntentParser's local company map and known-ticker set — enough for the
+    big-cap companies these tests reference, and it never touches the real
+    10k-entry ``data/symbol_catalog.json``.
+    """
+    path = tmp_path / "symbol_catalog.json"
+    path.write_text(
+        json.dumps(
+            {
+                "generated_at": "2099-01-01T00:00:00+00:00",
+                "ttl_hours": 168,
+                "entries": list(entries),
+            }
+        ),
+        encoding="utf-8",
+    )
+    return path
+
+
+def _plan_parser(tmp_path, entries=()):
+    from src.middleware.intent_parser import IntentParser
+    from src.middleware.symbol_resolver import SymbolResolver
+
+    return IntentParser(resolver=SymbolResolver(catalog_path=_catalog(tmp_path, entries)))
 
 
 class TestIntentParser:
@@ -165,3 +196,121 @@ class TestIntentParser:
         parser = IntentParser()
         result = parser.parse("What is NVDA's competitive advantage?")
         assert result["timeframe"] is None
+
+
+class TestQueryPlanParsing:
+    """parse_plan() multi-entity/intent/metric/period contract (2.2.3.1).
+
+    Uses an injected resolver over a controlled catalog so no network, real
+    catalog, Chroma, middleware, or model is involved.
+    """
+
+    def test_raw_question_preserved_exactly(self, tmp_path):
+        """Whitespace and punctuation survive verbatim in original_question."""
+        parser = _plan_parser(tmp_path)
+        raw = "  Compare  NVDA  and AMD's revenue?? \t"
+        plan = parser.parse_plan(raw)
+        assert plan.original_question == raw, "Raw question must be byte-identical"
+        # Matching-only normalization is a separate, collapsed representation.
+        assert plan.normalized_question != raw
+        assert "  " not in plan.normalized_question
+
+    def test_retrieval_query_is_separate_and_becomes_sq0(self, tmp_path):
+        """A carried standalone query enriches retrieval without touching the raw."""
+        parser = _plan_parser(tmp_path)
+        raw = "What about AMD?"
+        retrieval = "Compare NVDA and AMD revenue for FY 2025"
+        plan = parser.parse_plan(raw, retrieval_query=retrieval)
+
+        assert plan.original_question == raw, "Raw question stays unchanged"
+        assert plan.retrieval_query == retrieval, "Retrieval query is stored separately"
+        assert plan.subqueries[0].id == "sq0"
+        assert plan.subqueries[0].text == retrieval, "sq0 is the retrieval query"
+        # Entities/metrics/periods come from the enriched retrieval query.
+        assert plan.tickers == ["NVDA", "AMD"]
+        assert "total_revenue" in plan.metrics
+        assert "fy 2025" in plan.periods
+
+    def test_resolve_all_preserves_mention_order(self, tmp_path):
+        """'AMD versus NVIDIA' resolves to [AMD, NVDA] by mention, not map order."""
+        from src.middleware.symbol_resolver import SymbolResolver
+
+        resolver = SymbolResolver(catalog_path=_catalog(tmp_path))
+        results = resolver.resolve_all("AMD versus NVIDIA")
+        assert [r.ticker for r in results] == ["AMD", "NVDA"]
+        assert [r.start for r in results] == sorted(r.start for r in results)
+
+    def test_override_keeps_comparison_entity(self, tmp_path):
+        """An override plus another explicit ticker yields two entities."""
+        parser = _plan_parser(tmp_path)
+        plan = parser.parse_plan("Compare revenue with AMD", override_ticker="NVDA")
+        assert [e.ticker for e in plan.entities] == ["NVDA", "AMD"]
+        assert plan.entities[0].source == "override"
+        assert plan.entities[1].source in {"local_map", "known_ticker", "catalog_exact"}
+
+    def test_override_only_when_no_other_entity(self, tmp_path):
+        """With no other entity mentioned, the override is the only entity."""
+        parser = _plan_parser(tmp_path)
+        plan = parser.parse_plan("What is the revenue?", override_ticker="CRWD")
+        assert [e.ticker for e in plan.entities] == ["CRWD"]
+        assert plan.entities[0].source == "override"
+
+    def test_multi_intent_plan(self, tmp_path):
+        """Revenue trend plus risks retains both trend and risk intents."""
+        parser = _plan_parser(tmp_path)
+        plan = parser.parse_plan("Show NVDA revenue trend and its key risks")
+        assert "trend" in plan.intents
+        assert "risk" in plan.intents
+
+    def test_multiple_periods_retained(self, tmp_path):
+        """A 2023-through-2025 range is not collapsed to a single year."""
+        parser = _plan_parser(tmp_path)
+        plan = parser.parse_plan("What was Apple revenue from 2023 through 2025?")
+        assert "2023" in plan.periods
+        assert "2025" in plan.periods
+
+    def test_ambiguous_words_do_not_become_tickers(self, tmp_path):
+        """Ordinary words 'target'/'gap' inside prose never resolve to tickers."""
+        parser = _plan_parser(
+            tmp_path,
+            entries=[
+                {"ticker": "TGT", "name": "Target Corp"},
+                {"ticker": "GAP", "name": "Gap Inc"},
+            ],
+        )
+        plan = parser.parse_plan(
+            "what is the analyst price target and the gap between margins"
+        )
+        assert plan.tickers == [], f"Expected no tickers, got {plan.tickers}"
+
+    def test_plan_rejects_derived_entity_drift(self, tmp_path):
+        """A derived subquery introducing a new entity fails validation."""
+        from src.middleware.query_plan import QueryPlanError, QuerySubquery
+
+        parser = _plan_parser(tmp_path)
+        plan = parser.parse_plan("What is NVDA revenue?")
+        plan.subqueries.append(
+            QuerySubquery(
+                id="sq1", text="AMD revenue", entity_tickers=("AMD",),
+                derived=True, parent_id="sq0",
+            )
+        )
+        with pytest.raises(QueryPlanError) as exc:
+            plan.validate()
+        assert "derived_entity_drift" in exc.value.reason_codes
+
+    @pytest.mark.parametrize("question", [
+        "What is NVDA revenue?",
+        "How is Apple doing?",
+        "Compare AMD and NVDA",
+        "What is Meta's PE ratio in Q1 2026?",
+        "Broadcom dividend yield",
+        "What is the trend for NVDA revenue?",
+        "Why did NVDA stock drop?",
+        "What is the weather today?",
+    ])
+    def test_legacy_adapter_matches_existing_parse_contract(self, tmp_path, question):
+        """to_legacy_intent() reproduces parse() exactly for the same parser."""
+        parser = _plan_parser(tmp_path)
+        legacy = parser.parse_plan(question).to_legacy_intent()
+        assert legacy == parser.parse(question)

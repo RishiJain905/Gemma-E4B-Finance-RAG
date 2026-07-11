@@ -74,6 +74,7 @@ class PromptAugmenter:
         intent: dict,
         retrieval: dict,
         grounding_level: Optional[str] = None,
+        preselected: Optional[dict] = None,
     ) -> str:
         """
         Build the full augmented prompt.
@@ -82,19 +83,38 @@ class PromptAugmenter:
             question: Original user question
             intent: Parsed intent from IntentParser
             retrieval: Retrieved data from Retriever
+            grounding_level: Optional grounding label; derived from ``retrieval``
+                when omitted.
+            preselected: Optional pre-budgeted evidence from the adaptive
+                orchestrator's :class:`ContextBudget` (2.2.3.3), a dict with
+                ``facts``/``documents`` already selected, de-duplicated, and
+                sized. When provided, it is the single budget owner: these rows
+                are rendered as-is (no re-filtering, no independent per-document
+                truncation). When ``None``, behavior is byte-for-byte identical
+                to the pre-2.2.3.3 path.
 
         Returns:
             The complete prompt string ready to send to the model
         """
         question_type = intent.get("question_type", "general")
         ticker = intent.get("ticker")
-        facts = retrieval.get("facts", [])
-        # Filter unusable rows before prompt assembly so an empty
-        # "## Retrieved Documents" section is never emitted (2.2.1.1).
-        documents = usable_documents(retrieval)
+        adaptive = preselected is not None
+        if adaptive:
+            facts = list(preselected.get("facts", []))
+            # Pre-budgeted rows: already usable (blank bodies dropped upstream)
+            # and pre-sized, so no re-filtering here.
+            documents = list(preselected.get("documents", []))
+        else:
+            facts = retrieval.get("facts", [])
+            # Filter unusable rows before prompt assembly so an empty
+            # "## Retrieved Documents" section is never emitted (2.2.1.1).
+            documents = usable_documents(retrieval)
         if grounding_level is None:
-            n_facts, n_docs = evidence_counts(retrieval)
-            n = n_facts + n_docs
+            if adaptive:
+                n = len(facts) + len(documents)
+            else:
+                n_facts, n_docs = evidence_counts(retrieval)
+                n = n_facts + n_docs
             grounding_level = "grounded" if n >= 3 else "partial" if n >= 1 else "none"
         estimate_facts = facts if question_type == "projection" else []
         realized_facts = facts
@@ -117,9 +137,11 @@ class PromptAugmenter:
         if macro_section:
             sections.append(macro_section)
 
-        # 3. Retrieved documents (if any)
+        # 3. Retrieved documents (if any). On the adaptive path the ContextBudget
+        # already sized every chunk, so render bodies whole (no 2000-char cut).
         if documents:
-            sections.append(self._format_documents_section(documents))
+            sections.append(self._format_documents_section(
+                documents, max_body=None if adaptive else 2000))
 
         # 4. Handle empty retrieval
         if not facts and not documents:
@@ -239,12 +261,15 @@ class PromptAugmenter:
 
     # ── Documents Section ──────────────────────────────
 
-    def _format_documents_section(self, documents: list[dict]) -> str:
+    def _format_documents_section(self, documents: list[dict],
+                                  max_body: Optional[int] = 2000) -> str:
         """Format retrieved documents into a readable context section.
 
         ``documents`` must already be filtered to usable rows (see
         ``evidence.usable_documents``) — this only renders bodies, it does
-        not re-check for blanks.
+        not re-check for blanks. ``max_body`` caps each rendered body at that
+        many characters (legacy default 2000); pass ``None`` on the adaptive
+        path where the ContextBudget already owns sizing.
         """
         lines = ["## Retrieved Documents\n"]
 
@@ -256,9 +281,9 @@ class PromptAugmenter:
             source = metadata.get("source", doc.get("source", "unknown"))
             date = metadata.get("date", doc.get("date", ""))
 
-            # Truncate very long documents
-            if len(text) > 2000:
-                text = text[:2000] + "..."
+            # Truncate very long documents (legacy path only).
+            if max_body is not None and len(text) > max_body:
+                text = text[:max_body] + "..."
 
             header_parts = [f"### Document {i}: {doc_id}"]
             if ticker:

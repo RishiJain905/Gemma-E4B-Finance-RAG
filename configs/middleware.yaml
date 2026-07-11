@@ -22,6 +22,41 @@ max_tool_iterations: 3
 allow_write_tools: true
 max_refreshes_per_query: 2
 
+# Phase 2.2.3.2 — deterministic finance tool routing.
+# When enable_deterministic_tool_routing is on, safe analytical/comparison/
+# projection/bounded-calculation requests are routed to the existing read-only
+# tools before any model call (deterministic_router.route). Off by default so
+# 2.2.3.4 can A/B the route against the current model tool loop first.
+# enable_deterministic_answers additionally lets a fully-covered route skip
+# model generation and answer from a short template. Env overrides:
+# ENABLE_DETERMINISTIC_TOOL_ROUTING, MAX_DETERMINISTIC_TOOLS_PER_QUERY,
+# ENABLE_DETERMINISTIC_ANSWERS.
+enable_deterministic_tool_routing: false
+max_deterministic_tools_per_query: 3
+enable_deterministic_answers: false
+
+# Phase 2.2.3.3 — bounded adaptive-RAG orchestration.
+# When enable_adaptive_rag is on, 2.2.3.4 routes a request through the
+# fast/standard/complex lanes of adaptive_orchestrator.orchestrate under one
+# shared execution budget (<=3 subqueries incl. sq0, <=2 retrieval rounds, <=1
+# planning call, <=1 re-rank call, deterministic-tool cap) and one context
+# budget. Every adaptive stage falls soft to the existing single-query
+# Retriever.retrieve() — a query never fails because the adaptive layer failed.
+# The optional pre-answer planning model call is a further opt-in and only runs
+# when deterministic parsing cannot assign retrieval modes. Out-of-range limits
+# are clamped to the documented safe ranges with a warning (see
+# src/middleware/config.py). Env overrides: ENABLE_ADAPTIVE_RAG,
+# ADAPTIVE_ENABLE_PLANNING_CALL, ADAPTIVE_MAX_SUBQUERIES,
+# ADAPTIVE_MAX_RETRIEVAL_ROUNDS, ADAPTIVE_MAX_PLANNING_CALLS,
+# ADAPTIVE_MAX_CONTEXT_CHARS, ADAPTIVE_CONDITIONAL_RERANK.
+enable_adaptive_rag: false
+adaptive_enable_planning_call: false
+adaptive_max_subqueries: 3           # clamp 1–3 (includes sq0)
+adaptive_max_retrieval_rounds: 2     # clamp 1–2
+adaptive_max_planning_calls: 1       # clamp 0–1
+adaptive_max_context_chars: 18000    # hard context ceiling (clamp 1000–64000)
+adaptive_conditional_rerank: true
+
 # Phase 2.1.6 — fetch-on-miss ingestion.
 enable_fetch_on_miss: true
 fetch_on_miss_timeout_s: 10.0

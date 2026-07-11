@@ -293,6 +293,7 @@ def _model_alive(timeout: float = 5.0) -> bool:
         return False
 
 
+@pytest.mark.live
 def test_live_end_to_end_pipeline(tmp_path):
     """Live: register AAPL filings then process one through the full pipeline."""
     if not _endpoint_reachable(f"https://{EDGAR_HOST}"):

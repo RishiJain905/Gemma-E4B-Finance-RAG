@@ -379,6 +379,12 @@ async def health():
             "tools": bool(config.enable_tools),
             "streaming": bool(getattr(config, "enable_streaming", True)),
             "answer_policy": str(getattr(config, "answer_policy", "graded") or "graded").lower(),
+            # Bounded adaptive-RAG (2.2.3.4) effective booleans. Clients/eval
+            # read these to know whether the adaptive route + deterministic tool
+            # routing are actually live on this deployment.
+            "adaptive_rag": bool(getattr(config, "enable_adaptive_rag", False)),
+            "deterministic_tool_routing": bool(
+                getattr(config, "enable_deterministic_tool_routing", False)),
             # Conversation-memory (2.2.2) capabilities + effective limits. The
             # client reads these to size its multiline composer and history
             # controls; older servers omit them and the client uses local
@@ -524,7 +530,23 @@ def _return_timings_enabled() -> bool:
 
 
 async def _build_query_context(request: QueryRequest) -> dict:
-    """Run the shared query pipeline up to the augmented prompt."""
+    """Run the shared query pipeline up to the augmented prompt.
+
+    ONE request-path switch (2.2.3.4): the shared prefix (intent parse, bounded
+    history selection, follow-up compilation) is identical for both endpoints,
+    then a single decision selects the complete path —
+
+    - ``enable_adaptive_rag=false`` -> the legacy ``IntentParser -> Retriever ->
+      PromptAugmenter`` path (:func:`_build_legacy_query_context`);
+    - ``enable_adaptive_rag=true`` -> ``QueryPlan -> deterministic route ->
+      AdaptiveOrchestrator -> selected evidence -> PromptAugmenter``
+      (:func:`_build_adaptive_query_context`).
+
+    Both return the same context keys, so ``/query`` and ``/query/stream`` share
+    one compiled context. If the adaptive path raises (e.g. an invalid plan), we
+    record ``adaptive_fallback`` and run the legacy path with the untouched raw
+    question — the query never fails because the new layer failed.
+    """
     if not store:
         raise HTTPException(status_code=503, detail="Store not initialized")
 
@@ -583,14 +605,47 @@ async def _build_query_context(request: QueryRequest) -> dict:
         if conversation_meta is not None:
             conversation_meta["topic_reset"] = bool(compiled.topic_reset)
 
+    shared = {
+        "request": request,
+        "start": start,
+        "timings": timings,
+        "parser": parser,
+        "intent": intent,
+        "conversation_meta": conversation_meta,
+        "history_turns": history_turns,
+        "compiled": compiled,
+        "retrieval_query": retrieval_query,
+        "retrieval_intent": retrieval_intent,
+    }
+
+    if bool(getattr(config, "enable_adaptive_rag", False)):
+        try:
+            return await _build_adaptive_query_context(shared)
+        except Exception:  # noqa: BLE001 - adaptive layer must never fail a query
+            logger.exception("Adaptive context build failed; using legacy path")
+            return await _build_legacy_query_context(
+                shared, orchestration={"lane": None, "fallback_reason": "adaptive_fallback"}
+            )
+    return await _build_legacy_query_context(shared)
+
+
+async def _freshness_stage(
+    intent_like: dict, do_refresh: bool, timings: dict[str, object]
+) -> dict:
+    """Evaluate + (optionally) refresh freshness for one entity, with fetch-on-miss.
+
+    Shared by the legacy and adaptive context builders so both apply the exact
+    same freshness/auto-refresh/fetch-on-miss policy to the request's primary
+    entity. ``intent_like`` only needs ``ticker`` and ``ticker_confidence`` keys.
+    """
     stage_start = time.perf_counter()
-    freshness_meta = _evaluate_and_refresh(retrieval_intent.get("ticker"), request.refresh)
-    ticker = retrieval_intent.get("ticker")
+    freshness_meta = _evaluate_and_refresh(intent_like.get("ticker"), do_refresh)
+    ticker = intent_like.get("ticker")
     if (
         getattr(config, "enable_fetch_on_miss", True)
         and ticker
         and freshness_meta.get("overall") == "never_fetched"
-        and retrieval_intent.get("ticker_confidence", 0.0) >= FETCH_ON_MISS_MIN_CONFIDENCE
+        and intent_like.get("ticker_confidence", 0.0) >= FETCH_ON_MISS_MIN_CONFIDENCE
     ):
         res = await _maybe_fetch_on_miss(ticker)
         if res.get("fetched"):
@@ -602,6 +657,24 @@ async def _build_query_context(request: QueryRequest) -> dict:
                 warning = f"{warning} Reason: {res['error']}"
             freshness_meta["warning"] = warning
     _stage_timing(timings, "freshness_check", stage_start)
+    return freshness_meta
+
+
+async def _build_legacy_query_context(
+    shared: dict, *, orchestration: Optional[dict] = None
+) -> dict:
+    """The legacy ``IntentParser -> Retriever -> PromptAugmenter`` path.
+
+    Behavior is byte-for-byte identical to the pre-2.2.3.4 pipeline. ``orchestration``
+    is ``None`` on the pure legacy path and carries an ``adaptive_fallback``
+    marker only when the adaptive path failed and demoted here.
+    """
+    request: QueryRequest = shared["request"]
+    timings = shared["timings"]
+    retrieval_query = shared["retrieval_query"]
+    retrieval_intent = shared["retrieval_intent"]
+
+    freshness_meta = await _freshness_stage(retrieval_intent, request.refresh, timings)
 
     stage_start = time.perf_counter()
     from .retriever import Retriever
@@ -654,7 +727,7 @@ async def _build_query_context(request: QueryRequest) -> dict:
     _stage_timing(timings, "prompt_build", stage_start)
 
     return {
-        "start": start,
+        "start": shared["start"],
         "timings": timings,
         "intent": retrieval_intent,
         "freshness": freshness_meta,
@@ -662,10 +735,233 @@ async def _build_query_context(request: QueryRequest) -> dict:
         "grounding_level": grounding_level,
         "augmented_prompt": augmented_prompt,
         "include_evidence_trace": request.include_evidence_trace,
-        "conversation": conversation_meta,
-        "history_turns": history_turns,
-        "compiled": compiled,
+        "conversation": shared["conversation_meta"],
+        "history_turns": shared["history_turns"],
+        "compiled": shared["compiled"],
         "retrieval_query": retrieval_query,
+        "orchestration": orchestration,
+    }
+
+
+def _adaptive_available_metrics() -> tuple:
+    """The metric names present in the store, for the deterministic router.
+
+    Fails soft to an empty tuple (router then abstains on any named metric) so a
+    store without ``list_metrics`` never breaks the adaptive path.
+    """
+    try:
+        return tuple(store.sqlite.list_metrics())
+    except Exception:  # noqa: BLE001 - metric catalog is best-effort
+        return ()
+
+
+def _orchestration_metadata(result) -> dict:
+    """Map an OrchestrationResult to the response ``orchestration`` block.
+
+    Every counter is the ACTUAL executed value (not a configured maximum), so a
+    client/eval can see exactly how bounded the request stayed (2.2.3.4 Step 2).
+    """
+    ctx = result.context
+    tools = []
+    if result.tool_execution is not None:
+        tools = [inv.name for inv in result.tool_execution.invocations if inv.name]
+    dropped = 0
+    if ctx is not None:
+        dropped = int(ctx.dropped_facts) + int(ctx.dropped_documents)
+    return {
+        "lane": result.lane.value,
+        "reason_codes": list(result.reason_codes),
+        "subqueries_executed": len(result.subqueries_executed),
+        "retrieval_rounds": int(result.retrieval_rounds_used),
+        "planning_calls": 1 if result.planning_ran else 0,
+        "reranker_calls": 1 if result.rerank_ran else 0,
+        "deterministic_tools": tools,
+        "context_chars": int(result.context_size),
+        "evidence_dropped": dropped,
+        "fallback_reason": result.fallback_reason,
+    }
+
+
+def _fact_trace_id(fact: dict) -> dict:
+    return {
+        "ticker": fact.get("ticker"),
+        "metric": fact.get("metric"),
+        "period": fact.get("period"),
+    }
+
+
+def _doc_trace_id(doc: dict):
+    meta = doc.get("metadata") or {}
+    return doc.get("id") or meta.get("id") or meta.get("parent_id")
+
+
+def _plan_trace(plan) -> dict:
+    return {
+        "retrieval_query": plan.retrieval_query,
+        "entities": list(plan.tickers),
+        "intents": list(plan.intents),
+        "metrics": list(plan.metrics),
+        "periods": list(plan.periods),
+        "primary_intent": plan.primary_intent,
+        "subqueries": [sq.id for sq in plan.subqueries],
+        "reason_codes": list(plan.reason_codes),
+    }
+
+
+def _evidence_trace_orchestration(plan, result) -> dict:
+    """The exact adaptive route trace (2.2.3.4 Step 3) for the evidence trace.
+
+    Records only actions that actually occurred on the successful answer path:
+    the validated plan, the selected lane + reason codes, executed
+    subqueries/rounds, deterministic tool + calculation results, the re-rank
+    decision + fallback reason, and the final selected/dropped evidence ids
+    under the context budget. A rejected planner attempt is a reason code only —
+    its output is never mixed into the answer evidence.
+    """
+    ctx = result.context
+    tool_results: list[dict] = []
+    calculations: list[dict] = []
+    if result.tool_execution is not None:
+        for inv in result.tool_execution.invocations:
+            tool_results.append({
+                "name": inv.name,
+                "arguments": dict(inv.arguments or {}),
+                "reason_code": inv.reason_code,
+                "subquery_id": inv.subquery_id,
+                "result": inv.result,
+                "error": inv.error,
+            })
+        calculations = [dict(c) for c in result.tool_execution.calculations]
+
+    meta = _orchestration_metadata(result)
+    meta.update({
+        "query_plan": _plan_trace(plan),
+        "deterministic_tool_results": tool_results,
+        "calculations": calculations,
+        "subquery_ids": list(result.subqueries_executed),
+        "rerank_decision": {
+            "ran": bool(result.rerank_ran),
+            "reason_codes": [c for c in result.reason_codes if c.startswith("rerank")],
+        },
+        "selected_evidence": {
+            "fact_ids": [_fact_trace_id(f) for f in (ctx.facts if ctx else [])],
+            "document_ids": [_doc_trace_id(d) for d in (ctx.documents if ctx else [])],
+        },
+        "dropped_evidence": {
+            "facts": int(ctx.dropped_facts) if ctx else 0,
+            "documents": int(ctx.dropped_documents) if ctx else 0,
+        },
+        "context_budget": {
+            "context_chars": int(ctx.context_chars) if ctx else 0,
+            "estimated_tokens": int(ctx.estimated_tokens) if ctx else 0,
+            "truncated": bool(ctx.truncated) if ctx else False,
+        },
+    })
+    return meta
+
+
+async def _build_adaptive_query_context(shared: dict) -> dict:
+    """The adaptive ``QueryPlan -> route -> orchestrate -> PromptAugmenter`` path.
+
+    Builds one validated multi-entity plan from the compiled retrieval query,
+    runs the bounded orchestrator (deterministic route + lane selection + one
+    execution budget + one context budget + conditional re-rank), and grounds
+    the prompt with the pre-budgeted evidence. Raises only if the plan cannot be
+    built or validated; :func:`_build_query_context` then demotes to the legacy
+    path with the untouched raw question.
+    """
+    request: QueryRequest = shared["request"]
+    timings = shared["timings"]
+    parser = shared["parser"]
+    retrieval_query = shared["retrieval_query"]
+
+    # Build + validate the plan from the compiled standalone query (2.2.2). A
+    # QueryPlanError propagates to the caller's legacy fallback.
+    stage_start = time.perf_counter()
+    plan = parser.parse_plan(
+        request.question,
+        retrieval_query=(retrieval_query if retrieval_query != request.question else None),
+        override_ticker=request.ticker,
+    )
+    _stage_timing(timings, "query_plan", stage_start)
+
+    intent = plan.to_legacy_intent()
+    freshness_meta = await _freshness_stage(intent, request.refresh, timings)
+
+    stage_start = time.perf_counter()
+    from .adaptive_orchestrator import orchestrate
+    from .retriever import Retriever
+
+    r = retriever or Retriever(store=store, config=config)
+    result = orchestrate(
+        plan,
+        store,
+        config,
+        retriever=r,
+        available_metrics=_adaptive_available_metrics(),
+    )
+    _stage_timing(timings, "orchestration", stage_start)
+
+    # Build a retrieve()-compatible view from the single budgeted context so
+    # grounding, evidence counts, degraded answers, and the response builder all
+    # operate on exactly the evidence the model will see.
+    ctx_sel = result.context
+    sel_facts = list(ctx_sel.facts) if ctx_sel is not None else list(result.merged_facts)
+    sel_docs = list(ctx_sel.documents) if ctx_sel is not None else list(result.merged_documents)
+    retrieval = {
+        "facts": sel_facts,
+        "documents": sel_docs,
+        "ticker": intent.get("ticker"),
+        "strategy": result.lane.value,
+        "retrieval_strategy": result.retrieval_strategy or "vector",
+        "timings": {},
+    }
+    grounding_level = _grounding_level(retrieval)
+
+    # Evidence-trace collector (opt-in). The adaptive route trace records only
+    # the successful answer path (2.2.3.4 Step 3).
+    trace_collector: Optional[EvidenceTraceCollector] = None
+    if request.include_evidence_trace:
+        trace_collector = EvidenceTraceCollector(
+            answer_policy=_answer_policy(),
+            grounding_level=grounding_level,
+            raw_question=request.question,
+            retrieval_query=retrieval_query,
+            facts=usable_facts(retrieval),
+            documents=usable_documents(retrieval),
+        )
+        trace_collector.record_orchestration(_evidence_trace_orchestration(plan, result))
+    _evidence_trace_var.set(trace_collector)
+
+    stage_start = time.perf_counter()
+    from .prompt_augmenter import PromptAugmenter
+
+    # Prompt uses the RAW question, the legacy-projected plan intent, and the
+    # pre-budgeted evidence as the single budget owner (no re-filtering).
+    augmenter = PromptAugmenter(config=config)
+    augmented_prompt = augmenter.build_prompt(
+        question=request.question,
+        intent=intent,
+        retrieval={},
+        grounding_level=grounding_level,
+        preselected={"facts": sel_facts, "documents": sel_docs},
+    )
+    _stage_timing(timings, "prompt_build", stage_start)
+
+    return {
+        "start": shared["start"],
+        "timings": timings,
+        "intent": intent,
+        "freshness": freshness_meta,
+        "retrieval": retrieval,
+        "grounding_level": grounding_level,
+        "augmented_prompt": augmented_prompt,
+        "include_evidence_trace": request.include_evidence_trace,
+        "conversation": shared["conversation_meta"],
+        "history_turns": shared["history_turns"],
+        "compiled": shared["compiled"],
+        "retrieval_query": retrieval_query,
+        "orchestration": _orchestration_metadata(result),
     }
 
 
@@ -766,6 +1062,7 @@ def _build_query_response(
         resolved_tickers=resolved_tickers,
         resolved_metrics=resolved_metrics,
         resolved_timeframe=resolved_timeframe,
+        orchestration=context.get("orchestration"),
     )
 
 

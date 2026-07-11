@@ -153,3 +153,63 @@ class TestRetriever:
                     "question_type": "explanation"},
         )
         assert any(f.get("metric") == "total_revenue" for f in effective["facts"])
+
+
+# ── 2.2.3.4 review D: retrieve_candidates channel ids are request-local ──
+
+from types import SimpleNamespace as _NS  # noqa: E402
+
+
+class _FakeSearchStore:
+    """Minimal store whose vector search returns a fixed doc set."""
+
+    def __init__(self, docs):
+        self._docs = docs
+        self.chroma = _NS(last_search_timings={})
+
+    def search(self, query, n_results, ticker=None):
+        return {"documents": [dict(d) for d in self._docs], "facts": []}
+
+
+def _candidates_config():
+    from src.middleware.config import MiddlewareConfig
+    cfg = MiddlewareConfig()
+    cfg.enable_lexical = False       # vector-only path keeps the test hermetic
+    cfg.enable_reranker = False
+    return cfg
+
+
+def test_retrieve_candidates_channel_ids_are_request_local():
+    from src.middleware.retriever import Retriever
+
+    cfg = _candidates_config()
+    intent = {"ticker": "NVDA", "question_type": "news", "metrics": []}
+
+    r = Retriever(store=_FakeSearchStore(
+        [{"id": "a1", "document": "x"}, {"id": "a2", "document": "y"}]), config=cfg)
+    res_a = r.retrieve_candidates("q", intent, top_k_documents=5, top_k_facts=10)
+
+    # A DIFFERENT store/result on the SAME retriever instance must not bleed the
+    # previous call's channel ids (the bug was shared _last_* instance fields).
+    r.store = _FakeSearchStore([{"id": "b1", "document": "z"}])
+    res_b = r.retrieve_candidates("q", intent, top_k_documents=5, top_k_facts=10)
+
+    assert res_a["vector_ids"] == ["a1", "a2"]
+    assert res_a["lexical_ids"] == []
+    assert res_b["vector_ids"] == ["b1"]
+    # The ids came from the returned dict, not from instance state.
+    assert not hasattr(r, "_last_vector_ids")
+    assert not hasattr(r, "_last_lexical_ids")
+
+
+def test_retrieve_omits_channel_ids_from_legacy_dict():
+    from src.middleware.retriever import Retriever
+
+    cfg = _candidates_config()
+    intent = {"ticker": "NVDA", "question_type": "news", "metrics": []}
+    r = Retriever(store=_FakeSearchStore([{"id": "a1", "document": "x"}]), config=cfg)
+
+    legacy = r.retrieve("q", intent, top_k_documents=5, top_k_facts=10)
+    # Legacy retrieve() shape is unchanged — no channel-id keys leak in.
+    assert "vector_ids" not in legacy
+    assert "lexical_ids" not in legacy

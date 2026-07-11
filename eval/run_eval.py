@@ -184,11 +184,14 @@ def _row(case: dict, *, answer: str, detected_ticker, detected_intent,
          history_sent: int = 0, retrieval_query: Optional[str] = None,
          resolved_tickers: Optional[list] = None,
          resolved_metrics: Optional[list] = None,
-         resolved_timeframe: Optional[str] = None) -> dict:
+         resolved_timeframe: Optional[str] = None,
+         orchestration: Optional[dict] = None,
+         config_label: Optional[str] = None) -> dict:
     """Assemble a well-formed result row (always has every RESULT_KEY)."""
     ans = answer or ""
     sq_ids, sq_cov = _subquestion_fields(case, ans)
     question = case.get("question", "")
+    orch = orchestration if isinstance(orchestration, dict) else None
     return {
         "id": case["id"],
         "question": question,
@@ -223,6 +226,15 @@ def _row(case: dict, *, answer: str, detected_ticker, detected_intent,
         "resolved_timeframe": resolved_timeframe,
         "subquestion_ids": sq_ids,
         "subquestion_coverage": sq_cov,
+        # ── Adaptive orchestration fields (2.2.3.4) ──
+        # The full response.orchestration block plus the two most-queried
+        # scalars promoted to top-level so per-lane metrics and the config
+        # comparison can bucket rows without re-parsing. None on the legacy
+        # path / offline backend, so a legacy run is unaffected.
+        "config_label": config_label,
+        "orchestration": orch,
+        "lane": (orch or {}).get("lane"),
+        "fallback_reason": (orch or {}).get("fallback_reason"),
     }
 
 
@@ -428,6 +440,7 @@ def _row_from_endpoint(case: dict, data: dict, latency_s: float,
         model_available=model_available,
         error=error,
         retrieval_query=retrieval_query,
+        orchestration=data.get("orchestration"),
         **_ctx_kwargs(ctx, data, trace),
     )
 
@@ -1043,6 +1056,13 @@ def main(argv: Optional[list[str]] = None) -> int:
                    help="Print the per-dimension fixture coverage report and exit.")
     p.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT,
                    help="Per-case timeout (seconds).")
+    p.add_argument("--config-label", default=os.environ.get("EVAL_CONFIG_LABEL"),
+                   help="Label identifying the middleware configuration under "
+                        "test (2.2.3.4), e.g. legacy | adaptive_no_tools | "
+                        "adaptive_tools_rerank. Denormalized onto every row so "
+                        "score.py can attribute per-lane metrics to a config. "
+                        "The middleware config itself is set via env/flags "
+                        "(ENABLE_ADAPTIVE_RAG, ...); this only labels the run.")
     args = p.parse_args(argv)
 
     all_cases = load_cases(args.golden)
@@ -1071,6 +1091,12 @@ def main(argv: Optional[list[str]] = None) -> int:
         rows.extend(run_conversation(
             conv, query_url=args.query_url, timeout=args.timeout,
             use_live=not args.offline, allow_direct=True, dataset_digest=digest))
+
+    # Denormalize the run-level config label onto every row (2.2.3.4) so the
+    # per-lane/adaptive metrics can attribute this run to a configuration.
+    if args.config_label:
+        for r in rows:
+            r["config_label"] = args.config_label
 
     out = write_run(rows)
     meta = summarize_rows(rows)
