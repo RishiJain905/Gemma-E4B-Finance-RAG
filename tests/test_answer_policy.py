@@ -39,9 +39,49 @@ def _config(**overrides):
 
 
 def test_grounding_level():
-    assert middleware_app._grounding_level({"facts": [1, 2], "documents": [3]}) == "grounded"
-    assert middleware_app._grounding_level({"facts": [1], "documents": []}) == "partial"
-    assert middleware_app._grounding_level({"facts": [], "documents": []}) == "none"
+    grounded = {
+        "facts": [{"metric": "total_revenue", "value": 1.0},
+                  {"metric": "gross_margin", "value": 2.0}],
+        "documents": [{"document": "some retrieved text"}],
+    }
+    partial = {"facts": [{"metric": "total_revenue", "value": 1.0}], "documents": []}
+    none = {"facts": [], "documents": []}
+    assert middleware_app._grounding_level(grounded) == "grounded"
+    assert middleware_app._grounding_level(partial) == "partial"
+    assert middleware_app._grounding_level(none) == "none"
+
+
+def test_blank_document_does_not_count_as_grounding():
+    """A document row with metadata but a blank/whitespace body must not
+    inflate grounding (2.2.1.1 — the confirmed document/text P0 bug)."""
+    retrieval = {
+        "facts": [],
+        "documents": [
+            {"id": "doc-1", "document": "   ", "metadata": {"ticker": "NVDA"}},
+        ],
+    }
+    assert middleware_app._grounding_level(retrieval) == "none"
+
+    from src.middleware.evidence import evidence_counts
+    assert evidence_counts(retrieval) == (0, 0)
+
+
+def test_zero_value_fact_is_usable():
+    """A zero-valued fact remains valid evidence; a None-valued one does not."""
+    from src.middleware.evidence import evidence_counts, usable_facts
+
+    retrieval = {
+        "facts": [
+            {"metric": "net_income", "value": 0, "ticker": "NVDA"},
+            {"metric": "eps", "value": None, "ticker": "NVDA"},
+        ],
+        "documents": [],
+    }
+    usable = usable_facts(retrieval)
+    assert len(usable) == 1
+    assert usable[0]["metric"] == "net_income"
+    assert evidence_counts(retrieval) == (1, 0)
+    assert middleware_app._grounding_level(retrieval) == "partial"
 
 
 @pytest.mark.asyncio
@@ -170,3 +210,81 @@ async def test_no_fabricated_numbers_rule_present(monkeypatch):
     system_prompt = client.post.await_args.kwargs["json"]["messages"][0]["content"]
     assert "never invent specific numbers" in system_prompt.lower()
     assert "specific figures must come from context or tools" in system_prompt.lower()
+
+
+def test_strict_policy_is_unchanged():
+    """The strict system prompt is pinned byte-for-byte to the pre-2.2.1.1
+    middleware SYSTEM_PROMPT constant, now owned by prompt_policy.py."""
+    from src.middleware import prompt_policy
+
+    expected = (
+        "You are a financial research assistant. Answer the user's "
+        "question using ONLY the provided context. If the context "
+        "doesn't contain enough information, say so. "
+        "Cite sources inline using [Source: type/ticker] notation."
+    )
+    assert prompt_policy.STRICT_SYSTEM_PROMPT == expected
+    assert middleware_app.SYSTEM_PROMPT == expected
+    assert prompt_policy.build_system_prompt(
+        answer_policy="strict",
+        allow_general_fallback=True,
+        intent={"question_type": "fact_lookup"},
+        grounding_level="grounded",
+        tools_enabled=False,
+    ) == expected
+
+
+def test_all_model_paths_share_prompt_policy(monkeypatch):
+    """Plain, streaming, tool, and direct-eval paths build an identical
+    system prompt for equivalent policy/intent/grounding inputs — all four
+    route through prompt_policy.build_system_prompt (2.2.1.1)."""
+    import httpx
+
+    from eval import run_eval as R
+    from src.middleware import prompt_policy
+
+    monkeypatch.setattr(middleware_app, "config", _config(
+        answer_policy="graded", allow_general_fallback=True,
+    ))
+    intent = {"question_type": "fact_lookup"}
+
+    expected = prompt_policy.build_system_prompt(
+        answer_policy="graded", allow_general_fallback=True,
+        intent=intent, grounding_level="partial", tools_enabled=False,
+    )
+    expected_tools = prompt_policy.build_system_prompt(
+        answer_policy="graded", allow_general_fallback=True,
+        intent=intent, grounding_level="partial", tools_enabled=True,
+    )
+
+    # Plain call (also used verbatim by the streaming call site).
+    assert middleware_app._system_prompt_for_request(
+        intent, "partial", tools_enabled=False,
+    ) == expected
+    # Tool-loop call site.
+    assert middleware_app._system_prompt_for_request(
+        intent, "partial", tools_enabled=True,
+    ) == expected_tools
+
+    # Direct-eval path (eval/run_eval.py) — capture the payload sent to the model.
+    captured = {}
+
+    class FakeResp:
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {"choices": [{"message": {"content": "ok"}}]}
+
+    def fake_post(url, json=None, timeout=None):
+        captured["payload"] = json
+        return FakeResp()
+
+    monkeypatch.setattr(httpx, "post", fake_post)
+    eval_config = SimpleNamespace(
+        model_name="tracealchemy", llama_endpoint="http://test/v1/chat/completions",
+        default_temperature=0.3, max_tokens=256,
+        answer_policy="graded", allow_general_fallback=True,
+    )
+    R._call_model_sync(eval_config, "prompt body", intent=intent, grounding_level="partial")
+    assert captured["payload"]["messages"][0]["content"] == expected

@@ -235,12 +235,12 @@ def _format_context(retrieval: dict, intent: dict, max_facts: int = 8,
                          f"({f.get('period') or 'N/A'}, ticker={f.get('ticker')})")
     docs = retrieval.get("documents", [])
     if docs:
+        from src.middleware.evidence import document_body
+
         parts.append("\nDocuments:")
         for d in docs[:max_docs]:
             meta = d.get("metadata", {}) or {}
-            # Retriever documents carry the body under "document" (Chroma
-            # naming); "text"/"content" cover older/injected shapes.
-            text = (d.get("text") or d.get("content") or d.get("document") or "").strip()
+            text = document_body(d)
             text = text[:doc_chars] + ("…" if len(text) > doc_chars else "")
             parts.append(f"- [{meta.get('source', d.get('source', '?'))}/"
                          f"{meta.get('ticker', '?')}] {text}")
@@ -311,15 +311,29 @@ def _model_reachable(llama_endpoint: str, timeout: float = 5.0) -> bool:
         return False
 
 
-def _call_model_sync(config, prompt: str) -> str:
-    """Call the model synchronously via the OpenAI-compatible chat endpoint."""
-    import httpx
-    from src.middleware.app import SYSTEM_PROMPT
+def _call_model_sync(config, prompt: str, *, intent: Optional[dict] = None,
+                     grounding_level: str = "grounded") -> str:
+    """Call the model synchronously via the OpenAI-compatible chat endpoint.
 
+    Builds its system message through prompt_policy.build_system_prompt —
+    the same function the live middleware's plain/streaming/tool-loop calls
+    use — so the direct-eval path can never silently drift from live policy
+    (2.2.1.1).
+    """
+    import httpx
+    from src.middleware import prompt_policy
+
+    system_prompt = prompt_policy.build_system_prompt(
+        answer_policy=str(getattr(config, "answer_policy", "graded") or "graded"),
+        allow_general_fallback=bool(getattr(config, "allow_general_fallback", True)),
+        intent=intent,
+        grounding_level=grounding_level,
+        tools_enabled=False,
+    )
     payload = {
         "model": config.model_name,
         "messages": [
-            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "system", "content": system_prompt},
             {"role": "user", "content": prompt},
         ],
         "temperature": config.default_temperature,
@@ -361,17 +375,26 @@ def call_pipeline_direct(question: str) -> dict:
 
     Uses one retrieval pass for both the model prompt and the captured context.
     """
+    from src.middleware.evidence import evidence_counts
     from src.middleware.prompt_augmenter import PromptAugmenter
 
     intent, retrieval, config = retrieve_for_question(question)
+    # Usable-evidence counts (2.2.1.1) — same contract app.py uses, so the
+    # direct-eval path's facts_used/documents_used/grounding_level match
+    # what a live /query response would report for the same retrieval.
+    n_facts, n_docs = evidence_counts(retrieval)
+    n_evidence = n_facts + n_docs
+    grounding_level = "grounded" if n_evidence >= 3 else "partial" if n_evidence >= 1 else "none"
     prompt = PromptAugmenter(config=config).build_prompt(
         question=question, intent=intent, retrieval=retrieval,
+        grounding_level=grounding_level,
     )
 
     model_available = _model_reachable(config.llama_endpoint)
     if model_available:
         try:
-            answer = _call_model_sync(config, prompt)
+            answer = _call_model_sync(config, prompt, intent=intent,
+                                      grounding_level=grounding_level)
         except Exception:  # noqa: BLE001 - degrade on model error
             answer = _degraded_answer(retrieval, intent)
             model_available = False
@@ -388,8 +411,8 @@ def call_pipeline_direct(question: str) -> dict:
         "answer": answer,
         "detected_ticker": intent.get("ticker"),
         "detected_intent": intent.get("question_type"),
-        "facts_used": len(retrieval.get("facts", [])),
-        "documents_used": len(retrieval.get("documents", [])),
+        "facts_used": n_facts,
+        "documents_used": n_docs,
         "retrieved_sources": sources,
         "context": _format_context(retrieval, intent),
         "model_available": model_available,
