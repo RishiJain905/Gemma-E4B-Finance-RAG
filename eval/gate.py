@@ -110,6 +110,108 @@ PROMOTION_GATES = {
     "max_rerank_calls": 1,
 }
 
+EVIDENCE_SUFFICIENCY_GATES = {
+    "abstention_f1_min": 0.85,
+    "unsupported_number_relative_reduction_min": 0.30,
+    "unnecessary_retry_rate_max": 0.15,
+    "retrieval_rounds_above_two_max": 0,
+    "single_turn_correctness_max_regression": 0.02,
+}
+
+# Phase 2.2.4.3 citation-provenance / numeric-validation promotion gates
+# (Step 5). ``citation_support_rate`` and ``accepted_absent_citations`` are
+# single-run absolutes; the unsupported-number relative reduction is comparative
+# (baseline vs current). The false-positive-on-non-claims and validator-p95
+# gates are live-run measurements recorded in RESULTS.md, not single-summary.
+CITATION_VALIDATION_GATES = {
+    "citation_support_rate_min": 0.95,
+    "accepted_absent_citations_max": 0,
+    "numeric_unsupported_relative_reduction_min": 0.30,
+}
+
+
+def citation_validation_checks(current: dict, baseline: dict) -> list[str]:
+    """Enforce the 2.2.4.3 citation/numeric absolute + comparative gates.
+
+    Inert (returns ``[]``) unless the current summary carries a
+    ``citation_validation`` block, so pre-2.2.4.3 and placeholder-baseline runs
+    are unaffected.
+    """
+    block = current.get("citation_validation")
+    if not isinstance(block, dict):
+        return []
+    failures: list[str] = []
+
+    accepted_absent = block.get("accepted_absent_citations", 0)
+    if accepted_absent:
+        failures.append(
+            f"{accepted_absent} citation(s) to ids absent from model-visible "
+            "evidence were accepted (must be 0)")
+
+    support = block.get("citation_support_rate")
+    if support is not None and support < CITATION_VALIDATION_GATES["citation_support_rate_min"]:
+        failures.append(
+            f"citation_support_rate {support:.2f} < required minimum "
+            f"{CITATION_VALIDATION_GATES['citation_support_rate_min']:.2f}")
+
+    baseline_block = baseline.get("citation_validation") or {}
+    current_unsupported = block.get("numeric_unsupported_rate")
+    baseline_unsupported = baseline_block.get("numeric_unsupported_rate")
+    if baseline_unsupported not in (None, 0) and current_unsupported is not None:
+        reduction = (baseline_unsupported - current_unsupported) / baseline_unsupported
+        if reduction < CITATION_VALIDATION_GATES["numeric_unsupported_relative_reduction_min"]:
+            failures.append(
+                f"unsupported-number relative reduction {reduction:.2f} < required "
+                f"{CITATION_VALIDATION_GATES['numeric_unsupported_relative_reduction_min']:.2f}")
+    return failures
+
+
+def evidence_sufficiency_checks(current: dict, baseline: dict) -> list[str]:
+    """Enforce the 2.2.4.1 absolute, safety, and comparative promotion gates."""
+    block = current.get("evidence_sufficiency")
+    if not isinstance(block, dict):
+        return []
+    failures: list[str] = []
+    abstention = block.get("abstention_f1")
+    if abstention is not None and abstention < EVIDENCE_SUFFICIENCY_GATES["abstention_f1_min"]:
+        failures.append(
+            f"abstention_f1 {abstention:.2f} < required minimum "
+            f"{EVIDENCE_SUFFICIENCY_GATES['abstention_f1_min']:.2f}")
+    retry_rate = block.get("unnecessary_retry_rate")
+    if retry_rate is not None and retry_rate > EVIDENCE_SUFFICIENCY_GATES["unnecessary_retry_rate_max"]:
+        failures.append(
+            f"unnecessary_retry_rate {retry_rate:.2f} > allowed maximum "
+            f"{EVIDENCE_SUFFICIENCY_GATES['unnecessary_retry_rate_max']:.2f}")
+    above_two = (block.get("retrieval_rounds") or {}).get("above_two", 0)
+    if above_two > EVIDENCE_SUFFICIENCY_GATES["retrieval_rounds_above_two_max"]:
+        failures.append(
+            f"retrieval rounds exceeded two in {above_two} request(s)")
+
+    baseline_block = baseline.get("evidence_sufficiency") or {}
+    current_unsupported = block.get("unsupported_number_rate")
+    baseline_unsupported = baseline_block.get("unsupported_number_rate")
+    if baseline_unsupported not in (None, 0) and current_unsupported is not None:
+        reduction = (baseline_unsupported - current_unsupported) / baseline_unsupported
+        if reduction < EVIDENCE_SUFFICIENCY_GATES["unsupported_number_relative_reduction_min"]:
+            failures.append(
+                f"unsupported-number relative reduction {reduction:.2f} < required "
+                f"{EVIDENCE_SUFFICIENCY_GATES['unsupported_number_relative_reduction_min']:.2f}")
+
+    current_correctness = _metric_value(current, "answer_relevance")
+    baseline_correctness = _metric_value(baseline, "answer_relevance")
+    if current_correctness is None or baseline_correctness is None:
+        current_correctness = current.get("keyword_coverage")
+        baseline_correctness = baseline.get("keyword_coverage")
+    if (
+        current_correctness is not None and baseline_correctness is not None
+        and current_correctness < baseline_correctness
+        - EVIDENCE_SUFFICIENCY_GATES["single_turn_correctness_max_regression"]
+    ):
+        failures.append(
+            f"single-turn correctness regressed by "
+            f"{baseline_correctness - current_correctness:.2f} (maximum 0.02)")
+    return failures
+
 
 def adaptive_safety_checks(current: dict) -> list[str]:
     """Single-run adaptive safety invariants (2.2.3.4 Step 5). Empty = clear.
@@ -393,7 +495,9 @@ def main(argv: Optional[list[str]] = None) -> int:
     # before baseline regressions are even compared.
     hard_failures = (pretrace_checks(current, baseline, policy=args.policy)
                      + phase22_checks(current)
-                     + adaptive_safety_checks(current))
+                     + adaptive_safety_checks(current)
+                     + evidence_sufficiency_checks(current, baseline)
+                     + citation_validation_checks(current, baseline))
     if hard_failures:
         print(render_report({}, hard_failures))
         print(f"\nsummary:  {summary_path}")

@@ -109,6 +109,27 @@ class SourceCitation(BaseModel):
     relevance_score: Optional[float] = None
 
 
+class EvidenceCitation(BaseModel):
+    """A structured citation resolved against the model-visible evidence ledger.
+
+    2.2.4.3: an ``[E#]`` citation resolves to a request-local evidence item
+    (``support_status=supported``); an ``[E#]`` absent from the final ledger is
+    ``missing``; a botched id (``[E]``, ``[E1x]``) is ``malformed`` — neither is
+    ever converted into a real source citation. Legacy ``[Source: type/ticker]``
+    labels are retained (``support_status=supported``) during the compatibility
+    window with ``evidence_id`` unset.
+    """
+
+    evidence_id: Optional[str] = Field(
+        None, description="Request-local [E#] id, or None for a legacy source label")
+    source_type: Optional[str] = None
+    ticker: Optional[str] = None
+    metric: Optional[str] = None
+    period: Optional[str] = None
+    source_url: Optional[str] = None
+    support_status: Literal["supported", "missing", "malformed"] = "supported"
+
+
 class QueryResponse(BaseModel):
     """Structured response from the middleware."""
 
@@ -188,6 +209,31 @@ class QueryResponse(BaseModel):
                     "ACTUAL executed counters, not configured maxima. Present only "
                     "when enable_adaptive_rag is on; omitted (null) on the legacy "
                     "path so older clients are unaffected.",
+    )
+    evidence_sufficiency: Optional[dict] = Field(
+        None,
+        exclude_if=lambda value: value is None,
+        description="Evidence sufficiency/answer-policy metadata (2.2.4.1): "
+                    "{status, reason_codes, covered_subqueries, missing_subqueries, "
+                    "corrective_action, retry_performed}. Omitted while the feature "
+                    "flag is off.",
+    )
+    evidence_citations: Optional[list[EvidenceCitation]] = Field(
+        None,
+        exclude_if=lambda value: value is None,
+        description="Structured citations resolved against the model-visible "
+                    "evidence ledger (2.2.4.3). Present only when answer_validation "
+                    "is report|enforce; omitted (null) when validation is off.",
+    )
+    answer_validation: Optional[dict] = Field(
+        None,
+        exclude_if=lambda value: value is None,
+        description="Deterministic citation/numeric-validation metadata (2.2.4.3): "
+                    "{validation_status, citation_support_rate, numeric_claims_supported, "
+                    "numeric_claims_unsupported, numeric_claims_ambiguous, "
+                    "mismatch_counts, enforcement, ...}. Omitted (null) when "
+                    "answer_validation is off; validator errors report "
+                    "validation_status=report_unavailable rather than failing the query.",
     )
     freshness: dict = Field(
         default_factory=lambda: {

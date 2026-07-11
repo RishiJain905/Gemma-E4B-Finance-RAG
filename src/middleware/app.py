@@ -27,9 +27,16 @@ from fastapi.responses import StreamingResponse
 from src.storage.store import Store
 from . import prompt_policy
 from .config import MiddlewareConfig
-from .evidence import evidence_counts, usable_documents, usable_facts
+from .evidence import (
+    assign_evidence_ids,
+    build_evidence_items,
+    evidence_counts,
+    usable_documents,
+    usable_facts,
+)
 from .evidence_trace import EvidenceTraceCollector
 from .models import (
+    EvidenceCitation,
     FreshnessResponse,
     HealthResponse,
     MacroSnapshotResponse,
@@ -102,6 +109,23 @@ def _grounding_level(retrieval: dict) -> str:
     return "grounded" if n >= 3 else "partial" if n >= 1 else "none"
 
 
+def _answer_mode_from_sufficiency(
+    sufficiency,
+    *,
+    requires_specific_figures: bool,
+) -> str:
+    """Convert deterministic obligation coverage into one answer policy mode."""
+    from .evidence_grader import SufficiencyStatus
+
+    if sufficiency.status is SufficiencyStatus.SUFFICIENT:
+        return "grounded"
+    if any(row.covered_fields for row in sufficiency.coverage):
+        return "partial"
+    if not requires_specific_figures and _allow_general_fallback():
+        return "general"
+    return "refused"
+
+
 def _answer_policy() -> str:
     """Return the effective answer policy: per-request override, else configured default."""
     override = _answer_policy_override_var.get()
@@ -109,6 +133,28 @@ def _answer_policy() -> str:
         return override
     policy = str(getattr(config, "answer_policy", "graded") or "graded").lower()
     return "strict" if policy == "strict" else "graded"
+
+
+def _answer_validation_mode() -> str:
+    """Return the effective citation/numeric validation policy (2.2.4.3).
+
+    off (or an unknown value) preserves legacy behavior byte-for-byte; report
+    attaches validation metadata without changing the answer; enforce may
+    downgrade grounding or refuse a wholly-unsupported answer.
+    """
+    mode = str(getattr(config, "answer_validation", "off") or "off").strip().lower()
+    return mode if mode in ("off", "report", "enforce") else "off"
+
+
+def _evidence_ids_enabled() -> bool:
+    """Whether request-local ``[E#]`` evidence ids should be built/rendered."""
+    return _answer_validation_mode() != "off"
+
+
+def _build_evidence_ledger(retrieval: dict) -> list:
+    """Build the packed, ``E#``-numbered ledger from usable retrieval evidence."""
+    return assign_evidence_ids(
+        build_evidence_items(usable_facts(retrieval), usable_documents(retrieval)))
 
 
 def _reset_request_scoped_state(answer_policy: Optional[str]) -> None:
@@ -224,7 +270,9 @@ def _apply_answer_policy(answer: str, grounding_level: str) -> str:
         return answer
     if not answer or answer.startswith(("Error calling model:", "Model unavailable.")):
         return answer
-    if grounding_level != "none":
+    if grounding_level == "refused":
+        return NO_GENERAL_FALLBACK_MESSAGE
+    if grounding_level not in {"none", "general"}:
         return answer
     if not _allow_general_fallback():
         return NO_GENERAL_FALLBACK_MESSAGE
@@ -247,7 +295,7 @@ def _response_grounding(answer: str, grounding_level: str) -> str:
         return "grounded"
     if grounding_level == "partial":
         return "partial"
-    if grounding_level == "none" and _allow_general_fallback():
+    if grounding_level in {"none", "general"} and _allow_general_fallback():
         return "general"
     return "refused"
 
@@ -696,6 +744,10 @@ async def _build_legacy_query_context(
     }
     grounding_level = _grounding_level(retrieval)
 
+    # Request-local [E#] evidence ledger (2.2.4.3). Empty when validation is
+    # off, so the prompt and response stay byte-for-byte legacy.
+    evidence_ledger = _build_evidence_ledger(retrieval) if _evidence_ids_enabled() else []
+
     # Request-scoped evidence-trace collector (2.2.1.2), created right after
     # evidence normalization so facts/documents are the exact usable rows
     # (see src/middleware/evidence.py) — untruncated, full provenance. Left
@@ -710,6 +762,7 @@ async def _build_legacy_query_context(
             facts=usable_facts(retrieval),
             documents=usable_documents(retrieval),
         )
+        trace_collector.record_evidence_ledger(evidence_ledger)
     _evidence_trace_var.set(trace_collector)
 
     stage_start = time.perf_counter()
@@ -723,6 +776,7 @@ async def _build_legacy_query_context(
         intent=retrieval_intent,
         retrieval=retrieval,
         grounding_level=grounding_level,
+        evidence_ledger=evidence_ledger or None,
     )
     _stage_timing(timings, "prompt_build", stage_start)
 
@@ -740,6 +794,8 @@ async def _build_legacy_query_context(
         "compiled": shared["compiled"],
         "retrieval_query": retrieval_query,
         "orchestration": orchestration,
+        "evidence_ledger": evidence_ledger,
+        "calculations": [],
     }
 
 
@@ -780,6 +836,18 @@ def _orchestration_metadata(result) -> dict:
         "evidence_dropped": dropped,
         "fallback_reason": result.fallback_reason,
     }
+
+
+def _sufficiency_metadata(result, answer_mode: str) -> Optional[dict]:
+    """Build optional response metadata from the same graded result."""
+    if result.sufficiency is None:
+        return None
+    metadata = result.sufficiency.to_metadata()
+    metadata["status"] = answer_mode
+    metadata.pop("sufficiency", None)
+    metadata["corrective_action"] = result.corrective_action.value
+    metadata["retry_performed"] = bool(result.retry_performed)
+    return metadata
 
 
 def _fact_trace_id(fact: dict) -> dict:
@@ -916,7 +984,24 @@ async def _build_adaptive_query_context(shared: dict) -> dict:
         "retrieval_strategy": result.retrieval_strategy or "vector",
         "timings": {},
     }
-    grounding_level = _grounding_level(retrieval)
+    if result.sufficiency is not None:
+        specific = bool(plan.entities) or bool(plan.metrics) or bool(
+            set(plan.intents) & {"fact_lookup", "comparison", "trend", "projection"}
+        )
+        grounding_level = _answer_mode_from_sufficiency(
+            result.sufficiency, requires_specific_figures=specific)
+    else:
+        grounding_level = _grounding_level(retrieval)
+    sufficiency_meta = _sufficiency_metadata(result, grounding_level)
+
+    # Recorded deterministic calculations feed numeric validation (2.2.4.3):
+    # a cited figure produced by a bounded calculation is supported evidence.
+    calculations: list[dict] = []
+    if result.tool_execution is not None:
+        calculations = [dict(c) for c in result.tool_execution.calculations]
+
+    # Request-local [E#] evidence ledger over the pre-budgeted evidence.
+    evidence_ledger = _build_evidence_ledger(retrieval) if _evidence_ids_enabled() else []
 
     # Evidence-trace collector (opt-in). The adaptive route trace records only
     # the successful answer path (2.2.3.4 Step 3).
@@ -931,6 +1016,7 @@ async def _build_adaptive_query_context(shared: dict) -> dict:
             documents=usable_documents(retrieval),
         )
         trace_collector.record_orchestration(_evidence_trace_orchestration(plan, result))
+        trace_collector.record_evidence_ledger(evidence_ledger)
     _evidence_trace_var.set(trace_collector)
 
     stage_start = time.perf_counter()
@@ -945,6 +1031,8 @@ async def _build_adaptive_query_context(shared: dict) -> dict:
         retrieval={},
         grounding_level=grounding_level,
         preselected={"facts": sel_facts, "documents": sel_docs},
+        evidence_sufficiency=result.sufficiency,
+        evidence_ledger=evidence_ledger or None,
     )
     _stage_timing(timings, "prompt_build", stage_start)
 
@@ -962,6 +1050,9 @@ async def _build_adaptive_query_context(shared: dict) -> dict:
         "compiled": shared["compiled"],
         "retrieval_query": retrieval_query,
         "orchestration": _orchestration_metadata(result),
+        "evidence_sufficiency": sufficiency_meta,
+        "evidence_ledger": evidence_ledger,
+        "calculations": calculations,
     }
 
 
@@ -999,12 +1090,93 @@ def _task_settings(request: QueryRequest, intent: dict) -> tuple[float, int]:
     return temperature, max_tokens
 
 
+def _evidence_citation_model(record) -> EvidenceCitation:
+    """Map an answer_validator CitationRecord onto the response model."""
+    return EvidenceCitation(
+        evidence_id=record.evidence_id,
+        source_type=record.source_type,
+        ticker=record.ticker,
+        metric=record.metric,
+        period=record.period,
+        source_url=record.source_url,
+        support_status=record.support_status,
+    )
+
+
+def _enforce_validation(answer_text: str, grounding_level: str, report) -> tuple[str, str, str]:
+    """Apply the enforce policy (2.2.4.3). Returns (answer, grounding, action).
+
+    A wholly-unsupported answer is replaced with the existing honest refusal;
+    otherwise a violation (unsupported number or unresolved citation) downgrades
+    grounded->partial and appends a short support warning. No model call is made.
+    """
+    require_ids = bool(getattr(config, "require_evidence_ids", False))
+    if report.wholly_unsupported():
+        return NO_GENERAL_FALLBACK_MESSAGE, "refused", "refuse"
+    if not report.has_violations(require_evidence_ids=require_ids):
+        return answer_text, grounding_level, "none"
+    if grounding_level == "grounded":
+        grounding_level = "partial"
+    warning = report.support_warning()
+    if warning and warning not in answer_text:
+        answer_text = f"{answer_text}\n\n{warning}"
+    return answer_text, grounding_level, "downgrade"
+
+
+def _apply_answer_validation(
+    context: dict, answer_text: str, grounding_level: str,
+) -> tuple[str, str, Optional[dict], Optional[list]]:
+    """Run deterministic citation/numeric validation per policy (2.2.4.3).
+
+    Returns ``(answer_text, grounding_level, validation_meta, evidence_citations)``.
+    off -> all-None passthrough. report -> metadata + log, answer unchanged.
+    enforce -> may downgrade/refuse with a support warning. The validator never
+    makes a model call and always fails soft to ``report_unavailable``.
+    """
+    mode = _answer_validation_mode()
+    if mode == "off":
+        return answer_text, grounding_level, None, None
+
+    ledger = context.get("evidence_ledger") or []
+    calculations = context.get("calculations") or []
+    try:
+        from .answer_validator import AnswerValidation, validate_answer
+
+        report = validate_answer(
+            answer_text, ledger, calculations=calculations,
+            require_evidence_ids=bool(getattr(config, "require_evidence_ids", False)),
+        )
+    except Exception:  # noqa: BLE001 - validation must never crash a query
+        logger.exception("Answer validation failed; reporting report_unavailable")
+        from .answer_validator import AnswerValidation
+
+        meta = AnswerValidation.unavailable().to_metadata()
+        meta["enforcement"] = "none"
+        return answer_text, grounding_level, meta, None
+
+    meta = report.to_metadata()
+    evidence_citations = [_evidence_citation_model(c) for c in report.citations]
+    action = "none"
+    if mode == "enforce":
+        answer_text, grounding_level, action = _enforce_validation(
+            answer_text, grounding_level, report)
+    elif report.numeric_claims_unsupported or report.citations_missing or report.citations_malformed:
+        logger.info(
+            "answer_validation report: status=%s unsupported=%d missing=%d malformed=%d",
+            report.status, report.numeric_claims_unsupported,
+            report.citations_missing, report.citations_malformed)
+    meta["enforcement"] = action
+    return answer_text, grounding_level, meta, evidence_citations
+
+
 def _build_query_response(
     *,
     context: dict,
     answer_text: str,
     citations: list[SourceCitation],
     model_available: bool,
+    validation: Optional[dict] = None,
+    evidence_citations: Optional[list] = None,
 ) -> QueryResponse:
     """Build a QueryResponse from shared query context and model output."""
     intent = context["intent"]
@@ -1063,6 +1235,9 @@ def _build_query_response(
         resolved_metrics=resolved_metrics,
         resolved_timeframe=resolved_timeframe,
         orchestration=context.get("orchestration"),
+        evidence_sufficiency=context.get("evidence_sufficiency"),
+        evidence_citations=evidence_citations,
+        answer_validation=validation,
     )
 
 
@@ -1093,15 +1268,25 @@ async def _answer_query_context(request: QueryRequest, context: dict) -> QueryRe
             )
     else:
         logger.warning("Model unavailable - returning degraded answer")
-        answer_text = _format_degraded_answer(retrieval, intent)
+        answer_text = _format_degraded_answer(
+            retrieval, intent, context.get("evidence_sufficiency"))
         citations = []
     _stage_timing(context["timings"], "model_call", stage_start)
+
+    # Deterministic citation/numeric validation (2.2.4.3). off -> passthrough;
+    # report -> metadata only; enforce -> may downgrade/refuse. Updates the
+    # context grounding so _build_query_response reflects an enforced downgrade.
+    answer_text, grounding_level, validation, evidence_citations = _apply_answer_validation(
+        context, answer_text, grounding_level)
+    context["grounding_level"] = grounding_level
 
     return _build_query_response(
         context=context,
         answer_text=answer_text,
         citations=citations,
         model_available=model_available,
+        validation=validation,
+        evidence_citations=evidence_citations,
     )
 
 
@@ -1209,6 +1394,8 @@ async def query_stream(request: QueryRequest):
         stage_start = time.perf_counter()
         answer_parts: list[str] = []
         citations: list[SourceCitation] = []
+        validation: Optional[dict] = None
+        evidence_citations: Optional[list] = None
         try:
             temperature, max_tokens = _task_settings(request, context["intent"])
             async for token in _stream_model_tokens(
@@ -1244,6 +1431,11 @@ async def query_stream(request: QueryRequest):
                     answer_text,
                     context["augmented_prompt"],
                 )
+            # Deterministic citation/numeric validation (2.2.4.3). Enforced
+            # downgrades/refusals reach the terminal metadata event; already-
+            # streamed tokens are not rewritten (a known streaming limitation).
+            answer_text, context["grounding_level"], validation, evidence_citations = \
+                _apply_answer_validation(context, answer_text, context["grounding_level"])
         except Exception as exc:  # noqa: BLE001 - streaming must never fail a query
             logger.warning("Streaming model call failed; falling back server-side: %s", exc)
             fallback = await _answer_query_context(request, context)
@@ -1260,6 +1452,8 @@ async def query_stream(request: QueryRequest):
             answer_text=answer_text,
             citations=citations,
             model_available=True,
+            validation=validation,
+            evidence_citations=evidence_citations,
         )
         metadata = _response_to_dict(response)
         metadata.pop("answer", None)
@@ -1268,7 +1462,11 @@ async def query_stream(request: QueryRequest):
     return StreamingResponse(events(), media_type="text/event-stream")
 
 
-def _format_degraded_answer(retrieval: dict, intent: dict) -> str:
+def _format_degraded_answer(
+    retrieval: dict,
+    intent: dict,
+    evidence_sufficiency: Optional[dict] = None,
+) -> str:
     """Format retrieved data as a readable answer when the model is unavailable."""
     parts = ["⚠️ Model unavailable — showing raw retrieved data:\n"]
     facts = retrieval.get("facts", [])
@@ -1296,6 +1494,17 @@ def _format_degraded_answer(retrieval: dict, intent: dict) -> str:
     if not facts and not docs:
         parts.append("No stored data found for this question.")
         parts.append("")
+
+    if evidence_sufficiency:
+        missing = evidence_sufficiency.get("missing_subqueries") or []
+        reasons = evidence_sufficiency.get("reason_codes") or []
+        if missing or reasons:
+            parts.append(
+                "Evidence status: " + str(evidence_sufficiency.get("status", "refused"))
+                + "; missing=" + (", ".join(missing) or "none")
+                + "; reasons=" + (", ".join(reasons) or "none")
+            )
+            parts.append("")
 
     parts.append("Start llama-server to get AI-grounded answers.")
     return "\n".join(parts)

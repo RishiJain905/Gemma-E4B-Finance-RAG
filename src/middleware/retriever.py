@@ -70,6 +70,125 @@ def rrf_fuse(vector_hits: list[dict], lexical_hits: list[dict],
     return sorted(scores.items(), key=lambda x: -x[1])
 
 
+# ── Weighted subquery fusion (Phase 2.2.4.2) ───────────────
+
+def _fusion_identities(doc: dict) -> list[tuple]:
+    """All independent de-dup identities a doc carries (mirror of the adaptive
+    orchestrator's ``_doc_identities``): a stable id and a
+    (parent_id, chunk_index) pair are INDEPENDENT — the same physical chunk can
+    surface once keyed by id and once keyed by parent+chunk, and either match
+    means duplicate. Bodyless-and-idless docs fall back to their body text."""
+    meta = doc.get("metadata") or {}
+    identities: list[tuple] = []
+    doc_id = doc.get("id") or meta.get("id")
+    if doc_id is not None:
+        identities.append(("id", doc_id))
+    parent = meta.get("parent_id") or doc.get("parent_id")
+    chunk = meta.get("chunk_index", meta.get("chunk"))
+    if parent is not None and chunk is not None:
+        identities.append(("chunk", parent, chunk))
+    if not identities:
+        body = doc.get("document") or doc.get("text") or doc.get("content") or ""
+        identities.append(("body", str(body).strip()))
+    return identities
+
+
+def _fusion_low_authority(doc: dict) -> int:
+    """0 for authoritative/fresh docs, 1 for stale/scoreless — a stable
+    secondary sort key so authoritative evidence wins when scores are comparable."""
+    meta = doc.get("metadata") or {}
+    if meta.get("stale") or doc.get("stale"):
+        return 1
+    if doc.get("rerank_score") is None and doc.get("fusion_score") is None:
+        return 1
+    return 0
+
+
+def fuse_weighted_subqueries(
+    channels: list[dict], *, top_k: int, k: int = 60,
+) -> list[dict]:
+    """Weighted RRF over per-subquery ranked document lists (2.2.4.2 Step 4).
+
+    Each channel is ``{"subquery_id": str, "weight": float, "documents": [...]}``
+    where ``documents`` are already ranked (index = rank). A doc's fused score is
+    the weight-scaled reciprocal-rank sum across every subquery that surfaced it,
+    so the original ``sq0`` channel (weight 1.0) stays the strongest signal above
+    deterministic-derived (0.8) and planner-derived (0.6) channels. Documents are
+    deduplicated by stable id AND parent/chunk identity; at least one slot is
+    reserved for every covered subquery before the remaining slots are filled by
+    fused score (authoritative/fresh evidence preferred on ties); the result is
+    truncated to ``top_k``. Each returned doc keeps its ``subquery_ids``,
+    per-subquery ``channel_ranks``, ``subquery_weights``, and ``fused_score``.
+
+    Structured facts are never fused here — they attach to their obligation
+    directly (see the orchestrator's fact merge).
+    """
+    groups: list[dict] = []
+    index: dict[tuple, int] = {}
+    covered_order: list[str] = []
+
+    for channel in channels:
+        sqid = channel.get("subquery_id")
+        weight = float(channel.get("weight", 1.0))
+        docs = channel.get("documents") or []
+        if sqid not in covered_order:
+            covered_order.append(sqid)
+        for rank, doc in enumerate(docs):
+            if not isinstance(doc, dict):
+                continue
+            identities = _fusion_identities(doc)
+            gidx = next((index[i] for i in identities if i in index), None)
+            if gidx is None:
+                gidx = len(groups)
+                groups.append({
+                    "doc": dict(doc), "score": 0.0, "subquery_ids": [],
+                    "weights": {}, "channel_ranks": {},
+                })
+            group = groups[gidx]
+            for identity in identities:
+                index[identity] = gidx
+            group["score"] += weight * (1.0 / (k + rank + 1))
+            if sqid not in group["subquery_ids"]:
+                group["subquery_ids"].append(sqid)
+            group["weights"][sqid] = weight
+            prior = group["channel_ranks"].get(sqid)
+            group["channel_ranks"][sqid] = rank if prior is None else min(prior, rank)
+
+    ordered = sorted(
+        groups,
+        key=lambda g: (-g["score"], _fusion_low_authority(g["doc"]), str(g["doc"].get("id"))),
+    )
+
+    # Reserve one slot per covered subquery (in subquery order), highest-scoring
+    # eligible group first, before filling the rest by fused score.
+    reserved_gids: set[int] = set()
+    for sqid in covered_order:
+        for group in ordered:
+            if id(group) in reserved_gids:
+                continue
+            if sqid in group["subquery_ids"]:
+                reserved_gids.add(id(group))
+                break
+
+    final: list[dict] = [g for g in ordered if id(g) in reserved_gids]
+    for group in ordered:
+        if len(final) >= max(0, top_k):
+            break
+        if id(group) not in reserved_gids:
+            final.append(group)
+    final = final[: max(0, top_k)]
+
+    out: list[dict] = []
+    for group in final:
+        doc = dict(group["doc"])
+        doc["fused_score"] = round(group["score"], 8)
+        doc["subquery_ids"] = list(group["subquery_ids"])
+        doc["subquery_weights"] = dict(group["weights"])
+        doc["channel_ranks"] = dict(group["channel_ranks"])
+        out.append(doc)
+    return out
+
+
 class Retriever:
     """
     Hybrid retriever — queries SQLite + ChromaDB based on intent.
@@ -192,6 +311,36 @@ class Retriever:
         result.setdefault("lexical_ids", [])
         result["candidate_count"] = len(result.get("documents", []))
         return result
+
+    def expand_parent_sections(self, documents: list[dict]) -> list[dict]:
+        """Read adjacent sibling chunks for known parents from local Chroma only.
+
+        This bounded corrective seam never invokes ingestion, HTTP, arbitrary
+        URLs, or write tools. Missing parents/siblings fail soft per item.
+        """
+        expanded: list[dict] = []
+        seen: set[str] = set()
+        for document in documents:
+            metadata = document.get("metadata") or {}
+            parent = metadata.get("parent_id") or document.get("parent_id")
+            chunk = metadata.get("chunk_index", metadata.get("chunk"))
+            if parent is None or not isinstance(chunk, int):
+                continue
+            for index in (chunk - 1, chunk + 1):
+                if index < 0:
+                    continue
+                sibling_id = f"{parent}#{index}"
+                if sibling_id in seen:
+                    continue
+                seen.add(sibling_id)
+                try:
+                    sibling = self.store.chroma.get_document(sibling_id)
+                except Exception:  # noqa: BLE001 - correction is fail-soft per item
+                    logger.debug("Adjacent chunk unavailable: %s", sibling_id, exc_info=True)
+                    continue
+                if sibling:
+                    expanded.append(dict(sibling))
+        return expanded
 
     def _run_retrieval(self, query: str, intent: dict,
                        top_k_documents: int, top_k_facts: int,

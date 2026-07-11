@@ -86,6 +86,39 @@ class MiddlewareConfig:
         self.adaptive_max_context_chars: int = 18000   # hard context ceiling
         self.adaptive_conditional_rerank: bool = True
 
+        # Phase 2.2.4.1 — deterministic evidence sufficiency and one bounded
+        # internal corrective round. Both switches default off so the legacy
+        # count-based answer path remains byte-identical until promotion.
+        self.enable_evidence_sufficiency: bool = False
+        self.enable_corrective_retry: bool = False
+        self.max_corrective_retries: int = 1  # hard clamp 0–1
+
+        # Phase 2.2.4.3 — citation provenance & deterministic numerical
+        # validation. answer_validation selects the policy:
+        #   off     — legacy behavior, byte-identical (no evidence ids, no
+        #             validator, no extra response metadata);
+        #   report  — render [E#] evidence ids, run the deterministic validator,
+        #             attach validation metadata + log unsupported claims (no
+        #             answer/grounding change);
+        #   enforce — additionally downgrade grounded->partial (or refuse a
+        #             wholly-unsupported answer) with a short support warning.
+        # require_evidence_ids tightens enforcement during the rollout window so
+        # a specific-figure answer with no resolving [E#] is treated as a
+        # violation. The validator never makes a model call and always fails
+        # soft to report_unavailable. Env: ANSWER_VALIDATION, REQUIRE_EVIDENCE_IDS.
+        self.answer_validation: str = "report"  # off | report | enforce
+        self.require_evidence_ids: bool = False
+
+        # Phase 2.2.4.2 — selective query decomposition & weighted fusion. When
+        # on (and the complex lane is reached), a genuinely compound / low-
+        # coverage plan is decomposed into at most two derived, drift-validated
+        # subqueries whose specialized evidence is retrieved in the bounded
+        # corrective seam and fused with the original query as the strongest
+        # signal. Off by default: a simple query never decomposes and the
+        # RUN_DERIVED_SUBQUERIES corrective action stays the 2.2.4.1 deferred
+        # placeholder, so legacy behavior is byte-identical until promotion.
+        self.enable_query_decomposition: bool = False
+
         # Phase 2.1.6 — fetch-on-miss ingestion controls.
         self.enable_fetch_on_miss: bool = True
         self.fetch_on_miss_timeout_s: float = 10.0
@@ -125,6 +158,8 @@ class MiddlewareConfig:
         self._apply_env_overrides()
         self._clamp_conversation_limits()
         self._clamp_adaptive_limits()
+        self._clamp_corrective_limits()
+        self._normalize_answer_validation()
 
     def _load_from_file(self, path: Path):
         with open(path) as f:
@@ -197,6 +232,12 @@ class MiddlewareConfig:
         _int("ADAPTIVE_MAX_PLANNING_CALLS", "adaptive_max_planning_calls")
         _int("ADAPTIVE_MAX_CONTEXT_CHARS", "adaptive_max_context_chars")
         _bool("ADAPTIVE_CONDITIONAL_RERANK", "adaptive_conditional_rerank")
+        _bool("ENABLE_EVIDENCE_SUFFICIENCY", "enable_evidence_sufficiency")
+        _bool("ENABLE_CORRECTIVE_RETRY", "enable_corrective_retry")
+        _int("MAX_CORRECTIVE_RETRIES", "max_corrective_retries")
+        _bool("ENABLE_QUERY_DECOMPOSITION", "enable_query_decomposition")
+        _str("ANSWER_VALIDATION", "answer_validation")
+        _bool("REQUIRE_EVIDENCE_IDS", "require_evidence_ids")
 
     def _clamp_conversation_limits(self) -> None:
         """Clamp conversation budgets to documented safe maxima (2.2.2.1).
@@ -251,3 +292,28 @@ class MiddlewareConfig:
         if clamped:
             logger.warning(
                 "Clamped adaptive limits to safe ranges: %s", ", ".join(clamped))
+
+    def _normalize_answer_validation(self) -> None:
+        """Coerce answer_validation to off|report|enforce (invalid -> off)."""
+        value = str(getattr(self, "answer_validation", "report") or "").strip().lower()
+        if value not in ("off", "report", "enforce"):
+            logger.warning(
+                "Unknown answer_validation=%r; falling back to 'off'",
+                self.answer_validation)
+            value = "off"
+        self.answer_validation = value
+        self.require_evidence_ids = bool(getattr(self, "require_evidence_ids", False))
+
+    def _clamp_corrective_limits(self) -> None:
+        """Hard-clamp corrective retries to the documented zero-or-one range."""
+        try:
+            value = int(self.max_corrective_retries)
+        except (TypeError, ValueError):
+            value = 1
+        bounded = max(0, min(1, value))
+        if bounded != value:
+            logger.warning(
+                "Clamped max_corrective_retries to safe range: %s->%s",
+                value, bounded,
+            )
+        self.max_corrective_retries = bounded

@@ -57,6 +57,28 @@ adaptive_max_planning_calls: 1       # clamp 0–1
 adaptive_max_context_chars: 18000    # hard context ceiling (clamp 1000–64000)
 adaptive_conditional_rerank: true
 
+# Phase 2.2.4.1 — deterministic evidence sufficiency and one bounded internal
+# corrective retrieval. Both flags remain off until eval promotion. The retry
+# limit is hard-clamped to 0–1; total retrieval rounds remain capped at two.
+# Env: ENABLE_EVIDENCE_SUFFICIENCY, ENABLE_CORRECTIVE_RETRY,
+# MAX_CORRECTIVE_RETRIES.
+enable_evidence_sufficiency: false
+enable_corrective_retry: false
+max_corrective_retries: 1
+
+# Phase 2.2.4.3 — citation provenance & deterministic numerical validation.
+#   off     — legacy behavior, byte-identical (no [E#] ids, no validator).
+#   report  — render [E#] evidence ids, run the deterministic validator, and
+#             attach citation/numeric validation metadata (no answer change).
+#   enforce — additionally downgrade grounded->partial (or refuse a wholly-
+#             unsupported answer) with a short support warning.
+# The validator uses only the standard library + Decimal — it never makes a
+# model call and always fails soft to validation_status=report_unavailable.
+# require_evidence_ids tightens enforcement so a specific-figure answer with no
+# resolving [E#] counts as a violation. Env: ANSWER_VALIDATION, REQUIRE_EVIDENCE_IDS.
+answer_validation: report        # off | report | enforce
+require_evidence_ids: false
+
 # Phase 2.1.6 — fetch-on-miss ingestion.
 enable_fetch_on_miss: true
 fetch_on_miss_timeout_s: 10.0

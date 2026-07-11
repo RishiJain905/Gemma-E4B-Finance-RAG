@@ -286,3 +286,285 @@ class TestCompoundQueryQualityGate:
                 for pred, gold in pairs
             )
         assert _micro_f1(pooled) >= 0.90, "Pooled micro-F1 below 0.90 gate"
+
+
+# ══════════════════════════════════════════════════════════════════════
+# 2.2.4.2 — Selective query decomposition + derived-query drift validation
+# ══════════════════════════════════════════════════════════════════════
+
+
+def _plan(question, *, entities=(), metrics=(), intents=("general",), periods=()):
+    """Build a validated sq0-only plan for decomposition tests."""
+    from src.middleware.query_plan import (
+        QueryPlan,
+        QuerySubquery,
+        normalize_question,
+    )
+
+    ents = [_entity(t, start=i) for i, t in enumerate(entities)]
+    sq0 = QuerySubquery(
+        id="sq0", text=question,
+        entity_tickers=tuple(e.ticker for e in ents),
+        intents=tuple(intents), metrics=tuple(metrics), periods=tuple(periods),
+        retrieval_modes=("facts",) if metrics else (),
+    )
+    return QueryPlan(
+        original_question=question, retrieval_query=question,
+        normalized_question=normalize_question(question),
+        entities=ents, intents=list(intents), metrics=list(metrics),
+        periods=list(periods), subqueries=[sq0], primary_intent=intents[0],
+    ).validate()
+
+
+class TestDecomposePlan:
+    """decompose_plan only splits genuinely compound / low-coverage plans."""
+
+    def test_simple_fact_lookup_yields_no_derived(self):
+        from src.middleware.query_plan import decompose_plan
+
+        plan = _plan("What is NVDA revenue", entities=["NVDA"],
+                     metrics=["total_revenue"], intents=["fact_lookup"])
+        assert decompose_plan(plan) == []
+
+    def test_single_qualitative_topic_yields_no_derived(self):
+        from src.middleware.query_plan import decompose_plan
+
+        plan = _plan("Why did NVDA stock drop", entities=["NVDA"],
+                     intents=["explanation"])
+        assert decompose_plan(plan) == []
+
+    def test_fact_plus_risk_splits_by_modality(self):
+        from src.middleware.query_plan import decompose_plan
+
+        plan = _plan("NVDA revenue and risk factors", entities=["NVDA"],
+                     metrics=["total_revenue"], intents=["fact_lookup", "risk"])
+        derived = decompose_plan(plan)
+        assert [s.id for s in derived] == ["sq1", "sq2"]
+        modes = {m for s in derived for m in s.retrieval_modes}
+        assert "facts" in modes and "documents" in modes
+        assert all(s.derived and s.parent_id == "sq0" for s in derived)
+        assert all(s.derivation_source == "deterministic" for s in derived)
+        # Each derived subquery records the obligations it covers.
+        assert all(s.covers_obligations for s in derived)
+
+    def test_comparison_splits_one_lookup_per_entity(self):
+        from src.middleware.query_plan import decompose_plan
+
+        plan = _plan("Compare NVDA and AMD revenue",
+                     entities=["NVDA", "AMD"], metrics=["total_revenue"],
+                     intents=["comparison"])
+        derived = decompose_plan(plan)
+        assert [s.entity_tickers for s in derived] == [("NVDA",), ("AMD",)]
+        assert all(s.reason_code == "decompose_entity" for s in derived)
+
+    def test_two_tickers_split_per_entity(self):
+        from src.middleware.query_plan import decompose_plan
+
+        plan = _plan("NVDA revenue FY2024 versus AMD revenue FY2025",
+                     entities=["NVDA", "AMD"], metrics=["total_revenue"],
+                     intents=["comparison"], periods=["FY2024", "FY2025"])
+        derived = decompose_plan(plan)
+        assert [s.entity_tickers for s in derived] == [("NVDA",), ("AMD",)]
+        # Derived periods only ever narrow the parent plan.
+        for s in derived:
+            assert set(s.periods) <= {"FY2024", "FY2025"}
+
+    def test_macro_plus_company_splits_macro_and_company(self):
+        from src.middleware.query_plan import decompose_plan
+
+        plan = _plan("How does inflation affect NVDA", entities=["NVDA"],
+                     intents=["explanation"])
+        derived = decompose_plan(plan)
+        reasons = {s.reason_code for s in derived}
+        assert reasons == {"decompose_macro", "decompose_company"}
+        macro = next(s for s in derived if s.reason_code == "decompose_macro")
+        assert macro.retrieval_modes == ("macro",) and macro.entity_tickers == ()
+
+    def test_at_most_two_derived_even_with_three_entities(self):
+        from src.middleware.query_plan import decompose_plan
+
+        plan = _plan("Compare NVDA AMD INTC revenue",
+                     entities=["NVDA", "AMD", "INTC"], metrics=["total_revenue"],
+                     intents=["comparison"])
+        derived = decompose_plan(plan)
+        assert len(derived) == 2
+
+    def test_decompose_does_not_mutate_plan(self):
+        from src.middleware.query_plan import decompose_plan
+
+        plan = _plan("NVDA revenue and risk", entities=["NVDA"],
+                     metrics=["total_revenue"], intents=["fact_lookup", "risk"])
+        before = [s.id for s in plan.subqueries]
+        decompose_plan(plan)
+        assert [s.id for s in plan.subqueries] == before == ["sq0"]
+
+    def test_decompose_is_idempotent_on_already_derived_plan(self):
+        from src.middleware.query_plan import (
+            attach_derived_subqueries,
+            decompose_plan,
+        )
+
+        plan = _plan("NVDA revenue and risk", entities=["NVDA"],
+                     metrics=["total_revenue"], intents=["fact_lookup", "risk"])
+        extended = attach_derived_subqueries(plan, decompose_plan(plan))
+        assert decompose_plan(extended) == []
+
+
+class TestAttachDerivedSubqueries:
+    def test_attach_keeps_plan_capped_and_valid(self):
+        from src.middleware.query_plan import (
+            attach_derived_subqueries,
+            decompose_plan,
+        )
+
+        plan = _plan("Compare NVDA AMD INTC revenue",
+                     entities=["NVDA", "AMD", "INTC"], metrics=["total_revenue"],
+                     intents=["comparison"])
+        extended = attach_derived_subqueries(plan, decompose_plan(plan))
+        assert len(extended.subqueries) == 3  # sq0 + at most 2 derived
+        extended.validate()  # still valid, no drift
+
+    def test_attach_fails_soft_on_invalid_derived(self):
+        from src.middleware.query_plan import QuerySubquery, attach_derived_subqueries
+
+        plan = _plan("NVDA revenue", entities=["NVDA"],
+                     metrics=["total_revenue"], intents=["fact_lookup"])
+        # A derived subquery that drifts (new metric) cannot be attached.
+        bad = QuerySubquery(
+            id="sq1", text="NVDA net income", entity_tickers=("NVDA",),
+            metrics=("net_income",), derived=True, parent_id="sq0")
+        assert attach_derived_subqueries(plan, [bad]) is plan
+
+
+class TestDerivedDriftValidation:
+    """Every derived field must come from the validated plan or known aliases."""
+
+    def _base(self):
+        return _plan("NVDA revenue FY2025", entities=["NVDA"],
+                     metrics=["total_revenue"], intents=["fact_lookup"],
+                     periods=["FY2025"])
+
+    def _sub(self, **over):
+        from src.middleware.query_plan import QuerySubquery
+
+        base = dict(id="sq1", text="NVDA revenue FY2025",
+                    entity_tickers=("NVDA",), metrics=("total_revenue",),
+                    periods=("FY2025",), retrieval_modes=("facts",),
+                    derived=True, parent_id="sq0")
+        base.update(over)
+        return QuerySubquery(**base)
+
+    def test_valid_narrowing_subquery_passes(self):
+        from src.middleware.query_plan import validate_derived_subquery
+
+        ok, reasons = validate_derived_subquery(self._base(), self._sub())
+        assert ok and reasons == []
+
+    def test_alias_metric_is_allowed(self):
+        from src.middleware.query_plan import validate_derived_subquery
+
+        # "revenues" is a known grader alias of the plan's total_revenue.
+        ok, _ = validate_derived_subquery(
+            self._base(), self._sub(metrics=("revenues",), text="NVDA revenues FY2025"))
+        assert ok
+
+    def test_invented_ticker_rejected(self):
+        from src.middleware.query_plan import validate_derived_subquery
+
+        ok, reasons = validate_derived_subquery(
+            self._base(), self._sub(entity_tickers=("TSLA",), text="TSLA revenue FY2025"))
+        assert not ok and "drift_invented_entity" in reasons
+
+    def test_new_metric_rejected(self):
+        from src.middleware.query_plan import validate_derived_subquery
+
+        ok, reasons = validate_derived_subquery(
+            self._base(), self._sub(metrics=("gross_margin",)))
+        assert not ok and "drift_new_metric" in reasons
+
+    def test_new_period_rejected(self):
+        from src.middleware.query_plan import validate_derived_subquery
+
+        ok, reasons = validate_derived_subquery(
+            self._base(), self._sub(periods=("FY2099",), text="NVDA revenue FY2099"))
+        assert not ok and "drift_new_period" in reasons
+
+    def test_new_number_in_text_rejected(self):
+        from src.middleware.query_plan import validate_derived_subquery
+
+        ok, reasons = validate_derived_subquery(
+            self._base(), self._sub(text="NVDA revenue above 500"))
+        assert not ok and "drift_new_number" in reasons
+
+    def test_empty_or_stopword_query_rejected(self):
+        from src.middleware.query_plan import validate_derived_subquery
+
+        ok, reasons = validate_derived_subquery(
+            self._base(), self._sub(text="the of a", entity_tickers=(), metrics=(),
+                                    periods=(), retrieval_modes=()))
+        assert not ok and "drift_empty_query" in reasons
+
+    def test_invalid_mode_rejected(self):
+        from src.middleware.query_plan import validate_derived_subquery
+
+        ok, reasons = validate_derived_subquery(
+            self._base(), self._sub(retrieval_modes=("web",)))
+        assert not ok and "drift_invalid_mode" in reasons
+
+    def test_broader_topic_intent_rejected(self):
+        from src.middleware.query_plan import validate_derived_subquery
+
+        ok, reasons = validate_derived_subquery(
+            self._base(), self._sub(intents=("sentiment",)))
+        assert not ok and "drift_broader_topic" in reasons
+
+
+class TestSelectDerivedSubqueries:
+    """Shared validator/dedup/cap for deterministic + planner-proposed drafts."""
+
+    def _plan(self):
+        return _plan("NVDA revenue and risk factors", entities=["NVDA"],
+                     metrics=["total_revenue"], intents=["fact_lookup", "risk"])
+
+    def _cand(self, cid, **over):
+        from src.middleware.query_plan import QuerySubquery
+
+        base = dict(id=cid, text="NVDA revenue", entity_tickers=("NVDA",),
+                    metrics=("total_revenue",), retrieval_modes=("facts",),
+                    derived=True, parent_id="sq0")
+        base.update(over)
+        return QuerySubquery(**base)
+
+    def test_duplicate_obligations_deduped(self):
+        from src.middleware.query_plan import select_derived_subqueries
+
+        # Two candidates covering the identical obligation set.
+        cands = [self._cand("a"), self._cand("b")]
+        accepted, reasons = select_derived_subqueries(
+            self._plan(), cands, source="deterministic")
+        assert len(accepted) == 1
+        assert "drift_duplicate_obligations" in reasons
+
+    def test_caps_at_two_and_reids(self):
+        from src.middleware.query_plan import select_derived_subqueries
+
+        cands = [
+            self._cand("a", retrieval_modes=("facts",)),
+            self._cand("b", retrieval_modes=("documents",), metrics=(),
+                       text="NVDA risk"),
+            self._cand("c", entity_tickers=("NVDA",), retrieval_modes=("macro",),
+                       metrics=(), text="NVDA macro"),
+        ]
+        accepted, _ = select_derived_subqueries(
+            self._plan(), cands, source="planner")
+        assert [s.id for s in accepted] == ["sq1", "sq2"]
+        assert all(s.derivation_source == "planner" for s in accepted)
+
+    def test_invalid_candidate_reason_recorded(self):
+        from src.middleware.query_plan import select_derived_subqueries
+
+        cands = [self._cand("a", entity_tickers=("TSLA",), text="TSLA revenue")]
+        accepted, reasons = select_derived_subqueries(
+            self._plan(), cands, source="deterministic")
+        assert accepted == []
+        assert "drift_invented_entity" in reasons

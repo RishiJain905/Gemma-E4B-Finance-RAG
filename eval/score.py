@@ -142,6 +142,35 @@ def console_table(summary: dict) -> str:
             lines.append(f"{name:<38} {_fmt(block.get('score'))}"
                          f"   (n={block.get('n_eligible', 0)})")
 
+    sufficiency = summary.get("evidence_sufficiency")
+    if isinstance(sufficiency, dict):
+        lines.append("")
+        lines.append("=== Evidence sufficiency (Phase 2.2.4.1) ===")
+        for name in ("coverage_precision", "coverage_recall", "abstention_f1",
+                     "unnecessary_retry_rate", "unsupported_number_rate"):
+            lines.append(f"{name:<38} {_fmt(sufficiency.get(name))}")
+        lines.append(f"{'latency_ms':<38} {sufficiency.get('latency_ms', {})}")
+        lines.append(f"{'retrieval_rounds':<38} {sufficiency.get('retrieval_rounds', {})}")
+
+    decomposition = summary.get("decomposition")
+    if isinstance(decomposition, dict):
+        lines.append("")
+        lines.append("=== Selective decomposition (Phase 2.2.4.2) ===")
+        for name in ("drift_rate", "mean_derived_subqueries", "max_derived_subqueries",
+                     "subquestion_coverage", "simple_with_derived",
+                     "subquery_cap_violations", "retrieval_round_cap_violations"):
+            lines.append(f"{name:<38} {_fmt(decomposition.get(name))}")
+
+    validation = summary.get("citation_validation")
+    if isinstance(validation, dict):
+        lines.append("")
+        lines.append("=== Citation & numeric validation (Phase 2.2.4.3) ===")
+        for name in ("citation_support_rate", "citation_existence_rate",
+                     "numeric_support_rate", "numeric_unsupported_rate",
+                     "accepted_absent_citations", "downgrade_rate", "refusal_rate"):
+            lines.append(f"{name:<38} {_fmt(validation.get(name))}")
+        lines.append(f"{'mismatch_counts':<38} {validation.get('mismatch_counts', {})}")
+
     # Per-category table.
     per = summary.get("per_category") or {}
     if per:
@@ -193,6 +222,39 @@ def report_md(summary: dict, prev: Optional[dict]) -> str:
     if isinstance(adaptive, dict):
         label = summary.get("config_label") or "unlabeled"
         lines.append(f"## Adaptive orchestration — config `{label}`")
+        lines.append("")
+
+    sufficiency = summary.get("evidence_sufficiency")
+    if isinstance(sufficiency, dict):
+        lines.append("## Evidence sufficiency — 2.2.4.1")
+        lines.append("")
+        lines.append(f"- coverage precision/recall: "
+                     f"{_fmt(sufficiency.get('coverage_precision'))} / "
+                     f"{_fmt(sufficiency.get('coverage_recall'))}")
+        lines.append(f"- abstention F1: {_fmt(sufficiency.get('abstention_f1'))}")
+        lines.append(f"- unnecessary retry rate: "
+                     f"{_fmt(sufficiency.get('unnecessary_retry_rate'))}")
+        lines.append(f"- unsupported-number rate: "
+                     f"{_fmt(sufficiency.get('unsupported_number_rate'))}")
+        lines.append(f"- latency: {sufficiency.get('latency_ms', {})}")
+        lines.append(f"- retrieval rounds: {sufficiency.get('retrieval_rounds', {})}")
+        lines.append("")
+
+    decomposition = summary.get("decomposition")
+    if isinstance(decomposition, dict):
+        lines.append("## Selective decomposition — 2.2.4.2")
+        lines.append("")
+        lines.append(f"- derived-query drift rate: {_fmt(decomposition.get('drift_rate'))}")
+        lines.append(f"- mean / max derived subqueries: "
+                     f"{_fmt(decomposition.get('mean_derived_subqueries'))} / "
+                     f"{decomposition.get('max_derived_subqueries')}")
+        lines.append(f"- subquestion coverage: {_fmt(decomposition.get('subquestion_coverage'))}")
+        lines.append(f"- simple queries with derived subqueries (must be 0): "
+                     f"{decomposition.get('simple_with_derived')}")
+        lines.append(f"- subquery/round cap violations (must be 0): "
+                     f"{decomposition.get('subquery_cap_violations')} / "
+                     f"{decomposition.get('retrieval_round_cap_violations')}")
+        lines.append(f"- drift reason codes: {decomposition.get('drift_reason_codes', {})}")
         lines.append("")
         lines.append(f"- adaptive rows: {adaptive.get('n_adaptive', 0)}")
         lines.append(f"- lane distribution: {adaptive.get('lane_distribution', {})}")

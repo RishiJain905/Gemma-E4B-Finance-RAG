@@ -186,6 +186,9 @@ def _row(case: dict, *, answer: str, detected_ticker, detected_intent,
          resolved_metrics: Optional[list] = None,
          resolved_timeframe: Optional[str] = None,
          orchestration: Optional[dict] = None,
+         evidence_sufficiency: Optional[dict] = None,
+         decomposition: Optional[dict] = None,
+         answer_validation: Optional[dict] = None,
          config_label: Optional[str] = None) -> dict:
     """Assemble a well-formed result row (always has every RESULT_KEY)."""
     ans = answer or ""
@@ -235,6 +238,33 @@ def _row(case: dict, *, answer: str, detected_ticker, detected_intent,
         "orchestration": orch,
         "lane": (orch or {}).get("lane"),
         "fallback_reason": (orch or {}).get("fallback_reason"),
+        "evidence_sufficiency": (
+            evidence_sufficiency if isinstance(evidence_sufficiency, dict) else None
+        ),
+        # ── Selective decomposition / fusion fields (2.2.4.2) ──
+        # The response.decomposition block (derived-subquery ids, drift reason
+        # codes, proposed/accepted counts). None on the legacy path / offline
+        # backend, so a legacy run's rows are unaffected.
+        "decomposition": (
+            decomposition if isinstance(decomposition, dict) else None
+        ),
+        # ── Citation provenance / numeric validation fields (2.2.4.3) ──
+        # The response.answer_validation block (validation_status, citation
+        # support rate, numeric claim counts, mismatch counts). None when
+        # answer_validation is off, so a legacy run's rows are unaffected. The
+        # top-level numerical/unsupported counts bridge into the 2.2.4.1
+        # sufficiency metric's unsupported-number rate.
+        "answer_validation": (
+            answer_validation if isinstance(answer_validation, dict) else None
+        ),
+        "numerical_claim_count": (
+            int(answer_validation.get("numeric_claims_total") or 0)
+            if isinstance(answer_validation, dict) else 0
+        ),
+        "unsupported_number_count": (
+            int(answer_validation.get("numeric_claims_unsupported") or 0)
+            if isinstance(answer_validation, dict) else 0
+        ),
     }
 
 
@@ -441,6 +471,9 @@ def _row_from_endpoint(case: dict, data: dict, latency_s: float,
         error=error,
         retrieval_query=retrieval_query,
         orchestration=data.get("orchestration"),
+        evidence_sufficiency=data.get("evidence_sufficiency"),
+        decomposition=data.get("decomposition"),
+        answer_validation=data.get("answer_validation"),
         **_ctx_kwargs(ctx, data, trace),
     )
 

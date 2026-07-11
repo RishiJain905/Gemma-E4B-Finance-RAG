@@ -1240,6 +1240,150 @@ class TestAdaptiveGate:
         assert gate.adaptive_safety_checks({"n_cases": 2}) == []
 
 
+class TestEvidenceSufficiencyMetrics:
+    @staticmethod
+    def _suff_row(
+        row_id, *, expected_covered=(), covered=(), should_abstain=False,
+        status="grounded", retry=False, simple=True, unsupported=0,
+        numerical=0, rounds=1, latency=10.0,
+    ):
+        row = _row(row_id)
+        row["case"].update({
+            "expected_covered_subqueries": list(expected_covered),
+            "should_abstain": should_abstain,
+            "complexity": "simple" if simple else "complex",
+        })
+        row.update({
+            "grounding": status,
+            "latency_ms": latency,
+            "unsupported_number_count": unsupported,
+            "numerical_claim_count": numerical,
+            "evidence_sufficiency": {
+                "status": status,
+                "covered_subqueries": list(covered),
+                "missing_subqueries": [],
+                "reason_codes": [],
+                "corrective_action": "none",
+                "retry_performed": retry,
+            },
+            "orchestration": {"retrieval_rounds": rounds},
+        })
+        return row
+
+    def test_metrics_measure_coverage_retry_abstention_numbers_latency_and_rounds(self):
+        rows = [
+            self._suff_row("a", expected_covered=("sq0",), covered=("sq0",),
+                           numerical=2, latency=10, rounds=1),
+            self._suff_row("b", expected_covered=("sq0", "sq1"), covered=("sq0",),
+                           retry=True, simple=True, unsupported=1, numerical=2,
+                           latency=30, rounds=2),
+            self._suff_row("c", should_abstain=True, status="refused",
+                           simple=False, latency=20, rounds=1),
+        ]
+
+        block = M.evidence_sufficiency_metrics(rows)
+
+        assert block["coverage_precision"] == 1.0
+        assert block["coverage_recall"] == 0.6667
+        assert block["unnecessary_retry_rate"] == 0.5
+        assert block["abstention_f1"] == 1.0
+        assert block["unsupported_number_rate"] == 0.25
+        assert block["latency_ms"] == {"mean": 20.0, "p95": 30.0}
+        assert block["retrieval_rounds"] == {"mean": 1.333, "max": 2,
+                                               "above_two": 0}
+
+    def test_score_all_emits_block_only_when_feature_metadata_is_present(self):
+        assert "evidence_sufficiency" not in M.score_all([_row("legacy")], run_judge=False)
+        row = self._suff_row("enabled", expected_covered=("sq0",), covered=("sq0",))
+        assert "evidence_sufficiency" in M.score_all([row], run_judge=False)
+
+
+class TestEvidenceSufficiencyGate:
+    def test_absolute_and_relative_promotion_gates(self):
+        baseline = {"evidence_sufficiency": {"unsupported_number_rate": 0.20},
+                    "keyword_coverage": 0.90}
+        passing = {"evidence_sufficiency": {
+            "abstention_f1": 0.85,
+            "unsupported_number_rate": 0.14,
+            "unnecessary_retry_rate": 0.15,
+            "retrieval_rounds": {"above_two": 0},
+        }, "keyword_coverage": 0.88}
+        assert gate.evidence_sufficiency_checks(passing, baseline) == []
+
+        failing = {"evidence_sufficiency": {
+            "abstention_f1": 0.80,
+            "unsupported_number_rate": 0.19,
+            "unnecessary_retry_rate": 0.20,
+            "retrieval_rounds": {"above_two": 1},
+        }, "keyword_coverage": 0.85}
+        failures = gate.evidence_sufficiency_checks(failing, baseline)
+        assert len(failures) == 5
+
+
+class TestDecompositionMetrics:
+    @staticmethod
+    def _decomp_row(row_id, *, proposed=0, derived=0, drift=(), complexity="complex",
+                    subqueries_executed=1, rounds=1):
+        row = _row(row_id)
+        row["case"]["complexity"] = complexity
+        row["decomposition"] = {
+            "proposed_subqueries": proposed,
+            "derived_subqueries": derived,
+            "drift_reason_codes": list(drift),
+        }
+        row["orchestration"] = {
+            "subqueries_executed": subqueries_executed,
+            "retrieval_rounds": rounds,
+        }
+        return row
+
+    def test_measures_drift_rate_and_derived_counts(self):
+        rows = [
+            self._decomp_row("a", proposed=2, derived=2, rounds=2,
+                             subqueries_executed=3),
+            self._decomp_row("b", proposed=2, derived=1,
+                             drift=["drift_invented_entity"], rounds=2),
+        ]
+        block = M.decomposition_metrics(rows)
+        assert block["n_eligible"] == 2
+        assert block["proposed_subqueries"] == 4
+        assert block["accepted_subqueries"] == 3
+        assert block["drift_rate"] == 0.25          # 1 of 4 proposed rejected
+        assert block["max_derived_subqueries"] == 2
+        assert block["drift_reason_codes"] == {"drift_invented_entity": 1}
+        assert block["subquery_cap_violations"] == 0
+        assert block["retrieval_round_cap_violations"] == 0
+
+    def test_flags_simple_query_with_derived_and_cap_violations(self):
+        rows = [
+            self._decomp_row("s", proposed=1, derived=1, complexity="simple"),
+            self._decomp_row("v", proposed=1, derived=1, subqueries_executed=4,
+                             rounds=3),
+        ]
+        block = M.decomposition_metrics(rows)
+        assert block["n_simple"] == 1
+        assert block["simple_with_derived"] == 1           # invariant violated
+        assert block["subquery_cap_violations"] == 1       # 4 > 3
+        assert block["retrieval_round_cap_violations"] == 1  # 3 > 2
+
+    def test_score_all_emits_block_only_when_present(self):
+        assert "decomposition" not in M.score_all([_row("legacy")], run_judge=False)
+        row = self._decomp_row("d", proposed=2, derived=2)
+        assert "decomposition" in M.score_all([row], run_judge=False)
+
+    def test_row_from_endpoint_captures_decomposition(self):
+        case = {"id": "c1", "question": "NVDA revenue and risk"}
+        data = {
+            "answer": "ok", "model_available": True, "evidence_trace": _trace(),
+            "decomposition": {
+                "proposed_subqueries": 2, "derived_subqueries": 1,
+                "drift_reason_codes": ["drift_new_number"]},
+        }
+        row = R._row_from_endpoint(case, data, latency_s=0.02)
+        assert row["decomposition"]["derived_subqueries"] == 1
+        assert row["decomposition"]["drift_reason_codes"] == ["drift_new_number"]
+
+
 class TestRunEvalOrchestrationCapture:
     def test_row_from_endpoint_captures_orchestration(self):
         case = {"id": "c1", "question": "What is NVDA revenue?",
@@ -1256,11 +1400,104 @@ class TestRunEvalOrchestrationCapture:
                 "deterministic_tools": ["get_fundamentals"],
                 "context_chars": 400, "evidence_dropped": 0,
                 "fallback_reason": None},
+            "evidence_sufficiency": {
+                "status": "grounded", "reason_codes": [],
+                "covered_subqueries": ["sq0"], "missing_subqueries": [],
+                "corrective_action": "none", "retry_performed": False,
+            },
         }
         row = R._row_from_endpoint(case, data, latency_s=0.05)
 
         assert row["lane"] == "fast"
         assert row["fallback_reason"] is None
         assert row["orchestration"]["deterministic_tools"] == ["get_fundamentals"]
+        assert row["evidence_sufficiency"]["covered_subqueries"] == ["sq0"]
         # config_label defaults None until main() denormalizes the run label.
         assert row["config_label"] is None
+
+
+# ── Phase 2.2.4.3 — citation provenance / numeric validation eval ───────────
+
+class TestCitationValidationMetrics:
+    @staticmethod
+    def _val_row(row_id, **av):
+        row = _row(row_id)
+        row["answer_validation"] = {
+            "validation_status": av.get("status", "supported"),
+            "citation_support_rate": av.get("support_rate", 1.0),
+            "numeric_claims_supported": av.get("supported", 0),
+            "numeric_claims_unsupported": av.get("unsupported", 0),
+            "numeric_claims_ambiguous": av.get("ambiguous", 0),
+            "citations_total": av.get("cit_total", 0),
+            "citations_resolved": av.get("cit_resolved", 0),
+            "citations_missing": av.get("cit_missing", 0),
+            "citations_malformed": av.get("cit_malformed", 0),
+            "mismatch_counts": av.get(
+                "mismatch", {"unit": 0, "period": 0, "entity": 0, "value": 0}),
+            "enforcement": av.get("enforcement", "none"),
+        }
+        return row
+
+    def test_metrics_measure_citation_and_numeric_support(self):
+        rows = [
+            self._val_row("a", supported=3, unsupported=0, cit_total=3,
+                          cit_resolved=3, support_rate=1.0),
+            self._val_row("b", supported=1, unsupported=1, cit_total=2,
+                          cit_resolved=1, cit_missing=1, support_rate=0.5,
+                          enforcement="downgrade",
+                          mismatch={"unit": 1, "period": 0, "entity": 0, "value": 1}),
+        ]
+        block = M.citation_validation_metrics(rows)
+        assert block["n_eligible"] == 2
+        assert block["numeric_claims_supported"] == 4
+        assert block["numeric_claims_unsupported"] == 1
+        assert block["numeric_support_rate"] == round(4 / 5, 4)
+        assert block["numeric_unsupported_rate"] == round(1 / 5, 4)
+        assert block["citation_support_rate"] == 0.75          # mean(1.0, 0.5)
+        assert block["citation_existence_rate"] == 0.8         # 4 resolved / 5 resolvable
+        assert block["accepted_absent_citations"] == 0
+        assert block["downgrade_rate"] == 0.5
+        assert block["mismatch_counts"]["unit"] == 1
+
+    def test_score_all_emits_block_only_when_present(self):
+        assert "citation_validation" not in M.score_all([_row("legacy")], run_judge=False)
+        row = self._val_row("x", supported=1, cit_total=1, cit_resolved=1)
+        assert "citation_validation" in M.score_all([row], run_judge=False)
+
+    def test_row_from_endpoint_captures_answer_validation(self):
+        case = {"id": "c1", "question": "NVDA revenue"}
+        data = {
+            "answer": "Revenue was $26B [E1].", "model_available": True,
+            "evidence_trace": _trace(),
+            "answer_validation": {
+                "validation_status": "supported", "numeric_claims_total": 1,
+                "numeric_claims_unsupported": 0},
+            "evidence_citations": [{"evidence_id": "E1", "support_status": "supported"}],
+        }
+        row = R._row_from_endpoint(case, data, latency_s=0.02)
+        assert row["answer_validation"]["validation_status"] == "supported"
+        # Bridges into the 2.2.4.1 sufficiency unsupported-number rate.
+        assert row["numerical_claim_count"] == 1
+        assert row["unsupported_number_count"] == 0
+
+
+class TestCitationValidationGate:
+    def test_absolute_and_relative_gates(self):
+        baseline = {"citation_validation": {"numeric_unsupported_rate": 0.20}}
+        passing = {"citation_validation": {
+            "citation_support_rate": 0.96,
+            "accepted_absent_citations": 0,
+            "numeric_unsupported_rate": 0.10,
+        }}
+        assert gate.citation_validation_checks(passing, baseline) == []
+
+        failing = {"citation_validation": {
+            "citation_support_rate": 0.90,          # < 0.95
+            "accepted_absent_citations": 2,          # must be 0
+            "numeric_unsupported_rate": 0.18,        # only 10% relative reduction
+        }}
+        failures = gate.citation_validation_checks(failing, baseline)
+        assert len(failures) == 3
+
+    def test_inert_without_block(self):
+        assert gate.citation_validation_checks({"n_cases": 1}, {}) == []

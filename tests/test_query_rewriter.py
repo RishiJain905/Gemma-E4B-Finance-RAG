@@ -147,3 +147,72 @@ def test_fallback_disabled_by_default():
     # Even with an ambiguous slot, both flags default off -> no call.
     off = _config(enable_conversation_rewrite=False, enable_llm_rewrite_fallback=False)
     assert should_use_llm_fallback(compiled, off) is False
+
+
+# ── 2.2.4.2: planner-proposed subquery validation ──────────────────────────
+
+def _decomp_plan():
+    """A validated compound sq0-only plan for planner-subquery tests."""
+    from src.middleware.query_plan import (
+        QueryEntity,
+        QueryPlan,
+        QuerySubquery,
+        normalize_question,
+    )
+
+    q = "NVDA revenue and risk factors"
+    entities = [QueryEntity(ticker="NVDA", resolved_name="NVDA", confidence=1.0,
+                            source="resolved", mention="NVDA", start=0)]
+    sq0 = QuerySubquery(id="sq0", text=q, entity_tickers=("NVDA",),
+                        intents=("fact_lookup", "risk"), metrics=("total_revenue",),
+                        retrieval_modes=("facts",))
+    return QueryPlan(
+        original_question=q, retrieval_query=q,
+        normalized_question=normalize_question(q), entities=entities,
+        intents=["fact_lookup", "risk"], metrics=["total_revenue"], periods=[],
+        subqueries=[sq0], primary_intent="fact_lookup").validate()
+
+
+def test_planner_subqueries_accept_in_plan_and_stamp_source():
+    from src.middleware.query_rewriter import validate_planner_subqueries
+
+    plan = _decomp_plan()
+    proposed = [
+        {"text": "NVDA revenue", "entities": ["NVDA"], "metrics": ["total_revenue"],
+         "retrieval_modes": ["facts"]},
+        {"text": "NVDA risk", "entities": ["NVDA"], "retrieval_modes": ["documents"],
+         "intents": ["risk"]},
+    ]
+    accepted, reasons = validate_planner_subqueries(plan, proposed)
+    assert [s.id for s in accepted] == ["sq1", "sq2"]
+    assert all(s.derivation_source == "planner" for s in accepted)
+    assert reasons == []
+
+
+def test_planner_subqueries_reject_invented_entity():
+    from src.middleware.query_rewriter import validate_planner_subqueries
+
+    plan = _decomp_plan()
+    proposed = [{"text": "TSLA revenue", "entities": ["TSLA"],
+                 "metrics": ["total_revenue"], "retrieval_modes": ["facts"]}]
+    accepted, reasons = validate_planner_subqueries(plan, proposed)
+    assert accepted == []
+    assert "drift_invented_entity" in reasons
+
+
+def test_planner_subqueries_dedupe_and_cap_at_two_distinct():
+    from src.middleware.query_rewriter import validate_planner_subqueries
+
+    plan = _decomp_plan()
+    # A duplicate of the first is dropped before the two distinct slots fill.
+    proposed = [
+        {"text": "NVDA revenue", "entities": ["NVDA"], "metrics": ["total_revenue"],
+         "retrieval_modes": ["facts"]},
+        {"text": "NVDA revenue again", "entities": ["NVDA"], "metrics": ["total_revenue"],
+         "retrieval_modes": ["facts"]},                    # duplicate obligations
+        {"text": "NVDA risk", "entities": ["NVDA"], "retrieval_modes": ["documents"]},
+    ]
+    accepted, reasons = validate_planner_subqueries(plan, proposed)
+    assert [s.id for s in accepted] == ["sq1", "sq2"]
+    assert {s.retrieval_modes for s in accepted} == {("facts",), ("documents",)}
+    assert "drift_duplicate_obligations" in reasons

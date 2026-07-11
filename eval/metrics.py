@@ -911,6 +911,237 @@ def has_adaptive_rows(rows: list[dict]) -> bool:
     return any(_orch(r) is not None for r in rows)
 
 
+# ── Evidence sufficiency metrics (2.2.4.1) ────────────────────────────────
+
+def _sufficiency(row: dict) -> Optional[dict]:
+    block = row.get("evidence_sufficiency")
+    return block if isinstance(block, dict) else None
+
+
+def evidence_sufficiency_metrics(rows: list[dict]) -> dict:
+    """Measure obligation coverage, correction cost, abstention, and support."""
+    eligible = [row for row in rows if _sufficiency(row) is not None]
+    true_positive = 0
+    predicted_total = 0
+    expected_total = 0
+    for row in eligible:
+        predicted = set((_sufficiency(row) or {}).get("covered_subqueries") or [])
+        expected = set(_case(row).get("expected_covered_subqueries") or [])
+        true_positive += len(predicted & expected)
+        predicted_total += len(predicted)
+        expected_total += len(expected)
+
+    precision = true_positive / predicted_total if predicted_total else 0.0
+    recall = true_positive / expected_total if expected_total else 0.0
+
+    simple = [row for row in eligible if str(_case(row).get("complexity", "simple")) == "simple"]
+    unnecessary = sum(
+        1 for row in simple
+        if bool((_sufficiency(row) or {}).get("retry_performed"))
+        and not bool(_case(row).get("expected_corrective_retry", False))
+    )
+
+    tp = fp = fn = 0
+    for row in eligible:
+        expected_abstain = bool(_case(row).get("should_abstain", False))
+        predicted_abstain = (_sufficiency(row) or {}).get("status") == "refused"
+        tp += int(expected_abstain and predicted_abstain)
+        fp += int(not expected_abstain and predicted_abstain)
+        fn += int(expected_abstain and not predicted_abstain)
+    abstention_precision = tp / (tp + fp) if tp + fp else 0.0
+    abstention_recall = tp / (tp + fn) if tp + fn else 0.0
+    abstention_f1 = (
+        2 * abstention_precision * abstention_recall
+        / (abstention_precision + abstention_recall)
+        if abstention_precision + abstention_recall else 0.0
+    )
+
+    unsupported = sum(int(row.get("unsupported_number_count") or 0) for row in eligible)
+    numerical = sum(int(row.get("numerical_claim_count") or 0) for row in eligible)
+    latencies = [float(row.get("latency_ms") or 0.0) for row in eligible]
+    rounds = [int((_orch(row) or {}).get("retrieval_rounds", 0) or 0) for row in eligible]
+    return {
+        "n_eligible": len(eligible),
+        "coverage_precision": round(precision, 4),
+        "coverage_recall": round(recall, 4),
+        "unnecessary_retry_rate": round(unnecessary / len(simple), 4) if simple else 0.0,
+        "abstention_f1": round(abstention_f1, 4),
+        "unsupported_number_rate": round(unsupported / numerical, 4) if numerical else 0.0,
+        "latency_ms": {
+            "mean": round(sum(latencies) / len(latencies), 1) if latencies else 0.0,
+            "p95": _pct(latencies, 0.95),
+        },
+        "retrieval_rounds": {
+            "mean": round(sum(rounds) / len(rounds), 3) if rounds else 0.0,
+            "max": max(rounds, default=0),
+            "above_two": sum(1 for value in rounds if value > 2),
+        },
+    }
+
+
+def has_evidence_sufficiency_rows(rows: list[dict]) -> bool:
+    """Whether at least one row carries 2.2.4.1 response metadata."""
+    return any(_sufficiency(row) is not None for row in rows)
+
+
+# ── Selective decomposition / fusion metrics (2.2.4.2) ─────────────────────
+#
+# Offline, deterministic measures computed from the ``decomposition`` block the
+# middleware attaches to a response (and the eval harness copies onto each row):
+# derived-query drift rate, per-request derived counts, the simple-query
+# zero-decomposition invariant, subquestion evidence coverage, and the hard
+# cap invariants (≤3 subqueries, ≤2 retrieval rounds). The cross-config quality
+# deltas (Recall@5/10, nDCG@10, complex correctness) are produced from a live
+# two-config comparison in RESULTS.md; these are the single-run scaffolding.
+
+def _decomposition(row: dict) -> Optional[dict]:
+    block = row.get("decomposition")
+    return block if isinstance(block, dict) else None
+
+
+def has_decomposition_rows(rows: list[dict]) -> bool:
+    """Whether at least one row carries 2.2.4.2 decomposition metadata."""
+    return any(_decomposition(row) is not None for row in rows)
+
+
+def decomposition_metrics(rows: list[dict]) -> dict:
+    """Measure derived-query drift, coverage, cost, and the hard cap invariants.
+
+    ``drift_rate`` is the fraction of proposed derived subqueries the drift
+    validator rejected (promotion gate: < 0.05). ``simple_with_derived`` and the
+    two cap-violation counters must stay 0 (simple queries add no derived
+    subqueries; no plan exceeds three subqueries or two rounds).
+    """
+    eligible = [row for row in rows if _decomposition(row) is not None]
+    proposed = 0
+    accepted = 0
+    derived_counts: list[int] = []
+    drift_codes: dict[str, int] = {}
+    n_simple = 0
+    simple_with_derived = 0
+    subquery_cap_violations = 0
+    round_cap_violations = 0
+
+    for row in eligible:
+        block = _decomposition(row) or {}
+        p = int(block.get("proposed_subqueries", 0) or 0)
+        a = int(block.get("derived_subqueries", 0) or 0)
+        proposed += p
+        accepted += a
+        derived_counts.append(a)
+        for code in block.get("drift_reason_codes") or []:
+            drift_codes[code] = drift_codes.get(code, 0) + 1
+
+        if str(_case(row).get("complexity", "")).strip().lower() == "simple":
+            n_simple += 1
+            if a > 0:
+                simple_with_derived += 1
+
+        orch = _orch(row) or {}
+        if int(orch.get("subqueries_executed", 0) or 0) > ADAPTIVE_CAPS["subqueries_executed"]:
+            subquery_cap_violations += 1
+        if int(orch.get("retrieval_rounds", 0) or 0) > ADAPTIVE_CAPS["retrieval_rounds"]:
+            round_cap_violations += 1
+
+    coverage = compound_subquestion_coverage(rows)
+    return {
+        "n_eligible": len(eligible),
+        "proposed_subqueries": proposed,
+        "accepted_subqueries": accepted,
+        "drift_rate": round((proposed - accepted) / proposed, 4) if proposed else 0.0,
+        "drift_reason_codes": drift_codes,
+        "mean_derived_subqueries": (
+            round(sum(derived_counts) / len(derived_counts), 3) if derived_counts else 0.0),
+        "max_derived_subqueries": max(derived_counts, default=0),
+        "n_simple": n_simple,
+        "simple_with_derived": simple_with_derived,
+        "subquery_cap_violations": subquery_cap_violations,
+        "retrieval_round_cap_violations": round_cap_violations,
+        "subquestion_coverage": coverage.get("score"),
+    }
+
+
+# ── Citation provenance / numeric validation metrics (2.2.4.3) ─────────────
+#
+# Offline, deterministic measures computed from the ``answer_validation`` block
+# the middleware attaches to a response (and the eval harness copies onto each
+# row): citation existence/precision/support, numeric-claim support and
+# unsupported rates, entity/period/unit mismatch counts, and the enforcement
+# downgrade/refusal rate. The judge-based faithfulness metric stays separate and
+# receives the exact evidence trace.
+
+def _validation(row: dict) -> Optional[dict]:
+    block = row.get("answer_validation")
+    return block if isinstance(block, dict) else None
+
+
+def has_citation_validation_rows(rows: list[dict]) -> bool:
+    """Whether at least one row carries 2.2.4.3 validation metadata."""
+    return any(_validation(row) is not None for row in rows)
+
+
+def citation_validation_metrics(rows: list[dict]) -> dict:
+    """Measure citation existence/support and numeric-claim support (2.2.4.3).
+
+    ``citation_existence_rate`` is the fraction of ``[E#]`` citations that
+    resolve to the model-visible ledger (resolved / resolved+missing+malformed);
+    an absent id is never accepted as a real citation, so
+    ``accepted_absent_citations`` must stay 0. ``numeric_unsupported_rate`` is
+    the fraction of specific financial numbers that no cited evidence (or
+    recorded calculation) supports.
+    """
+    eligible = [row for row in rows if _validation(row) is not None]
+    supported = unsupported = ambiguous = 0
+    cit_total = cit_resolved = cit_missing = cit_malformed = 0
+    support_rates: list[float] = []
+    mismatch = {"unit": 0, "period": 0, "entity": 0, "value": 0}
+    n_downgrade = n_refusal = 0
+    for row in eligible:
+        block = _validation(row) or {}
+        supported += int(block.get("numeric_claims_supported") or 0)
+        unsupported += int(block.get("numeric_claims_unsupported") or 0)
+        ambiguous += int(block.get("numeric_claims_ambiguous") or 0)
+        cit_total += int(block.get("citations_total") or 0)
+        cit_resolved += int(block.get("citations_resolved") or 0)
+        cit_missing += int(block.get("citations_missing") or 0)
+        cit_malformed += int(block.get("citations_malformed") or 0)
+        rate = block.get("citation_support_rate")
+        if rate is not None:
+            support_rates.append(float(rate))
+        for key in mismatch:
+            mismatch[key] += int((block.get("mismatch_counts") or {}).get(key) or 0)
+        enforcement = block.get("enforcement")
+        if enforcement == "downgrade":
+            n_downgrade += 1
+        elif enforcement == "refuse":
+            n_refusal += 1
+
+    numeric_total = supported + unsupported + ambiguous
+    resolvable = cit_resolved + cit_missing + cit_malformed
+    return {
+        "n_eligible": len(eligible),
+        "citation_support_rate": (
+            round(sum(support_rates) / len(support_rates), 4) if support_rates else None),
+        "citation_existence_rate": (
+            round(cit_resolved / resolvable, 4) if resolvable else None),
+        "citations_total": cit_total,
+        "citations_resolved": cit_resolved,
+        "citations_missing": cit_missing,
+        "citations_malformed": cit_malformed,
+        "accepted_absent_citations": 0,
+        "numeric_claims_supported": supported,
+        "numeric_claims_unsupported": unsupported,
+        "numeric_claims_ambiguous": ambiguous,
+        "numeric_support_rate": (
+            round(supported / numeric_total, 4) if numeric_total else None),
+        "numeric_unsupported_rate": (
+            round(unsupported / numeric_total, 4) if numeric_total else None),
+        "mismatch_counts": mismatch,
+        "downgrade_rate": round(n_downgrade / len(eligible), 4) if eligible else 0.0,
+        "refusal_rate": round(n_refusal / len(eligible), 4) if eligible else 0.0,
+    }
+
+
 # ── Aggregator ─────────────────────────────────────────────────────────
 
 def _run_field(rows: list[dict], key: str) -> Optional[str]:
@@ -989,6 +1220,15 @@ def score_all(rows: list[dict], *, judge: Optional[Callable] = None,
     if has_adaptive_rows(rows) or label:
         summary["config_label"] = label
         summary["adaptive"] = adaptive_metrics(rows)
+
+    if has_evidence_sufficiency_rows(rows):
+        summary["evidence_sufficiency"] = evidence_sufficiency_metrics(rows)
+
+    if has_decomposition_rows(rows):
+        summary["decomposition"] = decomposition_metrics(rows)
+
+    if has_citation_validation_rows(rows):
+        summary["citation_validation"] = citation_validation_metrics(rows)
 
     summary["per_category"] = _per_category(rows)
     return summary
