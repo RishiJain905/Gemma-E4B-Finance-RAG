@@ -1320,6 +1320,70 @@ class TestEvidenceSufficiencyGate:
         assert len(failures) == 5
 
 
+class TestDecompositionMetrics:
+    @staticmethod
+    def _decomp_row(row_id, *, proposed=0, derived=0, drift=(), complexity="complex",
+                    subqueries_executed=1, rounds=1):
+        row = _row(row_id)
+        row["case"]["complexity"] = complexity
+        row["decomposition"] = {
+            "proposed_subqueries": proposed,
+            "derived_subqueries": derived,
+            "drift_reason_codes": list(drift),
+        }
+        row["orchestration"] = {
+            "subqueries_executed": subqueries_executed,
+            "retrieval_rounds": rounds,
+        }
+        return row
+
+    def test_measures_drift_rate_and_derived_counts(self):
+        rows = [
+            self._decomp_row("a", proposed=2, derived=2, rounds=2,
+                             subqueries_executed=3),
+            self._decomp_row("b", proposed=2, derived=1,
+                             drift=["drift_invented_entity"], rounds=2),
+        ]
+        block = M.decomposition_metrics(rows)
+        assert block["n_eligible"] == 2
+        assert block["proposed_subqueries"] == 4
+        assert block["accepted_subqueries"] == 3
+        assert block["drift_rate"] == 0.25          # 1 of 4 proposed rejected
+        assert block["max_derived_subqueries"] == 2
+        assert block["drift_reason_codes"] == {"drift_invented_entity": 1}
+        assert block["subquery_cap_violations"] == 0
+        assert block["retrieval_round_cap_violations"] == 0
+
+    def test_flags_simple_query_with_derived_and_cap_violations(self):
+        rows = [
+            self._decomp_row("s", proposed=1, derived=1, complexity="simple"),
+            self._decomp_row("v", proposed=1, derived=1, subqueries_executed=4,
+                             rounds=3),
+        ]
+        block = M.decomposition_metrics(rows)
+        assert block["n_simple"] == 1
+        assert block["simple_with_derived"] == 1           # invariant violated
+        assert block["subquery_cap_violations"] == 1       # 4 > 3
+        assert block["retrieval_round_cap_violations"] == 1  # 3 > 2
+
+    def test_score_all_emits_block_only_when_present(self):
+        assert "decomposition" not in M.score_all([_row("legacy")], run_judge=False)
+        row = self._decomp_row("d", proposed=2, derived=2)
+        assert "decomposition" in M.score_all([row], run_judge=False)
+
+    def test_row_from_endpoint_captures_decomposition(self):
+        case = {"id": "c1", "question": "NVDA revenue and risk"}
+        data = {
+            "answer": "ok", "model_available": True, "evidence_trace": _trace(),
+            "decomposition": {
+                "proposed_subqueries": 2, "derived_subqueries": 1,
+                "drift_reason_codes": ["drift_new_number"]},
+        }
+        row = R._row_from_endpoint(case, data, latency_s=0.02)
+        assert row["decomposition"]["derived_subqueries"] == 1
+        assert row["decomposition"]["drift_reason_codes"] == ["drift_new_number"]
+
+
 class TestRunEvalOrchestrationCapture:
     def test_row_from_endpoint_captures_orchestration(self):
         case = {"id": "c1", "question": "What is NVDA revenue?",

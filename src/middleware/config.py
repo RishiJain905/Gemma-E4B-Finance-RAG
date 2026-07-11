@@ -93,6 +93,16 @@ class MiddlewareConfig:
         self.enable_corrective_retry: bool = False
         self.max_corrective_retries: int = 1  # hard clamp 0–1
 
+        # Phase 2.2.4.2 — selective query decomposition & weighted fusion. When
+        # on (and the complex lane is reached), a genuinely compound / low-
+        # coverage plan is decomposed into at most two derived, drift-validated
+        # subqueries whose specialized evidence is retrieved in the bounded
+        # corrective seam and fused with the original query as the strongest
+        # signal. Off by default: a simple query never decomposes and the
+        # RUN_DERIVED_SUBQUERIES corrective action stays the 2.2.4.1 deferred
+        # placeholder, so legacy behavior is byte-identical until promotion.
+        self.enable_query_decomposition: bool = False
+
         # Phase 2.1.6 — fetch-on-miss ingestion controls.
         self.enable_fetch_on_miss: bool = True
         self.fetch_on_miss_timeout_s: float = 10.0
@@ -208,6 +218,7 @@ class MiddlewareConfig:
         _bool("ENABLE_EVIDENCE_SUFFICIENCY", "enable_evidence_sufficiency")
         _bool("ENABLE_CORRECTIVE_RETRY", "enable_corrective_retry")
         _int("MAX_CORRECTIVE_RETRIES", "max_corrective_retries")
+        _bool("ENABLE_QUERY_DECOMPOSITION", "enable_query_decomposition")
 
     def _clamp_conversation_limits(self) -> None:
         """Clamp conversation budgets to documented safe maxima (2.2.2.1).

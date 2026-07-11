@@ -46,7 +46,14 @@ from .evidence_grader import (
     grade_evidence,
     validated_metric_aliases,
 )
-from .query_plan import QueryEntity, QueryPlan, QuerySubquery, normalize_question
+from .query_plan import (
+    QueryEntity,
+    QueryPlan,
+    QuerySubquery,
+    attach_derived_subqueries,
+    decompose_plan,
+    normalize_question,
+)
 
 if TYPE_CHECKING:
     from .config import MiddlewareConfig
@@ -465,6 +472,14 @@ class OrchestrationResult:
     sufficiency: Optional[SufficiencyResult] = None
     corrective_action: CorrectiveAction = CorrectiveAction.NONE
     retry_performed: bool = False
+    # 2.2.4.2 decomposition telemetry. ``derived_subqueries`` are the ids
+    # actually retrieved and fused this request (never declared-but-unrun);
+    # ``drift_reason_codes`` records why any proposed derived subquery was
+    # rejected by the drift validator. ``proposed_subqueries`` counts every
+    # candidate the decomposer offered (accepted + rejected).
+    derived_subqueries: list[str] = field(default_factory=list)
+    drift_reason_codes: list[str] = field(default_factory=list)
+    proposed_subqueries: int = 0
 
     def add_reason(self, code: str) -> None:
         if code not in self.reason_codes:
@@ -504,9 +519,12 @@ def orchestrate(
     single-query ``Retriever.retrieve()`` result and never raises.
 
     ``available_metrics`` is passed to the deterministic router; ``planning_client``
-    / ``decompose`` / ``corrective_retry`` are optional bounded hooks (planning is
-    disabled by default; decomposition and the corrective second round belong to
-    2.2.4.2 / 2.2.4.1 and are no-ops until wired).
+    / ``decompose`` / ``corrective_retry`` are optional bounded hooks. Planning is
+    disabled by default. Selective decomposition (2.2.4.2) is gated by
+    ``enable_query_decomposition``: when on, the complex lane declares ≤2
+    drift-validated derived subqueries on the plan and the 2.2.4.1 corrective seam
+    retrieves + fuses them; when off, ``decompose`` proposals are recorded as
+    deferred and the ``RUN_DERIVED_SUBQUERIES`` action stays a no-op placeholder.
     """
     if not getattr(config, "enable_adaptive_rag", False):
         return _fallback(plan, retriever, store, config, reason="feature_disabled")
@@ -580,11 +598,15 @@ def _run_adaptive(
         logger.exception("Adaptive lane %s failed; falling back", lane.value)
         return _fallback(plan, retriever, store, config, reason="adaptive_error")
 
+    # Grade (and, when enabled, decompose) against ``result.plan`` — the complex
+    # lane may have attached drift-validated derived subqueries to it (2.2.4.2);
+    # for every other path ``result.plan is plan`` so behavior is unchanged.
     if getattr(config, "enable_evidence_sufficiency", False):
-        _apply_evidence_sufficiency(result, plan, store, config, budget, retriever)
+        _apply_evidence_sufficiency(
+            result, result.plan, store, config, budget, retriever)
 
-    _apply_context_budget(result, plan, config, lane)
-    result.retrieval = _as_retrieval_dict(plan, result)
+    _apply_context_budget(result, result.plan, config, lane)
+    result.retrieval = _as_retrieval_dict(result.plan, result)
     return result
 
 
@@ -770,28 +792,36 @@ def _execute_complex(
         result, decision, store, config, budget, execute_fn
     )
 
-    # Only sq0 is actually retrieved this task: the single retrieval round below
-    # runs the whole plan's retrieval_query, not per-subquery text. Selective
-    # decomposition into independently-retrieved subqueries is 2.2.4.2 — a
-    # reserved but INACTIVE seam here. A decompose() that yields derived
-    # subqueries is recorded as deferred, never counted or reported as executed,
-    # so subqueries_executed never claims a subquery that wasn't retrieved
-    # (2.2.3.4 review H).
+    # Selective decomposition (2.2.4.2): when enabled, a genuinely compound plan
+    # is split into ≤2 drift-validated derived subqueries that are DECLARED on
+    # the plan now (so the grader builds their obligations) but retrieved only in
+    # the bounded corrective seam. When disabled — or when no derived subquery
+    # survives validation — the seam is inert and a proposed decomposition is
+    # recorded as deferred, exactly as before. sq0 is the only subquery retrieved
+    # in this round, so ``subqueries_executed`` never claims an un-retrieved
+    # subquery (2.2.3.4 review H).
+    extra = _derive_subqueries(active_plan, decompose, config)
+    if extra:
+        if getattr(config, "enable_query_decomposition", False):
+            attached = attach_derived_subqueries(active_plan, extra)
+            if len(attached.subqueries) > len(active_plan.subqueries):
+                active_plan = attached
+                result.plan = active_plan
+                result.add_reason("subquery_decomposition_applied")
+                for subquery in active_plan.subqueries:
+                    if subquery.derived and subquery.reason_code:
+                        result.add_reason(subquery.reason_code)
+            else:
+                result.add_reason("subquery_decomposition_rejected")
+        else:
+            result.add_reason("subquery_decomposition_deferred")
+
     sq0 = active_plan.subqueries[0] if active_plan.subqueries else _synthetic_sq0(active_plan)
     executed: list[QuerySubquery] = []
     if budget.consume(SUBQUERY):
         executed.append(sq0)
     else:
         result.add_reason("subquery_budget_exhausted")
-
-    if decompose is not None:
-        try:
-            extra = [s for s in (decompose(active_plan) or []) if s.id != "sq0"]
-        except Exception:  # noqa: BLE001 - decomposition is a best-effort hook
-            logger.warning("Subquery decomposition failed; using rule plan", exc_info=True)
-            extra = []
-        if extra:
-            result.add_reason("subquery_decomposition_deferred")
 
     result.subqueries_executed = [sq.id for sq in executed]
 
@@ -868,8 +898,15 @@ def _apply_evidence_sufficiency(
         return
 
     if first.allowed_action is CorrectiveAction.RUN_DERIVED_SUBQUERIES:
-        # Reserved seam: 2.2.4.2 will execute validated derived subqueries here.
-        result.add_reason("run_derived_subqueries_deferred_2_2_4_2")
+        # 2.2.4.2 wires this reserved 2.2.4.1 seam: execute the plan's
+        # drift-validated derived subqueries through their specialized modalities
+        # and fuse. Gated by ``enable_query_decomposition`` so the seam stays the
+        # 2.2.4.1 deferred placeholder (legacy behavior) until promotion.
+        if getattr(config, "enable_query_decomposition", False):
+            _run_derived_subqueries(
+                result, plan, store, config, budget, retriever, first)
+        else:
+            result.add_reason("run_derived_subqueries_deferred_2_2_4_2")
         return
     if not budget.consume(RETRIEVAL_ROUND):
         result.add_reason("retrieval_round_budget_exhausted")
@@ -893,6 +930,197 @@ def _apply_evidence_sufficiency(
         )
     result.merged_facts = _merge_facts(result.merged_facts, facts)
     result.merged_documents = _dedupe_docs([*result.merged_documents, *documents])
+    result.sufficiency = grade_evidence(plan, {
+        "facts": result.merged_facts,
+        "documents": result.merged_documents,
+    })
+    if result.sufficiency.status is not SufficiencyStatus.SUFFICIENT:
+        result.add_reason("corrective_retry_exhausted")
+
+
+# ── Selective decomposition + weighted fusion (2.2.4.2) ────
+
+
+def _derive_subqueries(
+    plan: QueryPlan, decompose: Optional[DecomposeFn], config: "MiddlewareConfig"
+) -> list[QuerySubquery]:
+    """Proposed derived subqueries for a compound plan (never ``sq0``).
+
+    Uses the injected ``decompose`` hook when supplied (tests substitute a fake),
+    else the deterministic :func:`~src.middleware.query_plan.decompose_plan` when
+    decomposition is enabled, else none. Best-effort — a raising decomposer
+    yields ``[]`` so a broken hook can never fail the request."""
+    try:
+        if decompose is not None:
+            proposed = decompose(plan) or []
+        elif getattr(config, "enable_query_decomposition", False):
+            proposed = decompose_plan(plan) or []
+        else:
+            return []
+    except Exception:  # noqa: BLE001 - decomposition is a best-effort hook
+        logger.warning("Subquery decomposition failed; using rule plan", exc_info=True)
+        return []
+    return [s for s in proposed if getattr(s, "id", None) != "sq0"]
+
+
+def _subquery_legacy_intent(plan: QueryPlan, sq: QuerySubquery) -> dict:
+    """Project one derived subquery onto a legacy-intent dict so the existing
+    retriever routes it to the right specialized modality (facts/tools → SQLite,
+    qualitative → hybrid, news/risk/sentiment → document channel with the
+    ticker metadata filter, macro → FRED, projection → estimates)."""
+    intent = dict(plan.to_legacy_intent())
+    intent["ticker"] = sq.entity_tickers[0] if sq.entity_tickers else None
+    intent["metrics"] = list(sq.metrics)
+    if sq.periods:
+        intent["timeframe"] = sq.periods[0]
+    modes = set(sq.retrieval_modes)
+    sub_intents = set(sq.intents) or set(plan.intents)
+    if "macro" in modes:
+        intent["question_type"] = "general"
+        intent["ticker"] = None
+    elif "documents" in modes and "facts" not in modes:
+        if "news" in sub_intents:
+            intent["question_type"] = "news"
+        elif "risk" in sub_intents:
+            intent["question_type"] = "risk"
+        elif "sentiment" in sub_intents:
+            intent["question_type"] = "sentiment"
+        else:
+            intent["question_type"] = "explanation"
+    elif "facts" in modes and "documents" not in modes:
+        intent["question_type"] = (
+            "projection" if "projection" in sub_intents else "fact_lookup")
+    else:
+        if "projection" in sub_intents:
+            intent["question_type"] = "projection"
+        elif "comparison" in sub_intents:
+            intent["question_type"] = "comparison"
+        else:
+            intent["question_type"] = "fact_lookup"
+    return intent
+
+
+def _retrieve_derived_subquery(
+    r: "Retriever", plan: QueryPlan, sq: QuerySubquery, config: "MiddlewareConfig"
+) -> tuple[list[dict], list[dict]]:
+    """Retrieve one derived subquery's specialized evidence (un-reranked pool).
+
+    Uses ``retrieve_candidates`` so documents come back before any re-rank —
+    fusion owns the single conditional re-rank. Facts are tagged with their
+    subquery id for provenance."""
+    intent = _subquery_legacy_intent(plan, sq)
+    cand = r.retrieve_candidates(
+        query=sq.text, intent=intent,
+        top_k_documents=int(getattr(config, "top_k_documents", 5)),
+        top_k_facts=int(getattr(config, "top_k_facts", 10)),
+    )
+    facts = [dict(f, subquery_id=sq.id) for f in cand.get("facts", []) if isinstance(f, dict)]
+    docs = [d for d in cand.get("documents", []) if isinstance(d, dict)]
+    return facts, docs
+
+
+def _maybe_rerank_fused_documents(
+    r: "Retriever",
+    plan: QueryPlan,
+    fused: list[dict],
+    config: "MiddlewareConfig",
+    budget: ExecutionBudget,
+    result: OrchestrationResult,
+) -> list[dict]:
+    """Pass the fused candidates through the conditional re-ranker at most once.
+
+    Bounded by the shared single RERANK_CALL unit — if the sq0 round already
+    used it, this skips. Never raises: a reranker failure (or its silent RRF
+    fallback) keeps the fused order and records ``rerank_fallback``."""
+    top_k = int(getattr(config, "top_k_documents", 5))
+    if len(fused) < 2:
+        return fused
+    if not (getattr(config, "enable_reranker", False)
+            and getattr(config, "adaptive_conditional_rerank", True)):
+        return fused
+    if not budget.consume(RERANK_CALL):
+        result.add_reason("rerank_budget_exhausted")
+        return fused[:top_k]
+    try:
+        reranked = r.reranker.rerank(plan.retrieval_query, list(fused), top_n=top_k)
+    except Exception:  # noqa: BLE001 - reranker should not raise
+        logger.warning("Fused rerank failed; keeping fusion order", exc_info=True)
+        result.add_reason("rerank_fallback")
+        return fused[:top_k]
+    if reranked and all(d.get("rerank_score") is None for d in reranked):
+        result.add_reason("rerank_fallback")
+        return list(reranked)
+    result.rerank_ran = True
+    result.add_reason("rerank_applied_derived_fusion")
+    return list(reranked)
+
+
+def _run_derived_subqueries(
+    result: OrchestrationResult,
+    plan: QueryPlan,
+    store: Any,
+    config: "MiddlewareConfig",
+    budget: ExecutionBudget,
+    retriever: Optional["Retriever"],
+    first: SufficiencyResult,
+) -> None:
+    """Execute the plan's drift-validated derived subqueries (2.2.4.2 Steps 3-5).
+
+    One bounded retrieval round: each uncovered derived subquery is retrieved
+    through its specialized modality, its documents are fused with the original
+    ``sq0`` documents (weighted RRF — ``sq0`` strongest), the fused set is
+    conditionally re-ranked at most once, derived facts are merged onto their
+    obligations, and sufficiency is re-graded. The SUBQUERY / RETRIEVAL_ROUND /
+    RERANK caps make this uncircumventable; fail-soft keeps the pre-derived
+    evidence on any error."""
+    missing = set(first.missing_subqueries)
+    derived = [sq for sq in plan.subqueries if sq.derived and sq.id in missing]
+    result.proposed_subqueries = sum(1 for sq in plan.subqueries if sq.derived)
+    if not derived:
+        result.add_reason("no_derived_subqueries_to_run")
+        return
+    if not budget.consume(RETRIEVAL_ROUND):
+        result.add_reason("retrieval_round_budget_exhausted")
+        return
+
+    result.retry_performed = True
+    result.retrieval_rounds_used += 1
+    result.add_reason("corrective_retry_round")
+    result.add_reason("corrective_action_run_derived_subqueries")
+
+    try:
+        r = _get_retriever(retriever, store, config)
+        channels: list[dict] = [
+            {"subquery_id": "sq0", "weight": 1.0,
+             "documents": list(result.merged_documents)},
+        ]
+        derived_facts: list[dict] = []
+        for sq in derived:
+            if not budget.consume(SUBQUERY):
+                result.add_reason("subquery_budget_exhausted")
+                break
+            sq_facts, sq_docs = _retrieve_derived_subquery(r, plan, sq, config)
+            weight = 0.6 if sq.derivation_source == "planner" else 0.8
+            channels.append(
+                {"subquery_id": sq.id, "weight": weight, "documents": sq_docs})
+            derived_facts.extend(sq_facts)
+            result.subqueries_executed.append(sq.id)
+            result.derived_subqueries.append(sq.id)
+
+        from .retriever import fuse_weighted_subqueries
+        fused = fuse_weighted_subqueries(
+            channels, top_k=int(getattr(config, "top_k_documents", 5)),
+            k=int(getattr(config, "rrf_k", 60)))
+        fused = _maybe_rerank_fused_documents(r, plan, fused, config, budget, result)
+        result.merged_documents = fused
+        result.merged_facts = _merge_facts(result.merged_facts, derived_facts)
+        result.retrieval_strategy = "decomposed_fusion"
+        result.add_reason("derived_fusion_applied")
+    except Exception:  # noqa: BLE001 - decomposition must fall soft, never raise
+        logger.warning(
+            "Derived subquery execution failed; keeping sq0 evidence", exc_info=True)
+        result.add_reason("derived_subqueries_error")
+
     result.sufficiency = grade_evidence(plan, {
         "facts": result.merged_facts,
         "documents": result.merged_documents,

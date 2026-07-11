@@ -152,6 +152,15 @@ def console_table(summary: dict) -> str:
         lines.append(f"{'latency_ms':<38} {sufficiency.get('latency_ms', {})}")
         lines.append(f"{'retrieval_rounds':<38} {sufficiency.get('retrieval_rounds', {})}")
 
+    decomposition = summary.get("decomposition")
+    if isinstance(decomposition, dict):
+        lines.append("")
+        lines.append("=== Selective decomposition (Phase 2.2.4.2) ===")
+        for name in ("drift_rate", "mean_derived_subqueries", "max_derived_subqueries",
+                     "subquestion_coverage", "simple_with_derived",
+                     "subquery_cap_violations", "retrieval_round_cap_violations"):
+            lines.append(f"{name:<38} {_fmt(decomposition.get(name))}")
+
     # Per-category table.
     per = summary.get("per_category") or {}
     if per:
@@ -219,6 +228,23 @@ def report_md(summary: dict, prev: Optional[dict]) -> str:
                      f"{_fmt(sufficiency.get('unsupported_number_rate'))}")
         lines.append(f"- latency: {sufficiency.get('latency_ms', {})}")
         lines.append(f"- retrieval rounds: {sufficiency.get('retrieval_rounds', {})}")
+        lines.append("")
+
+    decomposition = summary.get("decomposition")
+    if isinstance(decomposition, dict):
+        lines.append("## Selective decomposition — 2.2.4.2")
+        lines.append("")
+        lines.append(f"- derived-query drift rate: {_fmt(decomposition.get('drift_rate'))}")
+        lines.append(f"- mean / max derived subqueries: "
+                     f"{_fmt(decomposition.get('mean_derived_subqueries'))} / "
+                     f"{decomposition.get('max_derived_subqueries')}")
+        lines.append(f"- subquestion coverage: {_fmt(decomposition.get('subquestion_coverage'))}")
+        lines.append(f"- simple queries with derived subqueries (must be 0): "
+                     f"{decomposition.get('simple_with_derived')}")
+        lines.append(f"- subquery/round cap violations (must be 0): "
+                     f"{decomposition.get('subquery_cap_violations')} / "
+                     f"{decomposition.get('retrieval_round_cap_violations')}")
+        lines.append(f"- drift reason codes: {decomposition.get('drift_reason_codes', {})}")
         lines.append("")
         lines.append(f"- adaptive rows: {adaptive.get('n_adaptive', 0)}")
         lines.append(f"- lane distribution: {adaptive.get('lane_distribution', {})}")

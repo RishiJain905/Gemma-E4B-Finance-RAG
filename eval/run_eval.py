@@ -187,6 +187,7 @@ def _row(case: dict, *, answer: str, detected_ticker, detected_intent,
          resolved_timeframe: Optional[str] = None,
          orchestration: Optional[dict] = None,
          evidence_sufficiency: Optional[dict] = None,
+         decomposition: Optional[dict] = None,
          config_label: Optional[str] = None) -> dict:
     """Assemble a well-formed result row (always has every RESULT_KEY)."""
     ans = answer or ""
@@ -238,6 +239,13 @@ def _row(case: dict, *, answer: str, detected_ticker, detected_intent,
         "fallback_reason": (orch or {}).get("fallback_reason"),
         "evidence_sufficiency": (
             evidence_sufficiency if isinstance(evidence_sufficiency, dict) else None
+        ),
+        # ── Selective decomposition / fusion fields (2.2.4.2) ──
+        # The response.decomposition block (derived-subquery ids, drift reason
+        # codes, proposed/accepted counts). None on the legacy path / offline
+        # backend, so a legacy run's rows are unaffected.
+        "decomposition": (
+            decomposition if isinstance(decomposition, dict) else None
         ),
     }
 
@@ -446,6 +454,7 @@ def _row_from_endpoint(case: dict, data: dict, latency_s: float,
         retrieval_query=retrieval_query,
         orchestration=data.get("orchestration"),
         evidence_sufficiency=data.get("evidence_sufficiency"),
+        decomposition=data.get("decomposition"),
         **_ctx_kwargs(ctx, data, trace),
     )
 

@@ -295,3 +295,45 @@ def _known_tickers() -> frozenset[str]:
     from .intent_parser import IntentParser
 
     return frozenset(IntentParser.KNOWN_TICKERS)
+
+
+# ── Planner-proposed subquery validation (2.2.4.2 Step 2) ──────────────────
+
+def validate_planner_subqueries(plan, proposed, *, resolver=None):
+    """Validate optional planner-proposed subqueries against a parent plan.
+
+    The optional 2.2.2.2 planner may propose derived subqueries as dicts
+    (``{"text", "entities", "metrics", "periods", "intents", "retrieval_modes"}``).
+    Each is shaped into a candidate :class:`QuerySubquery` and passed through the
+    *same* drift validator the deterministic decomposition uses
+    (:func:`~src.middleware.query_plan.select_derived_subqueries`), so a planner
+    can only ever narrow the validated plan — never invent a ticker, metric,
+    period, threshold, or broader topic. At most two survivors that add distinct
+    obligation coverage are kept, re-id'd ``sq1``/``sq2`` with
+    ``derivation_source="planner"``. Returns ``(accepted, drift_reason_codes)``;
+    the reason codes are recorded in the evidence trace on rejection.
+    """
+    from .query_plan import QuerySubquery, select_derived_subqueries
+
+    candidates: list = []
+    for spec in proposed or []:
+        if not isinstance(spec, dict):
+            continue
+        entities = tuple(
+            t for t in (_norm_ticker(e) for e in (spec.get("entities") or [])) if t)
+        metrics = tuple(
+            str(m).strip().lower().replace(" ", "_")
+            for m in (spec.get("metrics") or []) if str(m).strip())
+        periods = tuple(str(p).strip() for p in (spec.get("periods") or []) if str(p).strip())
+        modes = tuple(
+            str(m).strip()
+            for m in (spec.get("retrieval_modes") or spec.get("modes") or [])
+            if str(m).strip())
+        intents = tuple(str(i).strip() for i in (spec.get("intents") or []) if str(i).strip())
+        text = str(spec.get("text") or spec.get("query") or spec.get("standalone_query") or "").strip()
+        candidates.append(QuerySubquery(
+            id="sqp", text=text, entity_tickers=entities, intents=intents,
+            metrics=metrics, periods=periods, retrieval_modes=modes,
+            derived=True, parent_id="sq0",
+        ))
+    return select_derived_subqueries(plan, candidates, source="planner", limit=2)

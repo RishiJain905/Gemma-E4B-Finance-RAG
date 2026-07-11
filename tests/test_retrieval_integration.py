@@ -164,3 +164,85 @@ def test_features_disabled_preserves_vector_only(monkeypatch):
         assert resp.json()["retrieval_strategy"] == "vector"
         assert store_search_mock.called
         assert not lex_search_mock.called  # lexical channel skipped when disabled
+
+
+# ── 2.2.4.2: weighted subquery fusion ──────────────────────────────────
+
+def _doc(doc_id, **meta):
+    return {"id": doc_id, "document": f"body {doc_id}", "metadata": meta,
+            "fusion_score": 0.5}
+
+
+class TestWeightedSubqueryFusion:
+    def test_legacy_rrf_fuse_unchanged(self):
+        """The two-list rrf_fuse contract is preserved for legacy callers."""
+        from src.middleware.retriever import rrf_fuse
+
+        fused = rrf_fuse([{"id": "a"}, {"id": "b"}], [{"id": "b"}])
+        assert [fid for fid, _ in fused] == ["b", "a"]  # b in both channels wins
+
+    def test_original_query_weight_dominates(self):
+        """sq0 (weight 1.0) outranks a derived channel (0.8) that surfaces a doc
+        at a comparable rank."""
+        from src.middleware.retriever import fuse_weighted_subqueries
+
+        channels = [
+            {"subquery_id": "sq0", "weight": 1.0, "documents": [_doc("a")]},
+            {"subquery_id": "sq1", "weight": 0.8, "documents": [_doc("b")]},
+        ]
+        fused = fuse_weighted_subqueries(channels, top_k=5)
+        assert fused[0]["id"] == "a"
+        assert fused[0]["fused_score"] > fused[1]["fused_score"]
+
+    def test_provenance_preserved_on_each_result(self):
+        from src.middleware.retriever import fuse_weighted_subqueries
+
+        channels = [
+            {"subquery_id": "sq0", "weight": 1.0, "documents": [_doc("x"), _doc("y")]},
+            {"subquery_id": "sq1", "weight": 0.8, "documents": [_doc("x")]},
+        ]
+        fused = fuse_weighted_subqueries(channels, top_k=5)
+        shared = next(d for d in fused if d["id"] == "x")
+        assert shared["subquery_ids"] == ["sq0", "sq1"]
+        assert shared["subquery_weights"] == {"sq0": 1.0, "sq1": 0.8}
+        assert shared["channel_ranks"] == {"sq0": 0, "sq1": 0}
+
+    def test_reserves_one_slot_per_covered_subquery(self):
+        """Even under a tight top_k, a derived subquery's best doc is reserved
+        before the remaining slots fill by score."""
+        from src.middleware.retriever import fuse_weighted_subqueries
+
+        channels = [
+            {"subquery_id": "sq0", "weight": 1.0, "documents": [_doc("a"), _doc("b")]},
+            {"subquery_id": "sq1", "weight": 0.6, "documents": [_doc("c")]},
+        ]
+        fused = fuse_weighted_subqueries(channels, top_k=2)
+        ids = {d["id"] for d in fused}
+        assert "a" in ids and "c" in ids  # sq0 top + sq1 reserved
+
+    def test_parent_chunk_duplicates_deduped(self):
+        """The same physical chunk keyed once by id and once by parent+chunk
+        collapses to a single fused result."""
+        from src.middleware.retriever import fuse_weighted_subqueries
+
+        with_id = {"id": "doc#0", "document": "chunk body",
+                   "metadata": {"parent_id": "doc", "chunk_index": 0}}
+        by_chunk = {"document": "chunk body",
+                    "metadata": {"parent_id": "doc", "chunk_index": 0}}
+        channels = [
+            {"subquery_id": "sq0", "weight": 1.0, "documents": [with_id]},
+            {"subquery_id": "sq1", "weight": 0.8, "documents": [by_chunk]},
+        ]
+        fused = fuse_weighted_subqueries(channels, top_k=5)
+        assert len(fused) == 1
+        assert fused[0]["subquery_ids"] == ["sq0", "sq1"]
+
+    def test_stable_ordering_on_equal_scores(self):
+        """Equal-score docs order deterministically (by id) across runs."""
+        from src.middleware.retriever import fuse_weighted_subqueries
+
+        channels = [{"subquery_id": "sq0", "weight": 1.0,
+                     "documents": [_doc("b"), _doc("a"), _doc("c")]}]
+        first = [d["id"] for d in fuse_weighted_subqueries(channels, top_k=5)]
+        second = [d["id"] for d in fuse_weighted_subqueries(channels, top_k=5)]
+        assert first == second

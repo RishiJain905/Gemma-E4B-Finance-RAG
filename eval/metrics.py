@@ -984,6 +984,83 @@ def has_evidence_sufficiency_rows(rows: list[dict]) -> bool:
     return any(_sufficiency(row) is not None for row in rows)
 
 
+# ── Selective decomposition / fusion metrics (2.2.4.2) ─────────────────────
+#
+# Offline, deterministic measures computed from the ``decomposition`` block the
+# middleware attaches to a response (and the eval harness copies onto each row):
+# derived-query drift rate, per-request derived counts, the simple-query
+# zero-decomposition invariant, subquestion evidence coverage, and the hard
+# cap invariants (≤3 subqueries, ≤2 retrieval rounds). The cross-config quality
+# deltas (Recall@5/10, nDCG@10, complex correctness) are produced from a live
+# two-config comparison in RESULTS.md; these are the single-run scaffolding.
+
+def _decomposition(row: dict) -> Optional[dict]:
+    block = row.get("decomposition")
+    return block if isinstance(block, dict) else None
+
+
+def has_decomposition_rows(rows: list[dict]) -> bool:
+    """Whether at least one row carries 2.2.4.2 decomposition metadata."""
+    return any(_decomposition(row) is not None for row in rows)
+
+
+def decomposition_metrics(rows: list[dict]) -> dict:
+    """Measure derived-query drift, coverage, cost, and the hard cap invariants.
+
+    ``drift_rate`` is the fraction of proposed derived subqueries the drift
+    validator rejected (promotion gate: < 0.05). ``simple_with_derived`` and the
+    two cap-violation counters must stay 0 (simple queries add no derived
+    subqueries; no plan exceeds three subqueries or two rounds).
+    """
+    eligible = [row for row in rows if _decomposition(row) is not None]
+    proposed = 0
+    accepted = 0
+    derived_counts: list[int] = []
+    drift_codes: dict[str, int] = {}
+    n_simple = 0
+    simple_with_derived = 0
+    subquery_cap_violations = 0
+    round_cap_violations = 0
+
+    for row in eligible:
+        block = _decomposition(row) or {}
+        p = int(block.get("proposed_subqueries", 0) or 0)
+        a = int(block.get("derived_subqueries", 0) or 0)
+        proposed += p
+        accepted += a
+        derived_counts.append(a)
+        for code in block.get("drift_reason_codes") or []:
+            drift_codes[code] = drift_codes.get(code, 0) + 1
+
+        if str(_case(row).get("complexity", "")).strip().lower() == "simple":
+            n_simple += 1
+            if a > 0:
+                simple_with_derived += 1
+
+        orch = _orch(row) or {}
+        if int(orch.get("subqueries_executed", 0) or 0) > ADAPTIVE_CAPS["subqueries_executed"]:
+            subquery_cap_violations += 1
+        if int(orch.get("retrieval_rounds", 0) or 0) > ADAPTIVE_CAPS["retrieval_rounds"]:
+            round_cap_violations += 1
+
+    coverage = compound_subquestion_coverage(rows)
+    return {
+        "n_eligible": len(eligible),
+        "proposed_subqueries": proposed,
+        "accepted_subqueries": accepted,
+        "drift_rate": round((proposed - accepted) / proposed, 4) if proposed else 0.0,
+        "drift_reason_codes": drift_codes,
+        "mean_derived_subqueries": (
+            round(sum(derived_counts) / len(derived_counts), 3) if derived_counts else 0.0),
+        "max_derived_subqueries": max(derived_counts, default=0),
+        "n_simple": n_simple,
+        "simple_with_derived": simple_with_derived,
+        "subquery_cap_violations": subquery_cap_violations,
+        "retrieval_round_cap_violations": round_cap_violations,
+        "subquestion_coverage": coverage.get("score"),
+    }
+
+
 # ── Aggregator ─────────────────────────────────────────────────────────
 
 def _run_field(rows: list[dict], key: str) -> Optional[str]:
@@ -1065,6 +1142,9 @@ def score_all(rows: list[dict], *, judge: Optional[Callable] = None,
 
     if has_evidence_sufficiency_rows(rows):
         summary["evidence_sufficiency"] = evidence_sufficiency_metrics(rows)
+
+    if has_decomposition_rows(rows):
+        summary["decomposition"] = decomposition_metrics(rows)
 
     summary["per_category"] = _per_category(rows)
     return summary
