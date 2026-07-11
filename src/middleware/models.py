@@ -26,6 +26,12 @@ class QueryRequest(BaseModel):
         None,
         description="Per-request override of the server's answer policy: strict|graded",
     )
+    include_evidence_trace: bool = Field(
+        False,
+        description="Include the exact evidence trace (system/user prompts, usable "
+                    "facts/documents, tool results) used to produce the answer. "
+                    "Off by default; intended for evaluation requests (2.2.1.2).",
+    )
 
 
 class SourceCitation(BaseModel):
@@ -68,6 +74,13 @@ class QueryResponse(BaseModel):
         None,
         description="Resolved ticker {'name','source'} when the resolver mapped a "
                     "non-exact company name or typo (omitted for known_ticker/override)",
+    )
+    evidence_trace: Optional[dict] = Field(
+        None,
+        description="Exact model-visible evidence trace (2.2.1.2): system/user prompts, "
+                    "usable facts/documents, and tool results. Present only when the "
+                    "request set include_evidence_trace=true and a model call succeeded "
+                    "(never populated for a degraded/model-unavailable answer).",
     )
     freshness: dict = Field(
         default_factory=lambda: {

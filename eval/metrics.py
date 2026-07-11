@@ -1,20 +1,38 @@
 """
-eval/metrics.py — Stage 2 scoring functions for the eval harness (2.1.1.2).
+eval/metrics.py — Stage 2 scoring functions for the eval harness (2.1.1.2, 2.2.1.2).
 
 Turns raw run rows (from run_eval.py) into scores:
 
-  - intent_accuracy      detected_intent == expected_intent (over declaring cases)
-  - ticker_accuracy      detected_ticker == expected_ticker (all cases; None==None)
-  - retrieval_hit_rate   retrieved sources hit expected_sources (count fallback)
-  - keyword_coverage     fraction of must_mention terms present in the answer
-  - refusal_rate         fraction of model answers matching a refusal pattern
-  - faithfulness         LLM-as-judge groundedness (0–1, or None if model down)
-  - answer_relevance     LLM-as-judge relevance  (0–1, or None if model down)
+  - intent_accuracy         detected_intent == expected_intent (over declaring cases)
+  - ticker_accuracy         detected_ticker == expected_ticker (all cases; None==None)
+  - retrieval_hit_rate      retrieved sources hit expected_sources (count fallback)
+  - keyword_coverage        fraction of must_mention terms present in the answer
+  - refusal_rate            fraction of model answers matching a refusal pattern
+  - grounded_faithfulness   LLM-as-judge groundedness of grounded/partial answers
+                            against the exact evidence trace, incl. tool results
+  - policy_compliance       LLM-as-judge policy compliance across all four
+                            grounding modes (grounded/partial/general/refused)
+  - answer_relevance        LLM-as-judge relevance (0-1, or None if model down)
 
 Every function takes a list of run-row dicts. A row carries its golden case
 either under ``row["case"]`` (real runs) or inline (synthetic test rows); the
 ``_case`` helper handles both. The LLM-judge accepts an injectable ``judge``
 callable ``(prompt) -> text`` so unit tests never touch the network.
+
+2.2.1.2 replaced the single ``faithfulness`` metric (scored against a
+truncated re-retrieved ``context`` string, and thus inflated by strict
+refusals) with two metrics scored against the row's exact
+``evidence_trace`` (2.2.1.2):
+
+  - ``grounded_faithfulness`` only scores ``grounded``/``partial`` answers —
+    general and refused answers are excluded from its denominator so a
+    refusal can no longer inflate it.
+  - ``policy_compliance`` scores every mode against the rules for that mode.
+
+A row with a model-produced answer (``model_available``) but a missing or
+incomplete evidence trace (``trace_complete`` false) is never silently
+scored — it is excluded from both judge metrics' eligible pool and reported
+via ``trace_errors``.
 """
 
 from __future__ import annotations
@@ -26,6 +44,13 @@ from . import judge_prompts
 from .run_eval import normalize_source
 
 DEFAULT_MODEL_ENDPOINT = "http://127.0.0.1:8087/v1/chat/completions"
+
+# Bump when the shape of score_all()'s summary changes in a way that would
+# invalidate a naive comparison against an older baseline (2.2.1.2 Step 5).
+SCORE_SCHEMA_VERSION = 1
+
+# Grounding modes eligible for grounded_faithfulness (they claim grounding).
+GROUNDED_MODES = ("grounded", "partial")
 
 # Phrasings that count as the system refusing to answer. Lowercased substring match.
 REFUSAL_MARKERS = (
@@ -52,6 +77,9 @@ SCALAR_METRICS = (
     "refusal_rate",
 )
 
+# Metric keys whose value is a judge-result dict ({"score": ..., ...}).
+JUDGE_METRICS = ("grounded_faithfulness", "policy_compliance", "answer_relevance")
+
 
 # ── Helpers ────────────────────────────────────────────────────────────
 
@@ -73,6 +101,28 @@ def _norm_intent(t) -> Optional[str]:
     if t is None:
         return None
     return str(t).strip().lower() or None
+
+
+def _is_missing_trace(row: dict) -> bool:
+    """True when a model-produced answer lacks a complete evidence trace.
+
+    A degraded (``model_available=False``) row makes no model-visible-
+    evidence claim at all, so it is never "missing" in this sense — there is
+    nothing to have omitted.
+    """
+    return bool(row.get("model_available")) and not row.get("trace_complete", False)
+
+
+def trace_errors(rows: list[dict]) -> list[dict]:
+    """Rows with a model-produced answer but a missing/incomplete evidence trace.
+
+    Never silently scored — the 2.1.7 gate must fail before comparing metrics
+    when any of these exist (2.2.1.2 Step 5).
+    """
+    return [
+        {"id": r.get("id"), "reason": r.get("error") or "incomplete evidence trace"}
+        for r in rows if _is_missing_trace(r)
+    ]
 
 
 # ── Cheap metrics ───────────────────────────────────────────────────────
@@ -228,33 +278,37 @@ def default_judge(prompt: str, *, endpoint: str = DEFAULT_MODEL_ENDPOINT,
 
 
 def _judge_scores(rows: list[dict], *, build_prompt: Callable, judge: Optional[Callable],
-                  endpoint: str, timeout: float, need_context: bool,
-                  skip_fn: Optional[Callable] = None) -> dict:
-    """Shared driver for faithfulness / answer_relevance judging.
+                  endpoint: str, timeout: float,
+                  skip_fn: Callable) -> dict:
+    """Shared driver for the trace-grounded judges (grounded_faithfulness /
+    policy_compliance).
 
-    ``skip_fn(row) -> Optional[str]`` lets a metric exclude rows it cannot
-    meaningfully judge (returns the skip reason); skipped rows get a None score.
+    ``skip_fn(row) -> Optional[str]`` returns a skip reason (rows that are
+    empty-answer, degraded, missing-trace, or out-of-mode never reach the
+    judge) or ``None`` when the row is eligible. ``n_eligible`` counts rows
+    that passed ``skip_fn`` and had a non-empty answer, regardless of whether
+    the judge itself was reachable — that is what the 2.1.7 gate's
+    "eligible denominator" check compares run over run.
     """
     j = judge or (lambda p: default_judge(p, endpoint=endpoint, timeout=timeout))
     scores: list[float] = []
     per_case: list[dict] = []
     model_down = False
+    n_eligible = 0
 
     for r in rows:
         ans = r.get("answer") or ""
-        q = r.get("question") or ""
         cid = r.get("id")
         if not ans.strip():
             per_case.append({"id": cid, "score": None, "reason": "empty answer"})
             continue
-        skip_reason = skip_fn(r) if skip_fn else None
+        skip_reason = skip_fn(r)
         if skip_reason:
             per_case.append({"id": cid, "score": None, "reason": skip_reason})
             continue
-        ctx = r.get("context") or ""
-        # NOTE: empty context is NOT skipped — the faithfulness rubric handles it
-        # (score 0 for hallucination with no context, 1 for a faithful refusal).
-        prompt = build_prompt(q, ctx, ans) if need_context else build_prompt(q, ans)
+        n_eligible += 1
+        trace = r.get("evidence_trace") or {}
+        prompt = build_prompt(r, trace, ans)
         text = j(prompt)
         if text is None:
             model_down = True
@@ -269,77 +323,162 @@ def _judge_scores(rows: list[dict], *, build_prompt: Callable, judge: Optional[C
     return {
         "score": round(sum(scores) / len(scores), 4) if scores else None,
         "n_scored": len(scores),
+        "n_eligible": n_eligible,
         "n_skipped": len(rows) - len(scores),
         "model_available": not model_down,
         "per_case": per_case,
     }
 
 
-# Answers carrying the graded-policy general-knowledge label (2.1.7.1) claim
-# no grounding in retrieved context, so groundedness cannot be judged against
-# it; honesty is enforced by the label + never-fabricate-numbers rule instead.
-GENERAL_FALLBACK_MARKER = "not from your data"
-
-
-def _skip_labeled_general(row: dict) -> Optional[str]:
-    """Skip reason for answers explicitly labeled as general-knowledge fallback."""
-    ans = (row.get("answer") or "").strip().lower()
-    if ans.startswith(GENERAL_FALLBACK_MARKER):
-        return "labeled general-knowledge fallback (no groundedness claim)"
+def _skip_not_model_answer(row: dict) -> Optional[str]:
+    """Skip reason for rows that never reached a model call at all."""
+    if not row.get("model_available"):
+        return "model unavailable (degraded answer, not a policy choice)"
+    if _is_missing_trace(row):
+        return "missing/incomplete evidence trace"
     return None
 
 
-def faithfulness(rows: list[dict], *, judge: Optional[Callable] = None,
-                 endpoint: str = DEFAULT_MODEL_ENDPOINT,
-                 timeout: float = 120.0) -> dict:
-    """LLM-as-judge groundedness (0–1). Returns None score when the model is down."""
+def _skip_ungrounded_mode(row: dict) -> Optional[str]:
+    reason = _skip_not_model_answer(row)
+    if reason:
+        return reason
+    grounding = row.get("grounding")
+    if grounding not in GROUNDED_MODES:
+        return f"excluded: {grounding or 'unknown'} mode not scored for grounded faithfulness"
+    return None
+
+
+def grounded_faithfulness(rows: list[dict], *, judge: Optional[Callable] = None,
+                          endpoint: str = DEFAULT_MODEL_ENDPOINT,
+                          timeout: float = 120.0) -> dict:
+    """LLM-as-judge groundedness (0-1) of grounded/partial answers against the
+    exact evidence trace. General/refused answers and rows with a missing
+    trace never enter the denominator, so refusals cannot inflate this score.
+    """
     return _judge_scores(
-        rows, build_prompt=judge_prompts.faithfulness_prompt, judge=judge,
-        endpoint=endpoint, timeout=timeout, need_context=True,
-        skip_fn=_skip_labeled_general,
+        rows,
+        build_prompt=lambda r, trace, ans: judge_prompts.grounded_faithfulness_prompt(
+            r.get("question") or "", trace, ans),
+        judge=judge, endpoint=endpoint, timeout=timeout,
+        skip_fn=_skip_ungrounded_mode,
+    )
+
+
+def policy_compliance(rows: list[dict], *, judge: Optional[Callable] = None,
+                      endpoint: str = DEFAULT_MODEL_ENDPOINT,
+                      timeout: float = 120.0) -> dict:
+    """LLM-as-judge policy compliance (0-1) across all four grounding modes."""
+    return _judge_scores(
+        rows,
+        build_prompt=lambda r, trace, ans: judge_prompts.policy_compliance_prompt(
+            r.get("question") or "", trace, ans, r.get("grounding")),
+        judge=judge, endpoint=endpoint, timeout=timeout,
+        skip_fn=_skip_not_model_answer,
     )
 
 
 def answer_relevance(rows: list[dict], *, judge: Optional[Callable] = None,
                      endpoint: str = DEFAULT_MODEL_ENDPOINT,
                      timeout: float = 120.0) -> dict:
-    """LLM-as-judge answer relevance (0–1). Returns None score when the model is down."""
-    return _judge_scores(
-        rows, build_prompt=judge_prompts.relevance_prompt, judge=judge,
-        endpoint=endpoint, timeout=timeout, need_context=False,
-    )
+    """LLM-as-judge answer relevance (0-1). Returns None score when the model is down.
+
+    Unlike the trace-grounded judges, relevance needs only the question and
+    answer, so every non-empty answer (including general/refused) is eligible.
+    """
+    j = judge or (lambda p: default_judge(p, endpoint=endpoint, timeout=timeout))
+    scores: list[float] = []
+    per_case: list[dict] = []
+    model_down = False
+    n_eligible = 0
+
+    for r in rows:
+        ans = r.get("answer") or ""
+        cid = r.get("id")
+        if not ans.strip():
+            per_case.append({"id": cid, "score": None, "reason": "empty answer"})
+            continue
+        n_eligible += 1
+        prompt = judge_prompts.relevance_prompt(r.get("question") or "", ans)
+        text = j(prompt)
+        if text is None:
+            model_down = True
+            per_case.append({"id": cid, "score": None, "reason": "judge unavailable"})
+            continue
+        s = _parse_score(text)
+        per_case.append({"id": cid, "score": s,
+                         "reason": None if s is not None else "unparseable"})
+        if s is not None:
+            scores.append(s)
+
+    return {
+        "score": round(sum(scores) / len(scores), 4) if scores else None,
+        "n_scored": len(scores),
+        "n_eligible": n_eligible,
+        "n_skipped": len(rows) - len(scores),
+        "model_available": not model_down,
+        "per_case": per_case,
+    }
 
 
 # ── Aggregator ─────────────────────────────────────────────────────────
+
+def _run_field(rows: list[dict], key: str) -> Optional[str]:
+    """A stable per-run value denormalized onto every row (e.g. answer_policy,
+    dataset_digest) — returns it if every row agrees, else None."""
+    values = {r.get(key) for r in rows if r.get(key)}
+    return next(iter(values)) if len(values) == 1 else None
+
 
 def score_all(rows: list[dict], *, judge: Optional[Callable] = None,
               endpoint: str = DEFAULT_MODEL_ENDPOINT, timeout: float = 120.0,
               run_judge: bool = True) -> dict:
     """Compute every metric for a run. Returns the summary block.
 
-    ``run_judge=False`` skips the (slow) LLM-judge calls; faithfulness /
-    answer_relevance come back as None. Per-category breakdowns cover the cheap
+    ``run_judge=False`` skips the (slow) LLM-judge calls; the judge metrics
+    come back with ``score: None``. Per-category breakdowns cover the cheap
     scalar metrics.
     """
     n = len(rows)
+    errs = trace_errors(rows)
     summary: dict = {
+        "score_schema_version": SCORE_SCHEMA_VERSION,
         "n_cases": n,
         "n_model_available": sum(1 for r in rows if r.get("model_available")),
         "n_errors": sum(1 for r in rows if r.get("error")),
+        "trace_errors": errs,
+        "n_trace_errors": len(errs),
+        "answer_policy": _run_field(rows, "answer_policy"),
+        "dataset_digest": _run_field(rows, "dataset_digest"),
     }
     for m in SCALAR_METRICS:
         summary[m] = globals()[m](rows)
 
+    # Denominators for the cheap scalar metrics (2.2.1.2 Step 4: "report
+    # denominators ... for every metric"). The judge metrics report their own
+    # n_eligible/n_scored/n_skipped inline.
+    summary["denominators"] = {
+        "intent_accuracy": sum(
+            1 for r in rows if _norm_intent(_case(r).get("expected_intent")) is not None),
+        "ticker_accuracy": n,
+        "retrieval_hit_rate": n,
+        "keyword_coverage": sum(1 for r in rows if _case(r).get("must_mention")),
+        "refusal_rate": sum(1 for r in rows if r.get("answer") and r.get("model_available")),
+    }
+
     if run_judge:
-        summary["faithfulness"] = faithfulness(rows, judge=judge, endpoint=endpoint,
-                                                timeout=timeout)
-        summary["answer_relevance"] = answer_relevance(rows, judge=judge,
-                                                       endpoint=endpoint, timeout=timeout)
+        summary["grounded_faithfulness"] = grounded_faithfulness(
+            rows, judge=judge, endpoint=endpoint, timeout=timeout)
+        summary["policy_compliance"] = policy_compliance(
+            rows, judge=judge, endpoint=endpoint, timeout=timeout)
+        summary["answer_relevance"] = answer_relevance(
+            rows, judge=judge, endpoint=endpoint, timeout=timeout)
     else:
-        summary["faithfulness"] = {"score": None, "n_scored": 0, "n_skipped": n,
-                                    "model_available": False, "per_case": []}
-        summary["answer_relevance"] = {"score": None, "n_scored": 0, "n_skipped": n,
-                                       "model_available": False, "per_case": []}
+        empty = {"score": None, "n_scored": 0, "n_eligible": 0, "n_skipped": n,
+                 "model_available": False, "per_case": []}
+        summary["grounded_faithfulness"] = dict(empty)
+        summary["policy_compliance"] = dict(empty)
+        summary["answer_relevance"] = dict(empty)
 
     summary["per_category"] = _per_category(rows)
     return summary

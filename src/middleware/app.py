@@ -27,7 +27,8 @@ from fastapi.responses import StreamingResponse
 from src.storage.store import Store
 from . import prompt_policy
 from .config import MiddlewareConfig
-from .evidence import evidence_counts
+from .evidence import evidence_counts, usable_documents, usable_facts
+from .evidence_trace import EvidenceTraceCollector
 from .models import (
     FreshnessResponse,
     HealthResponse,
@@ -84,6 +85,9 @@ _tools_used_var: contextvars.ContextVar[Optional[list[str]]] = contextvars.Conte
 _answer_policy_override_var: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar(
     "answer_policy_override", default=None
 )
+_evidence_trace_var: contextvars.ContextVar[Optional[EvidenceTraceCollector]] = contextvars.ContextVar(
+    "evidence_trace", default=None
+)
 
 
 def _grounding_level(retrieval: dict) -> str:
@@ -107,8 +111,10 @@ def _answer_policy() -> str:
 
 
 def _reset_request_scoped_state(answer_policy: Optional[str]) -> None:
-    """Reset per-request contextvars: tool-call log and answer-policy override."""
+    """Reset per-request contextvars: tool-call log, answer-policy override,
+    and evidence-trace collector."""
     _tools_used_var.set([])
+    _evidence_trace_var.set(None)
     normalized = str(answer_policy or "").strip().lower()
     _answer_policy_override_var.set(normalized if normalized in ("strict", "graded") else None)
 
@@ -124,6 +130,33 @@ def _get_tools_used() -> Optional[list[str]]:
     """Return the current request's dispatched tool names, or None if empty."""
     used = _tools_used_var.get()
     return list(used) if used else None
+
+
+def _record_trace_prompt(system_prompt: str, user_prompt: str) -> None:
+    """Record the exact system/user messages for the request's evidence trace
+    (2.2.1.2). No-op when no trace was requested for this request."""
+    collector = _evidence_trace_var.get()
+    if collector is not None:
+        collector.record_prompt(system_prompt=system_prompt, user_prompt=user_prompt)
+
+
+def _record_trace_tool_result(name: str, arguments: dict, result: dict) -> None:
+    """Append one dispatched tool call to the request's evidence trace, if any."""
+    collector = _evidence_trace_var.get()
+    if collector is not None:
+        collector.record_tool_result(name, arguments, result)
+
+
+def _discard_trace_tool_results() -> None:
+    """Drop any tool results recorded so far on the request's evidence trace.
+
+    Called before a plain-call fallback (tools unsupported / empty tool-mode
+    response) records its messages, so the abandoned tool attempt's results
+    never leak into the successful answer path's trace.
+    """
+    collector = _evidence_trace_var.get()
+    if collector is not None:
+        collector.discard_tool_results()
 
 
 def _resolved_ticker_field(intent: dict) -> Optional[dict]:
@@ -533,6 +566,22 @@ async def _build_query_context(request: QueryRequest) -> dict:
     }
     grounding_level = _grounding_level(retrieval)
 
+    # Request-scoped evidence-trace collector (2.2.1.2), created right after
+    # evidence normalization so facts/documents are the exact usable rows
+    # (see src/middleware/evidence.py) — untruncated, full provenance. Left
+    # None (and thus omitted from the response) unless explicitly requested.
+    trace_collector: Optional[EvidenceTraceCollector] = None
+    if request.include_evidence_trace:
+        trace_collector = EvidenceTraceCollector(
+            answer_policy=_answer_policy(),
+            grounding_level=grounding_level,
+            raw_question=request.question,
+            retrieval_query=request.question,
+            facts=usable_facts(retrieval),
+            documents=usable_documents(retrieval),
+        )
+    _evidence_trace_var.set(trace_collector)
+
     stage_start = time.perf_counter()
     from .prompt_augmenter import PromptAugmenter
 
@@ -553,6 +602,7 @@ async def _build_query_context(request: QueryRequest) -> dict:
         "retrieval": retrieval,
         "grounding_level": grounding_level,
         "augmented_prompt": augmented_prompt,
+        "include_evidence_trace": request.include_evidence_trace,
     }
 
 
@@ -579,6 +629,15 @@ def _build_query_response(
     # /query/stream terminal metadata event since both call this function.
     n_facts, n_docs = evidence_counts(retrieval)
 
+    # Evidence trace (2.2.1.2) — opt-in, and only ever non-None when a model
+    # call actually recorded a prompt (never for the degraded path).
+    evidence_trace = None
+    if context.get("include_evidence_trace"):
+        collector = _evidence_trace_var.get()
+        trace = collector.finalize() if collector is not None else None
+        if trace is not None:
+            evidence_trace = trace.to_dict()
+
     return QueryResponse(
         answer=answer_text,
         citations=citations,
@@ -590,6 +649,7 @@ def _build_query_response(
         latency_ms=elapsed_ms,
         timings=context["timings"] if _return_timings_enabled() else None,
         model_available=model_available,
+        evidence_trace=evidence_trace,
         freshness=context["freshness"],
         retrieval_strategy=retrieval.get("retrieval_strategy"),
         tools_used=_get_tools_used(),
@@ -757,6 +817,17 @@ async def query_stream(request: QueryRequest):
                 context["grounding_level"],
             )
             citations = _extract_citations(answer_text)
+            # Streaming is always tools_enabled=False (see the guard above),
+            # so the exact system prompt is reproducible here for the
+            # evidence trace (2.2.1.2) without a second model call.
+            _record_trace_prompt(
+                _system_prompt_for_request(
+                    intent=context["intent"],
+                    grounding_level=context["grounding_level"],
+                    tools_enabled=False,
+                ),
+                context["augmented_prompt"],
+            )
             if context["intent"].get("question_type") == "projection":
                 from .guardrails import apply_projection_guardrail
 
@@ -1130,9 +1201,10 @@ async def _call_model(
 
     if not tools_on:
         answer, citations = await _post_and_parse(base_payload)
+        _record_trace_prompt(messages[0]["content"], prompt)
         return _apply_answer_policy(answer, grounding_level), citations
 
-    from .tools import ToolContext, dispatch_tool, openai_schema
+    from .tools import ToolContext, dispatch_tool_traced, openai_schema
 
     # The tool loop keeps its own messages list so every fallback to
     # _post_and_parse(base_payload) still sends the exact pre-tools prompt.
@@ -1166,6 +1238,8 @@ async def _call_model(
                 logger.warning("Model tools unsupported; falling back to plain calls")
                 _tools_supported = False
                 answer, citations = await _post_and_parse(base_payload)
+                _discard_trace_tool_results()
+                _record_trace_prompt(base_payload["messages"][0]["content"], prompt)
                 return _apply_answer_policy(answer, grounding_level), citations
             logger.error("Model call failed: %s", e)
             return f"Error calling model: {e}", []
@@ -1184,9 +1258,12 @@ async def _call_model(
             logger.warning("Model returned empty content with tools; disabling tools")
             _tools_supported = False
             answer, citations = await _post_and_parse(base_payload)
+            _discard_trace_tool_results()
+            _record_trace_prompt(base_payload["messages"][0]["content"], prompt)
             return _apply_answer_policy(answer, grounding_level), citations
         if not tool_calls:
             answer = _apply_answer_policy(content, grounding_level)
+            _record_trace_prompt(messages[0]["content"], prompt)
             return answer, _extract_citations(answer)
 
         messages.append(msg)
@@ -1194,7 +1271,12 @@ async def _call_model(
             tool_name = (call.get("function") or {}).get("name")
             if tool_name:
                 _record_tool_used(tool_name)
-            result = await asyncio.to_thread(dispatch_tool, call, store, ctx)
+            result, dispatched_name, dispatched_args = await asyncio.to_thread(
+                dispatch_tool_traced, call, store, ctx
+            )
+            # Recorded immediately after dispatch returns and before the
+            # matching role=tool message is appended (2.2.1.2 Step 2).
+            _record_trace_tool_result(dispatched_name or tool_name or "", dispatched_args, result)
             messages.append(
                 {
                     "role": "tool",
@@ -1204,6 +1286,7 @@ async def _call_model(
             )
 
     answer, citations = await _post_and_parse({**base_payload, "messages": messages})
+    _record_trace_prompt(messages[0]["content"], prompt)
     return _apply_answer_policy(answer, grounding_level), citations
 
 

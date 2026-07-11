@@ -3,7 +3,8 @@ eval/run_eval.py — Stage 1 of the evaluation harness: the runner.
 
 Drives every golden case through the query pipeline and captures, per case:
   answer, detected_ticker, detected_intent, facts_used, documents_used,
-  retrieved_sources, context (for the LLM-judge), latency_ms, model_available.
+  retrieved_sources, evidence_trace, trace_complete, answer_policy,
+  grounding, dataset_digest, latency_ms, model_available.
 
 Backend preference (per the 2.1.1.1 spec):
   1. Live middleware  — POST /query on :8000 (measures the real system).
@@ -12,15 +13,19 @@ Backend preference (per the 2.1.1.1 spec):
   3. Error row         — if both fail, emit a well-formed row with model_available=False
                          so scoring never crashes on a half-dead environment.
 
-The live /query endpoint returns counts + citations but not the retrieved
-context, so for the LLM-judge (2.1.1.2) the runner captures a compact
-``context`` string via one in-process retrieval — the same Store/Retriever/
-IntentParser the middleware uses, so it is faithful to what the middleware
-retrieved. The run artifact is thus self-contained: score.py / the judge need
-no store at scoring time.
+2.2.1.2 replaced the old judge-context mechanism — a second, truncated
+in-process retrieval (``_capture_context_and_sources``) run after the live
+``/query`` call returned — with the exact evidence trace the endpoint itself
+captured. Live requests set ``include_evidence_trace=true`` and the runner
+persists the returned trace verbatim; nothing is re-retrieved, and nothing is
+truncated. The direct/offline backend builds an equivalent trace in-process
+using the same evidence helpers (``src/middleware/evidence.py``) and prompt
+builder (``src/middleware/prompt_policy.py``) as the middleware, so both
+backends produce a trace of the same shape.
 
-The runner is import-safe and testable: ``run_case`` accepts an injectable
-``query_fn`` and flags to force a backend, so tests never need the network.
+A row whose model produced an answer but whose trace is missing or
+incomplete is marked with ``error`` — it is an evaluation error, not
+silently scorable context (see ``eval/metrics.py::trace_errors``).
 
 Usage:
     python eval/run_eval.py                 # live :8000, fall back to direct
@@ -31,6 +36,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -82,7 +88,8 @@ _SOURCE_ALIASES = {
 RESULT_KEYS = (
     "id", "question", "answer", "detected_ticker", "detected_intent",
     "facts_used", "documents_used", "retrieved_sources", "context",
-    "latency_ms", "model_available", "error", "case",
+    "evidence_trace", "trace_complete", "answer_policy", "grounding",
+    "dataset_digest", "latency_ms", "model_available", "error", "case",
 )
 
 # Cached in-process Store/config (built once, reused across cases).
@@ -107,10 +114,25 @@ def _extract_citation_types(answer: str) -> list[str]:
             for m in re.finditer(r"\[Source:\s*([^\]]+)\]", answer, re.IGNORECASE)]
 
 
+# ── Dataset digest (2.2.1.2 Step 3) ────────────────────────────────────
+
+def dataset_digest(cases: list[dict]) -> str:
+    """SHA-256 over the committed golden-dataset cases used for a run.
+
+    Standard library only. Deterministic — cases are serialized with sorted
+    keys so field order in the source file never changes the digest.
+    """
+    blob = json.dumps(cases, sort_keys=True, ensure_ascii=True, default=str)
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()
+
+
 # ── Row construction ───────────────────────────────────────────────────
 
 def _row(case: dict, *, answer: str, detected_ticker, detected_intent,
-         facts_used, documents_used, retrieved_sources, context: str,
+         facts_used, documents_used, retrieved_sources, context: str = "",
+         evidence_trace: Optional[dict] = None, trace_complete: bool = True,
+         answer_policy: Optional[str] = None, grounding: Optional[str] = None,
+         dataset_digest: Optional[str] = None,
          latency_ms, model_available: bool, error: Optional[str] = None) -> dict:
     """Assemble a well-formed result row (always has every RESULT_KEY)."""
     return {
@@ -123,6 +145,11 @@ def _row(case: dict, *, answer: str, detected_ticker, detected_intent,
         "documents_used": int(documents_used or 0),
         "retrieved_sources": sorted({s for s in (retrieved_sources or []) if s}),
         "context": context or "",
+        "evidence_trace": evidence_trace,
+        "trace_complete": bool(trace_complete),
+        "answer_policy": answer_policy,
+        "grounding": grounding,
+        "dataset_digest": dataset_digest,
         "latency_ms": round(float(latency_ms or 0), 1),
         "model_available": bool(model_available),
         "error": error,
@@ -130,21 +157,109 @@ def _row(case: dict, *, answer: str, detected_ticker, detected_intent,
     }
 
 
+def _trace_is_complete(trace: Optional[dict]) -> bool:
+    """Structural completeness check mirroring EvidenceTrace.is_complete()."""
+    if not isinstance(trace, dict):
+        return False
+    return bool(trace.get("system_prompt")) and bool(trace.get("user_prompt"))
+
+
+def _format_trace_context(trace: Optional[dict]) -> str:
+    """Render an evidence trace's facts/documents/tool_results as a compact
+    display string. Untruncated (2.2.1.2) — kept on the row for readability/
+    tooling; the LLM-judge reads the trace fields directly, not this string.
+    """
+    if not isinstance(trace, dict):
+        return ""
+    parts: list[str] = []
+    facts = trace.get("facts") or []
+    if facts:
+        parts.append("Facts:")
+        for f in facts:
+            parts.append(f"- {f.get('metric')}: {f.get('value')} "
+                         f"({f.get('period') or 'N/A'}, ticker={f.get('ticker')})")
+    documents = trace.get("documents") or []
+    if documents:
+        from src.middleware.evidence import document_body
+
+        parts.append("\nDocuments:")
+        for d in documents:
+            meta = d.get("metadata", {}) or {}
+            parts.append(f"- [{meta.get('source', d.get('source', '?'))}/"
+                         f"{meta.get('ticker', '?')}] {document_body(d)}")
+    tool_results = trace.get("tool_results") or []
+    if tool_results:
+        parts.append("\nTool results:")
+        for t in tool_results:
+            parts.append(f"- {t.get('name')}({t.get('arguments')}) -> "
+                         f"{json.dumps(t.get('result'))}")
+    if not parts:
+        return "(no evidence)"
+    return "\n".join(parts)
+
+
+def _sources_from_evidence(facts: list[dict], documents: list[dict],
+                           tool_results: Optional[list[dict]] = None) -> list[str]:
+    """Canonical sources surfaced by retrieval-shaped facts/documents, plus
+    any source hints inside tool results. Shared by the live path (reading
+    the endpoint's evidence trace) and the direct path (reading its own
+    retrieval)."""
+    sources: list[str] = []
+    for f in facts or []:
+        st = f.get("source_type") or ("fred" if f.get("ticker") == "MACRO" else "sqlite")
+        n = normalize_source(st)
+        if n:
+            sources.append(n)
+    for d in documents or []:
+        meta = d.get("metadata", {}) or {}
+        n = normalize_source(meta.get("source") or d.get("source"))
+        if n:
+            sources.append(n)
+    for t in tool_results or []:
+        result = t.get("result") if isinstance(t, dict) else None
+        if not isinstance(result, dict):
+            continue
+        n = normalize_source(result.get("source") or result.get("source_type"))
+        if n:
+            sources.append(n)
+        for row in result.get("results") or []:
+            if isinstance(row, dict):
+                n2 = normalize_source(row.get("source_type"))
+                if n2:
+                    sources.append(n2)
+    return sources
+
+
+def _sources_from_trace(trace: Optional[dict]) -> list[str]:
+    if not isinstance(trace, dict):
+        return []
+    return _sources_from_evidence(
+        trace.get("facts") or [], trace.get("documents") or [], trace.get("tool_results") or [])
+
+
 def _row_from_endpoint(case: dict, data: dict, latency_s: float,
-                       context: str = "", extra_sources: Optional[list] = None) -> dict:
+                       *, dataset_digest: Optional[str] = None) -> dict:
     """Shape a live /query (or injected) JSON response into a result row.
 
-    ``extra_sources`` (from the in-process context-retrieval pass) are merged
-    with citation sources so ``retrieved_sources`` reflects what was actually
-    retrieved, not only what the model chose to cite.
+    ``retrieved_sources`` is derived entirely from the response's citations
+    and its evidence trace (2.2.1.2) — no second retrieval is run.
     """
+    trace = data.get("evidence_trace")
+    model_available = bool(data.get("model_available", False))
+    trace_complete = _trace_is_complete(trace) if model_available else True
+
     sources = [normalize_source(c.get("source_type"))
                for c in (data.get("citations") or [])
                if isinstance(c, dict)]
-    for s in extra_sources or []:
-        if s:
-            sources.append(s)
+    sources.extend(_sources_from_trace(trace))
     sources = sorted({s for s in sources if s})
+
+    error = None
+    if model_available and not trace_complete:
+        error = "incomplete evidence trace for model-produced answer"
+
+    answer_policy = (trace or {}).get("answer_policy") if isinstance(trace, dict) else None
+
     return _row(
         case,
         answer=data.get("answer", ""),
@@ -153,14 +268,21 @@ def _row_from_endpoint(case: dict, data: dict, latency_s: float,
         facts_used=data.get("facts_used", 0),
         documents_used=data.get("documents_used", 0),
         retrieved_sources=sources,
-        context=context or data.get("context", ""),
+        context=_format_trace_context(trace),
+        evidence_trace=trace,
+        trace_complete=trace_complete,
+        answer_policy=answer_policy,
+        grounding=data.get("grounding"),
+        dataset_digest=dataset_digest,
         latency_ms=latency_s * 1000,
-        model_available=data.get("model_available", False),
+        model_available=model_available,
+        error=error,
     )
 
 
 def _error_row(case: dict, err: BaseException, latency_s: float,
-               *, live_err: Optional[BaseException] = None) -> dict:
+               *, live_err: Optional[BaseException] = None,
+               dataset_digest: Optional[str] = None) -> dict:
     """A well-formed row for when every backend failed."""
     parts = []
     if live_err:
@@ -177,13 +299,18 @@ def _error_row(case: dict, err: BaseException, latency_s: float,
         documents_used=0,
         retrieved_sources=[],
         context="",
+        evidence_trace=None,
+        trace_complete=True,  # no model answer was produced — nothing to omit
+        answer_policy=None,
+        grounding=None,
+        dataset_digest=dataset_digest,
         latency_ms=latency_s * 1000,
         model_available=False,
         error=msg,
     )
 
 
-# ── In-process retrieval (shared by the direct path + live context capture) ─
+# ── In-process retrieval (used by the direct/offline backend) ─────────
 
 def _get_config_and_store():
     """Lazily build (and cache) a MiddlewareConfig + Store for in-process
@@ -203,8 +330,9 @@ def _get_config_and_store():
 def retrieve_for_question(question: str):
     """Run intent parsing + hybrid retrieval in-process.
 
-    Returns (intent, retrieval). Shared by the direct pipeline path and by the
-    live path's context capture so both use identical retrieval logic.
+    Returns (intent, retrieval, config). This is the direct/offline backend's
+    only retrieval pass — it both builds the prompt and supplies the
+    evidence trace, so results are never re-retrieved for judging.
     """
     from src.middleware.intent_parser import IntentParser
     from src.middleware.retriever import Retriever
@@ -219,84 +347,30 @@ def retrieve_for_question(question: str):
     return intent, retrieval, config
 
 
-def _format_context(retrieval: dict, intent: dict, max_facts: int = 8,
-                    max_docs: int = 3, doc_chars: int = 600) -> str:
-    """Render retrieved facts + document excerpts as a compact context string.
-
-    This is what the LLM-judge reads to score faithfulness. Capped so the run
-    artifact stays small.
-    """
-    parts: list[str] = []
-    facts = retrieval.get("facts", [])
-    if facts:
-        parts.append("Facts:")
-        for f in facts[:max_facts]:
-            parts.append(f"- {f.get('metric')}: {f.get('value')} "
-                         f"({f.get('period') or 'N/A'}, ticker={f.get('ticker')})")
-    docs = retrieval.get("documents", [])
-    if docs:
-        from src.middleware.evidence import document_body
-
-        parts.append("\nDocuments:")
-        for d in docs[:max_docs]:
-            meta = d.get("metadata", {}) or {}
-            text = document_body(d)
-            text = text[:doc_chars] + ("…" if len(text) > doc_chars else "")
-            parts.append(f"- [{meta.get('source', d.get('source', '?'))}/"
-                         f"{meta.get('ticker', '?')}] {text}")
-    if not parts:
-        return "(no retrieved context)"
-    return "\n".join(parts)
-
-
-def _sources_from_retrieval(retrieval: dict) -> list[str]:
-    """Canonical sources actually surfaced by a retrieval dict."""
-    sources: list[str] = []
-    for f in retrieval.get("facts", []):
-        st = f.get("source_type") or ("fred" if f.get("ticker") == "MACRO" else "sqlite")
-        n = normalize_source(st)
-        if n:
-            sources.append(n)
-    for d in retrieval.get("documents", []):
-        meta = d.get("metadata", {}) or {}
-        n = normalize_source(meta.get("source") or d.get("source"))
-        if n:
-            sources.append(n)
-    return sources
-
-
 # ── Backend 1: live middleware ─────────────────────────────────────────
 
 def call_live_endpoint(question: str, *, query_url: str = DEFAULT_QUERY_URL,
                         timeout: float = DEFAULT_TIMEOUT,
                         client=None) -> dict:
-    """POST /query to the live middleware. Raises on any failure."""
+    """POST /query to the live middleware. Raises on any failure.
+
+    Always requests the evidence trace (2.2.1.2) so the runner never needs a
+    second, truncated in-process retrieval to judge the answer.
+    """
     import httpx
 
     own = client is None
     c = client or httpx.Client(timeout=httpx.Timeout(timeout, connect=5.0))
     try:
-        resp = c.post(query_url, json={"question": question, "refresh": False},
+        resp = c.post(query_url,
+                      json={"question": question, "refresh": False,
+                            "include_evidence_trace": True},
                       timeout=timeout)
         resp.raise_for_status()
         return resp.json()
     finally:
         if own:
             c.close()
-
-
-def _capture_context_and_sources(question: str) -> tuple[str, list[str]]:
-    """One in-process retrieval for a live-path row, returning (context, sources).
-
-    Faithful to the middleware: the same Store/Retriever/IntentParser, so the
-    retrieved sources here are what the middleware retrieved (the model may or
-    may not cite them). Best-effort: returns ("", []) on any failure.
-    """
-    try:
-        intent, retrieval, _cfg = retrieve_for_question(question)
-        return _format_context(retrieval, intent), _sources_from_retrieval(retrieval)
-    except Exception:  # noqa: BLE001 - context is best-effort; judge still runs
-        return "", []
 
 
 # ── Backend 2: direct in-process pipeline ─────────────────────────────
@@ -311,25 +385,34 @@ def _model_reachable(llama_endpoint: str, timeout: float = 5.0) -> bool:
         return False
 
 
-def _call_model_sync(config, prompt: str, *, intent: Optional[dict] = None,
-                     grounding_level: str = "grounded") -> str:
-    """Call the model synchronously via the OpenAI-compatible chat endpoint.
-
-    Builds its system message through prompt_policy.build_system_prompt —
-    the same function the live middleware's plain/streaming/tool-loop calls
-    use — so the direct-eval path can never silently drift from live policy
-    (2.2.1.1).
-    """
-    import httpx
+def _direct_system_prompt(config, intent: Optional[dict], grounding_level: str) -> str:
+    """Build the system prompt via the shared prompt_policy builder — the
+    same function the live middleware's plain/streaming/tool-loop calls use
+    (2.2.1.1) — so the direct-eval path's trace can never silently drift
+    from live policy."""
     from src.middleware import prompt_policy
 
-    system_prompt = prompt_policy.build_system_prompt(
+    return prompt_policy.build_system_prompt(
         answer_policy=str(getattr(config, "answer_policy", "graded") or "graded"),
         allow_general_fallback=bool(getattr(config, "allow_general_fallback", True)),
         intent=intent,
         grounding_level=grounding_level,
         tools_enabled=False,
     )
+
+
+def _call_model_sync(config, prompt: str, *, intent: Optional[dict] = None,
+                     grounding_level: str = "grounded") -> str:
+    """Call the model synchronously via the OpenAI-compatible chat endpoint.
+
+    Builds its system message through ``_direct_system_prompt`` — the same
+    prompt_policy.build_system_prompt call the live middleware's plain/
+    streaming/tool-loop calls use — so the direct-eval path can never
+    silently drift from live policy (2.2.1.1).
+    """
+    import httpx
+
+    system_prompt = _direct_system_prompt(config, intent, grounding_level)
     payload = {
         "model": config.model_name,
         "messages": [
@@ -370,12 +453,32 @@ def _degraded_answer(retrieval: dict, intent: dict) -> str:
     return "\n".join(parts)
 
 
+def _direct_grounding(answer: str, grounding_level: str, allow_general_fallback: bool) -> str:
+    """Mirror app.py's ``_response_grounding`` for the direct/offline path.
+
+    ``_is_declined_answer`` is a pure function (no module globals), so this
+    is safe to import lazily without touching the live app's request state.
+    """
+    from src.middleware.app import _is_declined_answer
+
+    if _is_declined_answer(answer):
+        return "refused"
+    if grounding_level in ("grounded", "partial"):
+        return grounding_level
+    if grounding_level == "none" and allow_general_fallback:
+        return "general"
+    return "refused"
+
+
 def call_pipeline_direct(question: str) -> dict:
     """Run the query pipeline in-process. Raises on any failure.
 
-    Uses one retrieval pass for both the model prompt and the captured context.
+    Builds an evidence trace (2.2.1.2) using the same evidence helpers and
+    prompt-policy builder the live middleware uses, from the single
+    retrieval pass that also builds the model prompt.
     """
-    from src.middleware.evidence import evidence_counts
+    from src.middleware.evidence import evidence_counts, usable_documents, usable_facts
+    from src.middleware.evidence_trace import EvidenceTrace
     from src.middleware.prompt_augmenter import PromptAugmenter
 
     intent, retrieval, config = retrieve_for_question(question)
@@ -389,19 +492,38 @@ def call_pipeline_direct(question: str) -> dict:
         question=question, intent=intent, retrieval=retrieval,
         grounding_level=grounding_level,
     )
+    answer_policy = str(getattr(config, "answer_policy", "graded") or "graded")
+    allow_general_fallback = bool(getattr(config, "allow_general_fallback", True))
 
     model_available = _model_reachable(config.llama_endpoint)
+    trace: Optional[EvidenceTrace] = None
     if model_available:
         try:
             answer = _call_model_sync(config, prompt, intent=intent,
                                       grounding_level=grounding_level)
+            trace = EvidenceTrace(
+                answer_policy=answer_policy,
+                grounding_level=grounding_level,
+                raw_question=question,
+                retrieval_query=question,
+                system_prompt=_direct_system_prompt(config, intent, grounding_level),
+                user_prompt=prompt,
+                facts=usable_facts(retrieval),
+                documents=usable_documents(retrieval),
+                tool_results=[],
+            )
         except Exception:  # noqa: BLE001 - degrade on model error
             answer = _degraded_answer(retrieval, intent)
             model_available = False
     else:
         answer = _degraded_answer(retrieval, intent)
 
-    sources = _sources_from_retrieval(retrieval)
+    grounding = (
+        _direct_grounding(answer, grounding_level, allow_general_fallback)
+        if model_available else None
+    )
+
+    sources = _sources_from_evidence(usable_facts(retrieval), usable_documents(retrieval))
     for ct in _extract_citation_types(answer):
         n = normalize_source(ct)
         if n:
@@ -414,12 +536,20 @@ def call_pipeline_direct(question: str) -> dict:
         "facts_used": n_facts,
         "documents_used": n_docs,
         "retrieved_sources": sources,
-        "context": _format_context(retrieval, intent),
+        "evidence_trace": trace.to_dict() if trace is not None else None,
+        "answer_policy": answer_policy if model_available else None,
+        "grounding": grounding,
         "model_available": model_available,
     }
 
 
-def _row_from_direct(case: dict, data: dict, latency_s: float) -> dict:
+def _row_from_direct(case: dict, data: dict, latency_s: float,
+                     *, dataset_digest: Optional[str] = None) -> dict:
+    trace = data.get("evidence_trace")
+    model_available = bool(data.get("model_available", False))
+    trace_complete = _trace_is_complete(trace) if model_available else True
+    error = "incomplete evidence trace for model-produced answer" \
+        if model_available and not trace_complete else None
     return _row(
         case,
         answer=data.get("answer", ""),
@@ -428,9 +558,15 @@ def _row_from_direct(case: dict, data: dict, latency_s: float) -> dict:
         facts_used=data.get("facts_used", 0),
         documents_used=data.get("documents_used", 0),
         retrieved_sources=data.get("retrieved_sources", []),
-        context=data.get("context", ""),
+        context=_format_trace_context(trace),
+        evidence_trace=trace,
+        trace_complete=trace_complete,
+        answer_policy=data.get("answer_policy"),
+        grounding=data.get("grounding"),
+        dataset_digest=dataset_digest,
         latency_ms=latency_s * 1000,
-        model_available=data.get("model_available", False),
+        model_available=model_available,
+        error=error,
     )
 
 
@@ -440,7 +576,7 @@ def run_case(case: dict, *, query_fn: Optional[Callable] = None,
              query_url: str = DEFAULT_QUERY_URL,
              timeout: float = DEFAULT_TIMEOUT,
              use_live: bool = True, allow_direct: bool = True,
-             capture_context: bool = True) -> dict:
+             dataset_digest: Optional[str] = None) -> dict:
     """Run one golden case through the pipeline and return a result row.
 
     Args:
@@ -451,8 +587,8 @@ def run_case(case: dict, *, query_fn: Optional[Callable] = None,
         timeout:        Per-request timeout (seconds).
         use_live:       Try the live middleware first.
         allow_direct:   Fall back to the in-process pipeline if the live path fails.
-        capture_context: For the live path, capture retrieved context via one
-                         in-process retrieval (for the LLM-judge).
+        dataset_digest: SHA-256 of the golden dataset used for this run (denormalized
+                        onto every row so score.py/gate.py can read it without the file).
 
     Returns a dict with every key in ``RESULT_KEYS`` (never raises).
     """
@@ -462,19 +598,16 @@ def run_case(case: dict, *, query_fn: Optional[Callable] = None,
     if query_fn is not None:
         try:
             data = query_fn(case)
-            ctx, extra = ("", [])
-            if capture_context and not data.get("context"):
-                ctx, extra = _capture_context_and_sources(case["question"])
-            return _row_from_endpoint(case, data, time.time() - t0,
-                                       context=ctx, extra_sources=extra)
+            return _row_from_endpoint(case, data, time.time() - t0, dataset_digest=dataset_digest)
         except Exception as e:  # noqa: BLE001
             if not allow_direct:
-                return _error_row(case, e, time.time() - t0)
+                return _error_row(case, e, time.time() - t0, dataset_digest=dataset_digest)
             try:
                 return _row_from_direct(case, call_pipeline_direct(case["question"]),
-                                         time.time() - t0)
+                                         time.time() - t0, dataset_digest=dataset_digest)
             except Exception as e2:  # noqa: BLE001
-                return _error_row(case, e2, time.time() - t0, live_err=e)
+                return _error_row(case, e2, time.time() - t0, live_err=e,
+                                  dataset_digest=dataset_digest)
 
     # 2. Live middleware.
     live_err: Optional[BaseException] = None
@@ -482,11 +615,7 @@ def run_case(case: dict, *, query_fn: Optional[Callable] = None,
         try:
             data = call_live_endpoint(case["question"], query_url=query_url,
                                        timeout=timeout)
-            ctx, extra = ("", [])
-            if capture_context and not data.get("context"):
-                ctx, extra = _capture_context_and_sources(case["question"])
-            return _row_from_endpoint(case, data, time.time() - t0,
-                                       context=ctx, extra_sources=extra)
+            return _row_from_endpoint(case, data, time.time() - t0, dataset_digest=dataset_digest)
         except Exception as e:  # noqa: BLE001
             live_err = e
 
@@ -494,13 +623,14 @@ def run_case(case: dict, *, query_fn: Optional[Callable] = None,
     if allow_direct:
         try:
             return _row_from_direct(case, call_pipeline_direct(case["question"]),
-                                     time.time() - t0)
+                                     time.time() - t0, dataset_digest=dataset_digest)
         except Exception as e:  # noqa: BLE001
-            return _error_row(case, e, time.time() - t0, live_err=live_err)
+            return _error_row(case, e, time.time() - t0, live_err=live_err,
+                              dataset_digest=dataset_digest)
 
     # 4. Nothing left.
     return _error_row(case, live_err or RuntimeError("no backend available"),
-                      time.time() - t0)
+                      time.time() - t0, dataset_digest=dataset_digest)
 
 
 # ── Dataset + run artifact IO ───────────────────────────────────────────
@@ -559,17 +689,15 @@ def main(argv: Optional[list[str]] = None) -> int:
                    help="Live middleware /query URL.")
     p.add_argument("--offline", action="store_true",
                    help="Skip the live endpoint; use the direct pipeline only.")
-    p.add_argument("--no-context", action="store_true",
-                   help="Skip captured context (faster; the LLM-judge will be skipped).")
     p.add_argument("--limit", type=int, default=None,
                    help="Run only the first N cases.")
     p.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT,
                    help="Per-case timeout (seconds).")
     args = p.parse_args(argv)
 
-    cases = load_cases(args.golden)
-    if args.limit:
-        cases = cases[: args.limit]
+    all_cases = load_cases(args.golden)
+    digest = dataset_digest(all_cases)
+    cases = all_cases[: args.limit] if args.limit else all_cases
 
     backend = "direct" if args.offline else "live+direct"
     print(f"Running {len(cases)} cases via {backend} (url={args.query_url}) ...")
@@ -577,7 +705,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     rows = [
         run_case(c, query_url=args.query_url, timeout=args.timeout,
                  use_live=not args.offline, allow_direct=True,
-                 capture_context=not args.no_context)
+                 dataset_digest=digest)
         for c in cases
     ]
 

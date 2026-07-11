@@ -1,17 +1,58 @@
-# Evaluation Harness (Phase 2.1.1)
+# Evaluation Harness (Phase 2.1.1, 2.2.1.2)
 
 A repeatable scoreboard for the Gemma-E4B-Finance-RAG query pipeline. It turns
 "this feels better" into numbers you can regress against:
 
-> faithfulness went 0.71 → 0.86, retrieval hit-rate 0.6 → 0.9
+> grounded_faithfulness went 0.71 → 0.86, retrieval hit-rate 0.6 → 0.9
 
 The harness has three stages, run in order:
 
 ```
-python eval/run_eval.py    # drive every golden case through the pipeline → eval/runs/<ts>.jsonl
-python eval/score.py        # score the latest run → eval/runs/<ts>.summary.json + console table
-python eval/gate.py         # compare latest summary vs eval/baseline.json → exit 0 / 1
+python eval/run_eval.py                # drive every golden case through the pipeline → eval/runs/<ts>.jsonl
+python eval/score.py --policy graded    # score the latest run → eval/runs/<ts>.summary.json + console table
+python eval/gate.py --policy graded     # compare latest summary vs eval/baselines/graded.json → exit 0 / 1
 ```
+
+## Exact evidence trace (2.2.1.2)
+
+Every run row carries an `evidence_trace`: the exact system/user prompts sent
+to the model, the exact usable facts/documents (untruncated, full
+provenance), and every tool result — captured by the middleware itself
+(`src/middleware/evidence_trace.py`), not reconstructed afterwards. The live
+runner requests it via `include_evidence_trace: true` on `POST /query` and
+persists it verbatim; it never re-runs retrieval to build judge context, and
+never truncates a document body for the judge (`PromptAugmenter` truncates
+the *prompt* at 2000 chars for the model's context budget — the trace does
+not). The direct/offline backend builds an equivalent trace in-process using
+the same evidence helpers (`src/middleware/evidence.py`) and prompt builder
+(`src/middleware/prompt_policy.py`) as the middleware.
+
+A row whose model produced an answer (`model_available: true`) but whose
+trace is missing or structurally incomplete (no captured system/user prompt)
+is an **evaluation error**, not silently scorable context — it is excluded
+from every judge metric's eligible pool and reported under
+`summary.trace_errors` / `summary.n_trace_errors`.
+
+## Metrics
+
+- `intent_accuracy`, `ticker_accuracy`, `retrieval_hit_rate`, `keyword_coverage`,
+  `refusal_rate` — cheap, deterministic (see `eval/metrics.py`).
+- `grounded_faithfulness` — LLM-as-judge groundedness (0-1) of **only**
+  `grounded`/`partial` answers, scored against the exact evidence trace
+  (facts, documents, and tool results). `general`/`refused` answers and rows
+  with a missing/incomplete trace never enter its denominator, so a strict
+  refusal can no longer inflate it.
+- `policy_compliance` — LLM-as-judge policy compliance (0-1) across **all
+  four** grounding modes (`grounded`/`partial`/`general`/`refused`), checked
+  against the rules for that mode (evidence-only claims, general-knowledge
+  labeling + caveat, justified refusal).
+- `answer_relevance` — LLM-as-judge relevance (0-1); needs only the question
+  and answer, so every non-empty answer is eligible regardless of mode.
+
+Every judge metric reports `n_eligible` (rows that passed mode/trace
+filtering, regardless of judge availability), `n_scored`, `n_skipped`, and
+`per_case` reasons — so a dropping eligible count is visible, not silently
+absorbed into a smaller average.
 
 ## Layout
 
@@ -20,12 +61,14 @@ eval/
   golden/
     finance_qa.jsonl    # committed — the curated golden dataset
   runs/                 # gitignored — per-run raw + summary artifacts
+  baselines/
+    strict.json          # committed — the bar the gate compares against for answer_policy=strict
+    graded.json           # committed — the bar the gate compares against for answer_policy=graded
   run_eval.py           # Stage 1 — runner
   metrics.py            # Stage 2 — scoring functions (incl. LLM-as-judge)
   judge_prompts.py      # LLM-judge prompt templates
   score.py              # Stage 2 — scoring CLI + report
   gate.py               # Stage 3 — regression gate
-  baseline.json         # committed — the bar the gate compares against
 ```
 
 ## The golden dataset
@@ -81,68 +124,54 @@ Re-validate after editing:
 .\scripts\start_stack.ps1
 
 .venv/Scripts/python.exe eval/run_eval.py
-.venv/Scripts/python.exe eval/score.py
-.venv/Scripts/python.exe eval/gate.py
+.venv/Scripts/python.exe eval/score.py --policy graded
+.venv/Scripts/python.exe eval/gate.py --policy graded
 ```
 
+Run under `answer_policy: strict` (e.g. `ANSWER_POLICY=strict` before starting
+the stack) and gate with `--policy strict` to check the strict baseline instead.
+
 `gate.py` exits non-zero if any metric regresses beyond tolerance vs.
-`eval/baseline.json` — wire it in before/after each Phase 2.1 feature and (optionally) in CI.
+`eval/baselines/<policy>.json`, or if any of the 2.2.1.2 pre-metric checks
+fail first: policy/schema/dataset-digest mismatch, an answerable model row
+missing a complete evidence trace, or a judge metric's eligible denominator
+dropping versus the baseline. Wire it in before/after each Phase 2 feature
+and (optionally) in CI.
 
 ### Runner backends
 
-`run_eval.py` prefers the **live middleware** (`POST :8000/query`) so it measures
-the real system. If `:8000` is down it falls back to importing the pipeline
-directly (`IntentParser → Retriever → PromptAugmenter → model`). If both are
-unavailable it still emits a well-formed row with `model_available: false`.
+`run_eval.py` prefers the **live middleware** (`POST :8000/query`, with
+`include_evidence_trace: true`) so it measures the real system using the
+exact trace the endpoint captured — no second retrieval, no truncation. If
+`:8000` is down it falls back to importing the pipeline directly
+(`IntentParser → Retriever → PromptAugmenter → model`), building an
+equivalent trace from the same in-process retrieval. If both are unavailable
+it still emits a well-formed row with `model_available: false`.
 
 Override the endpoint with `EVAL_QUERY_URL`; force the offline path with
 `--offline`.
 
 ### Refreshing the baseline
 
-The baseline is a committed snapshot, regenerated **deliberately** — never
-blindly. After an intentional improvement, promote the latest summary:
+Each baseline (`eval/baselines/strict.json` / `graded.json`) is a committed
+snapshot, regenerated **deliberately** — never blindly. After an intentional
+improvement, promote the latest summary for the policy you ran under:
 
 ```powershell
-.venv/Scripts/python.exe eval/score.py --set-baseline
-git add eval/baseline.json
+.venv/Scripts/python.exe eval/score.py --set-baseline --policy graded
+git add eval/baselines/graded.json
 ```
 
-## Current baseline (2026-06-21, 42 cases, live middleware + model)
+## Baseline status
 
-Generated by running the full set through the live middleware on `:8000` with
-the TraceAlchemy model on `:8087`:
-
-```
-intent_accuracy        0.93
-ticker_accuracy        0.83
-retrieval_hit_rate     0.95
-keyword_coverage       0.62
-refusal_rate           0.52   (lower is better)
-faithfulness (judge)   0.89
-answer_relevance       0.77
-```
-
-The scoreboard already surfaces real gaps to target in later Phase 2.1 work:
-
-- **Parser false-positives on multi-ticker / macro questions** drag
-  `ticker_accuracy` to 0.83 — comparisons get the first ticker (e.g. `NVDA`),
-  macro questions get `GDP`/`CPI`, and `P/E` text yields `P` or `E`.
-- **Analytical questions misclassified** — `intent_accuracy` is 0 for the
-  `analytical` category: "lowest forward P/E" / "highest earnings growth" /
-  "average P/E" parse as `general`/`fact_lookup`, not `comparison`. The 2.1.4
-  tool suite is the intended fix.
-- **Over-strict model** — `refusal_rate` is 0.52 overall and **1.0** for
-  `comparison`, `trend`, `explanation`, `sentiment`, `news`, `risk`, and
-  `analytical`: the model answers "I don't have enough data in my knowledge
-  base" even when the prompt carried 10 retrieved facts. `fact_lookup`
-  (refuse 0.22) and `macro` (refuse 0.20) mostly answer. This is the 2.1.7
-  "too strict" problem, now quantified.
-- **Keyword coverage 0.62** — refusals carry none of the `must_mention`
-  terms; answering more questions (lower `refusal_rate`) will lift this too.
-
-The gate enforces ±0.05 on every metric against this baseline, so a change
-that drops `faithfulness` or raises `refusal_rate` beyond that fails loudly.
+`eval/baselines/strict.json` and `eval/baselines/graded.json` currently ship
+as **placeholders**: every metric is `null` pending a live run scored against
+the exact-evidence-trace metrics (2.2.1.2). The pre-2.2.1.2 `eval/baseline.json`
+scored `faithfulness` against a truncated, re-retrieved context string and
+excluded tool results, so its numbers are not comparable to
+`grounded_faithfulness`/`policy_compliance` and were not migrated. Populate a
+real baseline with a live middleware + model run, review the numbers, then
+commit the result — see "Refreshing the baseline" above.
 
 ## Testing
 

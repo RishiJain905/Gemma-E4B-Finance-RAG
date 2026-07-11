@@ -1,0 +1,45 @@
+{
+  "schema_version": 1,
+  "score_schema_version": 1,
+  "trace_schema_version": 1,
+  "answer_policy": "strict",
+  "dataset_digest": "3aa440d6e3007304576d0f62103c07abc5e713814e96f76542a381d2352c1e5b",
+  "generated_at": null,
+  "source_run": null,
+  "is_baseline": true,
+  "note": "Placeholder baseline (2.2.1.2). No strict-policy run has ever been scored against the exact-evidence-trace metrics. Populate this file for real with `ANSWER_POLICY=strict python eval/run_eval.py && python eval/score.py --set-baseline --policy strict` against a live middleware + model, then commit the result as a deliberate, reviewed re-baseline.",
+  "n_cases": null,
+  "n_trace_errors": null,
+  "intent_accuracy": null,
+  "ticker_accuracy": null,
+  "retrieval_hit_rate": null,
+  "keyword_coverage": null,
+  "refusal_rate": null,
+  "grounded_faithfulness": {
+    "score": null, "n_scored": 0, "n_eligible": 0, "n_skipped": 0,
+    "model_available": false, "per_case": []
+  },
+  "policy_compliance": {
+    "score": null, "n_scored": 0, "n_eligible": 0, "n_skipped": 0,
+    "model_available": false, "per_case": []
+  },
+  "answer_relevance": {
+    "score": null, "n_scored": 0, "n_eligible": 0, "n_skipped": 0,
+    "model_available": false, "per_case": []
+  },
+  "eligible_counts": {
+    "grounded_faithfulness": 0,
+    "policy_compliance": 0,
+    "answer_relevance": 0
+  },
+  "tolerances": {
+    "intent_accuracy": 0.05,
+    "ticker_accuracy": 0.05,
+    "retrieval_hit_rate": 0.05,
+    "keyword_coverage": 0.05,
+    "refusal_rate": 0.05,
+    "grounded_faithfulness": 0.05,
+    "policy_compliance": 0.05,
+    "answer_relevance": 0.05
+  }
+}

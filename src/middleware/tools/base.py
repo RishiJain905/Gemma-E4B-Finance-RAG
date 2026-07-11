@@ -80,31 +80,43 @@ def validate_args(schema: dict, args: dict) -> Optional[str]:
 
 
 def dispatch_tool(call: dict, store, ctx: ToolContext) -> dict:
+    result, _name, _args = dispatch_tool_traced(call, store, ctx)
+    return result
+
+
+def dispatch_tool_traced(call: dict, store, ctx: ToolContext) -> tuple[dict, str, dict]:
+    """Dispatch a tool call, also returning the tool name and validated
+    (schema-filtered) arguments actually passed to the handler.
+
+    Used by the model-call tool loop to populate the evidence trace
+    (2.2.1.2) with exactly what a tool call resolved to. ``dispatch_tool``
+    is a thin wrapper around this for callers that only need the result.
+    """
     try:
         function = call.get("function", {}) or {}
         name = function.get("name", "")
         tool = REGISTRY.get(name)
         if not tool:
-            return {"error": f"unknown tool: {name}"}
+            return {"error": f"unknown tool: {name}"}, name, {}
 
         try:
             raw_args = json.loads(function.get("arguments") or "{}")
         except json.JSONDecodeError as e:
-            return {"error": f"invalid tool arguments JSON: {e}"}
+            return {"error": f"invalid tool arguments JSON: {e}"}, name, {}
         if not isinstance(raw_args, dict):
-            return {"error": "tool arguments must be an object"}
+            return {"error": "tool arguments must be an object"}, name, {}
 
         properties = tool.parameters.get("properties", {}) or {}
         args = {k: v for k, v in raw_args.items() if k in properties}
         error = validate_args(tool.parameters, args)
         if error:
-            return {"error": error, "tool": name}
+            return {"error": error, "tool": name}, name, args
 
         if tool.write and not ctx.allow_write:
-            return {"error": "write tools disabled"}
+            return {"error": "write tools disabled"}, name, args
         if tool.write:
             if ctx.refresh_count + 1 > ctx.max_refreshes:
-                return {"error": "max refreshes exceeded", "tool": name}
+                return {"error": "max refreshes exceeded", "tool": name}, name, args
             ctx.refresh_count += 1
 
         start = perf_counter()
@@ -112,11 +124,11 @@ def dispatch_tool(call: dict, store, ctx: ToolContext) -> dict:
             result = tool.handler(store, **args)
         except Exception as e:  # noqa: BLE001
             logger.exception("Tool handler failed: %s", name)
-            return {"error": str(e), "tool": name}
+            return {"error": str(e), "tool": name}, name, args
         finally:
             duration_ms = round((perf_counter() - start) * 1000, 1)
             logger.info("Tool call %s args=%s duration_ms=%s", name, args, duration_ms)
-        return result
+        return result, name, args
     except Exception as e:  # noqa: BLE001
         logger.exception("Tool dispatch failed")
-        return {"error": str(e)}
+        return {"error": str(e)}, "", {}
