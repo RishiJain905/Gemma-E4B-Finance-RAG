@@ -17,6 +17,31 @@ _PAGE_NUMBER_RE = re.compile(r"^PAGE\s+\d{1,4}$", re.IGNORECASE)
 _TOC_ENTRY_RE = re.compile(r"^ITEM\s+\d{1,2}[A-Z]?\..*\.{2,}\s*\d+\s*$", re.IGNORECASE)
 _NAV_LINES = frozenset({"TABLE OF CONTENTS", "INDEX", "PART I", "PART II", "PART III", "PART IV"})
 
+# Flat-text reflow (live calibration, 2.2.5.3): the legacy parser collapses a
+# whole filing onto one enormous whitespace-joined line, so the line-oriented
+# heading scan below finds nothing. When newline density is implausibly low
+# for real filing text, insert breaks before unambiguous inline SEC markers
+# ("PART II" / "Item 7A. <Title>") so the existing splitter and its
+# TOC/navigation rules can operate. Sections produced from reflowed text get a
+# minimum-body floor because inline tables of contents reflow into
+# heading-plus-page-number stubs that carry no evidence.
+_FLAT_TEXT_MIN_CHARS_PER_LINE = 2000
+_FLAT_TEXT_MIN_SECTION_BODY_CHARS = 80
+_INLINE_SECTION_BREAK_RE = re.compile(
+    r"\s(?=(?:PART\s+[IVX]{1,4}(?:\s*$|\s*[.:—-]|\s+ITEM\b)|ITEM\s+\d{1,2}[A-Z]?\.\s+[A-Z]))",
+    re.IGNORECASE,
+)
+
+
+def _reflow_flat_text(text: str) -> tuple[str, bool]:
+    """Return (possibly reflowed text, whether reflow fired)."""
+    if not text:
+        return text, False
+    density = len(text) / (text.count("\n") + 1)
+    if density < _FLAT_TEXT_MIN_CHARS_PER_LINE:
+        return text, False
+    return _INLINE_SECTION_BREAK_RE.sub("\n", text), True
+
 
 @dataclass(frozen=True)
 class FilingSection:
@@ -40,11 +65,19 @@ class FilingSection:
         return f"sec:{self.accession}:{self.section_key}"
 
 
+_MAX_HEADING_DISPLAY_CHARS = 120
+
+
 def _known_heading(line: str) -> tuple[str, str] | None:
     item = SEC_ITEM_HEADING_RE.match(line)
     if item:
         item_key = item.group("item").lower().replace(".", "_")
-        return f"item_{item_key}", line.strip()
+        heading = line.strip()
+        # Reflowed flat text keeps the section body on the heading line; show
+        # a bounded heading while the full line stays in the section body.
+        if len(heading) > _MAX_HEADING_DISPLAY_CHARS:
+            heading = heading[:_MAX_HEADING_DISPLAY_CHARS].rsplit(" ", 1)[0]
+        return f"item_{item_key}", heading
 
     upper = line.strip().upper()
     for heading in SECTION_HEADINGS:
@@ -100,7 +133,10 @@ def split_filing_sections(
             candidates.append((current_key, current_heading, current_lines))
         current_lines = []
 
-    for raw in (parsed_text or "").splitlines():
+    reflowed_text, was_flat = _reflow_flat_text(parsed_text or "")
+    min_body_chars = _FLAT_TEXT_MIN_SECTION_BODY_CHARS if was_flat else 1
+
+    for raw in reflowed_text.splitlines():
         line = raw.strip()
         known = _known_heading(line)
         if known:
@@ -138,8 +174,12 @@ def split_filing_sections(
     unknown_ordinal = 0
     for key, heading, lines in candidates:
         body = _normalise_body(lines, heading)
-        # A heading without any substantive body is not a usable section.
+        # A heading without any substantive body is not a usable section;
+        # reflowed flat text additionally floors the body length so TOC stubs
+        # ("Item 3. ... 19") never become sections.
         if not body or body.casefold() == heading.casefold():
+            continue
+        if len(body) < min_body_chars:
             continue
         if key == "unknown":
             unknown_ordinal += 1

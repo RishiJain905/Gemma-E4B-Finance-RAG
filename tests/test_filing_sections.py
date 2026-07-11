@@ -1,4 +1,4 @@
-"""tests/test_filing_sections.py
+﻿"""tests/test_filing_sections.py
 Deterministic SEC filing-section contract tests using local text fixtures.
 """
 
@@ -110,3 +110,41 @@ def test_8k_decimal_item_gets_canonical_key() -> None:
 
     assert sections[0].section_key == "item_1_01"
     assert sections[0].document_id.endswith(":item_1_01")
+
+
+def test_flat_single_line_text_is_reflowed_into_sections() -> None:
+    """Whitespace-collapsed (single-line) parser output still yields sections.
+
+    Live calibration (2.2.5.3): the legacy parser emits one enormous line, so
+    inline "Item N. <Title>" markers must be reflowed onto their own lines and
+    TOC stubs ("Item 3. ... 19") must not become sections.
+    """
+    prose_a = "The Company designs and sells consumer devices worldwide. " * 12
+    prose_b = "Revenue decreased due to foreign exchange headwinds this quarter. " * 12
+    flat = (
+        "xbrl context soup 0000320193 2025-09-28 2026-03-28 us-gaap:ProductMember "
+        + "filler " * 400
+        + "Item 1. Financial Statements 1 Item 2. Management's Discussion and Analysis 13 "
+        + "Item 1. Business " + prose_a
+        + "Item 2. Management's Discussion and Analysis of Financial Condition " + prose_b
+    ).strip()
+    assert "\n" not in flat
+
+    sections = split_filing_sections(flat, _metadata())
+
+    keys = [s.section_key for s in sections]
+    assert any(k.startswith("item_1") for k in keys)
+    assert any(k.startswith("item_2") for k in keys)
+    # TOC stubs reflow into heading + page number only and are floored away.
+    bodies = [s.text for s in sections]
+    assert all(len(b) >= 80 for b in bodies)
+    assert any("consumer devices" in b for b in bodies)
+    assert any("foreign exchange" in b for b in bodies)
+
+
+def test_normal_multiline_text_is_not_reflowed() -> None:
+    """Line-structured fixtures keep byte-identical behavior (no reflow, no floor)."""
+    text = "RISK FACTORS\nShort but real body line.\n"
+    sections = split_filing_sections(text, _metadata())
+    assert len(sections) == 1
+    assert sections[0].text.splitlines()[-1] == "Short but real body line."
