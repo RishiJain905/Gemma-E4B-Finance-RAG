@@ -56,19 +56,28 @@ How to apply:
 - Mechanics: GPT-5.6 Codex models are accessed from Claude Code through the Codex plugin. For implementation, debugging, investigation, data analysis, or other delegated work, use `/codex:rescue --model <model> --effort <effort> <task>`. Add `--background` for longer-running work, then use `/codex:status` and `/codex:result` to monitor it and retrieve the result. For reviews, use `/codex:review` or `/codex:adversarial-review`.
 - Claude models (sonnet-5, opus-4.8, fable-5) run via the Agent tool — prefer the effort presets above (`subagent_type: "sonnet-xhigh"` etc.) over a bare `model:` parameter, since a bare spawn cannot set effort.
 
-Using gpt-5.5 inside workflows and subagents:
-- The Agent/Workflow `model` parameter only accepts Claude models. To delegate work to gpt-5.5, use the Codex plugin's bundled `codex:codex-rescue` subagent rather than creating a custom Claude wrapper. If a wrapper is needed and is a must only then spawn a Claude wrapper agent with `model: 'sonnet', effort: 'low'` whose prompt instructs it to write a self-contained codex prompt. Plugin is priority and first target as it is setup with this intent and workflow in mind. 
-- For implementation or investigation, invoke `/codex:rescue --model gpt-5.5 --effort high --background <self-contained task>`.
+Using GPT-5.6 inside workflows and subagents:
+- The Agent/Workflow `model` parameter only accepts Claude models. To delegate work to a GPT-5.6 Codex model, use the Codex plugin's bundled `codex:codex-rescue` subagent rather than creating a custom Claude wrapper. If a wrapper is absolutely required, spawn a Claude wrapper with `model: 'sonnet', effort: 'low'` and instruct it to write a self-contained Codex prompt. Prefer the plugin whenever possible.
+- For implementation or investigation, choose the model and effort up front from the task-fit guidance below, then invoke `/codex:rescue --model <model> --effort <effort> --background <self-contained task>`.
 - Use `/codex:status` to check progress and `/codex:result` to retrieve the completed response.
 - For an independent code review, run `/codex:review --background`.
 - For a review focused on challenging design decisions, assumptions, or specific risk areas, run `/codex:adversarial-review --background <focus>`.
 - Claude may also delegate naturally by being instructed to ask Codex to complete a task.
 
-Understanding which codex model + Effort to use: 
-- To be created
+Understanding which Codex model + effort to use:
+- Select the model before spawning based on the task's expected complexity and required capability ceiling. Do not start with Luna and move upward only after failure.
+- **Preferred — Luna/max:** Bounded, well-specified work with clear success criteria, including bulk or mechanical changes, migrations, data analysis, routine investigation, and straightforward implementation. Prefer it when its ceiling comfortably covers the task; it offers the best cost efficiency of these choices.
+- **Preferred — Sol/high:** Complex production work such as multi-file features, ambiguous debugging, cross-system integration, and tasks requiring stronger technical judgment. Prefer it when Luna's ceiling is likely too low but the task does not genuinely require maximum-tier reasoning.
+- **Exceptional — Terra/max:** Reserve for genuinely hard, long-horizon, tool-heavy coding or analysis where sustained technical execution is the main constraint and design taste is not. Luna and Sol are generally more cost-efficient, so choose Terra/max only when the task specifically benefits from its higher coding-agent ceiling.
+- **Exceptional — Sol/max:** Reserve for genuinely hard, high-stakes, or deeply ambiguous work requiring the highest broad reasoning and judgment ceiling, such as novel debugging, consequential architecture, or difficult cross-system changes. Do not use it when Sol/high can confidently cover the task.
+- Luna/max and Sol/high are the normal choices. Terra/max and Sol/max are intentional choices for tasks assessed as exceptionally difficult before delegation, not fallback steps in an escalation ladder.
 
-Fallback handling: 
-- When codex is not responding due to usage limits being used, utilize going Claude models only. Refrence the Table and delegate accordingly. 
+Fallback handling (Codex usage limits / zero credits):
+- **Detection is the wrapper's job — every Codex dispatch must be verified, not assumed.** Immediately after dispatching, the wrapper checks the job result for the limit signatures: (a) an explicit "You've hit your usage limit… try again at HH:MM" error; (b) the instant-fail pattern — `task_complete` within seconds of submission with `last_agent_message: null`, usually alongside a `token_count`/`rate_limits` event showing `has_credits: false` or `balance: "0"` (visible in the newest `~/.codex/sessions/**/rollout-*.jsonl`). A dispatch that produced no repo changes and no agent message did NOT run — treat it as a limit failure, never as success.
+- **The wrapper never performs the fallback itself.** On detecting a limit failure it must NOT spawn subagents, NOT retry Codex, and NOT wait for the reset. It reports straight back to the orchestrating (main) session with: the failure signature it matched, the quoted reset time if present, and the untouched task spec. Then it stops.
+- **The orchestrator owns the reroute.** On receiving that report, the main session spawns the Claude subagent itself using the preset table above (multi-file/cross-cutting → `opus-xhigh`; compact well-specified → `sonnet-xhigh`; architectural/high-risk → `opus-max`), passing the same task spec. This keeps model routing, budget awareness, and gate discipline in one place.
+- **While credits are known-exhausted, skip Codex entirely** for subsequent tasks and route directly to Claude presets until a later dispatch (or the quoted reset time passing) proves Codex is back.
+- The orchestrator should still babysit every dispatch with a working-tree watcher: zero writes within ~8 minutes of a dispatch means inspect the newest Codex rollout file for the instant-fail signature rather than waiting longer.
 
 When Using Plan mode:
 - Inherited / current model the user is using will be the model that is used to create the plan for the task at hand. This will likely be Fable 5 or Opus 4.8
