@@ -421,6 +421,323 @@ def answer_relevance(rows: list[dict], *, judge: Optional[Callable] = None,
     }
 
 
+# ── Conversational / compound metrics (2.2.1.3) ────────────────────────
+#
+# All deterministic: they read captured structured fields (resolved vs.
+# expected tickers/metrics/timeframe, subquestion coverage, staleness/answer
+# disclosures) — never the model. Each returns a block with a ``score`` plus
+# its ``n_eligible`` denominator and ``n_pass`` so a dropping/zero denominator
+# is visible (the gate fails a required category with zero eligible fixtures).
+# Only compound coverage may optionally consult an injected judge; it defaults
+# to deterministic keyword matching.
+
+# The Phase 2.2 conversational metrics, in report/gate order.
+PHASE22_METRICS = (
+    "entity_carryover_accuracy",
+    "metric_carryover_accuracy",
+    "timeframe_carryover_accuracy",
+    "verbose_paraphrase_parity",
+    "compound_subquestion_coverage",
+    "stale_disclosure_rate",
+    "unanswerable_numeric_hallucination_rate",
+    "cross_session_leakage_rate",
+)
+
+# Phrasings that count as a visible data-freshness / staleness disclosure.
+STALE_DISCLOSURE_MARKERS = (
+    "stale",
+    "outdated",
+    "out of date",
+    "out-of-date",
+    "last updated",
+    "last refreshed",
+    "as-of",
+    "as of ",
+    "freshness",
+    "may be out of date",
+    "may not be current",
+    "may not reflect",
+    "not be current",
+    "data is from",
+    "data from ",
+    "⚠️",
+)
+
+# An "invented financial figure": currency amounts, magnitudes, percentages, or
+# valuation multiples. Bare years (2026) and quarter labels (Q1) do NOT match,
+# so an unanswerable answer can name a period without being flagged.
+_FINANCIAL_FIGURE = re.compile(
+    r"""
+      (?:[$€£]\s?\d)                                               # currency amount
+    | (?:\b\d[\d,]*(?:\.\d+)?\s*%)                                 # percentage
+    | (?:\b\d[\d,]*(?:\.\d+)?\s*(?:billion|million|trillion|bn|mn)\b)  # magnitude
+    | (?:\b\d+(?:\.\d+)?\s*x\b)                                    # valuation multiple
+    """,
+    re.IGNORECASE | re.VERBOSE,
+)
+
+
+def _norm_metric(m) -> Optional[str]:
+    """Normalize a metric token for comparison (lower, spaces→underscores)."""
+    if m is None:
+        return None
+    s = str(m).strip().lower().replace(" ", "_")
+    return s or None
+
+
+def _norm_timeframe(t) -> Optional[str]:
+    """Normalize a timeframe token (upper, strip spaces/hyphens removed)."""
+    if t is None:
+        return None
+    s = str(t).strip().upper().replace(" ", "").replace("-", "")
+    return s or None
+
+
+def subquestions_addressed(subquestions: list[dict], answer: str) -> list[str]:
+    """Ids of subquestions whose ``must_mention`` terms all appear in the answer.
+
+    Deterministic, case-insensitive substring match — the same rule
+    ``keyword_coverage`` uses, applied per subquestion. A subquestion with no
+    terms cannot be judged addressed and is treated as unaddressed.
+    """
+    ans = (answer or "").lower()
+    out: list[str] = []
+    for sq in subquestions or []:
+        terms = sq.get("must_mention") or []
+        if terms and all(str(t).lower() in ans for t in terms):
+            out.append(sq.get("id"))
+    return out
+
+
+def contains_financial_figure(text: str) -> bool:
+    """True when the text contains an invented-figure-shaped number.
+
+    Deterministic guard for unanswerable cases: a genuine no-data answer names
+    no dollar amount, percentage, magnitude, or multiple. Years/quarters are
+    intentionally excluded so a refusal may still reference a period.
+    """
+    return bool(_FINANCIAL_FIGURE.search(text or ""))
+
+
+def discloses_staleness(text: str) -> bool:
+    """True when the answer carries a visible freshness/staleness disclosure."""
+    low = (text or "").lower()
+    return any(m in low for m in STALE_DISCLOSURE_MARKERS)
+
+
+def _block(score: Optional[float], n_eligible: int, n_pass: int,
+           **extra) -> dict:
+    return {"score": score, "n_eligible": n_eligible, "n_pass": n_pass, **extra}
+
+
+def _carryover_accuracy(rows: list[dict], field: str) -> dict:
+    """Accuracy of one carried field over turns that declare it should carry.
+
+    Eligible = turns whose ``expected_carryover`` names ``field``. A turn passes
+    when the resolved value matches the carried expectation: exact for
+    ticker/timeframe, subset for the metric list.
+    """
+    n_elig = 0
+    n_pass = 0
+    for r in rows:
+        carry = _case(r).get("expected_carryover") or {}
+        want = carry.get(field)
+        if want in (None, "", []):
+            continue
+        n_elig += 1
+        if field == "ticker":
+            resolved = {_norm_ticker(t) for t in (r.get("resolved_tickers") or [])}
+            ok = _norm_ticker(want) in resolved
+        elif field == "metrics":
+            resolved = {_norm_metric(m) for m in (r.get("resolved_metrics") or [])}
+            ok = {_norm_metric(m) for m in want}.issubset(resolved)
+        else:  # timeframe
+            ok = _norm_timeframe(want) == _norm_timeframe(r.get("resolved_timeframe"))
+        if ok:
+            n_pass += 1
+    return _block(round(n_pass / n_elig, 4) if n_elig else None, n_elig, n_pass)
+
+
+def entity_carryover_accuracy(rows: list[dict]) -> dict:
+    """Fraction of ticker-carryover turns whose resolved ticker is the carried one."""
+    return _carryover_accuracy(rows, "ticker")
+
+
+def metric_carryover_accuracy(rows: list[dict]) -> dict:
+    """Fraction of metric-carryover turns whose resolved metrics cover the carried set."""
+    return _carryover_accuracy(rows, "metrics")
+
+
+def timeframe_carryover_accuracy(rows: list[dict]) -> dict:
+    """Fraction of timeframe-carryover turns whose resolved timeframe matches."""
+    return _carryover_accuracy(rows, "timeframe")
+
+
+def _normalized_plan(row: dict) -> tuple:
+    """The comparable retrieval plan for a row (2.2.1.3 paraphrase parity)."""
+    return (
+        tuple(sorted(_norm_ticker(t) for t in (row.get("resolved_tickers") or []))),
+        tuple(sorted(_norm_metric(m) for m in (row.get("resolved_metrics") or []))),
+        _norm_timeframe(row.get("resolved_timeframe")),
+        _norm_intent(row.get("detected_intent")),
+    )
+
+
+def verbose_paraphrase_parity(rows: list[dict]) -> dict:
+    """Fraction of paraphrase groups whose members resolve to the same plan.
+
+    Eligible = groups (``paraphrase_group``) with at least two members (a
+    verbose/concise pair). A group passes when every member's normalized
+    retrieval plan is identical.
+    """
+    groups: dict[str, list[dict]] = {}
+    for r in rows:
+        g = _case(r).get("paraphrase_group")
+        if g:
+            groups.setdefault(g, []).append(r)
+    n_elig = 0
+    n_pass = 0
+    for members in groups.values():
+        if len(members) < 2:
+            continue
+        n_elig += 1
+        if len({_normalized_plan(m) for m in members}) == 1:
+            n_pass += 1
+    return _block(round(n_pass / n_elig, 4) if n_elig else None, n_elig, n_pass)
+
+
+def compound_subquestion_coverage(rows: list[dict], *,
+                                  judge: Optional[Callable] = None) -> dict:
+    """Mean fraction of subquestions addressed across compound cases.
+
+    Eligible = rows whose case declares ``subquestions``. ``n_pass`` counts
+    fully-covered rows. Deterministic keyword matching by default; ``judge`` is
+    accepted for future answer-coverage grading but unused in the default path.
+    """
+    covs: list[float] = []
+    n_full = 0
+    for r in rows:
+        subs = _case(r).get("subquestions") or []
+        if not subs:
+            continue
+        addressed = subquestions_addressed(subs, r.get("answer") or "")
+        cov = len(addressed) / len(subs)
+        covs.append(cov)
+        if cov >= 1.0:
+            n_full += 1
+    score = round(sum(covs) / len(covs), 4) if covs else None
+    return _block(score, len(covs), n_full)
+
+
+def stale_disclosure_rate(rows: list[dict]) -> dict:
+    """Fraction of stale-required cases whose answer discloses staleness.
+
+    Eligible = cases with ``requires_stale_disclosure`` truthy. Higher is
+    better; the Phase 2.2 gate requires 1.00.
+    """
+    elig = [r for r in rows if _case(r).get("requires_stale_disclosure")]
+    if not elig:
+        return _block(None, 0, 0)
+    n_pass = sum(1 for r in elig if discloses_staleness(r.get("answer") or ""))
+    return _block(round(n_pass / len(elig), 4), len(elig), n_pass)
+
+
+def unanswerable_numeric_hallucination_rate(rows: list[dict]) -> dict:
+    """Fraction of unanswerable cases whose answer invents a financial figure.
+
+    Eligible = cases with ``answerability == "unanswerable"``. Lower is better;
+    the Phase 2.2 gate requires 0.00. ``n_pass`` counts clean (non-hallucinated)
+    answers.
+    """
+    elig = [r for r in rows if _case(r).get("answerability") == "unanswerable"]
+    if not elig:
+        return _block(None, 0, 0)
+    n_halluc = sum(1 for r in elig if contains_financial_figure(r.get("answer") or ""))
+    return _block(round(n_halluc / len(elig), 4), len(elig), len(elig) - n_halluc)
+
+
+def _conversation_legit_tickers(rows: list[dict]) -> dict:
+    """Map conversation_id -> set of tickers legitimately reachable in it.
+
+    A ticker is legitimate for a conversation if any of its turns declares it in
+    ``expected_tickers`` or carries it via ``expected_carryover.ticker``.
+    """
+    legit: dict[str, set] = {}
+    for r in rows:
+        cid = r.get("conversation_id")
+        if cid is None:
+            continue
+        bucket = legit.setdefault(cid, set())
+        for t in r.get("expected_tickers") or []:
+            n = _norm_ticker(t)
+            if n:
+                bucket.add(n)
+        carry = _case(r).get("expected_carryover") or {}
+        n = _norm_ticker(carry.get("ticker"))
+        if n:
+            bucket.add(n)
+    return legit
+
+
+def cross_session_leakage_rate(rows: list[dict]) -> dict:
+    """Fraction of conversation turns that resolved a ticker from another session.
+
+    Eligible = all conversation turns. A turn leaks when a resolved ticker is
+    foreign to its own conversation's legitimate set AND belongs to a *different*
+    conversation's legitimate set — i.e. context crossed sessions. Lower is
+    better; the Phase 2.2 gate requires 0.00.
+    """
+    conv_rows = [r for r in rows if r.get("conversation_id") is not None]
+    if not conv_rows:
+        return _block(None, 0, 0)
+    legit = _conversation_legit_tickers(rows)
+    n_leak = 0
+    for r in conv_rows:
+        cid = r["conversation_id"]
+        own = legit.get(cid, set())
+        others: set = set()
+        for k, v in legit.items():
+            if k != cid:
+                others |= v
+        resolved = {_norm_ticker(t) for t in (r.get("resolved_tickers") or [])}
+        if (resolved - own) & others:
+            n_leak += 1
+    return _block(round(n_leak / len(conv_rows), 4), len(conv_rows), len(conv_rows) - n_leak)
+
+
+def has_phase22_fixtures(rows: list[dict]) -> bool:
+    """True when a run includes any Phase 2.2 conversational/compound fixture.
+
+    Gates whether ``score_all`` emits the conversational metric blocks, so a
+    pre-2.2 single-turn-only run isn't forced to satisfy Phase 2.2 categories.
+    """
+    keys = ("expected_carryover", "subquestions", "paraphrase_group",
+            "requires_stale_disclosure", "answerability", "expected_metrics",
+            "expected_timeframe", "expected_tickers")
+    for r in rows:
+        if r.get("conversation_id") is not None:
+            return True
+        c = _case(r)
+        if any(c.get(k) for k in keys):
+            return True
+    return False
+
+
+def conversational_metrics(rows: list[dict]) -> dict:
+    """Compute every Phase 2.2 conversational metric block for a run."""
+    return {
+        "entity_carryover_accuracy": entity_carryover_accuracy(rows),
+        "metric_carryover_accuracy": metric_carryover_accuracy(rows),
+        "timeframe_carryover_accuracy": timeframe_carryover_accuracy(rows),
+        "verbose_paraphrase_parity": verbose_paraphrase_parity(rows),
+        "compound_subquestion_coverage": compound_subquestion_coverage(rows),
+        "stale_disclosure_rate": stale_disclosure_rate(rows),
+        "unanswerable_numeric_hallucination_rate":
+            unanswerable_numeric_hallucination_rate(rows),
+        "cross_session_leakage_rate": cross_session_leakage_rate(rows),
+    }
+
+
 # ── Aggregator ─────────────────────────────────────────────────────────
 
 def _run_field(rows: list[dict], key: str) -> Optional[str]:
@@ -480,8 +797,42 @@ def score_all(rows: list[dict], *, judge: Optional[Callable] = None,
         summary["policy_compliance"] = dict(empty)
         summary["answer_relevance"] = dict(empty)
 
+    # Phase 2.2 conversational/compound metrics (2.2.1.3) — deterministic, and
+    # only emitted when the run actually contains Phase 2.2 fixtures so a legacy
+    # single-turn-only run is not forced to satisfy conversational categories.
+    if has_phase22_fixtures(rows):
+        conv = conversational_metrics(rows)
+        summary.update(conv)
+        summary["conversational_denominators"] = {
+            m: {"n_eligible": conv[m]["n_eligible"], "n_pass": conv[m]["n_pass"]}
+            for m in PHASE22_METRICS
+        }
+        summary["conversational_by_category"] = _conversational_per_category(rows)
+
     summary["per_category"] = _per_category(rows)
     return summary
+
+
+def _conversational_per_category(rows: list[dict]) -> dict:
+    """Per-category eligible/pass counts for each Phase 2.2 metric.
+
+    Lets the report show that no category silently lost its denominator, per
+    2.2.1.3 Step 4 ("report overall and per-category denominators")."""
+    by_cat: dict[str, list[dict]] = {}
+    for r in rows:
+        cat = _case(r).get("category", "uncategorized")
+        by_cat.setdefault(cat, []).append(r)
+    out: dict[str, dict] = {}
+    for cat, cat_rows in by_cat.items():
+        blocks = conversational_metrics(cat_rows)
+        cat_out = {}
+        for m in PHASE22_METRICS:
+            b = blocks[m]
+            if b["n_eligible"]:
+                cat_out[m] = {"n_eligible": b["n_eligible"], "n_pass": b["n_pass"]}
+        if cat_out:
+            out[cat] = {"n": len(cat_rows), **cat_out}
+    return out
 
 
 def _per_category(rows: list[dict]) -> dict:

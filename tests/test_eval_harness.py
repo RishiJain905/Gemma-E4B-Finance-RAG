@@ -692,3 +692,404 @@ class TestScoreCLI:
         assert out == tmp_path / "strict.json"
         data = json.loads(out.read_text(encoding="utf-8"))
         assert data["answer_policy"] == "strict"
+
+
+# ══════════════════════════════════════════════════════════════════════
+# 2.2.1.3 — Conversational & compound-query golden set
+# ══════════════════════════════════════════════════════════════════════
+
+
+def _crow(cid="t0", *, conversation_id="convA", turn_index=0, answer="ok",
+          detected_intent="fact_lookup", resolved_tickers=(), resolved_metrics=(),
+          resolved_timeframe=None, expected_tickers=(), expected_metrics=(),
+          expected_timeframe=None, expected_carryover=None, subquestions=None,
+          paraphrase_group=None, requires_stale_disclosure=False,
+          answerability=None, category="conversation"):
+    """Build a conversation-turn result row for the deterministic metric tests.
+
+    Carries both the row-level resolved/expected fields and an attached ``case``
+    so ``metrics._case(row)`` sees the fixture expectations."""
+    case = {
+        "id": cid, "question": "q", "category": category,
+        "expected_tickers": list(expected_tickers),
+        "expected_metrics": list(expected_metrics),
+        "expected_timeframe": expected_timeframe,
+        "expected_carryover": expected_carryover,
+        "subquestions": subquestions or [],
+        "paraphrase_group": paraphrase_group,
+        "requires_stale_disclosure": requires_stale_disclosure,
+        "answerability": answerability,
+    }
+    return {
+        "id": cid, "answer": answer, "detected_intent": detected_intent,
+        "conversation_id": conversation_id, "turn_index": turn_index,
+        "resolved_tickers": list(resolved_tickers),
+        "resolved_metrics": list(resolved_metrics),
+        "resolved_timeframe": resolved_timeframe,
+        "expected_tickers": list(expected_tickers),
+        "case": case,
+    }
+
+
+# ── Fixtures: conversation file + challenge-set minimums ────────────────
+
+class TestConversationFixtures:
+    def test_conversation_file_valid(self):
+        convs = R.load_conversations()
+        assert convs, "no conversations loaded"
+        for cv in convs:
+            assert cv.get("id") and cv.get("turns"), cv
+            for t in cv["turns"]:
+                assert t.get("id") and t.get("question"), t
+
+    def test_all_ids_unique_across_files(self):
+        cases = R.load_cases()
+        convs = R.load_conversations()
+        assert R.fixture_id_collisions(cases, convs) == []
+
+    def test_challenge_set_minimums(self):
+        """The validation report meets every per-dimension minimum (2.2.1.3)."""
+        cases = R.load_cases()
+        convs = R.load_conversations()
+        counts, problems = R.validate_fixtures(cases, convs)
+        assert problems == [], problems
+        assert counts["conversations"] >= 12
+        assert counts["conversation_turns"] >= 30
+        assert counts["paraphrase_pairs"] >= 6
+        assert counts["compound"] >= 6
+        assert counts["multi_ticker"] >= 6
+        assert counts["timeframe"] >= 6
+        assert counts["stale"] >= 4
+        assert counts["unanswerable"] >= 4
+
+    def test_validate_fixtures_flags_missing_dimension(self):
+        """A thinned-out set is reported, not silently accepted."""
+        counts, problems = R.validate_fixtures([], [])
+        assert problems  # every minimum unmet
+        assert any("conversations" in p for p in problems)
+
+    def test_validate_fixtures_flags_id_collision(self):
+        cases = [{"id": "dup", "question": "q", "category": "x"}]
+        convs = [{"id": "dup", "turns": [{"id": "t", "question": "q"}]}]
+        assert "dup" in R.fixture_id_collisions(cases, convs)
+
+
+# ── Runner: sequential + interleaved history ────────────────────────────
+
+class TestConversationRunner:
+    def test_sequential_history_is_runner_owned(self):
+        """History starts empty and grows one completed turn at a time."""
+        seen = []
+
+        def qfn(case, history):
+            seen.append([h["question"] for h in history])
+            return {"answer": f"a-{case['id']}", "model_available": True}
+
+        conv = {"id": "c", "category": "follow_up", "turns": [
+            {"id": "c0", "question": "q0"},
+            {"id": "c1", "question": "q1"},
+            {"id": "c2", "question": "q2"}]}
+        rows = R.run_conversation(conv, query_fn=qfn, allow_direct=False)
+        assert seen == [[], ["q0"], ["q0", "q1"]]
+        assert [r["history_sent"] for r in rows] == [0, 1, 2]
+        assert [r["turn_index"] for r in rows] == [0, 1, 2]
+        assert all(r["conversation_id"] == "c" for r in rows)
+        assert all(k in rows[0] for k in R.RESULT_KEYS)
+
+    def test_interleaved_conversations_never_cross(self):
+        """Two conversations driven in interleaved order never see each other's
+        turns — histories are runner-owned per conversation (2.2.1.3 Step 3)."""
+        seen = {}
+
+        def qfn(case, history):
+            seen[case["id"]] = [h["question"] for h in history]
+            return {"answer": f"a-{case['id']}", "model_available": True}
+
+        convA = {"id": "A", "turns": [{"id": "A0", "question": "A q0"},
+                                      {"id": "A1", "question": "A q1"},
+                                      {"id": "A2", "question": "A q2"}]}
+        convB = {"id": "B", "turns": [{"id": "B0", "question": "B q0"},
+                                      {"id": "B1", "question": "B q1"}]}
+        histA, histB = [], []
+        order = [(convA, 0, histA), (convB, 0, histB), (convA, 1, histA),
+                 (convB, 1, histB), (convA, 2, histA)]
+        for conv, i, hist in order:
+            turn = conv["turns"][i]
+            tc = R._turn_case(conv, turn, i, "cat")
+            row = R.run_case(tc, query_fn=qfn, allow_direct=False,
+                             history=list(hist), conversation_id=conv["id"],
+                             turn_index=i)
+            hist.append({"question": turn["question"], "answer": row["answer"]})
+
+        assert seen["A0"] == []
+        assert seen["A1"] == ["A q0"]
+        assert seen["A2"] == ["A q0", "A q1"]
+        assert seen["B0"] == []
+        assert seen["B1"] == ["B q0"]
+        # No conversation ever saw the other's questions.
+        for k in ("A0", "A1", "A2"):
+            assert all("B" not in q for q in seen[k])
+        for k in ("B0", "B1"):
+            assert all("A" not in q for q in seen[k])
+
+    def test_mixed_single_and_conversation_artifacts(self):
+        """A run mixing single-turn cases and conversation turns yields rows of
+        one shape; single-turn rows carry no conversation position."""
+        def qfn_single(case):
+            return {"answer": "a", "model_available": True}
+
+        def qfn_turn(case, history):
+            return {"answer": "a", "model_available": True}
+
+        single = R.run_case({"id": "s1", "question": "q"}, query_fn=qfn_single,
+                            allow_direct=False)
+        conv = {"id": "cv", "category": "follow_up",
+                "turns": [{"id": "cv0", "question": "q0"},
+                          {"id": "cv1", "question": "q1"}]}
+        turns = R.run_conversation(conv, query_fn=qfn_turn, allow_direct=False)
+        rows = [single] + turns
+        assert all(all(k in r for k in R.RESULT_KEYS) for r in rows)
+        assert single["conversation_id"] is None and single["turn_index"] is None
+        assert turns[0]["conversation_id"] == "cv" and turns[1]["turn_index"] == 1
+
+    def test_resolved_fields_derived_from_trace(self):
+        """With no explicit resolved_* fields, the runner derives them from the
+        evidence trace + detected ticker (forward-compatible with 2.2.2)."""
+        trace = _trace(
+            facts=[{"metric": "gross_margin", "value": 0.7, "unit": "ratio",
+                    "period": "2026-Q2", "ticker": "NVDA", "source_type": "yfinance"}],
+            documents=[])
+
+        def qfn(case):
+            return {"answer": "a", "model_available": True,
+                    "detected_ticker": "NVDA", "detected_intent": "fact_lookup",
+                    "evidence_trace": trace}
+
+        row = R.run_case({"id": "x", "question": "q"}, query_fn=qfn, allow_direct=False)
+        assert row["resolved_tickers"] == ["NVDA"]
+        assert row["resolved_metrics"] == ["gross_margin"]
+        assert row["resolved_timeframe"] == "2026-Q2"
+
+    def test_explicit_resolved_fields_preferred(self):
+        """An explicit resolved_* field wins over trace derivation."""
+        def qfn(case):
+            return {"answer": "a", "model_available": True,
+                    "resolved_tickers": ["AMD"], "resolved_metrics": ["total_revenue"],
+                    "resolved_timeframe": "FY2025"}
+
+        row = R.run_case({"id": "x", "question": "q"}, query_fn=qfn, allow_direct=False)
+        assert row["resolved_tickers"] == ["AMD"]
+        assert row["resolved_metrics"] == ["total_revenue"]
+        assert row["resolved_timeframe"] == "FY2025"
+
+
+# ── Deterministic conversational metrics ────────────────────────────────
+
+class TestConversationalMetrics:
+    def test_entity_carryover_accuracy(self):
+        rows = [
+            _crow("a", expected_carryover={"ticker": "NVDA"}, resolved_tickers=["NVDA"]),
+            _crow("b", expected_carryover={"ticker": "META"}, resolved_tickers=["AAPL"]),
+            _crow("c", expected_carryover={"metrics": ["eps"]}, resolved_tickers=["X"]),
+        ]
+        res = M.entity_carryover_accuracy(rows)
+        assert res["n_eligible"] == 2  # only ticker-carry turns
+        assert res["score"] == 0.5
+
+    def test_metric_carryover_accuracy_subset(self):
+        rows = [
+            _crow("a", expected_carryover={"metrics": ["total_revenue"]},
+                  resolved_metrics=["total_revenue", "gross_margin"]),  # superset -> pass
+            _crow("b", expected_carryover={"metrics": ["net_income"]},
+                  resolved_metrics=["total_revenue"]),  # missing -> fail
+        ]
+        res = M.metric_carryover_accuracy(rows)
+        assert res["n_eligible"] == 2
+        assert res["score"] == 0.5
+
+    def test_timeframe_carryover_accuracy(self):
+        rows = [
+            _crow("a", expected_carryover={"timeframe": "2026-Q2"},
+                  resolved_timeframe="2026-Q2"),  # pass (normalized equal)
+            _crow("b", expected_carryover={"timeframe": "FY2025"},
+                  resolved_timeframe="2026-Q1"),  # fail
+        ]
+        res = M.timeframe_carryover_accuracy(rows)
+        assert res["score"] == 0.5
+
+    def test_carryover_no_eligible_returns_none(self):
+        rows = [_crow("a")]  # declares no carryover
+        res = M.entity_carryover_accuracy(rows)
+        assert res["n_eligible"] == 0 and res["score"] is None
+
+    def test_verbose_paraphrase_parity(self):
+        same = [
+            _crow("v", paraphrase_group="g1", resolved_tickers=["NVDA"],
+                  resolved_metrics=["total_revenue"], resolved_timeframe="2026-Q2"),
+            _crow("c", paraphrase_group="g1", resolved_tickers=["NVDA"],
+                  resolved_metrics=["total_revenue"], resolved_timeframe="2026-Q2"),
+        ]
+        assert M.verbose_paraphrase_parity(same)["score"] == 1.0
+        diff = [
+            _crow("v", paraphrase_group="g2", resolved_metrics=["total_revenue"]),
+            _crow("c", paraphrase_group="g2", resolved_metrics=["gross_margin"]),
+        ]
+        res = M.verbose_paraphrase_parity(diff)
+        assert res["n_eligible"] == 1 and res["score"] == 0.0
+
+    def test_compound_subquestion_coverage(self):
+        subs = [{"id": "s1", "must_mention": ["revenue"]},
+                {"id": "s2", "must_mention": ["gross margin"]}]
+        full = _crow("a", subquestions=subs, answer="revenue up, gross margin steady")
+        partial = _crow("b", subquestions=subs, answer="revenue up only")
+        res = M.compound_subquestion_coverage([full, partial])
+        assert res["n_eligible"] == 2
+        assert res["score"] == 0.75  # mean(1.0, 0.5)
+        assert res["n_pass"] == 1    # only the fully-covered row
+
+    def test_stale_disclosure_rate(self):
+        rows = [
+            _crow("a", requires_stale_disclosure=True,
+                  answer="Revenue was strong (data may be out of date)."),
+            _crow("b", requires_stale_disclosure=True, answer="Revenue was strong."),
+            _crow("c", requires_stale_disclosure=False, answer="ignored"),
+        ]
+        res = M.stale_disclosure_rate(rows)
+        assert res["n_eligible"] == 2
+        assert res["score"] == 0.5
+
+    def test_unanswerable_numeric_hallucination_rate(self):
+        rows = [
+            _crow("a", answerability="unanswerable",
+                  answer="I don't have that data; cannot answer."),  # clean
+            _crow("b", answerability="unanswerable",
+                  answer="Their revenue was about $5.2 billion."),  # invented figure
+            _crow("c", answerability="unanswerable",
+                  answer="No data for the fourth quarter of 2026."),  # year/quarter ok
+        ]
+        res = M.unanswerable_numeric_hallucination_rate(rows)
+        assert res["n_eligible"] == 3
+        assert res["score"] == round(1 / 3, 4)
+        assert res["n_pass"] == 2
+
+    def test_cross_session_leakage_rate(self):
+        rows = [
+            # convA legit = {NVDA}; convB legit = {AMD}
+            _crow("a0", conversation_id="A", expected_tickers=["NVDA"],
+                  resolved_tickers=["NVDA"]),  # clean
+            _crow("b0", conversation_id="B", expected_tickers=["AMD"],
+                  resolved_tickers=["NVDA"]),  # leaked A's ticker into B
+        ]
+        res = M.cross_session_leakage_rate(rows)
+        assert res["n_eligible"] == 2
+        assert res["score"] == 0.5
+
+    def test_cross_session_leakage_zero_when_clean(self):
+        rows = [
+            _crow("a0", conversation_id="A", expected_tickers=["NVDA"],
+                  resolved_tickers=["NVDA"]),
+            _crow("b0", conversation_id="B", expected_tickers=["AMD"],
+                  resolved_tickers=["AMD"]),
+        ]
+        assert M.cross_session_leakage_rate(rows)["score"] == 0.0
+
+    def test_financial_figure_and_staleness_helpers(self):
+        assert M.contains_financial_figure("about $5.2 billion")
+        assert M.contains_financial_figure("margin of 42.5%")
+        assert M.contains_financial_figure("trades at 15.9x earnings")
+        assert not M.contains_financial_figure("in the fourth quarter of 2026")
+        assert not M.contains_financial_figure("no data available")
+        assert M.discloses_staleness("This may be out of date.")
+        assert not M.discloses_staleness("Revenue grew strongly.")
+
+    def test_score_all_includes_conversational_when_present(self):
+        rows = [_crow("a", expected_carryover={"ticker": "NVDA"},
+                      resolved_tickers=["NVDA"])]
+        s = M.score_all(rows, run_judge=False)
+        for m in M.PHASE22_METRICS:
+            assert m in s
+        assert "conversational_denominators" in s
+        assert s["entity_carryover_accuracy"]["score"] == 1.0
+
+    def test_score_all_omits_conversational_when_absent(self):
+        rows = [_row(cid="a")]  # plain single-turn, no Phase 2.2 fields
+        s = M.score_all(rows, run_judge=False)
+        assert "entity_carryover_accuracy" not in s
+        assert "conversational_denominators" not in s
+
+
+# ── Phase 2.2 acceptance gate ───────────────────────────────────────────
+
+class TestPhase22Gate:
+    def _block(self, score, n_eligible=5):
+        return {"score": score, "n_eligible": n_eligible, "n_pass": n_eligible}
+
+    def _passing(self):
+        return {
+            "entity_carryover_accuracy": self._block(0.90),
+            "metric_carryover_accuracy": self._block(0.95),
+            "timeframe_carryover_accuracy": self._block(0.92),
+            "verbose_paraphrase_parity": self._block(1.0),
+            "compound_subquestion_coverage": self._block(0.85),
+            "stale_disclosure_rate": self._block(1.0),
+            "unanswerable_numeric_hallucination_rate": self._block(0.0),
+            "cross_session_leakage_rate": self._block(0.0),
+        }
+
+    def test_phase22_pass_at_thresholds(self):
+        assert gate.phase22_checks(self._passing()) == []
+
+    def test_phase22_fail_below_min(self):
+        s = self._passing()
+        s["entity_carryover_accuracy"] = self._block(0.89)  # < 0.90
+        failures = gate.phase22_checks(s)
+        assert any("entity_carryover_accuracy" in f for f in failures)
+
+    def test_phase22_fail_above_max(self):
+        s = self._passing()
+        s["cross_session_leakage_rate"] = self._block(0.05)  # > 0.00
+        failures = gate.phase22_checks(s)
+        assert any("cross_session_leakage_rate" in f for f in failures)
+
+    def test_phase22_fail_zero_eligible(self):
+        s = self._passing()
+        s["unanswerable_numeric_hallucination_rate"] = {
+            "score": None, "n_eligible": 0, "n_pass": 0}
+        failures = gate.phase22_checks(s)
+        assert any("zero eligible fixtures" in f for f in failures)
+
+    def test_phase22_eligible_but_unscored_is_not_a_failure(self):
+        s = self._passing()
+        s["stale_disclosure_rate"] = {"score": None, "n_eligible": 4, "n_pass": 0}
+        assert gate.phase22_checks(s) == []
+
+    def test_phase22_absent_metrics_not_activated(self):
+        """A run with no Phase 2.2 fixtures (no metric blocks) is unaffected."""
+        assert gate.phase22_checks({"intent_accuracy": 0.9}) == []
+
+    def test_gate_main_fails_on_phase22(self, tmp_path):
+        """The gate CLI returns non-zero when a Phase 2.2 threshold is missed,
+        even against an all-null placeholder baseline."""
+        baseline = tmp_path / "baseline.json"
+        base = {"answer_policy": "graded", "dataset_digest": "d",
+                "trace_schema_version": 1, "score_schema_version": 1,
+                "n_trace_errors": 0}
+        score.set_baseline(base, path=baseline)
+        summary = tmp_path / "s.summary.json"
+        s = dict(base)
+        s.update(self._passing())
+        s["cross_session_leakage_rate"] = self._block(0.5)  # leak -> fail
+        summary.write_text(json.dumps(s), encoding="utf-8")
+        assert gate.main(["--summary", str(summary), "--baseline", str(baseline)]) == 1
+
+    def test_gate_main_passes_with_good_phase22(self, tmp_path):
+        baseline = tmp_path / "baseline.json"
+        base = {"answer_policy": "graded", "dataset_digest": "d",
+                "trace_schema_version": 1, "score_schema_version": 1,
+                "n_trace_errors": 0}
+        score.set_baseline(base, path=baseline)
+        summary = tmp_path / "s.summary.json"
+        s = dict(base)
+        s.update(self._passing())
+        summary.write_text(json.dumps(s), encoding="utf-8")
+        assert gate.main(["--summary", str(summary), "--baseline", str(baseline)]) == 0

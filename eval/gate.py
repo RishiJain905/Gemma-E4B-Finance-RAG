@@ -72,6 +72,55 @@ DEFAULT_TOLERANCES = {
     "answer_relevance": 0.05,
 }
 
+# Phase 2.2 conversational-query acceptance thresholds (2.2.1.3 Step 5).
+# Absolute floors/ceilings, not baseline-relative tolerances: each ``(direction,
+# threshold)`` activates only when its metric block is present in the current
+# summary (i.e. the run scored Phase 2.2 fixtures). "min" = score must be >=
+# threshold; "max" = rate must be <= threshold.
+PHASE22_THRESHOLDS = {
+    "entity_carryover_accuracy": ("min", 0.90),
+    "metric_carryover_accuracy": ("min", 0.90),
+    "timeframe_carryover_accuracy": ("min", 0.90),
+    "verbose_paraphrase_parity": ("min", 0.90),
+    "compound_subquestion_coverage": ("min", 0.85),
+    "stale_disclosure_rate": ("min", 1.00),
+    "unanswerable_numeric_hallucination_rate": ("max", 0.00),
+    "cross_session_leakage_rate": ("max", 0.00),
+}
+
+
+def phase22_checks(current: dict) -> list[str]:
+    """Phase 2.2 acceptance failures (2.2.1.3 Step 5). Empty list = all clear.
+
+    For each Phase 2.2 metric present in the current summary:
+      - zero eligible fixtures for a required category → fail (a missing
+        category must never look like a pass);
+      - eligible but unscored (score None) → skip (don't manufacture a failure
+        from missing data — matches the null-metric placeholder baseline);
+      - scored → enforce the absolute floor/ceiling.
+
+    A metric block absent from the summary (a run with no Phase 2.2 fixtures at
+    all) is not activated, so pre-2.2 single-turn runs are unaffected.
+    """
+    failures: list[str] = []
+    for metric, (direction, threshold) in PHASE22_THRESHOLDS.items():
+        block = current.get(metric)
+        if not isinstance(block, dict):
+            continue  # metric not present in this run → threshold not activated
+        n_elig = block.get("n_eligible")
+        if n_elig == 0:
+            failures.append(
+                f"{metric}: zero eligible fixtures (required category missing)")
+            continue
+        score = block.get("score")
+        if score is None:
+            continue  # eligible but unscored — don't fail on missing data
+        if direction == "min" and score < threshold:
+            failures.append(f"{metric} {score:.2f} < required minimum {threshold:.2f}")
+        elif direction == "max" and score > threshold:
+            failures.append(f"{metric} {score:.2f} > allowed maximum {threshold:.2f}")
+    return failures
+
 
 def _metric_value(summary: dict, name: str):
     """Extract a scalar metric value (judge metrics pull .score)."""
@@ -287,9 +336,13 @@ def main(argv: Optional[list[str]] = None) -> int:
     current.setdefault("trace_schema_version", evidence_trace.SCHEMA_VERSION)
     current.setdefault("score_schema_version", M.SCORE_SCHEMA_VERSION)
 
-    pretrace_failures = pretrace_checks(current, baseline, policy=args.policy)
-    if pretrace_failures:
-        print(render_report({}, pretrace_failures))
+    # Hard pre-metric failures: measurement-fidelity checks (2.2.1.2) plus the
+    # Phase 2.2 acceptance thresholds (2.2.1.3). Either kind fails the gate
+    # before baseline regressions are even compared.
+    hard_failures = (pretrace_checks(current, baseline, policy=args.policy)
+                     + phase22_checks(current))
+    if hard_failures:
+        print(render_report({}, hard_failures))
         print(f"\nsummary:  {summary_path}")
         print(f"baseline: {baseline_file}")
         return 1

@@ -54,12 +54,59 @@ filtering, regardless of judge availability), `n_scored`, `n_skipped`, and
 `per_case` reasons — so a dropping eligible count is visible, not silently
 absorbed into a smaller average.
 
+### Conversational / compound metrics (2.2.1.3)
+
+Deterministic metrics for the conversation and compound-query golden set. Each
+reads captured structured fields (resolved vs. expected tickers/metrics/
+timeframe, subquestion coverage, staleness/answerability) — never the model —
+and reports its own `n_eligible` denominator and `n_pass`:
+
+- `entity_carryover_accuracy` / `metric_carryover_accuracy` /
+  `timeframe_carryover_accuracy` — over turns declaring that field under
+  `expected_carryover`, the fraction whose resolved value matches the carried
+  expectation.
+- `verbose_paraphrase_parity` — fraction of `paraphrase_group`s whose members
+  resolve to the same normalized retrieval plan (tickers, metrics, timeframe,
+  intent).
+- `compound_subquestion_coverage` — mean fraction of a compound question's
+  `subquestions` addressed (all of a subquestion's `must_mention` terms present).
+- `stale_disclosure_rate` — fraction of `requires_stale_disclosure` cases whose
+  answer carries a visible freshness warning.
+- `unanswerable_numeric_hallucination_rate` — fraction of `unanswerable` cases
+  whose answer invents a financial figure (currency/percent/magnitude/multiple;
+  bare years and quarters don't count). Lower is better.
+- `cross_session_leakage_rate` — fraction of conversation turns that resolved a
+  ticker belonging to a *different* conversation. Lower is better.
+
+These blocks appear in the summary only when the run scored Phase 2.2 fixtures
+(`metrics.has_phase22_fixtures`), plus `conversational_denominators` and
+`conversational_by_category` for the per-category denominator view. The runner
+owns conversation history (`run_conversation`); a single test interleaves two
+conversations to prove histories never cross.
+
+Because no rewrite step exists until 2.2.2, `retrieval_query == raw_question`
+and the resolved fields are derived best-effort from the evidence trace — the
+carryover metrics read low today and start rewarding real follow-up handling
+once 2.2.2 populates them explicitly.
+
+### Phase 2.2 acceptance gate
+
+`eval/gate.py::phase22_checks` enforces absolute Phase 2.2 thresholds
+(activated as soon as a run scores the metric, independent of the baseline):
+entity/metric/timeframe carryover ≥ 0.90, verbose paraphrase parity ≥ 0.90,
+compound subquestion coverage ≥ 0.85, stale disclosure rate = 1.00, unanswerable
+numeric hallucination rate = 0.00, cross-session leakage rate = 0.00. The gate
+also fails when any of these categories has **zero eligible fixtures** (a
+missing category must never look like a pass). These run alongside — and never
+weaken — the 2.2.1.2 pre-metric checks and the baseline regression comparison.
+
 ## Layout
 
 ```
 eval/
   golden/
-    finance_qa.jsonl    # committed — the curated golden dataset
+    finance_qa.jsonl              # committed — single-turn golden dataset
+    finance_conversations.jsonl   # committed — multi-turn conversations (2.2.1.3)
   runs/                 # gitignored — per-run raw + summary artifacts
   baselines/
     strict.json          # committed — the bar the gate compares against for answer_policy=strict

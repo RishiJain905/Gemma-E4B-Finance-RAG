@@ -129,6 +129,19 @@ def console_table(summary: dict) -> str:
                  f"errors: {summary.get('n_errors', 0)}  "
                  f"trace_errors: {summary.get('n_trace_errors', 0)}")
 
+    # Phase 2.2 conversational/compound metrics (2.2.1.3) — shown only when the
+    # run scored them. Each line reports score and its eligible denominator.
+    conv_present = [m for m in M.PHASE22_METRICS if isinstance(summary.get(m), dict)]
+    if conv_present:
+        lines.append("")
+        lines.append("=== Conversational (Phase 2.2) ===")
+        for name in M.PHASE22_METRICS:
+            block = summary.get(name)
+            if not isinstance(block, dict):
+                continue
+            lines.append(f"{name:<38} {_fmt(block.get('score'))}"
+                         f"   (n={block.get('n_eligible', 0)})")
+
     # Per-category table.
     per = summary.get("per_category") or {}
     if per:
