@@ -64,9 +64,12 @@ CREATE TABLE IF NOT EXISTS filings (
     accession TEXT UNIQUE,                           -- SEC accession number (or doc hash for other sources)
     source_url TEXT,                                 -- EDGAR URL or source link
     file_path TEXT,                                  -- Local cached copy path
-    status TEXT DEFAULT 'unprocessed',               -- 'unprocessed', 'parsed', 'failed'
+    status TEXT DEFAULT 'unprocessed',               -- 'unprocessed', 'index_pending', 'parsed', 'failed'
     parsed_at TEXT,                                  -- When TraceAlchemy finished parsing
     summary_embedding_id TEXT,                       -- Link to ChromaDB embedding
+    index_error TEXT,                                -- Retryable filing-text index failure reason
+    index_section_count INTEGER DEFAULT 0,           -- Verified section parents written
+    index_chunk_count INTEGER DEFAULT 0,             -- Verified child chunks written
     ingested_at TEXT DEFAULT (datetime('now'))
 );
 

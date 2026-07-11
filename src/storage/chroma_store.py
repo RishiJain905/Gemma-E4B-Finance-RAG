@@ -141,6 +141,9 @@ class ChromaStore:
     # request is ~6.3K tokens — comfortably below the 8192 ubatch ceiling.
     DEFAULT_CHUNK_CHARS = 1000
     DEFAULT_CHUNK_OVERLAP = 150
+    MAX_READ_LIMIT = 200
+    MAX_READ_OFFSET = 10_000
+    MAX_ADJACENT_SECTIONS = 10
 
     def __init__(self,
                  persist_directory: Optional[Path] = None,
@@ -226,9 +229,11 @@ class ChromaStore:
         if not chunks:
             return  # nothing to store (empty/whitespace text)
 
+        is_section_family = source == "sec_filing"
+
         # Short documents are stored as a single entry under their original id,
         # preserving the existing id scheme and avoiding the embedder's batch limit.
-        if len(chunks) == 1:
+        if len(chunks) == 1 and not is_section_family:
             self.collection.add(
                 documents=[chunks[0]],
                 metadatas=[meta],
@@ -246,6 +251,8 @@ class ChromaStore:
             chunk_meta["parent_id"] = document_id
             chunk_meta["chunk_index"] = i
             chunk_meta["chunk_count"] = total
+            if is_section_family:
+                chunk_meta["document_id"] = ids[i]
             if self.chunk_strategy == "structural":
                 chunk_meta["section"] = sections[i]
             metadatas.append(chunk_meta)
@@ -255,6 +262,100 @@ class ChromaStore:
             metadatas=metadatas,
             ids=ids
         )
+
+    @classmethod
+    def _validate_page(cls, limit: int, offset: int = 0) -> None:
+        if not isinstance(limit, int) or limit < 1 or limit > cls.MAX_READ_LIMIT:
+            raise ValueError(f"limit must be between 1 and {cls.MAX_READ_LIMIT}")
+        if not isinstance(offset, int) or offset < 0 or offset > cls.MAX_READ_OFFSET:
+            raise ValueError(f"offset must be between 0 and {cls.MAX_READ_OFFSET}")
+
+    @staticmethod
+    def _format_get_results(results: dict) -> list[dict]:
+        ids = list(results.get("ids") or [])
+        documents = list(results.get("documents") or [])
+        metadatas = list(results.get("metadatas") or [])
+        return [
+            {
+                "id": document_id,
+                "document": documents[index] if index < len(documents) else None,
+                "metadata": metadatas[index] if index < len(metadatas) else {},
+            }
+            for index, document_id in enumerate(ids)
+        ]
+
+    def get_section_chunks(
+        self, parent_id: str, *, limit: int, offset: int = 0,
+    ) -> list[dict]:
+        """Return one bounded, parent-filtered page of canonical child chunks."""
+        self._validate_page(limit, offset)
+        results = self.collection.get(
+            where={"parent_id": parent_id},
+            limit=limit,
+            offset=offset,
+            include=["documents", "metadatas"],
+        )
+        rows = self._format_get_results(results)
+        return sorted(rows, key=lambda row: row["metadata"].get("chunk_index", 0))
+
+    def get_adjacent_sections(
+        self,
+        accession: str,
+        section_index: int,
+        *,
+        before: int = 1,
+        after: int = 1,
+    ) -> list[dict]:
+        """Return chunks from a bounded section-index window in one filing."""
+        if not isinstance(section_index, int) or section_index < 0:
+            raise ValueError("section_index must be a non-negative integer")
+        if not isinstance(before, int) or not 0 <= before <= self.MAX_ADJACENT_SECTIONS:
+            raise ValueError(f"before must be between 0 and {self.MAX_ADJACENT_SECTIONS}")
+        if not isinstance(after, int) or not 0 <= after <= self.MAX_ADJACENT_SECTIONS:
+            raise ValueError(f"after must be between 0 and {self.MAX_ADJACENT_SECTIONS}")
+        lower = max(0, section_index - before)
+        upper = section_index + after
+        results = self.collection.get(
+            where={"$and": [
+                {"source": "sec_filing"},
+                {"accession": accession},
+                {"section_index": {"$gte": lower}},
+                {"section_index": {"$lte": upper}},
+            ]},
+            limit=self.MAX_READ_LIMIT,
+            include=["documents", "metadatas"],
+        )
+        rows = self._format_get_results(results)
+        return sorted(
+            rows,
+            key=lambda row: (
+                row["metadata"].get("section_index", 0),
+                row["metadata"].get("chunk_index", 0),
+            ),
+        )
+
+    def count_filing_sections(self, accession: Optional[str] = None) -> int:
+        """Count unique SEC filing section parents, optionally by accession."""
+        where: dict = {"source": "sec_filing"}
+        if accession is not None:
+            where = {"$and": [{"source": "sec_filing"}, {"accession": accession}]}
+        results = self.collection.get(where=where, include=["metadatas"])
+        return len({
+            metadata.get("parent_id")
+            for metadata in (results.get("metadatas") or [])
+            if metadata.get("parent_id")
+        })
+
+    def count_filing_section_chunks(self, parent_id: str) -> int:
+        """Count one section family's children without fetching document bodies."""
+        results = self.collection.get(
+            where={"parent_id": parent_id}, include=["metadatas"],
+        )
+        return len(results.get("ids") or [])
+
+    def delete_filing_section_family(self, parent_id: str) -> None:
+        """Delete every deterministic child chunk belonging to one section."""
+        self.collection.delete(where={"parent_id": parent_id})
 
     @staticmethod
     def _chunk_text(text: str, chunk_chars: int, overlap: int) -> list[str]:

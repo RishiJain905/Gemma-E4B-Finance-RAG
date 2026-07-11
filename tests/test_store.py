@@ -17,6 +17,7 @@ if "chromadb" not in sys.modules:
     sys.modules["chromadb.api"] = MagicMock()
 
 from src.storage.store import Store
+from src.sec.filing_sections import FilingSection
 
 
 @pytest.fixture
@@ -110,6 +111,72 @@ def test_save_document(store, mock_chroma):
         date="2026-05-15",
         metadata=None,
     )
+
+
+def test_add_filing_sections_routes_through_structural_chunker(store, mock_chroma):
+    section = FilingSection(
+        accession="ACC-1", ticker="NVDA", form="10-Q",
+        filing_date="2026-05-15", report_period="2026-03-31",
+        section_key="item_2", section_heading="Item 2. MD&A", section_index=0,
+        text="Item 2. MD&A\nRevenue increased.", source_url="https://sec.example",
+        parsed_path="parsed/ACC-1.txt",
+    )
+    mock_chroma.count_filing_section_chunks.side_effect = [0, 1]
+
+    result = store.add_filing_sections([section])
+
+    mock_chroma.delete_filing_section_family.assert_called_once_with(section.document_id)
+    mock_chroma.add_document.assert_called_once()
+    call = mock_chroma.add_document.call_args.kwargs
+    assert call["document_id"] == section.document_id
+    assert call["text"].startswith("Item 2. MD&A")
+    assert call["source"] == "sec_filing"
+    assert call["metadata"] == {
+        "accession": "ACC-1", "form": "10-Q", "filing_date": "2026-05-15",
+        "report_period": "2026-03-31", "section_key": "item_2",
+        "section_heading": "Item 2. MD&A", "section_index": 0,
+        "parent_id": "sec:ACC-1:item_2", "source_url": "https://sec.example",
+        "parsed_path": "parsed/ACC-1.txt",
+    }
+    assert result == {
+        "sections_written": 1, "chunks_written": 1,
+        "replacements": 0, "skipped": 0,
+    }
+
+
+def test_reprocessing_filing_section_replaces_family_without_duplicate(store, mock_chroma):
+    section = FilingSection(
+        accession="ACC-1", ticker="NVDA", form="10-Q",
+        filing_date="2026-05-15", report_period="2026-03-31",
+        section_key="item_2", section_heading="Item 2. MD&A", section_index=0,
+        text="Item 2. MD&A\nUpdated revenue.", source_url="https://sec.example",
+        parsed_path="parsed/ACC-1.txt",
+    )
+    mock_chroma.count_filing_section_chunks.side_effect = [1, 1]
+
+    result = store.add_filing_sections([section])
+
+    mock_chroma.delete_filing_section_family.assert_called_once_with(section.document_id)
+    assert mock_chroma.add_document.call_args.kwargs["document_id"] == section.document_id
+    assert result["replacements"] == 1
+    assert result["sections_written"] == 1
+
+
+def test_section_read_apis_delegate_with_bounds(fully_mocked_store):
+    store, _sqlite, chroma = fully_mocked_store
+    chroma.get_section_chunks.return_value = [{"id": "x"}]
+    chroma.get_adjacent_sections.return_value = [{"id": "y"}]
+    chroma.count_filing_sections.return_value = 4
+
+    assert store.get_section_chunks("parent", limit=5, offset=2) == [{"id": "x"}]
+    assert store.get_adjacent_sections("ACC", 3, before=1, after=2) == [{"id": "y"}]
+    assert store.count_filing_sections("ACC") == 4
+    store.delete_filing_section_family("parent")
+
+    chroma.get_section_chunks.assert_called_once_with("parent", limit=5, offset=2)
+    chroma.get_adjacent_sections.assert_called_once_with("ACC", 3, before=1, after=2)
+    chroma.count_filing_sections.assert_called_once_with("ACC")
+    chroma.delete_filing_section_family.assert_called_once_with("parent")
 
 
 # ── Hybrid search ────────────────────────────────────

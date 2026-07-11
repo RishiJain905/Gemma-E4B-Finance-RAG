@@ -395,6 +395,24 @@ class UnifiedScheduler:
                 "error": status.get("error_message"),
             }
 
+        # Persisted counters only: status must never invoke an embedding call.
+        with self.store.sqlite._connect() as conn:
+            filing_index = dict(
+                conn.execute(
+                    "SELECT "
+                    "SUM(CASE WHEN status='index_pending' THEN 1 ELSE 0 END) "
+                    "AS pending, "
+                    "COALESCE(SUM(index_section_count), 0) AS sections, "
+                    "COALESCE(SUM(index_chunk_count), 0) AS chunks "
+                    "FROM filings"
+                ).fetchone()
+            )
+        sources.setdefault("sec_filings", {})["filing_text_index"] = {
+            "pending": int(filing_index.get("pending") or 0),
+            "sections": int(filing_index.get("sections") or 0),
+            "chunks": int(filing_index.get("chunks") or 0),
+        }
+
         return {
             "sources": sources,
             "timestamp": datetime.now(timezone.utc).isoformat(),

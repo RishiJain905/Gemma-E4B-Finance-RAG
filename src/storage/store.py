@@ -300,6 +300,65 @@ class Store:
         """Store multiple documents at once."""
         self.chroma.add_documents_batch(ids, texts, metadatas)
 
+    def add_filing_sections(self, sections: list) -> dict[str, int]:
+        """Replace and index SEC section families through Chroma's chunker."""
+        counts = {
+            "sections_written": 0,
+            "chunks_written": 0,
+            "replacements": 0,
+            "skipped": 0,
+        }
+        for section in sections:
+            if not section.text.strip():
+                counts["skipped"] += 1
+                continue
+            existing_count = self.chroma.count_filing_section_chunks(section.document_id)
+            self.chroma.delete_filing_section_family(section.document_id)
+            self.chroma.add_document(
+                document_id=section.document_id,
+                text=section.text,
+                ticker=section.ticker,
+                source="sec_filing",
+                date=section.filing_date,
+                metadata={
+                    "accession": section.accession,
+                    "form": section.form,
+                    "filing_date": section.filing_date,
+                    "report_period": section.report_period,
+                    "section_key": section.section_key,
+                    "section_heading": section.section_heading,
+                    "section_index": section.section_index,
+                    "parent_id": section.document_id,
+                    "source_url": section.source_url,
+                    "parsed_path": section.parsed_path,
+                },
+            )
+            stored_count = self.chroma.count_filing_section_chunks(section.document_id)
+            if not stored_count:
+                raise RuntimeError(f"No chunks stored for {section.document_id}")
+            counts["sections_written"] += 1
+            counts["chunks_written"] += stored_count
+            counts["replacements"] += int(existing_count > 0)
+        return counts
+
+    def get_section_chunks(
+        self, parent_id: str, *, limit: int, offset: int = 0,
+    ) -> list[dict]:
+        return self.chroma.get_section_chunks(parent_id, limit=limit, offset=offset)
+
+    def get_adjacent_sections(
+        self, accession: str, section_index: int, *, before: int = 1, after: int = 1,
+    ) -> list[dict]:
+        return self.chroma.get_adjacent_sections(
+            accession, section_index, before=before, after=after,
+        )
+
+    def count_filing_sections(self, accession: Optional[str] = None) -> int:
+        return self.chroma.count_filing_sections(accession)
+
+    def delete_filing_section_family(self, parent_id: str) -> None:
+        self.chroma.delete_filing_section_family(parent_id)
+
     # ── Hybrid Search ─────────────────────────────────
 
     def search(self, query: str, n_results: int = 5,
@@ -374,7 +433,10 @@ class Store:
 
     def process_filing(self, filing_record: dict,
                        extracted_text: str,
-                       extracted_facts: list[dict]):
+                       extracted_facts: list[dict],
+                       *,
+                       index_document: bool = True,
+                       mark_parsed: bool = True):
         """
         Process a full filing through the model-as-parser pipeline.
 
@@ -392,13 +454,14 @@ class Store:
             f"{filing_record['source_type']}/{filing_record['ticker']}/"
             f"{filing_record['filing_type']}-{filing_record['period']}"
         )
-        self.save_document(
-            document_id=doc_id,
-            text=extracted_text,
-            ticker=filing_record["ticker"],
-            source=filing_record["filing_type"],
-            date=filing_record["filing_date"],
-        )
+        if index_document:
+            self.save_document(
+                document_id=doc_id,
+                text=extracted_text,
+                ticker=filing_record["ticker"],
+                source=filing_record["filing_type"],
+                date=filing_record["filing_date"],
+            )
 
         # 2. Save each extracted fact
         for fact in extracted_facts:
@@ -413,10 +476,11 @@ class Store:
             )
 
         # 3. Mark as parsed
-        self.sqlite.mark_filing_parsed(
-            filing_record["accession"],
-            embedding_id=doc_id
-        )
+        if mark_parsed:
+            self.sqlite.mark_filing_parsed(
+                filing_record["accession"],
+                embedding_id=doc_id
+            )
 
     # ── Cache Management ──────────────────────────────
 

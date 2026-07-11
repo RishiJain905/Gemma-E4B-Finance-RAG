@@ -44,6 +44,21 @@ class SQLiteStore:
 
         with self._connect() as conn:
             conn.executescript(sql)
+            existing = {
+                row[1] for row in conn.execute("PRAGMA table_info(filings)").fetchall()
+            }
+            migrations = {
+                "index_error": "ALTER TABLE filings ADD COLUMN index_error TEXT",
+                "index_section_count": (
+                    "ALTER TABLE filings ADD COLUMN index_section_count INTEGER DEFAULT 0"
+                ),
+                "index_chunk_count": (
+                    "ALTER TABLE filings ADD COLUMN index_chunk_count INTEGER DEFAULT 0"
+                ),
+            }
+            for column, statement in migrations.items():
+                if column not in existing:
+                    conn.execute(statement)
             conn.commit()
 
     @staticmethod
@@ -109,6 +124,9 @@ CREATE TABLE IF NOT EXISTS filings (
     status TEXT DEFAULT 'unprocessed',
     parsed_at TEXT,
     summary_embedding_id TEXT,
+    index_error TEXT,
+    index_section_count INTEGER DEFAULT 0,
+    index_chunk_count INTEGER DEFAULT 0,
     ingested_at TEXT DEFAULT (datetime('now'))
 );
 
@@ -357,20 +375,43 @@ CREATE INDEX IF NOT EXISTS idx_ingestion_log_run ON ingestion_log(run_id);
             conn.commit()
             return cursor.rowcount > 0
 
-    def mark_filing_parsed(self, accession: str, embedding_id: str = None):
+    def mark_filing_parsed(
+        self,
+        accession: str,
+        embedding_id: str = None,
+        file_path: str = None,
+        section_count: int = 0,
+        chunk_count: int = 0,
+    ):
         """Mark a filing as successfully parsed by TraceAlchemy."""
         sql = """
-        UPDATE filings SET status='parsed', parsed_at=datetime('now'), summary_embedding_id=?
+        UPDATE filings SET status='parsed', parsed_at=datetime('now'),
+            summary_embedding_id=?, file_path=COALESCE(?, file_path), index_error=NULL,
+            index_section_count=?, index_chunk_count=?
         WHERE accession=?
         """
         with self._connect() as conn:
-            conn.execute(sql, (embedding_id, accession))
+            conn.execute(
+                sql, (embedding_id, file_path, section_count, chunk_count, accession),
+            )
+            conn.commit()
+
+    def mark_filing_index_pending(
+        self, accession: str, *, file_path: str, error: str,
+    ) -> None:
+        """Record a durable parsed artifact whose vector indexing must retry."""
+        sql = """
+        UPDATE filings SET status='index_pending', file_path=?, index_error=?
+        WHERE accession=?
+        """
+        with self._connect() as conn:
+            conn.execute(sql, (file_path, error, accession))
             conn.commit()
 
     def get_unprocessed_filings(self, limit: int = 10) -> list[dict]:
         """Get filings that haven't been parsed yet."""
         sql = (
-            "SELECT * FROM filings WHERE status='unprocessed' "
+            "SELECT * FROM filings WHERE status IN ('unprocessed', 'index_pending') "
             "ORDER BY filing_date DESC LIMIT ?"
         )
         with self._connect() as conn:

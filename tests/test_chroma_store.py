@@ -359,3 +359,99 @@ def test_add_document_chunks_long_text(chroma_store):
     assert metas[0]["chunk_count"] == len(ids)
     # Each chunk respects the configured window size.
     assert all(len(d) <= chroma_store.chunk_chars for d in docs)
+
+
+def test_sec_filing_family_uses_deterministic_child_ids_and_full_metadata(chroma_store):
+    metadata = {
+        "accession": "ACC-1", "form": "10-K", "filing_date": "2025-01-15",
+        "report_period": "2024-09-28", "section_key": "item_1",
+        "section_heading": "Item 1. Business", "section_index": 0,
+        "parent_id": "sec:ACC-1:item_1", "source_url": "https://sec.example",
+    }
+    chroma_store.add_document(
+        document_id="sec:ACC-1:item_1", text="Item 1. Business\nRevenue was $42.",
+        ticker="AAPL", source="sec_filing", date="2025-01-15", metadata=metadata,
+    )
+
+    call = chroma_store.collection.add.call_args.kwargs
+    assert call["ids"] == ["sec:ACC-1:item_1#0"]
+    assert call["documents"][0].startswith("Item 1. Business")
+    assert call["metadatas"][0] == {
+        **metadata, "ticker": "AAPL", "source": "sec_filing", "date": "2025-01-15",
+        "chunk_index": 0, "chunk_count": 1, "section": "Item 1. Business",
+        "document_id": "sec:ACC-1:item_1#0",
+    }
+
+
+def test_get_section_chunks_is_filtered_and_bounded(chroma_store):
+    chroma_store.collection.get.return_value = {
+        "ids": ["p#1"], "documents": ["body"],
+        "metadatas": [{"parent_id": "p", "chunk_index": 1}],
+    }
+
+    result = chroma_store.get_section_chunks("p", limit=10, offset=2)
+
+    chroma_store.collection.get.assert_called_once_with(
+        where={"parent_id": "p"}, limit=10, offset=2,
+        include=["documents", "metadatas"],
+    )
+    assert result == [{
+        "id": "p#1", "document": "body",
+        "metadata": {"parent_id": "p", "chunk_index": 1},
+    }]
+
+
+def test_get_section_chunks_rejects_unbounded_pages(chroma_store):
+    with pytest.raises(ValueError):
+        chroma_store.get_section_chunks("p", limit=ChromaStore.MAX_READ_LIMIT + 1)
+    with pytest.raises(ValueError):
+        chroma_store.get_section_chunks("p", limit=1, offset=-1)
+    chroma_store.collection.get.assert_not_called()
+
+
+def test_adjacent_sections_filters_accession_not_corpus(chroma_store):
+    chroma_store.collection.get.return_value = {
+        "ids": ["a#0", "b#0"], "documents": ["A", "B"],
+        "metadatas": [
+            {"accession": "ACC-1", "section_index": 2, "chunk_index": 0},
+            {"accession": "ACC-1", "section_index": 3, "chunk_index": 0},
+        ],
+    }
+
+    result = chroma_store.get_adjacent_sections("ACC-1", 3, before=1, after=0)
+
+    kwargs = chroma_store.collection.get.call_args.kwargs
+    assert kwargs["where"] == {"$and": [
+        {"source": "sec_filing"}, {"accession": "ACC-1"},
+        {"section_index": {"$gte": 2}}, {"section_index": {"$lte": 3}},
+    ]}
+    assert kwargs["limit"] == ChromaStore.MAX_READ_LIMIT
+    assert [row["id"] for row in result] == ["a#0", "b#0"]
+
+
+def test_count_and_delete_filing_sections_use_metadata_filters(chroma_store):
+    chroma_store.collection.get.return_value = {
+        "ids": ["a#0", "a#1", "b#0"],
+        "metadatas": [
+            {"parent_id": "a"}, {"parent_id": "a"}, {"parent_id": "b"},
+        ],
+    }
+
+    assert chroma_store.count_filing_sections("ACC-1") == 2
+    chroma_store.collection.get.assert_called_once_with(
+        where={"$and": [{"source": "sec_filing"}, {"accession": "ACC-1"}]},
+        include=["metadatas"],
+    )
+    chroma_store.delete_filing_section_family("a")
+    chroma_store.collection.delete.assert_called_once_with(where={"parent_id": "a"})
+
+
+def test_count_filing_section_chunks_filters_parent_without_documents(chroma_store):
+    chroma_store.collection.get.return_value = {
+        "ids": ["a#0", "a#1"], "metadatas": [{}, {}],
+    }
+
+    assert chroma_store.count_filing_section_chunks("a") == 2
+    chroma_store.collection.get.assert_called_once_with(
+        where={"parent_id": "a"}, include=["metadatas"],
+    )

@@ -88,6 +88,34 @@ sec:
 
 ---
 
+## `configs/sec.yaml`
+
+SEC filing-text indexing is independently rollout-controlled. The default is
+off, so filing processing retains its legacy behavior until explicitly enabled.
+
+```yaml
+sec:
+  index_filing_text: false
+  max_sections_per_filing: 200
+  max_section_chars: 2000000
+  index_forms: [10-K, 10-Q, 8-K]
+```
+
+| Field | Default | Meaning |
+|-------|---------|---------|
+| `sec.index_filing_text` | `false` | Persist and index actual SEC filing sections through the existing Chroma structural chunker. When false, the legacy filing path is unchanged. |
+| `sec.max_sections_per_filing` | `200` | Safety bound on section parents accepted from one filing (hard-capped at 500). Excess sections are logged and skipped. |
+| `sec.max_section_chars` | `2000000` | Parser sanity cap per section (hard-capped at 10,000,000). Oversized sections are skipped and logged; text is never silently truncated. |
+| `sec.index_forms` | `[10-K, 10-Q, 8-K]` | Filing forms eligible for section indexing when the rollout flag is enabled. |
+
+Parsed artifacts are stored beside the configured SQLite database under
+`sec/parsed/`. A successful artifact whose vector write fails remains in the
+additive `index_pending` state with its failure reason and is selected for a
+later retry. Scheduler status reads persisted pending/section/chunk counters;
+it does not call the embedding service.
+
+---
+
 ## `configs/middleware.yaml`
 
 Loaded by `MiddlewareConfig` (`src/middleware/config.py`). Only keys that match

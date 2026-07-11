@@ -208,6 +208,25 @@ def test_status_report_never_checked_and_age_hours(tmp_path):
     assert report["pipeline"] == proc.status_report.return_value
 
 
+def test_status_report_exposes_section_index_observability(tmp_path):
+    scheduler, _store, proc = _make_scheduler(tmp_path)
+    proc.status_report.return_value = {
+        "total_unprocessed": 0,
+        "total_index_pending": 2,
+        "total_parsed": 4,
+        "indexed_sections": 30,
+        "indexed_chunks": 92,
+        "filings_by_ticker": {},
+    }
+
+    with _patch_core_tickers([]):
+        report = scheduler.status_report()
+
+    assert report["pipeline"]["total_index_pending"] == 2
+    assert report["pipeline"]["indexed_sections"] == 30
+    assert report["pipeline"]["indexed_chunks"] == 92
+
+
 # ── 7. reset_discovery_cache ────────────────────────
 
 def test_reset_discovery_cache_marks_stale(tmp_path):
