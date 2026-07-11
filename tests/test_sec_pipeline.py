@@ -109,6 +109,27 @@ def _make_store(tmp_path):
     )
 
 
+def _use_deterministic_embeddings(store):
+    """Keep offline pipeline tests on the real Chroma path without llama-server."""
+
+    def _post(_url, *, json):
+        inputs = json["input"]
+        if isinstance(inputs, str):
+            inputs = [inputs]
+
+        response = MagicMock()
+        response.json.return_value = {
+            "data": [
+                {"embedding": [1.0, float((sum(map(ord, text)) % 97) + 1), 0.5]}
+                for text in inputs
+            ],
+        }
+        return response
+
+    store.chroma.embedding_fn._client.post = MagicMock(side_effect=_post)
+    return store
+
+
 # ============================================================
 # 1. SECEdgarFilingFetcher Tests
 # ============================================================
@@ -439,7 +460,7 @@ class TestFilingProcessor:
         assert result["failed"] == 0
 
     def test_process_pending_filings_with_mock(self, tmp_path):
-        store = _make_store(tmp_path)
+        store = _use_deterministic_embeddings(_make_store(tmp_path))
         store.register_filing(
             ticker="NVDA",
             filing_type="10-Q",
@@ -627,7 +648,7 @@ class TestPhase14Integration:
     """Phase 1.3 + 1.4 coexistence in a shared Store."""
 
     def test_sec_pipeline_coexists_with_yfinance_data(self, tmp_path):
-        store = _make_store(tmp_path)
+        store = _use_deterministic_embeddings(_make_store(tmp_path))
 
         store.save_fundamental(
             ticker="NVDA",

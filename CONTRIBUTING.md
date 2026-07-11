@@ -37,6 +37,17 @@ setup, code style, testing, and the pull-request process.
    `requirements.txt` already pins `pytest`; `pytest-cov` is needed for the
    coverage commands below.
 
+> **One-time model download (Phase 2.1.2 re-ranker):** enabling the
+> cross-encoder re-ranker (`enable_reranker: true` with
+> `reranker_backend: "cross-encoder"`) lazy-loads
+> `cross-encoder/ms-marco-MiniLM-L-6-v2` via `sentence-transformers` on first
+> use — a ~90 MB download from Hugging Face cached under
+> `~/.cache/huggingface/`. This happens automatically the first time a query
+> runs with the re-ranker on; it is **not** needed for the default config
+> (`enable_reranker: false`) or the `llm` backend (which reuses the
+> TraceAlchemy model on `:8087`). If the download fails (offline), the
+> re-ranker falls back to the fused order and logs a warning.
+
 4. **Configure secrets** — create a `.env` in the project root:
 
    ```
@@ -44,9 +55,14 @@ setup, code style, testing, and the pull-request process.
    SEC_EDGAR_USER_AGENT=Your Name your.email@example.com
    ```
 
+5. **Configure model paths** — copy `configs/model.example.yaml` to
+   `configs/model.local.yaml` and set `paths.main_model`, `paths.build_dir`, and
+   (if using MTP) `speculative_decoding.draft_model_path`. This file is
+   gitignored.
+
    See [docs/CONFIGURATION.md](docs/CONFIGURATION.md) for details.
 
-5. **Sanity-check the environment:**
+6. **Sanity-check the environment:**
 
    ```bash
    python scripts/validate_setup.py
@@ -161,4 +177,4 @@ pytest tests/ --live                   # include opt-in live model/SEC tests
    any related task, and note how you tested it.
 
 5. **Keep the PR scoped** — avoid mixing unrelated changes. Do not commit
-   secrets, the `.env` file, or generated data under `data/`.
+   secrets, the `.env` file, `configs/model.local.yaml`, or generated data under `data/`.

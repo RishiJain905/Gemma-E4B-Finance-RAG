@@ -2,6 +2,8 @@
 
 # Data files (generated, not committed)
 data/
+data/symbol_catalog.json
+data/tracked_dynamic.json
 *.db
 *.sqlite
 
@@ -26,6 +28,9 @@ htmlcov/
 .pytest_cache/
 .ruff_cache/
 
+# Eval harness — per-run artifacts (the golden set IS committed)
+eval/runs/
+
 # IDE
 .vscode/
 .idea/
@@ -44,3 +49,9 @@ Thumbs.db
 .env.development
 .env.test
 .env.production
+
+# Machine-specific model paths (copy from configs/model.example.yaml)
+configs/model.local.yaml
+
+# Claude Code local (machine-specific) settings; project skills ARE committed
+.claude/settings.local.json

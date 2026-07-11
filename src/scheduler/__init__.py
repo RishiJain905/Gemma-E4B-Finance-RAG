@@ -78,10 +78,15 @@ class UnifiedScheduler:
             "ttl_key": "ir_pages",
             "weight": 6,
         },
+        "estimates": {
+            "class": "EstimatesIngestor",
+            "ttl_key": "estimates",
+            "weight": 7,
+        },
     }
 
     # Run-mode source selections.
-    DAILY_SOURCES = ["yfinance", "fred", "sec_filings", "ir_pages"]
+    DAILY_SOURCES = ["yfinance", "fred", "sec_filings", "ir_pages", "estimates"]
     HOURLY_SOURCES = ["gdelt"]
     WEEKLY_SOURCES = ["earnings_transcripts", "sec_filings"]
 
@@ -106,6 +111,7 @@ class UnifiedScheduler:
         defaults = {
             "fundamentals": 24, "news": 6, "macro": 24, "sec_filings": 12,
             "gdelt_news": 6, "transcripts": 168, "ir_pages": 24,
+            "estimates": 24,
         }
         try:
             import yaml
@@ -196,6 +202,12 @@ class UnifiedScheduler:
             results = IRIngestor(store=self.store).fetch_all_core()
             stored = sum(r.get("items_stored", 0) for r in results.values())
             return {"tickers_processed": len(results), "items_stored": stored}
+
+        if name == "estimates":
+            from src.macros.estimates_ingestor import EstimatesIngestor
+            results = EstimatesIngestor(store=self.store).fetch_all_core()
+            stored = sum(r.get("facts_stored", 0) for r in results.values())
+            return {"tickers_processed": len(results), "facts_stored": stored}
 
         raise ValueError(f"Unknown source: {name}")
 

@@ -11,13 +11,18 @@ Usage:
     uvicorn src.middleware.app:app --host 0.0.0.0 --port 8000 --reload
 """
 
+import asyncio
+import contextvars
+import json
 import logging
 import time
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import Optional
 
 import httpx
 from fastapi import FastAPI, HTTPException
+from fastapi.responses import StreamingResponse
 
 from src.storage.store import Store
 from .config import MiddlewareConfig
@@ -37,17 +42,274 @@ from .models import (
 
 logger = logging.getLogger(__name__)
 
+SYSTEM_PROMPT = (
+    "You are a financial research assistant. Answer the user's "
+    "question using ONLY the provided context. If the context "
+    "doesn't contain enough information, say so. "
+    "Cite sources inline using [Source: type/ticker] notation."
+)
+
+# Used instead of SYSTEM_PROMPT when tool-calling is enabled. The base
+# prompt's "ONLY the provided context ... say so" rule contradicts tool use
+# and makes the model refuse instead of calling a tool, so the tools-mode
+# prompt replaces (not appends to) it. Tools-off requests never see this.
+TOOLS_SYSTEM_PROMPT = (
+    "You are a financial research assistant with callable tools. Answer using "
+    "the provided context and your tools. When the context does not already "
+    "contain the answer — especially for ranking, filtering, or aggregating "
+    "across stocks (use query_facts), targeted lookups (get_fundamentals), or "
+    "data freshness (check_freshness) — call the appropriate tool rather than "
+    "refusing. Only say the data is unavailable if the context and your tools "
+    "cannot provide it. Answer strictly from context and tool results; never "
+    "invent numbers. Cite sources inline using [Source: type/ticker] notation."
+)
+
+GENERAL_FALLBACK_PREFIX = "Not from your data - general knowledge:"
+GENERAL_FALLBACK_CAVEAT = "Please verify against a primary source before relying on it."
+NO_GENERAL_FALLBACK_MESSAGE = (
+    "I don't have enough data in my knowledge base to answer this. "
+    "General-knowledge fallback is disabled for this deployment."
+)
+
 # ── Global state (set during lifespan) ─────────────────
 
 config: Optional[MiddlewareConfig] = None
 store: Optional[Store] = None
 model_client: Optional[httpx.AsyncClient] = None
+_tools_supported: bool = True
+MACRO_SNAPSHOT_METRICS = ["GDP", "CPIAUCSL", "FEDFUNDS", "UNRATE", "DGS10", "T10Y2Y"]
+_MODEL_TASKS_CACHE: Optional[dict] = None
+FETCH_ON_MISS_MIN_CONFIDENCE = 0.9
+retriever = None  # Shared Retriever (built on startup) — Phase 2.1.2
+_MODEL_HEALTH_TTL_S = 10.0
+_HEALTH_SUMMARY_TTL_S = 3.0
+_model_health = {"ok": False, "ts": 0.0}
+_health_cache = {"ts": 0.0, "value": None}
+_scheduler = None
+
+# Per-request state (Phase 2.1.8.3). Each incoming request runs in its own
+# asyncio Task, which copies the context at creation time, so these never
+# leak between concurrent requests as long as they're reset at the top of
+# _build_query_context — the single entry point shared by /query and
+# /query/stream.
+_tools_used_var: contextvars.ContextVar[Optional[list[str]]] = contextvars.ContextVar(
+    "tools_used", default=None
+)
+_answer_policy_override_var: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar(
+    "answer_policy_override", default=None
+)
+
+
+def _grounding_level(retrieval: dict) -> str:
+    """Return the graded grounding level from retrieved facts/documents."""
+    n = len(retrieval.get("facts", [])) + len(retrieval.get("documents", []))
+    return "grounded" if n >= 3 else "partial" if n >= 1 else "none"
+
+
+def _answer_policy() -> str:
+    """Return the effective answer policy: per-request override, else configured default."""
+    override = _answer_policy_override_var.get()
+    if override in ("strict", "graded"):
+        return override
+    policy = str(getattr(config, "answer_policy", "graded") or "graded").lower()
+    return "strict" if policy == "strict" else "graded"
+
+
+def _reset_request_scoped_state(answer_policy: Optional[str]) -> None:
+    """Reset per-request contextvars: tool-call log and answer-policy override."""
+    _tools_used_var.set([])
+    normalized = str(answer_policy or "").strip().lower()
+    _answer_policy_override_var.set(normalized if normalized in ("strict", "graded") else None)
+
+
+def _record_tool_used(name: str) -> None:
+    """Append a dispatched tool name to the current request's tool-call log."""
+    used = _tools_used_var.get()
+    if used is not None and name and name not in used:
+        used.append(name)
+
+
+def _get_tools_used() -> Optional[list[str]]:
+    """Return the current request's dispatched tool names, or None if empty."""
+    used = _tools_used_var.get()
+    return list(used) if used else None
+
+
+def _resolved_ticker_field(intent: dict) -> Optional[dict]:
+    """Return {'name','source'} when the resolver mapped a non-exact ticker.
+
+    Omitted for exact matches (known_ticker/override) so the field only
+    fires for name lookups and typo-corrected fuzzy matches.
+    """
+    source = intent.get("ticker_source")
+    name = intent.get("resolved_name")
+    if not source or not name or source in ("known_ticker", "override"):
+        return None
+    return {"name": name, "source": source}
+
+
+def _allow_general_fallback() -> bool:
+    """Return whether no-context general fallback answers are allowed."""
+    return bool(getattr(config, "allow_general_fallback", True))
+
+
+def _graded_system_prompt(
+    intent: Optional[dict],
+    grounding_level: str,
+    tools_enabled: bool = False,
+) -> str:
+    """Build the intent-aware graded answer-policy system prompt."""
+    question_type = (intent or {}).get("question_type", "general")
+    mode_guidance = {
+        "grounded": (
+            "Mode: grounded. Answer using ONLY the retrieved facts/documents — "
+            "every factual claim must come from them. Cite sourced claims "
+            "inline using [Source: type/ticker]. Do not add outside knowledge "
+            "and do not use the 'Not from your data' prefix."
+        ),
+        "partial": (
+            "Mode: partial. Answer only the parts supported by retrieved data, "
+            "explicitly name what is missing, and do not fill the gaps with "
+            "outside knowledge or the 'Not from your data' prefix."
+        ),
+        "none": (
+            "Mode: general fallback. No relevant stored facts/documents were "
+            "retrieved. If the request is answerable from stable background "
+            "knowledge, prefix the answer exactly with 'Not from your data - "
+            "general knowledge:' and include a caveat to verify against a "
+            "primary source. Refuse if the request is unsafe or genuinely "
+            "unknowable."
+        ),
+    }
+    if grounding_level == "none" and not _allow_general_fallback():
+        mode_guidance["none"] = (
+            "Mode: refuse. No relevant stored facts/documents were retrieved "
+            "and general fallback is disabled. Say you do not have enough data "
+            "instead of using background knowledge."
+        )
+
+    tool_guidance = ""
+    if tools_enabled:
+        tool_guidance = (
+            "\n- Tools are available. Prefer calling the appropriate tool for "
+            "targeted facts, ranking/filtering, or freshness before refusing."
+        )
+
+    return (
+        "You are a financial research assistant.\n\n"
+        "## Answer policy\n"
+        "Choose one response mode from the grounding level provided.\n"
+        "- Grounded: sufficient facts/docs -> answer and cite [Source: ...].\n"
+        "- Partial: some relevant data -> answer what is supported and state "
+        "what is missing.\n"
+        "- General fallback: no relevant data -> clearly label general "
+        "knowledge and include a primary-source verification caveat.\n"
+        "- Refuse: only for genuinely unknowable or unsafe asks.\n\n"
+        "Hard rule in every mode: never invent specific numbers such as "
+        "prices, P/E, targets, revenue, margins, growth rates, dates, or "
+        "counts. Specific figures must come from context or tools.\n"
+        "The 'Not from your data - general knowledge:' prefix is reserved for "
+        "the general-fallback mode only — never use it when any relevant data "
+        "was retrieved.\n\n"
+        f"Intent: {question_type}\n"
+        f"Grounding level: {grounding_level}\n"
+        f"{mode_guidance.get(grounding_level, mode_guidance['none'])}"
+        f"{tool_guidance}"
+    )
+
+
+def _system_prompt_for_request(
+    intent: Optional[dict],
+    grounding_level: str,
+    tools_enabled: bool = False,
+) -> str:
+    """Return the strict regression prompt or graded policy prompt."""
+    if _answer_policy() == "strict":
+        return TOOLS_SYSTEM_PROMPT if tools_enabled else SYSTEM_PROMPT
+    return _graded_system_prompt(intent, grounding_level, tools_enabled)
+
+
+def _is_declined_answer(answer: str) -> bool:
+    """Heuristically detect model refusals/unsafe declines."""
+    text = (answer or "").strip().lower()
+    if not text:
+        return True
+    decline_markers = (
+        "i don't have enough data",
+        "i do not have enough data",
+        "i can't answer",
+        "i cannot answer",
+        "i'm unable to answer",
+        "i am unable to answer",
+        "cannot provide",
+        "can't provide",
+        "unsafe",
+        "not enough information",
+        "data is unavailable",
+    )
+    return any(marker in text for marker in decline_markers)
+
+
+def _apply_answer_policy(answer: str, grounding_level: str) -> str:
+    """Enforce deterministic labels/refusals that should not depend on sampling."""
+    if _answer_policy() == "strict":
+        return answer
+    if not answer or answer.startswith(("Error calling model:", "Model unavailable.")):
+        return answer
+    if grounding_level != "none":
+        return answer
+    if not _allow_general_fallback():
+        return NO_GENERAL_FALLBACK_MESSAGE
+    if _is_declined_answer(answer):
+        return answer
+
+    labeled = answer.strip()
+    if not labeled.lower().startswith(GENERAL_FALLBACK_PREFIX.lower()):
+        labeled = f"{GENERAL_FALLBACK_PREFIX} {labeled}"
+    if "verify against a primary source" not in labeled.lower():
+        labeled = f"{labeled}\n\n{GENERAL_FALLBACK_CAVEAT}"
+    return labeled
+
+
+def _response_grounding(answer: str, grounding_level: str) -> str:
+    """Map the actual answer path to response metadata."""
+    if _is_declined_answer(answer):
+        return "refused"
+    if grounding_level == "grounded":
+        return "grounded"
+    if grounding_level == "partial":
+        return "partial"
+    if grounding_level == "none" and _allow_general_fallback():
+        return "general"
+    return "refused"
+
+
+async def _invoke_model(
+    prompt: str,
+    temperature: float,
+    max_tokens: int,
+    intent: dict,
+    grounding_level: str,
+) -> tuple[str, list[SourceCitation]]:
+    """Call _call_model while preserving old-signature test monkeypatches."""
+    import inspect
+
+    params = inspect.signature(_call_model).parameters
+    if "intent" not in params:
+        return await _call_model(prompt, temperature, max_tokens)
+    return await _call_model(
+        prompt=prompt,
+        temperature=temperature,
+        max_tokens=max_tokens,
+        intent=intent,
+        grounding_level=grounding_level,
+    )
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Startup and shutdown lifecycle."""
-    global config, store, model_client
+    global config, store, model_client, retriever
 
     logger.info("Starting middleware...")
     from src.utils.env import load_env
@@ -55,8 +317,16 @@ async def lifespan(app: FastAPI):
     config = MiddlewareConfig()
     store = Store(
         embedding_endpoint=config.embedding_endpoint,
+        embedding_cache_size=config.embedding_cache_size,
     )
     model_client = httpx.AsyncClient(timeout=60)
+
+    # Shared retriever so the BM25 lexical index is built once and reused
+    # across requests (Phase 2.1.2). Warm it eagerly on startup.
+    from .retriever import Retriever
+    retriever = Retriever(store=store, config=config)
+    if config.enable_lexical:
+        retriever.warm_lexical_index()
 
     yield  # App runs here
 
@@ -75,6 +345,54 @@ app = FastAPI(
 )
 
 
+def _find_tasks_block(node) -> dict:
+    if not isinstance(node, dict):
+        return {}
+    tasks = node.get("tasks")
+    if isinstance(tasks, dict):
+        return tasks
+    for value in node.values():
+        found = _find_tasks_block(value)
+        if found:
+            return found
+    return {}
+
+
+def _task_params(task_name) -> dict:
+    """Return model task params from configs/model.yaml; fail soft."""
+    global _MODEL_TASKS_CACHE
+    try:
+        if _MODEL_TASKS_CACHE is None:
+            import yaml
+
+            path = Path(__file__).resolve().parents[2] / "configs" / "model.yaml"
+            with open(path, encoding="utf-8") as f:
+                loaded = yaml.safe_load(f) or {}
+            _MODEL_TASKS_CACHE = _find_tasks_block(loaded)
+        task = _MODEL_TASKS_CACHE.get(str(task_name), {})
+        return task if isinstance(task, dict) else {}
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Failed to load model task params: %s", exc)
+        _MODEL_TASKS_CACHE = {}
+        return {}
+
+
+def _macro_snapshot_data() -> dict:
+    return store.get_fundamentals_batch("MACRO", metrics=MACRO_SNAPSHOT_METRICS)
+
+
+def _sentiment_data(ticker: str, days: int = 7) -> dict:
+    from src.macros.gdelt_ingestor import GDELTIngestor
+
+    return GDELTIngestor(store=store).get_sentiment_summary(ticker.upper(), days=days)
+
+
+def _guidance_data(ticker: str) -> dict:
+    from src.macros.earnings_transcripts import EarningsTranscriptIngestor
+
+    return EarningsTranscriptIngestor(store=store).get_latest_guidance(ticker.upper())
+
+
 # ── Health ─────────────────────────────────────────────
 
 @app.get("/health", response_model=HealthResponse)
@@ -85,17 +403,73 @@ async def health():
 
     storage_health = store.heartbeat()
     model_ok = await _check_model_health()
+    summary = _cached_health_summary()
 
-    # Scheduler status (best-effort).
+    capabilities = None
+    if config:
+        capabilities = {
+            "tools": bool(config.enable_tools),
+            "streaming": bool(getattr(config, "enable_streaming", True)),
+            "answer_policy": str(getattr(config, "answer_policy", "graded") or "graded").lower(),
+        }
+
+    return HealthResponse(
+        status="ok" if storage_health.get("sqlite") else "degraded",
+        storage=storage_health,
+        model_available=model_ok,
+        scheduler=summary.get("scheduler"),
+        freshness=summary.get("freshness"),
+        capabilities=capabilities,
+    )
+
+
+@app.get("/tools")
+async def tools():
+    """List model-callable middleware tools and tool-gating state."""
+    from .tools import REGISTRY
+
+    return {
+        "enabled": bool(config.enable_tools) if config else False,
+        "allow_write_tools": bool(config.allow_write_tools) if config else False,
+        "tools": [
+            {
+                "name": tool.name,
+                "description": tool.description,
+                "write": tool.write,
+            }
+            for tool in REGISTRY.values()
+        ],
+    }
+
+
+def _mark_model_health(ok: bool) -> None:
+    """Refresh the in-process model-health cache."""
+    _model_health["ok"] = bool(ok)
+    _model_health["ts"] = time.monotonic()
+
+
+def _get_scheduler():
+    """Return the lazily-built scheduler used by /health."""
+    global _scheduler
+    if _scheduler is None:
+        from src.scheduler import UnifiedScheduler
+        _scheduler = UnifiedScheduler(store=store)
+    return _scheduler
+
+
+def _cached_health_summary(ttl: float = _HEALTH_SUMMARY_TTL_S) -> dict:
+    """Return cached scheduler status and ticker freshness for /health."""
+    now = time.monotonic()
+    cached = _health_cache.get("value")
+    if cached is not None and now - float(_health_cache.get("ts", 0.0)) < ttl:
+        return cached
+
     scheduler_status = None
     try:
-        from src.scheduler import UnifiedScheduler
-        sched = UnifiedScheduler(store=store)
-        scheduler_status = sched.status_report()
+        scheduler_status = _get_scheduler().status_report()
     except Exception as e:  # noqa: BLE001
         logger.warning("Scheduler status unavailable: %s", e)
 
-    # Per-ticker freshness summary (best-effort).
     freshness_summary: dict[str, str] = {}
     for ticker in ["NVDA", "AMD", "AAPL", "MSFT", "META", "CRWD"]:
         try:
@@ -104,30 +478,226 @@ async def health():
         except Exception:  # noqa: BLE001
             freshness_summary[ticker] = "error"
 
-    return HealthResponse(
-        status="ok" if storage_health.get("sqlite") else "degraded",
-        storage=storage_health,
-        model_available=model_ok,
-        scheduler=scheduler_status,
-        freshness=freshness_summary,
-    )
+    value = {"scheduler": scheduler_status, "freshness": freshness_summary}
+    _health_cache["value"] = value
+    _health_cache["ts"] = now
+    return value
 
 
-async def _check_model_health() -> bool:
+async def _check_model_health(ttl: float = _MODEL_HEALTH_TTL_S) -> bool:
     """Ping the llama-server to check if the model is available."""
     if not config or not model_client:
         return False
+    now = time.monotonic()
+    if now - float(_model_health.get("ts", 0.0)) < ttl:
+        return bool(_model_health.get("ok", False))
     try:
         resp = await model_client.get(
             config.llama_endpoint.replace("/v1/chat/completions", "/health"),
             timeout=5,
         )
-        return resp.status_code == 200
+        ok = resp.status_code == 200
+        _mark_model_health(ok)
+        return ok
     except Exception:
+        _mark_model_health(False)
         return False
 
 
 # ── Query (Full Pipeline) ──────────────────────────────
+
+async def _maybe_fetch_on_miss(ticker: str) -> dict:
+    """Run fetch-on-miss ingestion off the event loop with a hard timeout."""
+    from .on_demand import fetch_ticker_on_miss
+
+    # Validate config BEFORE starting any work: once the to_thread task is
+    # created the fetch runs (with network I/O) even if wait_for errors out.
+    # Strict type check on purpose — mock/partial configs must not trigger
+    # a live network fetch.
+    timeout = getattr(config, "fetch_on_miss_timeout_s", None)
+    if not isinstance(timeout, (int, float)) or isinstance(timeout, bool) or timeout <= 0:
+        logger.debug("Fetch-on-miss skipped for %s: invalid timeout config", ticker)
+        return {"fetched": False, "ticker": ticker, "sources": [], "error": "invalid_config"}
+
+    try:
+        task = asyncio.create_task(asyncio.to_thread(fetch_ticker_on_miss, store, ticker))
+        return await asyncio.wait_for(task, timeout=timeout)
+    except asyncio.TimeoutError:
+        logger.warning("Fetch-on-miss timed out for %s", ticker)
+        return {"fetched": False, "ticker": ticker, "sources": [], "error": "timeout"}
+    except Exception as e:  # noqa: BLE001 - never let fetch-on-miss crash a query
+        logger.warning("Fetch-on-miss failed unexpectedly for %s: %s", ticker, e)
+        return {"fetched": False, "ticker": ticker, "sources": [], "error": str(e)}
+
+
+def _stage_timing(timings: dict[str, object], name: str, stage_start: float) -> float:
+    """Record and return a stage duration in milliseconds."""
+    elapsed = round((time.perf_counter() - stage_start) * 1000, 1)
+    timings[name] = elapsed
+    return elapsed
+
+
+def _return_timings_enabled() -> bool:
+    """Return whether response timing metadata should be included."""
+    return_timings = getattr(config, "return_timings", True)
+    return return_timings if isinstance(return_timings, bool) else True
+
+
+async def _build_query_context(request: QueryRequest) -> dict:
+    """Run the shared query pipeline up to the augmented prompt."""
+    if not store:
+        raise HTTPException(status_code=503, detail="Store not initialized")
+
+    start = time.time()
+    timings: dict[str, object] = {}
+    _reset_request_scoped_state(request.answer_policy)
+
+    stage_start = time.perf_counter()
+    from .intent_parser import IntentParser
+
+    parser = IntentParser()
+    intent = parser.parse(request.question, override_ticker=request.ticker)
+    _stage_timing(timings, "intent_parse", stage_start)
+
+    stage_start = time.perf_counter()
+    freshness_meta = _evaluate_and_refresh(intent.get("ticker"), request.refresh)
+    ticker = intent.get("ticker")
+    if (
+        getattr(config, "enable_fetch_on_miss", True)
+        and ticker
+        and freshness_meta.get("overall") == "never_fetched"
+        and intent.get("ticker_confidence", 0.0) >= FETCH_ON_MISS_MIN_CONFIDENCE
+    ):
+        res = await _maybe_fetch_on_miss(ticker)
+        if res.get("fetched"):
+            freshness_meta.setdefault("fetched_on_miss", []).append(ticker)
+            freshness_meta["overall"] = "fresh"
+        else:
+            warning = f"Couldn't fetch live data for {ticker} right now."
+            if res.get("error"):
+                warning = f"{warning} Reason: {res['error']}"
+            freshness_meta["warning"] = warning
+    _stage_timing(timings, "freshness_check", stage_start)
+
+    stage_start = time.perf_counter()
+    from .retriever import Retriever
+
+    r = retriever or Retriever(store=store, config=config)
+    retrieval = r.retrieve(
+        query=request.question,
+        intent=intent,
+        top_k_documents=config.top_k_documents,
+        top_k_facts=config.top_k_facts,
+    )
+    retrieval_ms = _stage_timing(timings, "retrieval", stage_start)
+    retrieval_timings = retrieval.get("timings", {}) if isinstance(retrieval, dict) else {}
+    timings["retrieval"] = {
+        "total": retrieval_ms,
+        "embedding": round(float(retrieval_timings.get("embedding", 0.0) or 0.0), 1),
+        "chroma": round(float(retrieval_timings.get("chroma", 0.0) or 0.0), 1),
+        "sqlite": round(float(retrieval_timings.get("sqlite", 0.0) or 0.0), 1),
+    }
+    grounding_level = _grounding_level(retrieval)
+
+    stage_start = time.perf_counter()
+    from .prompt_augmenter import PromptAugmenter
+
+    augmenter = PromptAugmenter(config=config)
+    augmented_prompt = augmenter.build_prompt(
+        question=request.question,
+        intent=intent,
+        retrieval=retrieval,
+        grounding_level=grounding_level,
+    )
+    _stage_timing(timings, "prompt_build", stage_start)
+
+    return {
+        "start": start,
+        "timings": timings,
+        "intent": intent,
+        "freshness": freshness_meta,
+        "retrieval": retrieval,
+        "grounding_level": grounding_level,
+        "augmented_prompt": augmented_prompt,
+    }
+
+
+def _task_settings(request: QueryRequest, intent: dict) -> tuple[float, int]:
+    """Return temperature and max_tokens for this request."""
+    task = _task_params("analysis") if intent.get("question_type") == "projection" else {}
+    temperature = request.temperature or task.get("temperature") or config.default_temperature
+    max_tokens = request.max_tokens or task.get("max_tokens") or config.max_tokens
+    return temperature, max_tokens
+
+
+def _build_query_response(
+    *,
+    context: dict,
+    answer_text: str,
+    citations: list[SourceCitation],
+    model_available: bool,
+) -> QueryResponse:
+    """Build a QueryResponse from shared query context and model output."""
+    intent = context["intent"]
+    retrieval = context["retrieval"]
+    elapsed_ms = round((time.time() - context["start"]) * 1000, 1)
+
+    return QueryResponse(
+        answer=answer_text,
+        citations=citations,
+        detected_ticker=intent.get("ticker"),
+        detected_intent=intent.get("question_type"),
+        facts_used=len(retrieval.get("facts", [])),
+        documents_used=len(retrieval.get("documents", [])),
+        grounding=_response_grounding(answer_text, context["grounding_level"]),
+        latency_ms=elapsed_ms,
+        timings=context["timings"] if _return_timings_enabled() else None,
+        model_available=model_available,
+        freshness=context["freshness"],
+        retrieval_strategy=retrieval.get("retrieval_strategy"),
+        tools_used=_get_tools_used(),
+        resolved_ticker=_resolved_ticker_field(intent),
+    )
+
+
+async def _answer_query_context(request: QueryRequest, context: dict) -> QueryResponse:
+    """Complete a prepared query context through the non-streaming model path."""
+    intent = context["intent"]
+    retrieval = context["retrieval"]
+    grounding_level = context["grounding_level"]
+    stage_start = time.perf_counter()
+    model_available = await _check_model_health()
+    if model_available:
+        temperature, max_tokens = _task_settings(request, intent)
+        answer_text, citations = await _invoke_model(
+            prompt=context["augmented_prompt"],
+            temperature=temperature,
+            max_tokens=max_tokens,
+            intent=intent,
+            grounding_level=grounding_level,
+        )
+        if not answer_text.startswith("Error calling model:"):
+            _mark_model_health(True)
+        if intent.get("question_type") == "projection":
+            from .guardrails import apply_projection_guardrail
+
+            answer_text, _flagged = apply_projection_guardrail(
+                answer_text,
+                context["augmented_prompt"],
+            )
+    else:
+        logger.warning("Model unavailable - returning degraded answer")
+        answer_text = _format_degraded_answer(retrieval, intent)
+        citations = []
+    _stage_timing(context["timings"], "model_call", stage_start)
+
+    return _build_query_response(
+        context=context,
+        answer_text=answer_text,
+        citations=citations,
+        model_available=model_available,
+    )
+
 
 @app.post("/query", response_model=QueryResponse)
 async def query(request: QueryRequest):
@@ -140,65 +710,145 @@ async def query(request: QueryRequest):
       3. Build augmented prompt
       4. Call TraceAlchemy model
       5. Return grounded answer with citations
+
+    Shares `_build_query_context` / `_answer_query_context` with
+    `/query/stream` so the two paths cannot drift.
     """
-    start = time.time()
+    context = await _build_query_context(request)
+    return await _answer_query_context(request, context)
 
-    if not store:
-        raise HTTPException(status_code=503, detail="Store not initialized")
 
-    # Step 1: Intent parsing (delegated to 1.5.2)
-    from .intent_parser import IntentParser
-    parser = IntentParser()
-    intent = parser.parse(request.question, override_ticker=request.ticker)
+def _response_to_dict(response: QueryResponse) -> dict:
+    """Return a pydantic model as a JSON-serializable dict."""
+    if hasattr(response, "model_dump"):
+        return response.model_dump()
+    return response.dict()
 
-    # Step 1b: Staleness-aware freshness check (Phase 1.7.4)
-    freshness_meta = _evaluate_and_refresh(intent.get("ticker"), request.refresh)
 
-    # Step 2: Dual retrieval (delegated to 1.5.3)
-    from .retriever import Retriever
-    retriever = Retriever(store=store, config=config)
-    retrieval = retriever.retrieve(
-        query=request.question,
-        intent=intent,
-        top_k_documents=config.top_k_documents,
-        top_k_facts=config.top_k_facts,
-    )
+def _sse(event: str, data: dict) -> str:
+    """Format one server-sent event."""
+    return f"event: {event}\ndata: {json.dumps(data, default=str)}\n\n"
 
-    # Step 3: Prompt augmentation (delegated to 1.5.4)
-    from .prompt_augmenter import PromptAugmenter
-    augmenter = PromptAugmenter(config=config)
-    augmented_prompt = augmenter.build_prompt(
-        question=request.question,
-        intent=intent,
-        retrieval=retrieval,
-    )
 
-    # Step 4: Call the model — or degrade gracefully when it is unavailable.
+async def _stream_model_tokens(
+    *,
+    prompt: str,
+    temperature: float,
+    max_tokens: int,
+    intent: dict,
+    grounding_level: str,
+):
+    """Yield token deltas from llama-server's OpenAI-compatible stream."""
+    if not model_client or not config:
+        raise RuntimeError("model client unavailable")
+
+    payload = {
+        "model": config.model_name,
+        "messages": [
+            {
+                "role": "system",
+                "content": _system_prompt_for_request(
+                    intent=intent,
+                    grounding_level=grounding_level,
+                    tools_enabled=False,
+                ),
+            },
+            {"role": "user", "content": prompt},
+        ],
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+        "stream": True,
+    }
+
+    async with model_client.stream("POST", config.llama_endpoint, json=payload) as resp:
+        if hasattr(resp, "raise_for_status"):
+            resp.raise_for_status()
+        async for line in resp.aiter_lines():
+            line = (line or "").strip()
+            if not line:
+                continue
+            if line.startswith("data:"):
+                line = line.removeprefix("data:").strip()
+            if line == "[DONE]":
+                break
+            try:
+                data = json.loads(line)
+            except json.JSONDecodeError:
+                logger.debug("Ignoring malformed model stream line: %s", line[:120])
+                continue
+            choice = (data.get("choices") or [{}])[0]
+            delta = choice.get("delta") or {}
+            token = delta.get("content")
+            if token is None:
+                token = (choice.get("message") or {}).get("content")
+            if token:
+                yield token
+    _mark_model_health(True)
+
+
+@app.post("/query/stream")
+async def query_stream(request: QueryRequest):
+    """Stream token deltas as SSE, followed by terminal query metadata."""
+    if not bool(getattr(config, "enable_streaming", True)):
+        raise HTTPException(status_code=404, detail="Streaming disabled")
+    if bool(getattr(config, "enable_tools", False)):
+        raise HTTPException(status_code=404, detail="Streaming disabled while tools are enabled")
+
+    context = await _build_query_context(request)
     model_available = await _check_model_health()
-    if model_available:
-        answer_text, citations = await _call_model(
-            prompt=augmented_prompt,
-            temperature=request.temperature or config.default_temperature,
-            max_tokens=request.max_tokens or config.max_tokens,
+    if not model_available:
+        raise HTTPException(status_code=404, detail="Streaming unavailable when model is unavailable")
+
+    async def events():
+        stage_start = time.perf_counter()
+        answer_parts: list[str] = []
+        citations: list[SourceCitation] = []
+        try:
+            temperature, max_tokens = _task_settings(request, context["intent"])
+            async for token in _stream_model_tokens(
+                prompt=context["augmented_prompt"],
+                temperature=temperature,
+                max_tokens=max_tokens,
+                intent=context["intent"],
+                grounding_level=context["grounding_level"],
+            ):
+                answer_parts.append(token)
+                yield _sse("token", {"token": token})
+
+            answer_text = _apply_answer_policy(
+                "".join(answer_parts),
+                context["grounding_level"],
+            )
+            citations = _extract_citations(answer_text)
+            if context["intent"].get("question_type") == "projection":
+                from .guardrails import apply_projection_guardrail
+
+                answer_text, _flagged = apply_projection_guardrail(
+                    answer_text,
+                    context["augmented_prompt"],
+                )
+        except Exception as exc:  # noqa: BLE001 - streaming must never fail a query
+            logger.warning("Streaming model call failed; falling back server-side: %s", exc)
+            fallback = await _answer_query_context(request, context)
+            if fallback.answer:
+                yield _sse("token", {"token": fallback.answer})
+            metadata = _response_to_dict(fallback)
+            metadata.pop("answer", None)
+            yield _sse("metadata", metadata)
+            return
+
+        _stage_timing(context["timings"], "model_call", stage_start)
+        response = _build_query_response(
+            context=context,
+            answer_text=answer_text,
+            citations=citations,
+            model_available=True,
         )
-    else:
-        logger.warning("Model unavailable — returning degraded answer")
-        answer_text = _format_degraded_answer(retrieval, intent)
-        citations = []
+        metadata = _response_to_dict(response)
+        metadata.pop("answer", None)
+        yield _sse("metadata", metadata)
 
-    elapsed_ms = round((time.time() - start) * 1000, 1)
-
-    return QueryResponse(
-        answer=answer_text,
-        citations=citations,
-        detected_ticker=intent.get("ticker"),
-        detected_intent=intent.get("question_type"),
-        facts_used=len(retrieval.get("facts", [])),
-        documents_used=len(retrieval.get("documents", [])),
-        latency_ms=elapsed_ms,
-        model_available=model_available,
-        freshness=freshness_meta,
-    )
+    return StreamingResponse(events(), media_type="text/event-stream")
 
 
 def _format_degraded_answer(retrieval: dict, intent: dict) -> str:
@@ -251,6 +901,7 @@ _SOURCE_ALIASES = {
     "earnings_transcripts": "earnings_transcripts",
     "ir": "ir_pages",
     "ir_pages": "ir_pages",
+    "estimates": "estimates",
 }
 
 
@@ -264,6 +915,14 @@ def _normalize_sources(sources: Optional[list[str]]) -> list[str]:
         if logical and logical not in out:
             out.append(logical)
     return out
+
+
+def _stale_source_names(report: dict) -> list[str]:
+    """Return logical source names that are stale or have never been fetched."""
+    return [
+        name for name, info in report.get("sources", {}).items()
+        if info.get("status") in ("stale", "never_fetched")
+    ]
 
 
 # Logical sources that have a scheduler-managed ingestion pipeline. Refreshing
@@ -357,6 +1016,18 @@ def _refresh_one_source_direct(ticker: str, logical: str) -> None:
         from src.macros.ir_ingestor import IRIngestor
         IRIngestor(store=store).fetch_for_ticker(ticker)
         store.mark_source_fresh(ticker, cache_source, ttl)
+    elif logical == "estimates":
+        from src.macros.estimates_ingestor import EstimatesIngestor
+        result = EstimatesIngestor(store=store).fetch_for_ticker(ticker)
+        status = result.get("status")
+        if status not in ("success", "no_data"):
+            raise RuntimeError(
+                f"estimates refresh failed for {ticker}: {status} "
+                f"{result.get('errors') or []}"
+            )
+        # no_data still marks fresh: lack of analyst coverage (e.g. ETFs)
+        # shouldn't trigger a refetch on every stale check.
+        store.mark_source_fresh(ticker, cache_source, ttl)
     else:
         raise ValueError(f"Unknown source: {logical}")
 
@@ -394,6 +1065,7 @@ def _evaluate_and_refresh(ticker: Optional[str], do_refresh: bool) -> dict:
         "overall": "unknown",
         "refreshed_during_query": [],
         "stale_sources_used": [],
+        "fetched_on_miss": [],
         "warning": None,
     }
     if not ticker or not store:
@@ -460,10 +1132,7 @@ async def refresh_ticker(ticker: str, body: Optional[RefreshRequest] = None):
     sources_provided = bool(body and body.sources)
     requested = _normalize_sources(body.sources if body else None)
     report = store.get_freshness_report(ticker)
-    stale = [
-        name for name, info in report.get("sources", {}).items()
-        if info.get("status") in ("stale", "never_fetched")
-    ]
+    stale = _stale_source_names(report)
 
     if sources_provided:
         to_refresh = requested
@@ -474,6 +1143,13 @@ async def refresh_ticker(ticker: str, body: Optional[RefreshRequest] = None):
 
     refreshed, errors = _refresh_ticker_sources(ticker, to_refresh)
 
+    # Keep the BM25 lexical index fresh after ingestion (Phase 2.1.2.3).
+    if retriever is not None:
+        try:
+            retriever.refresh_lexical_index()
+        except Exception as e:  # noqa: BLE001 - never fail the refresh response
+            logger.warning("Lexical index refresh failed: %s", e)
+
     return RefreshResponse(
         ticker=ticker,
         refreshed=refreshed,
@@ -483,33 +1159,123 @@ async def refresh_ticker(ticker: str, body: Optional[RefreshRequest] = None):
     )
 
 
-async def _call_model(prompt: str, temperature: float,
-                      max_tokens: int) -> tuple[str, list[SourceCitation]]:
+async def _call_model(
+    prompt: str,
+    temperature: float,
+    max_tokens: int,
+    intent: Optional[dict] = None,
+    grounding_level: str = "grounded",
+) -> tuple[str, list[SourceCitation]]:
     """Send the augmented prompt to TraceAlchemy and parse the response."""
+    global _tools_supported
+
     if not model_client or not config:
         return "Model unavailable. Please ensure llama-server is running.", []
 
-    payload = {
+    tools_on = bool(getattr(config, "enable_tools", False)) and _tools_supported
+    messages = [
+        {
+            "role": "system",
+            "content": _system_prompt_for_request(
+                intent=intent,
+                grounding_level=grounding_level,
+                tools_enabled=False,
+            ),
+        },
+        {"role": "user", "content": prompt},
+    ]
+    base_payload = {
         "model": config.model_name,
-        "messages": [
-            {
-                "role": "system",
-                "content": (
-                    "You are a financial research assistant. Answer the user's "
-                    "question using ONLY the provided context. If the context "
-                    "doesn't contain enough information, say so. "
-                    "Cite sources inline using [Source: type/ticker] notation."
-                ),
-            },
-            {"role": "user", "content": prompt},
-        ],
+        "messages": messages,
         "temperature": temperature,
         "max_tokens": max_tokens,
     }
 
+    if not tools_on:
+        answer, citations = await _post_and_parse(base_payload)
+        return _apply_answer_policy(answer, grounding_level), citations
+
+    from .tools import ToolContext, dispatch_tool, openai_schema
+
+    # The tool loop keeps its own messages list so every fallback to
+    # _post_and_parse(base_payload) still sends the exact pre-tools prompt.
+    messages = [
+        {
+            "role": "system",
+            "content": _system_prompt_for_request(
+                intent=intent,
+                grounding_level=grounding_level,
+                tools_enabled=True,
+            ),
+        },
+        {"role": "user", "content": prompt},
+    ]
+    schema = openai_schema()
+    ctx = ToolContext(
+        allow_write=config.allow_write_tools,
+        max_refreshes=config.max_refreshes_per_query,
+    )
+    for iteration in range(config.max_tool_iterations):
+        payload = {**base_payload, "messages": messages, "tools": schema}
+        try:
+            resp = await model_client.post(config.llama_endpoint, json=payload)
+            resp.raise_for_status()
+            _mark_model_health(True)
+            data = resp.json()
+        except httpx.HTTPStatusError as e:
+            body = e.response.text if e.response is not None else ""
+            status = e.response.status_code if e.response is not None else None
+            if status in (400, 404, 500) and "tool" in body.lower():
+                logger.warning("Model tools unsupported; falling back to plain calls")
+                _tools_supported = False
+                answer, citations = await _post_and_parse(base_payload)
+                return _apply_answer_policy(answer, grounding_level), citations
+            logger.error("Model call failed: %s", e)
+            return f"Error calling model: {e}", []
+        except Exception as e:  # noqa: BLE001
+            logger.error("Model call failed: %s", e)
+            return f"Error calling model: {e}", []
+
+        try:
+            msg = (data.get("choices") or [{}])[0].get("message") or {}
+            content = msg.get("content") or ""
+            tool_calls = msg.get("tool_calls") or []
+        except (AttributeError, IndexError, TypeError) as e:
+            logger.error("Malformed model response in tool loop: %s", e)
+            return f"Error calling model: malformed response ({e})", []
+        if iteration == 0 and not tool_calls and not content.strip():
+            logger.warning("Model returned empty content with tools; disabling tools")
+            _tools_supported = False
+            answer, citations = await _post_and_parse(base_payload)
+            return _apply_answer_policy(answer, grounding_level), citations
+        if not tool_calls:
+            answer = _apply_answer_policy(content, grounding_level)
+            return answer, _extract_citations(answer)
+
+        messages.append(msg)
+        for call in tool_calls:
+            tool_name = (call.get("function") or {}).get("name")
+            if tool_name:
+                _record_tool_used(tool_name)
+            result = await asyncio.to_thread(dispatch_tool, call, store, ctx)
+            messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": call.get("id", ""),
+                    "content": json.dumps(result),
+                }
+            )
+
+    answer, citations = await _post_and_parse({**base_payload, "messages": messages})
+    return _apply_answer_policy(answer, grounding_level), citations
+
+
+async def _post_and_parse(payload: dict) -> tuple[str, list[SourceCitation]]:
+    """POST a chat payload and parse content plus inline citations."""
     try:
         resp = await model_client.post(config.llama_endpoint, json=payload)
         resp.raise_for_status()
+        _mark_model_health(True)
         data = resp.json()
         content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
 
@@ -541,25 +1307,45 @@ def _extract_citations(text: str) -> list[SourceCitation]:
 
 @app.post("/search", response_model=SearchResponse)
 async def search(request: SearchRequest):
-    """Raw hybrid search — returns retrieved data without model inference."""
+    """Raw hybrid search — returns retrieved data without model inference.
+
+    Documents come through the shared retriever's hybrid path (vector + BM25 +
+    re-rank, per config) so ``fusion_score`` / ``rerank_score`` are exposed for
+    inspecting ranking quality (Phase 2.1.2.3).
+    """
     if not store:
         raise HTTPException(status_code=503, detail="Store not initialized")
 
+    from .retriever import Retriever
+    r = retriever or Retriever(store=store, config=config)
+
+    documents: list[dict] = []
+    facts: list[dict] = []
+    ticker_out = request.ticker
     try:
-        results = store.search(
+        facts_results = store.search(
             query=request.query,
             n_results=request.n_results,
             ticker=request.ticker,
         )
-    except Exception as e:
-        logger.warning("Search failed (embedding server may be down): %s", e)
-        # Return empty results gracefully when embedding server is unavailable
-        results = {"documents": [], "facts": [], "ticker": request.ticker}
+        facts = facts_results.get("facts", [])
+        ticker_out = facts_results.get("ticker") or request.ticker
+    except Exception as e:  # noqa: BLE001
+        logger.warning("Search facts failed (embedding server may be down): %s", e)
+
+    try:
+        documents = r.retrieve_documents(
+            query=request.query,
+            ticker=request.ticker,
+            n_results=request.n_results,
+        )
+    except Exception as e:  # noqa: BLE001
+        logger.warning("Search documents failed: %s", e)
 
     return SearchResponse(
-        documents=results.get("documents", []),
-        facts=results.get("facts", []),
-        ticker=results.get("ticker"),
+        documents=documents,
+        facts=facts,
+        ticker=ticker_out,
     )
 
 
@@ -574,9 +1360,7 @@ async def macro_snapshot():
     if not store:
         raise HTTPException(status_code=503, detail="Store not initialized")
 
-    macro = store.get_fundamentals_batch("MACRO", metrics=[
-        "GDP", "CPIAUCSL", "FEDFUNDS", "UNRATE", "DGS10", "T10Y2Y",
-    ])
+    macro = _macro_snapshot_data()
 
     return MacroSnapshotResponse(
         gdp=macro.get("GDP"),
@@ -602,9 +1386,7 @@ async def sentiment(ticker: str, days: int = 7):
     if not store:
         raise HTTPException(status_code=503, detail="Store not initialized")
 
-    from src.macros.gdelt_ingestor import GDELTIngestor
-    ingestor = GDELTIngestor(store=store)
-    summary = ingestor.get_sentiment_summary(ticker.upper(), days=days)
+    summary = _sentiment_data(ticker, days=days)
 
     return SentimentResponse(
         ticker=summary.get("ticker", ticker.upper()),
@@ -625,9 +1407,7 @@ async def guidance(ticker: str):
     if not store:
         raise HTTPException(status_code=503, detail="Store not initialized")
 
-    from src.macros.earnings_transcripts import EarningsTranscriptIngestor
-    ingestor = EarningsTranscriptIngestor(store=store)
-    guidance_data = ingestor.get_latest_guidance(ticker.upper())
+    guidance_data = _guidance_data(ticker)
 
     if not guidance_data:
         return {"ticker": ticker.upper(), "guidance": {}, "status": "not_found"}

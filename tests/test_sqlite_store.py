@@ -1,6 +1,5 @@
 # Test suite for SQLiteStore — Phase 1.2.2
 
-import sqlite3
 from pathlib import Path
 
 import pytest

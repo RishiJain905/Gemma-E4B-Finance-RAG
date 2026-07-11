@@ -4,7 +4,7 @@ Pydantic models for request/response schemas.
 """
 
 from datetime import datetime
-from typing import Optional
+from typing import Literal, Optional
 
 from pydantic import BaseModel, Field
 
@@ -22,6 +22,10 @@ class QueryRequest(BaseModel):
     stream: bool = Field(False, description="Enable streaming response")
     refresh: bool = Field(True, description="Auto-refresh stale data before answering")
     include_sources: bool = Field(True, description="Include source citations")
+    answer_policy: Optional[str] = Field(
+        None,
+        description="Per-request override of the server's answer policy: strict|graded",
+    )
 
 
 class SourceCitation(BaseModel):
@@ -46,13 +50,31 @@ class QueryResponse(BaseModel):
     detected_intent: Optional[str] = None
     facts_used: int = 0
     documents_used: int = 0
+    grounding: Literal["grounded", "partial", "general", "refused"] = Field(
+        "refused",
+        description="Answer grounding mode used: grounded|partial|general|refused",
+    )
     latency_ms: float = 0.0
+    timings: Optional[dict] = Field(
+        None,
+        description="Optional per-stage latency breakdown in milliseconds",
+    )
     model_available: bool = True
+    retrieval_strategy: Optional[str] = Field(
+        None, description="Document retrieval path used: vector|hybrid|hybrid+rerank")
+    tools_used: Optional[list[str]] = Field(
+        None, description="Names of middleware tools invoked while answering, if any")
+    resolved_ticker: Optional[dict] = Field(
+        None,
+        description="Resolved ticker {'name','source'} when the resolver mapped a "
+                    "non-exact company name or typo (omitted for known_ticker/override)",
+    )
     freshness: dict = Field(
         default_factory=lambda: {
             "overall": "unknown",
             "refreshed_during_query": [],
             "stale_sources_used": [],
+            "fetched_on_miss": [],
             "warning": None,
         },
         description="Freshness metadata for the data used in the answer",
@@ -68,6 +90,10 @@ class HealthResponse(BaseModel):
     model_available: bool = False
     scheduler: Optional[dict] = None
     freshness: Optional[dict] = None
+    capabilities: Optional[dict] = Field(
+        None,
+        description="Active deployment capabilities: {'tools','streaming','answer_policy'}",
+    )
     version: str = "1.0.0"
 
 

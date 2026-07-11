@@ -19,7 +19,6 @@ NOTE: Live API tests (marked @pytest.mark.live) require:
     - Run with: pytest tests/test_macros.py -v --live
 """
 
-import json
 import sys
 from pathlib import Path
 from unittest.mock import MagicMock, patch

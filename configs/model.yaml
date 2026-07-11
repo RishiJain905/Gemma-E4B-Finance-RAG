@@ -1,7 +1,7 @@
 # configs/model.yaml
-# TraceAlchemy Model Configuration — Windows + AMD RDNA3
-# Inference runs on Windows PC with AMD GPU.
-# The Hermes agent operates on Linux; model is served remotely.
+# Committed defaults for TraceAlchemy + llama-server.
+# Machine-specific paths belong in configs/model.local.yaml (gitignored).
+# Copy configs/model.example.yaml to  ->  configs/model.local.yaml to start.
 
 model:
   name: "TraceAlchemy-Gemma-4-E4B-Finance-IT"
@@ -25,7 +25,7 @@ model:
   gpu_vendor: "AMD"
   gpu_arch: "RDNA3 (gfx1101)"
   gpu_layers: 99
-  gpu_memory: 16  # GB, adjust based on your actual VRAM
+  gpu_memory: 16
 
   # ── Context & Limits ─────────────────────────────────
   max_context: 131072
@@ -39,9 +39,9 @@ model:
   # ── Speculative Decoding (MTP) ──────────────────────
   speculative_decoding:
     enabled: true
-    type: "mtp"                               # Multi-Token Prediction
+    type: "mtp"
     draft_model: "gemma-4-E4B-it-assistant"
-    draft_model_path: "D:\\LOCAL-MODELS\\AtomicChat\\gemma-4-E4B-it-assistant-GGUF\\gemma-4-E4B-it-assistant.F16.gguf"
+    draft_model_path: "${DRAFT_MODEL_PATH}"
     draft_block_size: 3
     draft_quant: "F16"
 
@@ -85,13 +85,13 @@ model:
   embedding:
     enabled: true
     endpoint: "http://127.0.0.1:8087/v1/embeddings"
-    dimension: 2560    # TraceAlchemy embedding output dimension (informational)
+    dimension: 2560
     normalize: true
     batch_supported: true
     pooling: "mean"
 
-  # ── Model Paths (Windows) ────────────────────────────
+  # ── Model Paths — set in configs/model.local.yaml ────
   paths:
-    main_model: "D:\\LOCAL-MODELS\\trjxter\\TraceAlchemy-Gemma-4-E4B-Finance-IT-gguf\\gemma-4-E4B-it.Q8_0.gguf"
-    build_dir: "F:\\Personal\\TQ-Optimizer-Test\\atomic-llama-cpp-turboquant\\build-rdna3-gfx1101"
-    binary: "bin\\llama-server.exe"
+    main_model: "${MAIN_MODEL_PATH}"
+    build_dir: "${LLAMA_BUILD_DIR}"
+    binary: "bin/llama-server.exe"

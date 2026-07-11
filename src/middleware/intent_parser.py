@@ -18,7 +18,10 @@ Usage:
 
 import logging
 import re
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
+
+if TYPE_CHECKING:
+    from .symbol_resolver import SymbolResolver
 
 logger = logging.getLogger(__name__)
 
@@ -86,6 +89,16 @@ class IntentParser:
 
     KNOWN_TICKERS = set(COMPANY_TO_TICKER.values())
 
+    # Uppercase words that look like tickers but are almost always English.
+    # Shared by the step-3 fallback below and SymbolResolver's catalog ticker
+    # match (several of these ARE real symbols — e.g. ARE, ALL, IT, CAN — and
+    # must not resolve from prose).
+    COMMON_QUERY_WORDS = {"I", "A", "AN", "THE", "IT", "IS", "BE", "TO",
+                          "OF", "IN", "ON", "AT", "BY", "AS", "OR", "IF",
+                          "NO", "GO", "DO", "WE", "HE", "SHE", "ALL", "FOR",
+                          "AND", "NOT", "ARE", "WAS", "HAS", "HAD", "CAN",
+                          "WILL", "MAY", "YOUR", "YOU", "THAT", "THIS", "WITH"}
+
     # ── Metric Keywords ────────────────────────────────
 
     METRIC_PATTERNS = [
@@ -127,6 +140,7 @@ class IntentParser:
         (r"\bcash flow\b", "operating_cash_flow"),
 
         # Valuation
+        (r"\bprice target\b", "price_target_mean"),
         (r"\bpe ratio\b", "pe_ratio"),
         (r"\bprice to earnings\b", "pe_ratio"),
         (r"\bp/e\b", "pe_ratio"),
@@ -198,6 +212,17 @@ class IntentParser:
             r"\bwhat (causes|drives|impacts|affects)\b",
             r"\breason\b",
         ],
+        "projection": [
+            r"\bprice target\b",
+            r"\bprojection[s]?\b",
+            r"\bconsensus\b",
+            r"\bnext (quarter|year)\b",
+            r"\bforecast\b",
+            r"\bexpect(s|ed|ation|ations)?\b",
+            r"\bguidance\b",
+            r"\bestimate[ds]?\b",
+            r"\bwill .* (grow|reach|hit)\b",
+        ],
         "sentiment": [
             r"\bsentiment\b",
             r"\bmarket (mood|feeling|attitude)\b",
@@ -228,6 +253,7 @@ class IntentParser:
         "comparison",
         "trend",
         "explanation",
+        "projection",
         "sentiment",
         "news",
         "risk",
@@ -255,7 +281,9 @@ class IntentParser:
         (r"\bytd\b", "ytd"),
     ]
 
-    def __init__(self):
+    def __init__(self, resolver: Optional["SymbolResolver"] = None):
+        from .symbol_resolver import NO_MATCH, get_default_resolver
+
         # Pre-compile regex patterns for performance
         self._metric_regexes = [
             (re.compile(pattern, re.IGNORECASE), metric)
@@ -269,6 +297,8 @@ class IntentParser:
             (re.compile(pattern, re.IGNORECASE), tf_type)
             for pattern, tf_type in self.TIMEFRAME_PATTERNS
         ]
+        self._resolver = resolver or get_default_resolver()
+        self._last_resolution = NO_MATCH
 
     # ── Public API ─────────────────────────────────────
 
@@ -291,13 +321,26 @@ class IntentParser:
                 "original_question": str,
             }
         """
+        if override_ticker:
+            from .symbol_resolver import Resolution
+
+            ticker = override_ticker
+            ticker_resolution = Resolution(override_ticker, 1.0, None, "override")
+            self._last_resolution = ticker_resolution
+        else:
+            ticker = self._detect_ticker(question)
+            ticker_resolution = self._last_resolution
+
         intent = {
-            "ticker": override_ticker or self._detect_ticker(question),
+            "ticker": ticker,
             "metrics": self._extract_metrics(question),
             "question_type": self._classify_question_type(question),
             "timeframe": self._extract_timeframe(question),
             "timeframe_type": self._extract_timeframe_type(question),
             "original_question": question,
+            "ticker_confidence": ticker_resolution.confidence,
+            "resolved_name": ticker_resolution.resolved_name,
+            "ticker_source": ticker_resolution.source,
         }
         logger.debug(
             "Parsed intent: ticker=%s type=%s metrics=%s timeframe=%s",
@@ -310,27 +353,33 @@ class IntentParser:
 
     def _detect_ticker(self, text: str) -> Optional[str]:
         """Detect ticker from company name or symbol in the question."""
+        from .symbol_resolver import NO_MATCH, Resolution
+
+        self._last_resolution = NO_MATCH
         normalized = text.lower()
 
         # 1. Check company names first (more specific)
         for company_name, ticker in self.COMPANY_TO_TICKER.items():
             if company_name in normalized:
+                self._last_resolution = Resolution(ticker, 1.0, company_name, "local_map")
                 return ticker
 
         # 2. Check for uppercase ticker symbols (1-5 letters)
         candidates = set(re.findall(r'\b[A-Z]{1,5}\b', text))
         for c in candidates:
             if c in self.KNOWN_TICKERS:
+                self._last_resolution = Resolution(c, 1.0, c, "known_ticker")
                 return c
 
+        resolved = self._resolver.resolve(text)
+        if resolved.ticker:
+            self._last_resolution = resolved
+            return resolved.ticker
+
         # 3. Fallback: return first uppercase word that looks like a ticker
-        common_words = {"I", "A", "AN", "THE", "IT", "IS", "BE", "TO",
-                        "OF", "IN", "ON", "AT", "BY", "AS", "OR", "IF",
-                        "NO", "GO", "DO", "WE", "HE", "SHE", "ALL", "FOR",
-                        "AND", "NOT", "ARE", "WAS", "HAS", "HAD", "CAN",
-                        "WILL", "MAY", "YOUR", "YOU", "THAT", "THIS", "WITH"}
         for c in candidates:
-            if c not in common_words and len(c) >= 1:
+            if c not in self.COMMON_QUERY_WORDS and len(c) >= 1:
+                self._last_resolution = Resolution(c, 0.3, None, "fallback")
                 return c
 
         return None

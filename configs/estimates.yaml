@@ -1,0 +1,10 @@
+provider: yfinance
+request_delay: 3.0
+max_retries: 3
+timeout: 30
+fmp:
+  api_key: "${FMP_API_KEY}"
+  base_url: "https://financialmodelingprep.com/api/v3"
+finnhub:
+  api_key: "${FINNHUB_API_KEY}"
+  base_url: "https://finnhub.io/api/v1"

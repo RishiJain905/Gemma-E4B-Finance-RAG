@@ -1,0 +1,105 @@
+# configs/model.example.yaml
+# ─────────────────────────────────────────────────────────────────────────────
+# Machine-specific model paths live here — NOT in the committed model.yaml.
+#
+# Setup:
+#   1. Copy this file to configs/model.local.yaml
+#   2. Set paths.main_model, paths.build_dir, and (if using MTP) the draft path
+#   3. model.local.yaml is gitignored — safe for personal directories
+#
+# You can also set environment variables instead of editing the local file:
+#   MAIN_MODEL_PATH, LLAMA_BUILD_DIR, DRAFT_MODEL_PATH
+# ─────────────────────────────────────────────────────────────────────────────
+
+model:
+  name: "TraceAlchemy-Gemma-4-E4B-Finance-IT"
+  id: "tracealchemy"
+  backend: "llama-server"
+
+  # ── Network ──────────────────────────────────────────
+  host: "127.0.0.1"
+  port: 8087
+  base_url: "http://127.0.0.1:8087"
+  platform: "windows"          # windows | linux | macos
+
+  # ── Architecture ─────────────────────────────────────
+  family: "Gemma 4 E4B"
+  architecture: "Mixture-of-Experts (MoE)"
+  parameters_total: "~9B"
+  parameters_active: "~2.6B"
+  quantization: "Q8_0"
+
+  # ── GPU (adjust for your hardware) ───────────────────
+  gpu_vendor: "AMD"
+  gpu_arch: "RDNA3 (gfx1101)"
+  gpu_layers: 99
+  gpu_memory: 16               # GB — informational; adjust to your VRAM
+
+  # ── Context & Limits ─────────────────────────────────
+  max_context: 131072
+  max_tokens_default: 2048
+  max_tokens_max: 8192
+  supported_modes:
+    - chat
+    - completion
+    - embedding
+
+  # ── Speculative Decoding (MTP) ──────────────────────
+  speculative_decoding:
+    enabled: true
+    type: "mtp"
+    draft_model: "gemma-4-E4B-it-assistant"
+    draft_model_path: "${DRAFT_MODEL_PATH}"
+    draft_block_size: 3
+    draft_quant: "F16"
+
+  # ── Cache ────────────────────────────────────────────
+  cache:
+    type_key: "q8_0"
+    type_value: "turbo4"
+
+  # ── CPU ──────────────────────────────────────────────
+  cpu_threads: 8
+
+  # ── API Endpoints ────────────────────────────────────
+  endpoints:
+    chat_completions: "/v1/chat/completions"
+    completions: "/v1/completions"
+    embeddings: "/v1/embeddings"
+
+  # ── Default Sampling ─────────────────────────────────
+  defaults:
+    temperature: 0.7
+    top_p: 0.95
+    top_k: 40
+    repeat_penalty: 1.1
+
+  # ── Per-Task Parameters ──────────────────────────────
+  tasks:
+    fact_extraction:
+      description: "Parsing SEC filings into structured data"
+      temperature: 0.1
+      max_tokens: 1024
+    general_qa:
+      description: "Answering user queries with RAG context"
+      temperature: 0.7
+      max_tokens: 512
+    analysis:
+      description: "Deep financial analysis and reasoning"
+      temperature: 0.5
+      max_tokens: 2048
+
+  # ── Embedding ────────────────────────────────────────
+  embedding:
+    enabled: true
+    endpoint: "http://127.0.0.1:8087/v1/embeddings"
+    dimension: 2560
+    normalize: true
+    batch_supported: true
+    pooling: "mean"
+
+  # ── Model Paths — override in model.local.yaml ───────
+  paths:
+    main_model: "${MAIN_MODEL_PATH}"
+    build_dir: "${LLAMA_BUILD_DIR}"
+    binary: "bin/llama-server.exe"    # relative to build_dir; use "llama-server" on Linux if on PATH

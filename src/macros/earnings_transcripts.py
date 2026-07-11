@@ -17,7 +17,6 @@ import logging
 import re
 import time
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import Optional
 
 import requests
@@ -136,7 +135,7 @@ class EarningsTranscriptIngestor:
                 unit=fact.get("unit", "usd"),
                 period=quarter,
                 period_type="quarterly",
-                source_type=f"earnings_transcript",
+                source_type="earnings_transcript",
                 source_url=f"https://seekingalpha.com/symbol/{ticker}/earnings/transcripts",
             )
             stored_count += 1
