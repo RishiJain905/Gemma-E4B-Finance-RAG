@@ -27,6 +27,28 @@ enable_fetch_on_miss: true
 fetch_on_miss_timeout_s: 10.0
 fetch_on_miss_per_query: 1
 
+# Phase 2.2.2.1 — bounded client-owned conversation history.
+# The middleware stays stateless; the client (scripts/chat.py) owns the turns
+# and sends them per request. These cap how much of that history/question one
+# request may use. Values above the documented safe maxima are clamped with a
+# warning (see src/middleware/config.py). Env overrides: CONVERSATION_MAX_TURNS,
+# CONVERSATION_MAX_HISTORY_CHARS, CONVERSATION_MAX_QUESTION_CHARS.
+conversation_max_turns: 8            # max recent turns kept (ceiling 50)
+conversation_max_history_chars: 8000 # max total history chars kept (ceiling 32000)
+conversation_max_question_chars: 16000  # hard cap on the current question (422 over-limit)
+
+# Phase 2.2.2.2 — follow-up rewriting & entity carryover.
+# When enable_conversation_rewrite is on and history is present, the current
+# turn + bounded history are compiled into a SEPARATE retrieval query while the
+# raw question is left byte-for-byte unchanged. Off by default (behavior
+# unchanged) until the conversational gates pass. enable_llm_rewrite_fallback
+# adds one bounded, schema/catalog-validated model call only when deterministic
+# compilation leaves a slot ambiguous. Env: ENABLE_CONVERSATION_REWRITE,
+# ENABLE_LLM_REWRITE_FALLBACK, CONVERSATION_REWRITE_TIMEOUT_S.
+enable_conversation_rewrite: false
+enable_llm_rewrite_fallback: false
+conversation_rewrite_timeout_s: 15.0
+
 # Phase 2.1.2 — hybrid retrieval & re-ranking.
 # Lexical (BM25) channel + RRF fusion (2.1.2.1). Low-risk; on by default.
 enable_lexical: true

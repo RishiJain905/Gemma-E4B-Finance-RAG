@@ -115,3 +115,41 @@ class TestRetriever:
         tickers = retriever._extract_all_tickers("Compare NVDA and AMD")
         assert "NVDA" in tickers
         assert "AMD" in tickers
+
+    def test_carried_intent_drives_retrieval_for_pronoun_followup(self, store):
+        """A pronoun follow-up carries the entity so retrieval still finds it (2.2.2.2).
+
+        The raw turn ("Why did it grow?") names no ticker, so the parsed intent
+        alone retrieves nothing. compile_question carries NVDA from the grounded
+        prior answer; retrieving with that effective intent returns the fact.
+        """
+        from src.middleware.conversation import compile_question
+        from src.middleware.models import ChatTurn
+        from src.middleware.retriever import Retriever
+
+        store.save_fundamental("NVDA", "total_revenue", 26.0, "billion_usd",
+                               "2026-Q1", "quarterly", "sec_10q")
+        history = [
+            ChatTurn(role="user", content="Show NVDA revenue for FY2025"),
+            ChatTurn(role="assistant", content="an answer",
+                     context={"grounding": "grounded", "ticker": "NVDA"}),
+        ]
+        compiled = compile_question("Why did it grow?", history)
+        assert compiled.entity == "NVDA"
+
+        retriever = Retriever(store=store)
+        # Without the carried entity, retrieving for an unrelated ticker finds
+        # nothing...
+        raw = retriever.retrieve(
+            query="Why did it grow?",
+            intent={"ticker": "ZZZZ", "metrics": ["total_revenue"],
+                    "question_type": "fact_lookup"},
+        )
+        assert raw["facts"] == []
+        # ...but the effective (carried) intent recovers the fact.
+        effective = retriever.retrieve(
+            query=compiled.retrieval_query,
+            intent={"ticker": compiled.entity, "metrics": compiled.metrics,
+                    "question_type": "explanation"},
+        )
+        assert any(f.get("metric") == "total_revenue" for f in effective["facts"])

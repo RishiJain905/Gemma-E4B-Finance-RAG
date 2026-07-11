@@ -24,6 +24,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import httpx
 import pytest
 from fastapi.testclient import TestClient
+from pydantic import ValidationError
 
 if "chromadb" not in sys.modules:
     _mock_chroma = type(sys)("chromadb")
@@ -749,6 +750,102 @@ class TestMiddlewareIntegration:
 
         search_result = store.search("NVDA revenue")
         assert search_result["facts"] or search_result["documents"]
+
+
+# ============================================================
+# 5b. Conversation history contract (2.2.2.1)
+# ============================================================
+
+
+class TestConversationContract:
+    """Additive /query history contract — single-turn stays byte-for-byte."""
+
+    def _mock_plain_query_app(self, monkeypatch, answer="NVDA revenue is 26B"):
+        """Wire a minimal mocked /query pipeline (no tools/stream/model server)."""
+        from types import SimpleNamespace
+
+        import src.middleware.app as middleware_app
+
+        config = SimpleNamespace(
+            model_name="tracealchemy",
+            llama_endpoint="http://test/v1/chat/completions",
+            default_temperature=0.3, max_tokens=256,
+            top_k_documents=5, top_k_facts=10,
+            enable_tools=False, enable_streaming=True, enable_fetch_on_miss=False,
+            answer_policy="graded", allow_general_fallback=True, return_timings=True,
+            conversation_max_turns=8, conversation_max_history_chars=8000,
+        )
+        parser = MagicMock()
+        parser.parse.return_value = {
+            "ticker": "NVDA", "ticker_confidence": 1.0,
+            "question_type": "fact_lookup", "metrics": ["total_revenue"],
+        }
+        monkeypatch.setattr("src.middleware.intent_parser.IntentParser",
+                            MagicMock(return_value=parser))
+        monkeypatch.setattr(middleware_app, "config", config)
+        monkeypatch.setattr(middleware_app, "store", object())
+        monkeypatch.setattr(middleware_app, "retriever", SimpleNamespace(
+            retrieve=lambda **_k: {
+                "facts": [{"metric": "total_revenue", "value": 26.0}],
+                "documents": [], "retrieval_strategy": "vector", "timings": {}}))
+        monkeypatch.setattr(middleware_app, "_evaluate_and_refresh",
+                            MagicMock(return_value={"overall": "fresh", "fetched_on_miss": []}))
+        monkeypatch.setattr(middleware_app, "_check_model_health", AsyncMock(return_value=True))
+        monkeypatch.setattr(middleware_app, "_task_params", lambda _t: {})
+
+        completion = MagicMock()
+        completion.raise_for_status.return_value = None
+        completion.json.return_value = {"choices": [{"message": {"content": answer}}]}
+        monkeypatch.setattr(middleware_app, "model_client",
+                            SimpleNamespace(post=AsyncMock(return_value=completion)))
+        return middleware_app
+
+    def test_query_request_without_history_is_backward_compatible(self, monkeypatch):
+        from src.middleware.models import QueryRequest
+
+        # Model defaults: additive fields are empty/None.
+        req = QueryRequest(question="What is NVDA revenue?")
+        assert req.history == []
+        assert req.session_id is None
+
+        app = self._mock_plain_query_app(monkeypatch)
+        client = TestClient(app.app)
+
+        # No history -> conversation metadata omitted (single-turn behavior).
+        r0 = client.post("/query", json={"question": "What is NVDA revenue?"})
+        assert r0.status_code == 200
+        assert r0.json()["conversation"] is None
+
+        # With history -> metadata reports what was received/used.
+        r1 = client.post("/query", json={
+            "question": "And AMD?",
+            "session_id": "sess-1",
+            "history": [
+                {"role": "user", "content": "What is NVDA revenue?"},
+                {"role": "assistant", "content": "NVDA revenue is 26B"},
+            ],
+        })
+        assert r1.status_code == 200
+        convo = r1.json()["conversation"]
+        assert convo == {
+            "history_turns_received": 2,
+            "history_turns_used": 2,
+            "history_truncated": False,
+            "topic_reset": False,
+        }
+
+    def test_current_question_is_never_silently_truncated(self):
+        from src.middleware.models import MAX_QUESTION_CHARS, QueryRequest
+
+        # At the limit: accepted verbatim, no truncation.
+        at_limit = "a" * MAX_QUESTION_CHARS
+        req = QueryRequest(question=at_limit)
+        assert req.question == at_limit
+        assert len(req.question) == MAX_QUESTION_CHARS
+
+        # Over the limit: explicit validation error, not a shortened question.
+        with pytest.raises(ValidationError):
+            QueryRequest(question="a" * (MAX_QUESTION_CHARS + 1))
 
 
 # ============================================================

@@ -100,6 +100,24 @@ also fails when any of these categories has **zero eligible fixtures** (a
 missing category must never look like a pass). These run alongside — and never
 weaken — the 2.2.1.2 pre-metric checks and the baseline regression comparison.
 
+### From the chat client (2.2.2.3)
+
+`scripts/chat.py` wraps this harness for convenience — it only shells out to
+`run_eval.py`/`score.py`, and never loads or starts the model itself:
+
+- `/eval [N]` — drive the first `N` **single-turn** golden cases
+  (`run_eval.py --limit N --no-conversations`) and print the run tail.
+- `/eval conversations [N]` — include the multi-turn **conversation** fixtures
+  (`run_eval.py --limit N`), then score deterministically
+  (`score.py --no-judge`) and print the carryover / topic-reset /
+  subquestion-coverage / cross-session-leakage metrics.
+
+Both are **opt-in and live**: they require an already-running stack (middleware
+on `:8000`, and the model on `:8087` for the run to produce non-degraded
+answers). They are a convenience wrapper, not a substitute for the full
+`run → score → gate` flow above. The chat client's own unit tests inject a fake
+runner, so no eval process, model, or network is touched offline.
+
 ## Layout
 
 ```

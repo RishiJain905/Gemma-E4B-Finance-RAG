@@ -33,6 +33,7 @@ from .models import (
     FreshnessResponse,
     HealthResponse,
     MacroSnapshotResponse,
+    MAX_QUESTION_CHARS,
     QueryRequest,
     QueryResponse,
     RefreshRequest,
@@ -378,6 +379,18 @@ async def health():
             "tools": bool(config.enable_tools),
             "streaming": bool(getattr(config, "enable_streaming", True)),
             "answer_policy": str(getattr(config, "answer_policy", "graded") or "graded").lower(),
+            # Conversation-memory (2.2.2) capabilities + effective limits. The
+            # client reads these to size its multiline composer and history
+            # controls; older servers omit them and the client uses local
+            # defaults. history/multiline are always-true on this build since
+            # the request contract accepts bounded history and multi-line
+            # questions up to max_question_chars.
+            "history": True,
+            "multiline": True,
+            "max_question_chars": int(MAX_QUESTION_CHARS),
+            "conversation_max_turns": int(getattr(config, "conversation_max_turns", 8)),
+            "conversation_max_history_chars": int(
+                getattr(config, "conversation_max_history_chars", 8000)),
         }
 
     return HealthResponse(
@@ -526,14 +539,58 @@ async def _build_query_context(request: QueryRequest) -> dict:
     intent = parser.parse(request.question, override_ticker=request.ticker)
     _stage_timing(timings, "intent_parse", stage_start)
 
+    # Bounded client-owned history selection (2.2.2.1). The middleware stays
+    # stateless: it validates + selects the turns the client sent and reports
+    # how many it used. No history -> single-turn behavior is unchanged and the
+    # conversation metadata block is omitted.
+    conversation_meta: Optional[dict] = None
+    history_turns: list = []
+    if request.history:
+        from .conversation import select_history
+
+        selection = select_history(
+            request.history,
+            max_turns=getattr(config, "conversation_max_turns", 8),
+            max_chars=getattr(config, "conversation_max_history_chars", 8000),
+        )
+        conversation_meta = selection.as_metadata()
+        history_turns = selection.turns
+
+    # Follow-up rewriting & entity carryover (2.2.2.2). Behind a config flag and
+    # only when history is present. Compiles a SEPARATE retrieval query and an
+    # effective retrieval intent (carried entity/metric/timeframe) while leaving
+    # request.question untouched. Off (or no history) -> retrieval_intent is the
+    # raw intent and retrieval_query is the raw question, so nothing changes.
+    compiled = None
+    retrieval_query = request.question
+    retrieval_intent = intent
+    if history_turns and getattr(config, "enable_conversation_rewrite", False):
+        from .conversation import compile_question
+
+        compiled = compile_question(
+            request.question, history_turns, override_ticker=request.ticker,
+        )
+        from .query_rewriter import should_use_llm_fallback
+
+        if should_use_llm_fallback(compiled, config):
+            from .query_rewriter import rewrite_query
+
+            compiled = await asyncio.to_thread(
+                rewrite_query, request.question, history_turns, compiled, config=config,
+            )
+        retrieval_query = compiled.retrieval_query or request.question
+        retrieval_intent = _effective_intent(intent, compiled)
+        if conversation_meta is not None:
+            conversation_meta["topic_reset"] = bool(compiled.topic_reset)
+
     stage_start = time.perf_counter()
-    freshness_meta = _evaluate_and_refresh(intent.get("ticker"), request.refresh)
-    ticker = intent.get("ticker")
+    freshness_meta = _evaluate_and_refresh(retrieval_intent.get("ticker"), request.refresh)
+    ticker = retrieval_intent.get("ticker")
     if (
         getattr(config, "enable_fetch_on_miss", True)
         and ticker
         and freshness_meta.get("overall") == "never_fetched"
-        and intent.get("ticker_confidence", 0.0) >= FETCH_ON_MISS_MIN_CONFIDENCE
+        and retrieval_intent.get("ticker_confidence", 0.0) >= FETCH_ON_MISS_MIN_CONFIDENCE
     ):
         res = await _maybe_fetch_on_miss(ticker)
         if res.get("fetched"):
@@ -551,8 +608,8 @@ async def _build_query_context(request: QueryRequest) -> dict:
 
     r = retriever or Retriever(store=store, config=config)
     retrieval = r.retrieve(
-        query=request.question,
-        intent=intent,
+        query=retrieval_query,
+        intent=retrieval_intent,
         top_k_documents=config.top_k_documents,
         top_k_facts=config.top_k_facts,
     )
@@ -576,7 +633,7 @@ async def _build_query_context(request: QueryRequest) -> dict:
             answer_policy=_answer_policy(),
             grounding_level=grounding_level,
             raw_question=request.question,
-            retrieval_query=request.question,
+            retrieval_query=retrieval_query,
             facts=usable_facts(retrieval),
             documents=usable_documents(retrieval),
         )
@@ -585,10 +642,12 @@ async def _build_query_context(request: QueryRequest) -> dict:
     stage_start = time.perf_counter()
     from .prompt_augmenter import PromptAugmenter
 
+    # Prompt/answer use the RAW question and the effective (carried) intent;
+    # only retrieval used the compiled query.
     augmenter = PromptAugmenter(config=config)
     augmented_prompt = augmenter.build_prompt(
         question=request.question,
-        intent=intent,
+        intent=retrieval_intent,
         retrieval=retrieval,
         grounding_level=grounding_level,
     )
@@ -597,13 +656,43 @@ async def _build_query_context(request: QueryRequest) -> dict:
     return {
         "start": start,
         "timings": timings,
-        "intent": intent,
+        "intent": retrieval_intent,
         "freshness": freshness_meta,
         "retrieval": retrieval,
         "grounding_level": grounding_level,
         "augmented_prompt": augmented_prompt,
         "include_evidence_trace": request.include_evidence_trace,
+        "conversation": conversation_meta,
+        "history_turns": history_turns,
+        "compiled": compiled,
+        "retrieval_query": retrieval_query,
     }
+
+
+def _effective_intent(intent: dict, compiled) -> dict:
+    """Overlay carried/resolved slots onto the parsed intent for retrieval.
+
+    The raw question's intent is preserved except where follow-up compilation
+    (2.2.2.2) resolved an entity, metric, or timeframe the raw turn lacked. The
+    carried ticker is marked ``ticker_source="carryover"`` so the response's
+    resolved-ticker field (which only fires for non-exact name lookups) is not
+    spuriously populated for it.
+    """
+    eff = dict(intent)
+    entity = getattr(compiled, "entity", None)
+    if entity and entity != eff.get("ticker"):
+        eff["ticker"] = entity
+        if entity in getattr(compiled, "carried_entities", []):
+            eff["ticker_source"] = "carryover"
+            eff["resolved_name"] = None
+            eff["ticker_confidence"] = 1.0
+    metrics = getattr(compiled, "metrics", None)
+    if metrics:
+        eff["metrics"] = list(metrics)
+    timeframe = getattr(compiled, "timeframe", None)
+    if timeframe and not eff.get("timeframe"):
+        eff["timeframe"] = timeframe
+    return eff
 
 
 def _task_settings(request: QueryRequest, intent: dict) -> tuple[float, int]:
@@ -638,6 +727,23 @@ def _build_query_response(
         if trace is not None:
             evidence_trace = trace.to_dict()
 
+    # Follow-up rewriting metadata (2.2.2.2) — only present when compilation ran
+    # (flag on + history). Exposes the compiled query and the carried slots so a
+    # client can show what carried and the eval harness can record explicit
+    # resolved values.
+    compiled = context.get("compiled")
+    retrieval_query = None
+    carried_context = None
+    resolved_tickers = None
+    resolved_metrics = None
+    resolved_timeframe = None
+    if compiled is not None:
+        retrieval_query = context.get("retrieval_query")
+        carried_context = compiled.as_metadata()
+        resolved_tickers = [compiled.entity] if compiled.entity else list(compiled.carried_entities)
+        resolved_metrics = list(compiled.metrics)
+        resolved_timeframe = compiled.timeframe
+
     return QueryResponse(
         answer=answer_text,
         citations=citations,
@@ -650,10 +756,16 @@ def _build_query_response(
         timings=context["timings"] if _return_timings_enabled() else None,
         model_available=model_available,
         evidence_trace=evidence_trace,
+        conversation=context.get("conversation"),
         freshness=context["freshness"],
         retrieval_strategy=retrieval.get("retrieval_strategy"),
         tools_used=_get_tools_used(),
         resolved_ticker=_resolved_ticker_field(intent),
+        retrieval_query=retrieval_query,
+        carried_context=carried_context,
+        resolved_tickers=resolved_tickers,
+        resolved_metrics=resolved_metrics,
+        resolved_timeframe=resolved_timeframe,
     )
 
 

@@ -183,6 +183,10 @@ you> /tools              # list model-callable tools
 you> /grounding strict   # force the strict answer policy for this session
 you> /eval 10            # run the eval harness (10 cases) against this server
 you> /ticker NVDA        # pin a ticker for following questions
+you> And how about AMD?  # follow-ups reuse this session's bounded history
+you> /history            # preview this conversation's turns (local, no API call)
+you> /new                # start a fresh conversation (clear history, new session id)
+you> /history off        # run single-turn (stop sending/recording history)
 you> /help               # full command list
 you> /quit               # stops the middleware if this script started it
 ```
