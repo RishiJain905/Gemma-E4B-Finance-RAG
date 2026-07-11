@@ -202,7 +202,13 @@ class HealthResponse(BaseModel):
     freshness: Optional[dict] = None
     capabilities: Optional[dict] = Field(
         None,
-        description="Active deployment capabilities: {'tools','streaming','answer_policy'}",
+        description="Active deployment capabilities and effective limits. Always "
+                    "includes {'tools','streaming','answer_policy'}; on servers that "
+                    "support conversation memory (2.2.2) it also advertises "
+                    "{'history','multiline','max_question_chars','conversation_max_turns',"
+                    "'conversation_max_history_chars'} so clients can read the real "
+                    "limits instead of guessing. Older servers omit the extra keys and "
+                    "clients fall back to local defaults.",
     )
     version: str = "1.0.0"
 

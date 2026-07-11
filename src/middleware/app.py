@@ -33,6 +33,7 @@ from .models import (
     FreshnessResponse,
     HealthResponse,
     MacroSnapshotResponse,
+    MAX_QUESTION_CHARS,
     QueryRequest,
     QueryResponse,
     RefreshRequest,
@@ -378,6 +379,18 @@ async def health():
             "tools": bool(config.enable_tools),
             "streaming": bool(getattr(config, "enable_streaming", True)),
             "answer_policy": str(getattr(config, "answer_policy", "graded") or "graded").lower(),
+            # Conversation-memory (2.2.2) capabilities + effective limits. The
+            # client reads these to size its multiline composer and history
+            # controls; older servers omit them and the client uses local
+            # defaults. history/multiline are always-true on this build since
+            # the request contract accepts bounded history and multi-line
+            # questions up to max_question_chars.
+            "history": True,
+            "multiline": True,
+            "max_question_chars": int(MAX_QUESTION_CHARS),
+            "conversation_max_turns": int(getattr(config, "conversation_max_turns", 8)),
+            "conversation_max_history_chars": int(
+                getattr(config, "conversation_max_history_chars", 8000)),
         }
 
     return HealthResponse(

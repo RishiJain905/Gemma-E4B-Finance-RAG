@@ -7,6 +7,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from fastapi.testclient import TestClient
 
 from src.middleware import app as middleware_app
 from src.middleware.models import QueryRequest, SourceCitation
@@ -22,11 +23,14 @@ def _config(**overrides):
         "top_k_documents": 5,
         "top_k_facts": 10,
         "enable_tools": False,
+        "enable_streaming": True,
         "enable_fetch_on_miss": False,
         "answer_policy": "graded",
         "allow_general_fallback": True,
         "return_timings": True,
         "embedding_cache_size": 256,
+        "conversation_max_turns": 8,
+        "conversation_max_history_chars": 8000,
     }
     values.update(overrides)
     return SimpleNamespace(**values)
@@ -174,3 +178,24 @@ async def test_no_behavior_change(monkeypatch):
     assert cached.facts_used == uncached.facts_used
     assert cached.documents_used == uncached.documents_used
     assert uncached.timings is None
+
+
+def test_health_advertises_conversation_and_multiline_capabilities(monkeypatch):
+    """/health advertises the effective history/multiline limits (2.2.2.3) so
+    the client can size its composer instead of guessing."""
+    monkeypatch.setattr(middleware_app, "config", _config(
+        enable_tools=False, enable_streaming=True, answer_policy="graded"))
+    monkeypatch.setattr(
+        middleware_app, "store",
+        SimpleNamespace(heartbeat=lambda: {"sqlite": True, "chroma": True}))
+    monkeypatch.setattr(middleware_app, "_check_model_health", AsyncMock(return_value=True))
+    monkeypatch.setattr(
+        middleware_app, "_cached_health_summary", lambda: {"scheduler": None, "freshness": {}})
+
+    caps = TestClient(middleware_app.app).get("/health").json()["capabilities"]
+
+    assert caps["history"] is True
+    assert caps["multiline"] is True
+    assert caps["max_question_chars"] == 16000
+    assert caps["conversation_max_turns"] == 8
+    assert caps["conversation_max_history_chars"] == 8000

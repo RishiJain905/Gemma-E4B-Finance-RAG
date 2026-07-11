@@ -68,6 +68,12 @@ def _bare_session(client, *, stream_enabled=False, stream_unavailable=True, verb
     session.history = []
     session.session_id = "sess-test"
     session.history_enabled = True
+    # 2.2.2.3 effective limits/capabilities (normally set from /health).
+    session.max_question_chars = chat.DEFAULT_MAX_QUESTION_CHARS
+    session.history_capable = True
+    session.multiline_capable = True
+    session.conversation_max_turns = None
+    session.conversation_max_history_chars = None
     return session
 
 
@@ -665,6 +671,8 @@ def test_health_reports_capabilities(monkeypatch):
         enable_tools=True,
         enable_streaming=False,
         answer_policy="strict",
+        conversation_max_turns=8,
+        conversation_max_history_chars=8000,
     )
     monkeypatch.setattr(middleware_app, "config", config)
     monkeypatch.setattr(
@@ -679,5 +687,253 @@ def test_health_reports_capabilities(monkeypatch):
     response = client.get("/health")
 
     assert response.status_code == 200
-    data = response.json()
-    assert data["capabilities"] == {"tools": True, "streaming": False, "answer_policy": "strict"}
+    caps = response.json()["capabilities"]
+    # 2.2.2.1 flags preserved …
+    assert caps["tools"] is True
+    assert caps["streaming"] is False
+    assert caps["answer_policy"] == "strict"
+    # … plus 2.2.2.3 conversation/multiline capability flags + effective limits.
+    assert caps["history"] is True
+    assert caps["multiline"] is True
+    assert caps["max_question_chars"] == 16000
+    assert caps["conversation_max_turns"] == 8
+    assert caps["conversation_max_history_chars"] == 8000
+
+
+# ── 2.2.2.3: multiline composer, limits/errors, session visibility, eval ──
+
+def _scripted_input(lines, *, exhaust=EOFError):
+    """An ``input()`` stand-in that returns queued lines then raises ``exhaust``
+    (EOFError/KeyboardInterrupt) — mimics the terminal EOF/Ctrl+C boundary."""
+    it = iter(lines)
+
+    def _fn(_prompt=""):
+        try:
+            return next(it)
+        except StopIteration:
+            raise exhaust
+
+    return _fn
+
+
+def test_multiline_buffer_preserves_newlines_and_punctuation():
+    buf = chat.MultilineBuffer()
+    buf.add("Compare NVDA and AMD revenue growth from FY2023 to FY2025.")
+    buf.add("Include margin changes; summarize the strongest cited risk for each!")
+    text = buf.text()
+    # Newlines join the lines exactly; punctuation is untouched.
+    assert text == (
+        "Compare NVDA and AMD revenue growth from FY2023 to FY2025.\n"
+        "Include margin changes; summarize the strongest cited risk for each!"
+    )
+    assert text.count("\n") == 1
+    assert buf.char_count() == len(text)
+    assert not buf.is_empty()
+
+
+def test_send_submits_exactly_one_question():
+    client = RecordingClient(_query_data("combined answer"))
+    session = _bare_session(client)
+    input_fn = _scripted_input([
+        "Compare NVDA and AMD revenue growth from FY2023 to FY2025.",
+        "Include margin changes and summarize the strongest cited risk for each.",
+        "/send",
+    ])
+
+    submitted = chat.compose_multiline(session, None, False, input_fn=input_fn)
+
+    assert submitted is True
+    # Exactly one request, carrying the exact newline-joined question.
+    assert len(client.posts) == 1
+    assert client.posts[0]["question"] == (
+        "Compare NVDA and AMD revenue growth from FY2023 to FY2025.\n"
+        "Include margin changes and summarize the strongest cited risk for each."
+    )
+
+
+def test_cancel_and_interrupt_do_not_submit_or_change_history():
+    # /cancel discards the draft.
+    client = RecordingClient()
+    session = _bare_session(client)
+    submitted = chat.compose_multiline(
+        session, None, False,
+        input_fn=_scripted_input(["a buffered line", "/cancel"]))
+    assert submitted is False
+    assert client.posts == []
+    assert session.history == []
+
+    # EOF (Ctrl+D) cancels the buffer, not the session.
+    submitted = chat.compose_multiline(
+        session, None, False,
+        input_fn=_scripted_input(["half a thought"], exhaust=EOFError))
+    assert submitted is False
+    assert client.posts == []
+    assert session.history == []
+
+    # Ctrl+C cancels the buffer, not the session.
+    submitted = chat.compose_multiline(
+        session, None, False,
+        input_fn=_scripted_input(["half a thought"], exhaust=KeyboardInterrupt))
+    assert submitted is False
+    assert client.posts == []
+    assert session.history == []
+
+
+def test_oversized_multiline_question_is_not_sent():
+    client = RecordingClient()
+    session = _bare_session(client)
+    session.max_question_chars = 50
+    long_line = "x" * 200
+    # Oversized /send is rejected locally; a following /cancel exits.
+    submitted = chat.compose_multiline(
+        session, None, False,
+        input_fn=_scripted_input([long_line, "/send", "/cancel"]))
+
+    assert submitted is False
+    assert client.posts == []  # never left the client
+    assert session.history == []
+
+
+def test_422_prints_structured_validation_detail(capsys):
+    long_msg = ("String should have at most 16000 characters — the composed "
+                "question exceeded the server limit and was rejected without "
+                "truncation so no partial question was ever answered (detail-tail-marker)")
+    detail = [{
+        "type": "string_too_long",
+        "loc": ["body", "question"],
+        "msg": long_msg,
+        "ctx": {"max_length": 16000},
+    }]
+
+    class Client422:
+        def post(self, path, json=None):
+            return FakeResponse(status_code=422, data={"detail": detail}, text="clip")
+
+    session = _bare_session(Client422())
+    session.query("q", ticker=None, refresh=False)
+
+    out = capsys.readouterr().out
+    assert "422" in out
+    assert "body.question" in out
+    assert "string_too_long" in out
+    # Full detail, not clipped to 200 chars — the tail marker survives.
+    assert "detail-tail-marker" in out
+
+
+def test_422_does_not_disable_streaming():
+    class Stream422Client:
+        def __init__(self):
+            self.stream_calls = 0
+            self.post_calls = 0
+
+        def stream(self, *_args, **_kwargs):
+            self.stream_calls += 1
+            return FakeStreamResponse([], status_code=422, text="unprocessable")
+
+        def post(self, path, json=None):
+            self.post_calls += 1
+            return FakeResponse(data=_query_data("fallback answer"))
+
+    client = Stream422Client()
+    session = _bare_session(client, stream_enabled=True, stream_unavailable=False)
+
+    session.query("first", ticker=None, refresh=False)
+    # A 422 must not poison streaming: still enabled for the next question.
+    assert session.stream_unavailable is False
+    session.query("second", ticker=None, refresh=False)
+
+    assert client.stream_calls == 2   # streaming attempted both times
+    assert client.post_calls == 2     # each falls back once to POST /query
+    assert session.stream_unavailable is False
+
+
+def test_old_server_without_conversation_capability_still_works(capsys):
+    class OldClient:
+        def __init__(self):
+            self.posts = []
+
+        def get(self, path):
+            # Old middleware: /health has no conversation capability keys.
+            return FakeResponse(data={
+                "status": "ok",
+                "capabilities": {"tools": False, "streaming": True, "answer_policy": "graded"},
+            })
+
+        def post(self, path, json=None):
+            self.posts.append(json)
+            return FakeResponse(data=_query_data("still answered"))
+
+    client = OldClient()
+    session = _bare_session(client)
+
+    caps = session.load_capabilities()
+    # Missing keys leave local defaults in place.
+    assert session.max_question_chars == chat.DEFAULT_MAX_QUESTION_CHARS
+    assert "max_question_chars" not in (caps or {})
+
+    session.query("What is NVDA revenue?", ticker=None, refresh=False)
+    out = capsys.readouterr().out
+    assert "still answered" in out
+    assert len(client.posts) == 1
+
+
+def test_verbose_metadata_shows_carried_context(capsys):
+    data = _query_data()
+    data["carried_context"] = {
+        "entities": ["AMD"], "metrics": ["revenue"], "timeframe": "FY2025"}
+
+    chat._render_metadata(data, verbose=True)
+    verbose_out = capsys.readouterr().out
+    assert "context: AMD · revenue · FY2025" in verbose_out
+
+    chat._render_metadata(data, verbose=False)
+    plain_out = capsys.readouterr().out
+    assert "context:" not in plain_out
+
+
+def test_history_preview_does_not_expose_evidence_trace(capsys):
+    session = _bare_session(RecordingClient())
+    session.history = [
+        {"role": "user", "content": "What is NVDA revenue?"},
+        {
+            "role": "assistant",
+            "content": "NVDA revenue is 26B",
+            # Neither the follow-up context nor any leaked evidence trace / system
+            # prompt / tool schema must ever reach the /history preview.
+            "context": {"ticker": "NVDA", "intent": "fact_lookup"},
+            "evidence_trace": {"system_prompt": "SECRET-SYSTEM-PROMPT",
+                               "documents": ["SECRET-EVIDENCE-DOC"]},
+        },
+    ]
+
+    session.print_history()
+    out = capsys.readouterr().out
+
+    assert "NVDA revenue is 26B" in out          # the user-visible turn preview
+    assert "SECRET-SYSTEM-PROMPT" not in out     # no system prompt
+    assert "SECRET-EVIDENCE-DOC" not in out      # no retrieved evidence
+    assert "evidence_trace" not in out
+    assert "system_prompt" not in out
+
+
+def test_conversation_eval_command_uses_expected_runner_arguments():
+    calls: list[list[str]] = []
+
+    def fake_runner(argv):
+        calls.append(list(argv))
+        if argv and str(argv[0]).endswith("score.py"):
+            return 0, ("=== Conversational (Phase 2.2) ===\n"
+                       "entity_carryover_accuracy              0.90   (n=10)\n"
+                       "cross_session_leakage_rate             0.00   (n=10)\n")
+        return 0, "Wrote 12 results -> eval/runs/1.jsonl"
+
+    # Conversation mode: run the fixtures, then score deterministically.
+    chat.do_eval(3, conversations=True, runner=fake_runner)
+    assert calls[0] == [str(chat.RUN_EVAL), "--limit", "3"]
+    assert calls[1] == [str(chat.SCORE_EVAL), "--no-judge"]
+    assert len(calls) == 2
+
+    # Single-turn mode: single-turn cases only, no conversations, no scoring.
+    calls.clear()
+    chat.do_eval(10, runner=fake_runner)
+    assert calls == [[str(chat.RUN_EVAL), "--limit", "10", "--no-conversations"]]
