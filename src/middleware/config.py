@@ -48,6 +48,17 @@ class MiddlewareConfig:
         self.allow_write_tools: bool = False
         self.max_refreshes_per_query: int = 2
 
+        # Phase 2.2.3.2 — deterministic finance tool routing. When
+        # enable_deterministic_tool_routing is on, safe analytical/comparison/
+        # projection/calculation requests are routed to the existing read tools
+        # before any model call (see deterministic_router.route). Off by default
+        # so 2.2.3.4 can compare the route against the current tool loop first.
+        # enable_deterministic_answers additionally lets a fully-covered route
+        # skip model generation and answer from a template.
+        self.enable_deterministic_tool_routing: bool = False
+        self.max_deterministic_tools_per_query: int = 3
+        self.enable_deterministic_answers: bool = False
+
         # Phase 2.1.6 — fetch-on-miss ingestion controls.
         self.enable_fetch_on_miss: bool = True
         self.fetch_on_miss_timeout_s: float = 10.0
@@ -134,6 +145,9 @@ class MiddlewareConfig:
         _int("MAX_TOOL_ITERATIONS", "max_tool_iterations")
         _bool("ALLOW_WRITE_TOOLS", "allow_write_tools")
         _int("MAX_REFRESHES_PER_QUERY", "max_refreshes_per_query")
+        _bool("ENABLE_DETERMINISTIC_TOOL_ROUTING", "enable_deterministic_tool_routing")
+        _int("MAX_DETERMINISTIC_TOOLS_PER_QUERY", "max_deterministic_tools_per_query")
+        _bool("ENABLE_DETERMINISTIC_ANSWERS", "enable_deterministic_answers")
         _bool("ENABLE_FETCH_ON_MISS", "enable_fetch_on_miss")
         _float("FETCH_ON_MISS_TIMEOUT_S", "fetch_on_miss_timeout_s")
         _int("FETCH_ON_MISS_PER_QUERY", "fetch_on_miss_per_query")
