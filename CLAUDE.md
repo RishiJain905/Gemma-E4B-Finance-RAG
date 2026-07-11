@@ -14,6 +14,27 @@ Rankings, higher = better. Cost reflects what I actually pay (OpenAI has really 
 | opus-4.8 | 4 | 7 | 8 |
 | fable-5 | 2 | 9 | 9 |
 
+### Claude subagent presets (model + effort)
+
+The Agent tool has no per-spawn effort parameter — effort is pinned in the agent definition. Five presets live in `.claude/agents/` (spawn via `subagent_type: "<preset>"`); Fable is spawned plainly with `model: 'fable'` and inherits the session's effort:
+
+| preset | model | effort | use for |
+|--------|-------|--------|---------|
+| `sonnet-low` | sonnet-5 | low | Trivial mechanical side tasks with zero design decisions: file sweeps, renames, doc/config tweaks, simple test fixes. |
+| `sonnet-xhigh` | sonnet-5 | xhigh | **Default worker.** Well-specified single-feature implementation, defensive integration, user-facing UI/copy at taste 7, test authoring. |
+| `sonnet-max` | sonnet-5 | max | Clear-spec but demanding multi-file work; debugging with a known repro; first escalation when sonnet-xhigh misses the bar (difficulty = depth, not ambiguity). |
+| `opus-xhigh` | opus-4.8 | xhigh | Design-sensitive or cross-cutting work: API design, plan/implementation reviews, subtle debugging without a clean repro (difficulty = ambiguity/judgment). |
+| `opus-max` | opus-4.8 | max | Heaviest delegation: architectural refactors, root-cause hunts that survived a sonnet-max escalation, high-risk changes to shared pipelines. Last stop before Fable does it personally. |
+| *(fable, no preset)* | fable-5 | inherits session | Open-ended design and judgment calls the orchestrator would otherwise keep; rare — usually the orchestrator IS Fable. |
+
+Routing by complexity — ask two questions: *is the difficulty volume or ambiguity?* and *what breaks if it's slightly wrong?*
+- Spec is explicit and failure is cheap/caught-by-gate → lowest sonnet preset that plausibly clears the bar.
+- Volume/depth rises but the spec stays clear → move up the sonnet ladder, not to opus.
+- Ambiguity, judgment, taste ≥ 8, or cross-subsystem blast radius → jump straight to an opus preset; don't ladder through sonnet.
+- Escalation is one-way and immediate: the same miss or failure twice on a preset → next tier (sonnet-xhigh → sonnet-max → opus-xhigh → opus-max → Fable inline), never a retry at the same tier.
+- These presets do not replace Codex routing: bulk/mechanical clear-spec diffs still go to a GPT-5.6 Codex model first; the presets cover work needing Claude judgment/taste, reviews, and the Codex-down fallback.
+- Presets fix only the floor (model, effort, verify-gate discipline); all task-specific steering — scope, approach, constraints, what a prior attempt got wrong, report format — goes in the spawn `prompt`, which layers on top of the preset's system prompt. Steer there; don't create new agent files for one-off specializations.
+
 ### Codex models
 
 | model | cost | intelligence | taste | effort |
@@ -32,7 +53,7 @@ How to apply:
 - Reviews of plans/implementations: fable-5 or opus-4.8, optionally a GPT-5.6 Codex model as an extra independent perspective.
 - Never use Haiku.
 - Mechanics: GPT-5.6 Codex models are accessed from Claude Code through the Codex plugin. For implementation, debugging, investigation, data analysis, or other delegated work, use `/codex:rescue --model <model> --effort <effort> <task>`. Add `--background` for longer-running work, then use `/codex:status` and `/codex:result` to monitor it and retrieve the result. For reviews, use `/codex:review` or `/codex:adversarial-review`.
-- Claude models (sonnet-5, opus-4.8, fable-5) run via the Agent/Workflow model parameter.
+- Claude models (sonnet-5, opus-4.8, fable-5) run via the Agent tool — prefer the effort presets above (`subagent_type: "sonnet-xhigh"` etc.) over a bare `model:` parameter, since a bare spawn cannot set effort.
 
 Using gpt-5.5 inside workflows and subagents:
 - The Agent/Workflow `model` parameter only accepts Claude models. To delegate work to gpt-5.5, use the Codex plugin's bundled `codex:codex-rescue` subagent rather than creating a custom Claude wrapper. If a wrapper is needed and is a must only then spawn a Claude wrapper agent with `model: 'sonnet', effort: 'low'` whose prompt instructs it to write a self-contained codex prompt. Plugin is priority and first target as it is setup with this intent and workflow in mind. 
