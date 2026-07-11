@@ -3,10 +3,21 @@ src/middleware/config.py
 Middleware configuration — loaded from configs/ or environment.
 """
 
+import logging
 from pathlib import Path
 from typing import Optional
 
 import yaml
+
+logger = logging.getLogger(__name__)
+
+# Documented safe maxima for the conversation budget (2.2.2.1). Configured
+# values above these are clamped (with one warning) so a misconfiguration can
+# never let an unbounded history/question payload through. The question ceiling
+# matches models.MAX_QUESTION_CHARS — the pydantic-enforced hard cap.
+_MAX_CONVERSATION_TURNS_CEILING = 50
+_MAX_HISTORY_CHARS_CEILING = 32000
+_MAX_QUESTION_CHARS_CEILING = 16000
 
 
 class MiddlewareConfig:
@@ -42,6 +53,13 @@ class MiddlewareConfig:
         self.fetch_on_miss_timeout_s: float = 10.0
         self.fetch_on_miss_per_query: int = 1
 
+        # Phase 2.2.2.1 — bounded client-owned conversation history. The
+        # middleware stays stateless; these cap how much of the client-sent
+        # history/question one request may use (see conversation.select_history).
+        self.conversation_max_turns: int = 8
+        self.conversation_max_history_chars: int = 8000
+        self.conversation_max_question_chars: int = 16000
+
         # Phase 2.1.2 — hybrid retrieval & re-ranking.
         # Lexical (BM25) channel + RRF fusion (2.1.2.1).
         self.enable_lexical: bool = True
@@ -57,6 +75,7 @@ class MiddlewareConfig:
         if config_path.exists():
             self._load_from_file(config_path)
         self._apply_env_overrides()
+        self._clamp_conversation_limits()
 
     def _load_from_file(self, path: Path):
         with open(path) as f:
@@ -113,3 +132,32 @@ class MiddlewareConfig:
         _bool("RETURN_TIMINGS", "return_timings")
         _bool("ENABLE_STREAMING", "enable_streaming")
         _int("EMBEDDING_CACHE_SIZE", "embedding_cache_size")
+        _int("CONVERSATION_MAX_TURNS", "conversation_max_turns")
+        _int("CONVERSATION_MAX_HISTORY_CHARS", "conversation_max_history_chars")
+        _int("CONVERSATION_MAX_QUESTION_CHARS", "conversation_max_question_chars")
+
+    def _clamp_conversation_limits(self) -> None:
+        """Clamp conversation budgets to documented safe maxima (2.2.2.1).
+
+        A single warning is logged if any value was out of range, rather than
+        accepting an unbounded history/question payload.
+        """
+        clamped: list[str] = []
+
+        def _clamp(attr: str, lo: int, hi: int) -> None:
+            try:
+                val = int(getattr(self, attr))
+            except (TypeError, ValueError):
+                val = hi
+            bounded = max(lo, min(hi, val))
+            if bounded != val:
+                clamped.append(f"{attr}={val}->{bounded}")
+            setattr(self, attr, bounded)
+
+        _clamp("conversation_max_turns", 0, _MAX_CONVERSATION_TURNS_CEILING)
+        _clamp("conversation_max_history_chars", 0, _MAX_HISTORY_CHARS_CEILING)
+        _clamp("conversation_max_question_chars", 1, _MAX_QUESTION_CHARS_CEILING)
+
+        if clamped:
+            logger.warning(
+                "Clamped conversation limits to safe maxima: %s", ", ".join(clamped))

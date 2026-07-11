@@ -506,10 +506,11 @@ def call_live_endpoint(question: str, *, query_url: str = DEFAULT_QUERY_URL,
     second, truncated in-process retrieval to judge the answer.
 
     ``history`` (2.2.1.3) is the runner-owned list of completed
-    ``{question, answer}`` turns for the current conversation. It is sent in a
-    forward-compatible ``history`` field the middleware ignores today (pydantic
-    ``extra="ignore"``) and will start honoring in 2.2.2.1 — the runner owns
-    conversation state; the middleware stays stateless.
+    ``{question, answer}`` turns for the current conversation. Each completed
+    turn is flattened into the ChatTurn wire contract the middleware honors
+    since 2.2.2.1 — a user message followed by its assistant message
+    (``{role, content}``). The runner owns conversation state; the middleware
+    stays stateless. There is exactly one history contract: ChatTurn.
     """
     import httpx
 
@@ -517,8 +518,18 @@ def call_live_endpoint(question: str, *, query_url: str = DEFAULT_QUERY_URL,
     c = client or httpx.Client(timeout=httpx.Timeout(timeout, connect=5.0))
     body = {"question": question, "refresh": False, "include_evidence_trace": True}
     if history:
-        body["history"] = [{"question": h.get("question", ""),
-                            "answer": h.get("answer", "")} for h in history]
+        turns: list[dict] = []
+        for h in history:
+            q = (h.get("question") or "").strip()
+            a = (h.get("answer") or "").strip()
+            # ChatTurn content must be non-blank; skip empty prior answers so a
+            # degraded/error turn never 422s the next request.
+            if q:
+                turns.append({"role": "user", "content": h.get("question", "")})
+            if a:
+                turns.append({"role": "assistant", "content": h.get("answer", "")})
+        if turns:
+            body["history"] = turns
     try:
         resp = c.post(query_url, json=body, timeout=timeout)
         resp.raise_for_status()

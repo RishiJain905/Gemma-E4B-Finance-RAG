@@ -3,17 +3,67 @@ src/middleware/models.py
 Pydantic models for request/response schemas.
 """
 
+import re
 from datetime import datetime
 from typing import Literal, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
+
+# Absolute hard ceiling for the current raw question (2.2.2.1). The middleware
+# never silently truncates it — an over-limit question is an explicit
+# validation error (HTTP 422). configs/middleware.yaml mirrors this as
+# conversation_max_question_chars; this constant is the enforced pydantic cap.
+MAX_QUESTION_CHARS = 16000
+
+# Safe opaque session identifier: bounded length, conservative character set.
+# session_id is tracing metadata only — never a server-side lookup key — so
+# this only guards against unbounded/pathological values, not against reuse.
+_SESSION_ID_RE = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
+
+
+class ChatTurn(BaseModel):
+    """One bounded, client-owned conversation turn (2.2.2.1).
+
+    A turn is a single chat message. ``history`` on :class:`QueryRequest` is a
+    flat, chronological list of these. The middleware validates and uses them
+    but never persists them; the client (``scripts/chat.py``) owns the memory.
+    """
+
+    role: Literal["user", "assistant"] = Field(
+        ..., description="Who produced this turn")
+    content: str = Field(..., description="Turn text; must be non-blank")
+    turn_id: Optional[str] = Field(
+        None, description="Opaque per-turn id for tracing only; never a lookup key")
+    context: Optional[dict] = Field(
+        None,
+        description="Structured context carried from a prior response "
+                    "(resolved tickers/metrics/timeframe/grounding). Consumed by "
+                    "follow-up rewriting (2.2.2.2); retained only on assistant turns.",
+    )
+
+    @field_validator("content")
+    @classmethod
+    def _content_nonblank(cls, v: str) -> str:
+        if not v or not v.strip():
+            raise ValueError("chat turn content must be non-blank")
+        return v
 
 
 class QueryRequest(BaseModel):
     """Incoming user query."""
 
-    question: str = Field(..., min_length=1, max_length=2000,
+    question: str = Field(..., min_length=1, max_length=MAX_QUESTION_CHARS,
                           description="Natural language financial question")
+    history: list[ChatTurn] = Field(
+        default_factory=list,
+        description="Bounded, client-owned conversation history (2.2.2.1). "
+                    "Additive — an omitted/empty list preserves single-turn behavior.",
+    )
+    session_id: Optional[str] = Field(
+        None,
+        description="Opaque client-generated session id for tracing only. Not a "
+                    "server-side lookup key; bounded/sanitized, never persisted.",
+    )
     ticker: Optional[str] = Field(None, description="Optional ticker override")
     temperature: Optional[float] = Field(None, ge=0.0, le=2.0,
                                          description="Model temperature override")
@@ -32,6 +82,19 @@ class QueryRequest(BaseModel):
                     "facts/documents, tool results) used to produce the answer. "
                     "Off by default; intended for evaluation requests (2.2.1.2).",
     )
+
+    @field_validator("session_id")
+    @classmethod
+    def _session_id_safe(cls, v: Optional[str]) -> Optional[str]:
+        if v is None:
+            return None
+        v = v.strip()
+        if not v:
+            return None
+        if not _SESSION_ID_RE.match(v):
+            raise ValueError(
+                "session_id must be 1-128 chars of [A-Za-z0-9._:-]")
+        return v
 
 
 class SourceCitation(BaseModel):
@@ -81,6 +144,13 @@ class QueryResponse(BaseModel):
                     "usable facts/documents, and tool results. Present only when the "
                     "request set include_evidence_trace=true and a model call succeeded "
                     "(never populated for a degraded/model-unavailable answer).",
+    )
+    conversation: Optional[dict] = Field(
+        None,
+        description="Conversation-history metadata (2.2.2.1): "
+                    "{history_turns_received, history_turns_used, history_truncated, "
+                    "topic_reset}. Present only when the request carried history; "
+                    "omitted (null) for single-turn requests.",
     )
     freshness: dict = Field(
         default_factory=lambda: {

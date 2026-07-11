@@ -16,7 +16,7 @@ document/prompt evidence contract and evaluator fidelity are repaired.
 
 ## 2.2.2 — Conversational query understanding
 
-- [ ] 2.2.2.1 request-history-contract-and-bounded-memory — spec: `docs/phase2.2/2.2.2-conversational-query-understanding/2.2.2.1-request-history-contract-and-bounded-memory.md` — add a bounded, client-owned `ChatTurn` history contract to `/query`; middleware stays stateless.
+- [x] 2.2.2.1 request-history-contract-and-bounded-memory — spec: `docs/phase2.2/2.2.2-conversational-query-understanding/2.2.2.1-request-history-contract-and-bounded-memory.md` — add a bounded, client-owned `ChatTurn` history contract to `/query`; middleware stays stateless. — **Done:** ChatTurn + bounded select_history (8 turns/8k chars), question cap 2k→16k with explicit 422 (no silent truncation), ChatSession owns history + /new /clear /history controls, eval runner sends ChatTurn shape; single-turn behavior byte-for-byte unchanged. VERIFY: PASS (856 passed).
 - [ ] 2.2.2.2 follow-up-rewriting-and-entity-carryover — spec: `docs/phase2.2/2.2.2-conversational-query-understanding/2.2.2.2-follow-up-rewriting-and-entity-carryover.md` — compile turn + history into a standalone retrieval query; deterministic ticker/metric/period carryover with at most one optional planner call.
 - [ ] 2.2.2.3 multiline-chat-sessions-and-evaluation — spec: `docs/phase2.2/2.2.2-conversational-query-understanding/2.2.2.3-multiline-chat-sessions-and-evaluation.md` — `/ask` multiline composer + session controls in `scripts/chat.py`; offline integration test for verbose/follow-up questions.
 

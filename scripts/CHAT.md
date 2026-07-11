@@ -40,6 +40,9 @@ server doesn't report a `capabilities` block.
 | `/verbose on\|off` | Toggle the server `timings` breakdown under answers. |
 | `/grounding strict\|graded` | Send `answer_policy` with every query this session (server-side override). |
 | `/grounding clear` | Stop overriding — use the server's configured default. |
+| `/new` or `/clear` | Start a fresh conversation: clear this session's history and rotate its local `session_id`. Explicit settings (`/grounding`, `/verbose`, `/history off`, pinned `/ticker`, `/autorefresh`) are preserved. |
+| `/history` | Preview this conversation's turns locally (turn number, role, short text). No API call. |
+| `/history off\|on` | Stop / resume sending and recording conversation history (for privacy or single-turn comparisons). |
 | `/health` | Show the middleware health + freshness summary. |
 | `/tools` | List model-callable tools (`GET /tools`); degrades gracefully if the endpoint is missing or tools are disabled. |
 | `/eval [N]` | Run `python eval/run_eval.py --limit N` (default 5) against this running server and print the tail. |
@@ -72,6 +75,33 @@ includes, in this order:
 8. **`timings: …`** (only with `/verbose on`) — the server's per-stage
    latency breakdown, including retrieval sub-timings
    (`retrieval.embedding`, `retrieval.chroma`, `retrieval.sqlite`).
+
+## Conversation memory (2.2.2.1)
+
+Each `ChatSession` owns its own bounded conversation history and a local
+`session_id`. The middleware stays **stateless**: every request carries the
+recent turns and the id, and the server validates and uses them without
+persisting anything. Nothing is written to disk.
+
+- A turn is recorded **only** after the server accepts the request and returns
+  a terminal, non-blank answer. Failed, cancelled, validation-error, or
+  incomplete-streamed requests never enter history.
+- Each assistant turn also stores a small structured context (detected/resolved
+  ticker, intent, grounding, timeframe) so a later follow-up can resolve
+  references like "and AMD?".
+- The server bounds what it uses: at most `conversation_max_turns` recent turns
+  and `conversation_max_history_chars` characters (see
+  `configs/middleware.yaml`). The current question has its own independent
+  16,000-character limit and is **never** silently truncated — an over-limit
+  question is a validation error.
+- Responses include a `conversation` block
+  (`history_turns_received`, `history_turns_used`, `history_truncated`,
+  `topic_reset`) whenever history was sent.
+- `session_id` is tracing metadata only — never a server-side lookup key.
+
+Use `/new` (or `/clear`) to start a fresh conversation, `/history` to preview
+the local turns, and `/history off` to run single-turn (no history sent or
+recorded).
 
 ## Capabilities block
 

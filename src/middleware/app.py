@@ -526,6 +526,24 @@ async def _build_query_context(request: QueryRequest) -> dict:
     intent = parser.parse(request.question, override_ticker=request.ticker)
     _stage_timing(timings, "intent_parse", stage_start)
 
+    # Bounded client-owned history selection (2.2.2.1). The middleware stays
+    # stateless: it validates + selects the turns the client sent, reports how
+    # many it used, and (from 2.2.2.2) will consume them for follow-up
+    # rewriting. No history -> single-turn behavior is unchanged and the
+    # conversation metadata block is omitted.
+    conversation_meta: Optional[dict] = None
+    history_turns: list = []
+    if request.history:
+        from .conversation import select_history
+
+        selection = select_history(
+            request.history,
+            max_turns=getattr(config, "conversation_max_turns", 8),
+            max_chars=getattr(config, "conversation_max_history_chars", 8000),
+        )
+        conversation_meta = selection.as_metadata()
+        history_turns = selection.turns
+
     stage_start = time.perf_counter()
     freshness_meta = _evaluate_and_refresh(intent.get("ticker"), request.refresh)
     ticker = intent.get("ticker")
@@ -603,6 +621,8 @@ async def _build_query_context(request: QueryRequest) -> dict:
         "grounding_level": grounding_level,
         "augmented_prompt": augmented_prompt,
         "include_evidence_trace": request.include_evidence_trace,
+        "conversation": conversation_meta,
+        "history_turns": history_turns,
     }
 
 
@@ -650,6 +670,7 @@ def _build_query_response(
         timings=context["timings"] if _return_timings_enabled() else None,
         model_available=model_available,
         evidence_trace=evidence_trace,
+        conversation=context.get("conversation"),
         freshness=context["freshness"],
         retrieval_strategy=retrieval.get("retrieval_strategy"),
         tools_used=_get_tools_used(),

@@ -56,6 +56,21 @@ def _query_data(answer="answer", timings=None):
     }
 
 
+def _bare_session(client, *, stream_enabled=False, stream_unavailable=True, verbose=False):
+    """A ChatSession bypassing __init__ (no real httpx.Client), with the full
+    2.2.2.1 conversation state initialized so query()/record paths work."""
+    session = chat.ChatSession.__new__(chat.ChatSession)
+    session.client = client
+    session.stream_enabled = stream_enabled
+    session.stream_unavailable = stream_unavailable
+    session.verbose = verbose
+    session.answer_policy = None
+    session.history = []
+    session.session_id = "sess-test"
+    session.history_enabled = True
+    return session
+
+
 def test_uses_persistent_client(monkeypatch, capsys):
     created = []
 
@@ -112,11 +127,7 @@ def test_streaming_prints_incrementally(capsys):
                 ]
             )
 
-    session = chat.ChatSession.__new__(chat.ChatSession)
-    session.client = FakeClient()
-    session.stream_enabled = True
-    session.stream_unavailable = False
-    session.verbose = False
+    session = _bare_session(FakeClient(), stream_enabled=True, stream_unavailable=False)
 
     session.query("hello", ticker=None, refresh=False)
 
@@ -140,11 +151,7 @@ def test_stream_fallback(capsys):
             return FakeResponse(data=_query_data(f"fallback {self.post_calls}"))
 
     client = FakeClient()
-    session = chat.ChatSession.__new__(chat.ChatSession)
-    session.client = client
-    session.stream_enabled = True
-    session.stream_unavailable = False
-    session.verbose = False
+    session = _bare_session(client, stream_enabled=True, stream_unavailable=False)
 
     session.query("one", ticker=None, refresh=False)
     session.query("two", ticker=None, refresh=False)
@@ -162,11 +169,7 @@ def test_spinner_cleared(capsys):
         def post(self, path, json=None):
             return FakeResponse(data=_query_data("plain answer"))
 
-    session = chat.ChatSession.__new__(chat.ChatSession)
-    session.client = FakeClient()
-    session.stream_enabled = False
-    session.stream_unavailable = True
-    session.verbose = False
+    session = _bare_session(FakeClient())
 
     session.query("plain", ticker=None, refresh=False)
 
@@ -189,11 +192,7 @@ def test_verbose_shows_timings(capsys):
                 )
             )
 
-    session = chat.ChatSession.__new__(chat.ChatSession)
-    session.client = FakeClient()
-    session.stream_enabled = False
-    session.stream_unavailable = True
-    session.verbose = True
+    session = _bare_session(FakeClient(), verbose=True)
 
     session.query("timed", ticker=None, refresh=False)
 
@@ -437,6 +436,8 @@ def test_help_lists_new_commands():
     assert "/tools" in chat.HELP
     assert "/grounding" in chat.HELP
     assert "/eval" in chat.HELP
+    assert "/new" in chat.HELP
+    assert "/history" in chat.HELP
 
 
 def test_query_reports_tools_used(monkeypatch):
@@ -535,6 +536,128 @@ def test_query_reports_tools_used(monkeypatch):
     assert response.status_code == 200
     data = response.json()
     assert data["tools_used"] == ["query_facts"]
+
+
+# ── 2.2.2.1: client-owned conversation memory ──────────
+
+class RecordingClient:
+    """Records every /query payload and returns a canned answer."""
+
+    def __init__(self, data=None):
+        self.posts: list[dict] = []
+        self._data = data or _query_data("recorded answer")
+
+    def post(self, path, json=None):
+        self.posts.append(json)
+        return FakeResponse(data=self._data)
+
+
+def test_successful_query_appends_user_and_assistant_turns():
+    session = _bare_session(RecordingClient(_query_data("NVDA revenue is 26B")))
+
+    session.query("What is NVDA revenue?", ticker=None, refresh=False)
+
+    assert [t["role"] for t in session.history] == ["user", "assistant"]
+    assert session.history[0]["content"] == "What is NVDA revenue?"
+    assert session.history[1]["content"] == "NVDA revenue is 26B"
+    # Assistant turn carries the distilled context a follow-up needs (2.2.2.2).
+    assert session.history[1]["context"]["ticker"] == "NVDA"
+    assert session.history[1]["context"]["intent"] == "fact_lookup"
+    assert session.history[1]["context"]["grounding"] == "grounded"
+
+
+def test_failed_or_cancelled_query_does_not_mutate_history():
+    # 1. Transport error (request never accepted).
+    class BoomClient:
+        def post(self, path, json=None):
+            raise ConnectionError("down")
+
+    session = _bare_session(BoomClient())
+    session.query("q", ticker=None, refresh=False)
+    assert session.history == []
+
+    # 2. Non-200 (e.g. validation error) — nothing recorded.
+    class ErrorClient:
+        def post(self, path, json=None):
+            return FakeResponse(status_code=422, text="bad")
+
+    session = _bare_session(ErrorClient())
+    session.query("q", ticker=None, refresh=False)
+    assert session.history == []
+
+    # 3. Accepted but empty completion — not a usable turn.
+    session = _bare_session(RecordingClient(_query_data("")))
+    session.query("q", ticker=None, refresh=False)
+    assert session.history == []
+
+
+def test_two_chat_sessions_never_share_turns():
+    a = _bare_session(RecordingClient(_query_data("answer A")))
+    b = _bare_session(RecordingClient(_query_data("answer B")))
+    a.session_id = chat._new_session_id()
+    b.session_id = chat._new_session_id()
+
+    a.query("q a", ticker=None, refresh=False)
+    b.query("q b", ticker=None, refresh=False)
+
+    assert a.history is not b.history
+    assert a.session_id != b.session_id
+    assert [t["content"] for t in a.history] == ["q a", "answer A"]
+    assert [t["content"] for t in b.history] == ["q b", "answer B"]
+
+
+def test_new_clears_turns_and_rotates_session_id():
+    session = _bare_session(RecordingClient())
+    session.answer_policy = "strict"
+    session.query("q1", ticker=None, refresh=False)
+    assert session.history
+    old_id = session.session_id
+
+    session.new_session()
+
+    assert session.history == []
+    assert session.session_id != old_id
+    # Explicit CLI settings survive a conversation reset.
+    assert session.answer_policy == "strict"
+
+
+def test_history_off_sends_no_turns():
+    client = RecordingClient()
+    session = _bare_session(client)
+    # Seed a prior turn, then disable history.
+    session.query("q1", ticker=None, refresh=False)
+    assert session.history
+    session.history_enabled = False
+
+    session.query("q2", ticker=None, refresh=False)
+
+    last_payload = client.posts[-1]
+    assert "history" not in last_payload
+    assert "session_id" not in last_payload
+    # Disabled history is neither sent nor grown by the new turn.
+    assert [t["content"] for t in session.history] == ["q1", "recorded answer"]
+
+
+def test_stream_and_non_stream_paths_record_equivalent_history():
+    class StreamClient:
+        def stream(self, method, path, json=None):
+            return FakeStreamResponse([
+                "event: token",
+                'data: {"token": "answer"}',
+                "",
+                "event: metadata",
+                'data: {"detected_ticker": "NVDA", "detected_intent": "fact_lookup", '
+                '"grounding": "grounded", "model_available": true}',
+                "",
+            ])
+
+    streamed = _bare_session(StreamClient(), stream_enabled=True, stream_unavailable=False)
+    streamed.query("What is NVDA revenue?", ticker=None, refresh=False)
+
+    non_stream = _bare_session(RecordingClient(_query_data("answer")))
+    non_stream.query("What is NVDA revenue?", ticker=None, refresh=False)
+
+    assert streamed.history == non_stream.history
 
 
 def test_health_reports_capabilities(monkeypatch):

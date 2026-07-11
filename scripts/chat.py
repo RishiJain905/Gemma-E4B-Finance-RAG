@@ -24,6 +24,7 @@ import subprocess
 import sys
 import threading
 import time
+import uuid
 from pathlib import Path
 
 import httpx
@@ -108,14 +109,29 @@ class _ElapsedSpinner:
             time.sleep(0.1)
 
 
+def _new_session_id() -> str:
+    """Generate a fresh local session id (tracing only, never persisted)."""
+    return uuid.uuid4().hex
+
+
 def _payload(
-    question: str, ticker: str | None, refresh: bool, answer_policy: str | None = None
+    question: str,
+    ticker: str | None,
+    refresh: bool,
+    answer_policy: str | None = None,
+    *,
+    history: list[dict] | None = None,
+    session_id: str | None = None,
 ) -> dict:
     payload = {"question": question, "refresh": refresh}
     if ticker:
         payload["ticker"] = ticker
     if answer_policy:
         payload["answer_policy"] = answer_policy
+    if history:
+        payload["history"] = history
+    if session_id:
+        payload["session_id"] = session_id
     return payload
 
 
@@ -197,7 +213,15 @@ def _render_metadata(data: dict, *, verbose: bool) -> None:
 
 
 class ChatSession:
-    """Persistent HTTP session for middleware chat operations."""
+    """Persistent HTTP session for middleware chat operations.
+
+    Owns this conversation's bounded memory (2.2.2.1): a flat, chronological
+    list of ChatTurn dicts and a local ``session_id``. The middleware stays
+    stateless — each request carries the selected history and the id (tracing
+    only). Turns are recorded only after a request is accepted and produces a
+    terminal answer; failed/cancelled/validation-error/incomplete requests
+    never mutate history. History is never persisted to disk.
+    """
 
     def __init__(
         self,
@@ -212,6 +236,11 @@ class ChatSession:
         self.stream_unavailable = not stream_enabled
         self.verbose = False
         self.answer_policy: str | None = None  # per-session /grounding override
+        # Conversation memory — instance-scoped so two ChatSessions never share
+        # turns. No module-level history / mutable default / global last-ticker.
+        self.history: list[dict] = []
+        self.session_id: str = _new_session_id()
+        self.history_enabled: bool = True
 
     def close(self) -> None:
         self.client.close()
@@ -222,13 +251,95 @@ class ChatSession:
         except Exception:
             return False
 
+    # ── Conversation memory ────────────────────────────
+
+    def new_session(self) -> None:
+        """Clear turns and rotate the local session id for a fresh conversation.
+
+        Explicit CLI settings (/grounding answer_policy, /verbose, /history
+        on|off) are deliberately preserved — only the conversation is reset.
+        """
+        self.history = []
+        self.session_id = _new_session_id()
+
+    def _outgoing_history(self) -> list[dict] | None:
+        """The history to send with the next request (None when disabled/empty)."""
+        if not self.history_enabled or not self.history:
+            return None
+        return list(self.history)
+
+    def _assistant_context(self, metadata: dict) -> dict | None:
+        """Distil the response fields a follow-up (2.2.2.2) needs to resolve
+        references: detected/resolved tickers, intent, grounding, timeframe."""
+        ctx: dict = {}
+        ticker = metadata.get("detected_ticker")
+        if ticker:
+            ctx["ticker"] = ticker
+        resolved = metadata.get("resolved_ticker")
+        if resolved:
+            ctx["resolved_ticker"] = resolved
+        intent = metadata.get("detected_intent")
+        if intent:
+            ctx["intent"] = intent
+        grounding = metadata.get("grounding")
+        if grounding:
+            ctx["grounding"] = grounding
+        timeframe = metadata.get("timeframe")
+        if timeframe:
+            ctx["timeframe"] = timeframe
+        return ctx or None
+
+    def _record_turn(self, question: str, result: dict) -> None:
+        """Append the completed user+assistant turns after a terminal answer.
+
+        Called only when a request was accepted and produced a non-blank answer,
+        so incomplete/failed requests never enter history.
+        """
+        if not self.history_enabled:
+            return
+        answer = (result.get("answer") or "").strip()
+        if not question.strip() or not answer:
+            return
+        metadata = result.get("metadata") or {}
+        self.history.append({"role": "user", "content": question})
+        assistant_turn: dict = {"role": "assistant", "content": answer}
+        ctx = self._assistant_context(metadata)
+        if ctx:
+            assistant_turn["context"] = ctx
+        self.history.append(assistant_turn)
+
+    def print_history(self) -> None:
+        """Local preview of the conversation — no API request (2.2.2.1 Step 4)."""
+        if not self.history:
+            print(col("  (no conversation history)", C.DIM))
+            return
+        state = "on" if self.history_enabled else "off"
+        print(col(f"  session {self.session_id[:8]} — history {state}, "
+                  f"{len(self.history)} turns", C.DIM))
+        for i, turn in enumerate(self.history):
+            role = turn.get("role", "?")
+            content = (turn.get("content") or "").replace("\n", " ")
+            preview = content[:60] + ("..." if len(content) > 60 else "")
+            print(col(f"  {i}. {role}: {preview}", C.DIM))
+
+    # ── Query ──────────────────────────────────────────
+
     def query(self, question: str, ticker: str | None, refresh: bool) -> None:
-        payload = _payload(question, ticker, refresh, getattr(self, "answer_policy", None))
+        payload = _payload(
+            question, ticker, refresh, getattr(self, "answer_policy", None),
+            history=self._outgoing_history(),
+            session_id=self.session_id if self.history_enabled else None,
+        )
+        result: dict | None = None
         if self.stream_enabled and not self.stream_unavailable:
-            if self._query_stream(payload):
-                return
-            self.stream_unavailable = True
-        self._query_non_stream(payload)
+            handled, result = self._query_stream(payload)
+            if not handled:
+                self.stream_unavailable = True
+                result = self._query_non_stream(payload)
+        else:
+            result = self._query_non_stream(payload)
+        if result is not None:
+            self._record_turn(question, result)
 
     def refresh(self, arg: str) -> None:
         do_refresh(self.client, arg)
@@ -239,13 +350,22 @@ class ChatSession:
     def tools(self) -> None:
         do_tools(self.client)
 
-    def _query_stream(self, payload: dict) -> bool:
+    def _query_stream(self, payload: dict) -> tuple[bool, dict | None]:
+        """Stream a query. Returns ``(handled, result)``.
+
+        ``handled`` is False only when streaming was not usable (non-200 /
+        pre-token failure) so ``query`` can fall back to POST /query. ``result``
+        is ``{"answer", "metadata"}`` only on a complete terminal response
+        (tokens + metadata event); None for an incomplete stream, so an
+        incomplete request is never recorded into history.
+        """
         metadata: dict | None = None
         printed_token = False
+        answer_parts: list[str] = []
         try:
             with self.client.stream("POST", "/query/stream", json=payload) as resp:
                 if resp.status_code != 200:
-                    return False
+                    return False, None
                 print()
                 for event, raw_data in _iter_sse_events(resp.iter_lines()):
                     if event == "token":
@@ -253,26 +373,31 @@ class ChatSession:
                         token = data.get("token") or ""
                         if token:
                             printed_token = True
+                            answer_parts.append(token)
                             print(token, end="", flush=True)
                     elif event == "metadata":
                         metadata = json.loads(raw_data)
                     elif event == "error":
-                        return printed_token
+                        return printed_token, None
         except Exception as e:
             if printed_token:
                 print(col(f"\n  stream ended early: {e}", C.YE))
-                return True
-            return False
+                return True, None
+            return False, None
 
         if printed_token:
             print()
         if metadata is not None:
             _render_metadata(metadata, verbose=self.verbose)
             print()
-            return True
-        return False
+            return True, {"answer": "".join(answer_parts), "metadata": metadata}
+        # Tokens printed but no terminal metadata: handled (avoid a double
+        # answer from a fallback) but incomplete, so nothing is recorded.
+        return printed_token, None
 
-    def _query_non_stream(self, payload: dict) -> None:
+    def _query_non_stream(self, payload: dict) -> dict | None:
+        """POST /query. Returns ``{"answer", "metadata"}`` on a 200 with a
+        non-blank answer, else None (failed/empty requests are not recorded)."""
         spinner = _ElapsedSpinner()
         spinner.start()
         try:
@@ -280,13 +405,13 @@ class ChatSession:
         except Exception as e:
             spinner.stop()
             print(col(f"  request failed: {e}", C.RE))
-            return
+            return None
         finally:
             spinner.stop()
 
         if resp.status_code != 200:
             print(col(f"  HTTP {resp.status_code}: {resp.text[:200]}", C.RE))
-            return
+            return None
 
         data = resp.json()
         answer = (data.get("answer") or "").strip()
@@ -298,6 +423,9 @@ class ChatSession:
 
         _render_metadata(data, verbose=self.verbose)
         print()
+        if not answer:
+            return None
+        return {"answer": data.get("answer") or "", "metadata": data}
 
 
 # ── Middleware lifecycle ───────────────────────────────
@@ -480,6 +608,9 @@ HELP = f"""
   {C.CY}/verbose on|off{C.R}          toggle server timings under answers
   {C.CY}/grounding strict|graded{C.R} set the answer policy sent with each query
   {C.CY}/grounding clear{C.R}         use the server's default answer policy
+  {C.CY}/new{C.R} or {C.CY}/clear{C.R}           start a fresh conversation (clear history, new session id)
+  {C.CY}/history{C.R}                 preview this conversation's turns (no API call)
+  {C.CY}/history off|on{C.R}          stop/resume sending & recording history
   {C.CY}/health{C.R}                  show middleware health summary
   {C.CY}/tools{C.R}                   show model-callable tools
   {C.CY}/eval [N]{C.R}                run the eval harness (default 5 cases) against this server
@@ -584,6 +715,22 @@ def main():
                         print(col("  grounding policy = server default", C.DIM))
                     else:
                         print(col("  usage: /grounding strict|graded|clear", C.YE))
+                elif cmd in ("new", "clear"):
+                    session.new_session()
+                    print(col("  started a new conversation (history cleared, "
+                              f"session {session.session_id[:8]}).", C.DIM))
+                elif cmd == "history":
+                    val = rest.strip().lower()
+                    if val == "off":
+                        session.history_enabled = False
+                        print(col("  history = off (not sending or recording turns)", C.DIM))
+                    elif val == "on":
+                        session.history_enabled = True
+                        print(col("  history = on", C.DIM))
+                    elif val == "":
+                        session.print_history()
+                    else:
+                        print(col("  usage: /history [off|on]", C.YE))
                 elif cmd == "eval":
                     limit = int(rest.strip()) if rest.strip().isdigit() else 5
                     do_eval(limit)
