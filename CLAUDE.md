@@ -21,17 +21,17 @@ The Agent tool has no per-spawn effort parameter — effort is pinned in the age
 | preset | model | effort | use for |
 |--------|-------|--------|---------|
 | `sonnet-low` | sonnet-5 | low | Trivial mechanical side tasks with zero design decisions: file sweeps, renames, doc/config tweaks, simple test fixes. |
-| `sonnet-xhigh` | sonnet-5 | xhigh | **Default worker.** Well-specified single-feature implementation, defensive integration, user-facing UI/copy at taste 7, test authoring. |
-| `sonnet-max` | sonnet-5 | max | Clear-spec but demanding multi-file work; debugging with a known repro; first escalation when sonnet-xhigh misses the bar (difficulty = depth, not ambiguity). |
-| `opus-xhigh` | opus-4.8 | xhigh | Design-sensitive or cross-cutting work: API design, plan/implementation reviews, subtle debugging without a clean repro (difficulty = ambiguity/judgment). |
-| `opus-max` | opus-4.8 | max | Heaviest delegation: architectural refactors, root-cause hunts that survived a sonnet-max escalation, high-risk changes to shared pipelines. Last stop before Fable does it personally. |
+| `sonnet-xhigh` | sonnet-5 | xhigh | Default for **compact** well-specified work: single-file/single-feature implementation, test authoring, user-facing UI/copy at taste 7. Also the budget fallback when usage is tight. |
+| `sonnet-max` | sonnet-5 | max | Niche only: debugging with a known repro, or deep-but-mechanical work confined to one file/domain. Not a rung on the escalation ladder — at max effort on multi-file volume it burns more tokens than opus-xhigh finishing in one pass. |
+| `opus-xhigh` | opus-4.8 | xhigh | **Default implementer.** Multi-file features, cross-cutting integration, API design, plan/implementation reviews, subtle debugging. First choice once a task spans files/subsystems, regardless of how clear the spec is. |
+| `opus-max` | opus-4.8 | max | Heaviest delegation: architectural refactors, root-cause hunts that survived an opus-xhigh attempt, high-risk changes to shared pipelines. Last stop before Fable does it personally. |
 | *(fable, no preset)* | fable-5 | inherits session | Open-ended design and judgment calls the orchestrator would otherwise keep; rare — usually the orchestrator IS Fable. |
 
-Routing by complexity — ask two questions: *is the difficulty volume or ambiguity?* and *what breaks if it's slightly wrong?*
-- Spec is explicit and failure is cheap/caught-by-gate → lowest sonnet preset that plausibly clears the bar.
-- Volume/depth rises but the spec stays clear → move up the sonnet ladder, not to opus.
-- Ambiguity, judgment, taste ≥ 8, or cross-subsystem blast radius → jump straight to an opus preset; don't ladder through sonnet.
-- Escalation is one-way and immediate: the same miss or failure twice on a preset → next tier (sonnet-xhigh → sonnet-max → opus-xhigh → opus-max → Fable inline), never a retry at the same tier.
+Routing by complexity — ask two questions: *does the task span more than one file/subsystem?* and *what breaks if it's slightly wrong?*
+- Spec explicit, scope compact, failure caught by the gate → `sonnet-low`/`sonnet-xhigh`.
+- Scope grows to multi-file — even with a crystal-clear spec → `opus-xhigh` directly. Don't ladder through sonnet-max; fewer smart tokens beat more cheap ones (max-effort Sonnet thinking plus extra gate iterations usually out-burns Opus finishing in one pass).
+- Ambiguity, judgment, taste ≥ 8, or cross-subsystem blast radius → `opus-xhigh`; add high-risk on top → `opus-max`.
+- Escalation is one-way and immediate: the same miss or failure twice on a preset → next tier (sonnet-xhigh → opus-xhigh → opus-max → Fable inline), never a retry at the same tier. sonnet-max sits off-ladder as a special-purpose tool, not an escalation step.
 - These presets do not replace Codex routing: bulk/mechanical clear-spec diffs still go to a GPT-5.6 Codex model first; the presets cover work needing Claude judgment/taste, reviews, and the Codex-down fallback.
 - Presets fix only the floor (model, effort, verify-gate discipline); all task-specific steering — scope, approach, constraints, what a prior attempt got wrong, report format — goes in the spawn `prompt`, which layers on top of the preset's system prompt. Steer there; don't create new agent files for one-off specializations.
 
