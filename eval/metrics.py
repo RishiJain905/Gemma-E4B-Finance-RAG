@@ -1142,6 +1142,137 @@ def citation_validation_metrics(rows: list[dict]) -> dict:
     }
 
 
+# ── Long-document / hierarchical retrieval metrics (2.2.5.3) ───────────────
+#
+# Deterministic, offline metrics for the flat-vs-hierarchical comparison over the
+# checked-in synthetic corpus (tests/fixtures/sec/hierarchical_corpus.json). They
+# operate on per-case retrieval results (retrieved chunk ids + labeled relevant
+# ids) produced by ``run_eval.evaluate_long_document_configs`` — no model, no
+# embeddings, no network. The promotion gate (spec Step 5) reads the aggregated
+# block: Recall@10 lift, context-precision regression, packed prompt chars, and
+# the unsupported-numeric rate.
+
+# Long-document scalar keys averaged per retrieval config.
+LONG_DOC_SCALARS = (
+    "recall_at_5",
+    "recall_at_10",
+    "context_precision",
+    "subquestion_coverage",
+    "answer_correctness",
+    "prompt_chars",
+    "prompt_tokens",
+    "expansion_count",
+    "retrieval_latency_ms",
+    "unsupported_numeric_claims",
+)
+
+
+def recall_at_k(retrieved_ids: list, relevant_ids: list, k: int) -> Optional[float]:
+    """Fraction of relevant ids present in the first ``k`` retrieved ids.
+
+    ``None`` when a case has no relevant evidence (e.g. an unanswerable case) so
+    it is excluded from the recall denominator rather than scored as a perfect 1.
+    """
+    relevant = {r for r in (relevant_ids or []) if r}
+    if not relevant:
+        return None
+    top = [r for r in (retrieved_ids or [])][:max(0, k)]
+    hit = len(relevant & set(top))
+    return round(hit / len(relevant), 4)
+
+
+def context_precision(retrieved_ids: list, relevant_ids: list) -> Optional[float]:
+    """Fraction of retrieved ids that are relevant (retrieval noisiness).
+
+    ``None`` when nothing was retrieved so an empty retrieval does not count as
+    perfect precision.
+    """
+    retrieved = [r for r in (retrieved_ids or []) if r]
+    if not retrieved:
+        return None
+    relevant = {r for r in (relevant_ids or []) if r}
+    hit = sum(1 for r in retrieved if r in relevant)
+    return round(hit / len(retrieved), 4)
+
+
+def _mean_defined(values: list) -> Optional[float]:
+    present = [v for v in values if v is not None]
+    if not present:
+        return None
+    return round(sum(present) / len(present), 4)
+
+
+def long_document_summary(per_case_rows: list[dict]) -> dict:
+    """Aggregate per-case long-document rows into a per-config summary block.
+
+    ``per_case_rows`` each carry a ``config`` label plus the LONG_DOC_SCALARS.
+    Returns ``{config: {n, <scalar>: mean, ...}}`` with ``None`` means excluded
+    from the denominator (so an undefined recall never inflates a config).
+    """
+    by_config: dict[str, list[dict]] = {}
+    for row in per_case_rows or []:
+        by_config.setdefault(row.get("config", "unknown"), []).append(row)
+    out: dict[str, dict] = {}
+    for config, rows in by_config.items():
+        block = {"n": len(rows)}
+        for key in LONG_DOC_SCALARS:
+            block[key] = _mean_defined([r.get(key) for r in rows])
+        out[config] = block
+    return out
+
+
+def long_document_gate(summary: dict, *, flat="flat", hierarchical="hierarchical",
+                       char_baseline="flat_large_k",
+                       min_recall10_lift: float = 0.08,
+                       max_precision_regression: float = 0.02,
+                       max_correctness_regression: float = 0.02) -> dict:
+    """Evaluate the 2.2.5.3 promotion gate from a long-document summary.
+
+    Returns each check's pass/fail and the observed deltas so RESULTS.md can cite
+    them. Recall@10 must improve by at least ``min_recall10_lift`` over the flat
+    baseline; context precision and answer correctness must not regress past their
+    tolerances; and the packed hierarchical prompt must be no larger than the
+    ``char_baseline`` config — i.e. hierarchical must reach the larger-top-k
+    recall WITHOUT the larger-top-k prompt cost, which is the whole point of
+    bounded expansion over naively raising k.
+    """
+    base = summary.get(flat) or {}
+    hier = summary.get(hierarchical) or {}
+    char_base = summary.get(char_baseline) or {}
+
+    def _delta(key, against=base):
+        b, h = against.get(key), hier.get(key)
+        if b is None or h is None:
+            return None
+        return round(h - b, 4)
+
+    recall_lift = _delta("recall_at_10")
+    precision_delta = _delta("context_precision")
+    correctness_delta = _delta("answer_correctness")
+    chars_delta = _delta("prompt_chars", against=char_base)
+    checks = {
+        "recall_at_10_lift": {
+            "delta": recall_lift,
+            "pass": recall_lift is not None and recall_lift >= min_recall10_lift,
+        },
+        "context_precision_not_regressed": {
+            "delta": precision_delta,
+            "pass": precision_delta is not None
+            and precision_delta >= -max_precision_regression,
+        },
+        "answer_correctness_not_regressed": {
+            "delta": correctness_delta,
+            "pass": correctness_delta is not None
+            and correctness_delta >= -max_correctness_regression,
+        },
+        "prompt_chars_not_higher_than_large_k": {
+            "delta": chars_delta,
+            "pass": chars_delta is not None and chars_delta <= 0,
+        },
+    }
+    return {"passed": all(c["pass"] for c in checks.values()), "checks": checks}
+
+
 # ── Aggregator ─────────────────────────────────────────────────────────
 
 def _run_field(rows: list[dict], key: str) -> Optional[str]:

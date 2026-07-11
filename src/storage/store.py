@@ -152,6 +152,72 @@ def select_companyfacts(
     return results
 
 
+def _companyfacts_alt_value(value_text: str):
+    """Best-effort numeric value for a CompanyFacts alternative observation."""
+    try:
+        return float(Decimal(str(value_text)))
+    except Exception:  # noqa: BLE001 - keep the raw text if it will not parse
+        return value_text
+
+
+def companyfacts_rows_to_evidence(rows: list[dict]) -> list[dict]:
+    """Project canonical CompanyFacts rows into structured fact-evidence rows.
+
+    Each selected observation becomes one authoritative fact-evidence row
+    (``source_type="sec_companyfacts"``) carrying full provenance (taxonomy /
+    concept / accession / filed_at / as_of / source_url). Every distinct
+    ``alternatives`` value is emitted as its OWN separate evidence row flagged
+    ``conflict=True`` — conflicting filed values are never averaged or collapsed,
+    so the evidence grader can disclose them. Order is preserved (primary row
+    first, then its alternatives).
+    """
+    evidence: list[dict] = []
+    for row in rows or []:
+        primary = {
+            "metric": row.get("metric"),
+            "value": row.get("value"),
+            "value_text": row.get("value_text"),
+            "ticker": row.get("ticker"),
+            "period": row.get("period"),
+            "period_start": row.get("period_start"),
+            "period_type": row.get("period_type"),
+            "unit": row.get("unit"),
+            "source_type": "sec_companyfacts",
+            "source_url": row.get("source_url"),
+            "as_of": row.get("as_of"),
+            "taxonomy": row.get("taxonomy"),
+            "concept": row.get("concept"),
+            "accession": row.get("accession"),
+            "form": row.get("form"),
+            "filed_at": row.get("filed_at"),
+            "conflict": bool(row.get("conflict")),
+        }
+        if row.get("conflict"):
+            primary["conflict_reason"] = "companyfacts_multiple_filed_values"
+        evidence.append(primary)
+        for alt in row.get("alternatives") or []:
+            evidence.append({
+                "metric": row.get("metric"),
+                "value": _companyfacts_alt_value(alt.get("value_text")),
+                "value_text": alt.get("value_text"),
+                "ticker": row.get("ticker"),
+                "period": row.get("period"),
+                "period_type": row.get("period_type"),
+                "unit": row.get("unit"),
+                "source_type": "sec_companyfacts",
+                "source_url": alt.get("source_url"),
+                "as_of": row.get("as_of"),
+                "taxonomy": alt.get("taxonomy"),
+                "concept": alt.get("concept"),
+                "accession": alt.get("accession"),
+                "form": alt.get("form"),
+                "filed_at": alt.get("filed_at"),
+                "conflict": True,
+                "conflict_reason": "companyfacts_alternative_value",
+            })
+    return evidence
+
+
 class Store:
     """
     Unified storage layer combining structured (SQLite) and
@@ -259,6 +325,39 @@ class Store:
             periods=periods,
             as_of=cutoff,
         )
+
+    def companyfacts_evidence(
+        self,
+        ticker: str,
+        metrics: list[str],
+        *,
+        periods: Optional[list[str]] = None,
+        as_of: Optional[str] = None,
+        latest_only: bool = True,
+    ) -> list[dict]:
+        """Authoritative CompanyFacts as structured fact-evidence rows.
+
+        Returns ``[]`` when CompanyFacts ingestion is disabled (the config gate in
+        :meth:`get_companyfacts`) so a disabled source is a strict no-op. When
+        ``latest_only`` and no explicit ``periods`` are requested, keeps only the
+        most recent filed period per (metric, unit) so a "latest revenue" style
+        query is not flooded with every historical quarter; conflicting filed
+        values within the kept period remain separate evidence rows.
+        """
+        rows = self.get_companyfacts(ticker, metrics, periods=periods, as_of=as_of)
+        if latest_only and not periods:
+            newest: dict[tuple, str] = {}
+            for row in rows:
+                key = (row.get("metric"), row.get("unit"))
+                period = str(row.get("period") or "")
+                if key not in newest or period > newest[key]:
+                    newest[key] = period
+            rows = [
+                row for row in rows
+                if str(row.get("period") or "") == newest.get(
+                    (row.get("metric"), row.get("unit")))
+            ]
+        return companyfacts_rows_to_evidence(rows)
 
     # ── Document Storage (ChromaDB) ──────────────────
 

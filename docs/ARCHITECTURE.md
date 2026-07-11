@@ -311,6 +311,76 @@ DDL in `SQLiteStore._inline_schema()`.
 
 ---
 
+## Hierarchical Retrieval & Authoritative Facts (Phase 2.2.5)
+
+Two additive, independently gated capabilities improve long-document evidence
+and structured-fact authority without changing the default query path.
+
+### Filing → section → child hierarchy
+
+SEC filings are indexed as a natural hierarchy (2.2.5.2): a filing (`accession`)
+holds sections (`parent_id = sec:{accession}:{section_key}`, `section_index`),
+each split into child chunks (`chunk_index`). `src/middleware/hierarchical_retrieval.py`
+(`expand_filing_hits`) reconstructs *just enough* local context around a precise
+child hit:
+
+- the exact hit and its section heading are always kept;
+- at most `hierarchy_max_siblings` same-section neighbors are added when the hit
+  begins or ends mid-sentence/table (one preceding, one following);
+- at most `hierarchy_max_adjacent_sections` adjacent sections are added, only
+  when a requested obligation matches the adjacent heading or the evidence grader
+  reports missing local context;
+- shared parent/sibling chunks are deduplicated across hits, expansion stops
+  before the shared context character budget is exceeded, and **an entire filing
+  parent is never returned**.
+
+Every expanded item preserves the root hit's original retrieval score plus
+`expansion_reason` and `root_hit_id`. The expander is wired into the adaptive
+orchestrator's `EXPAND_PARENT_SECTION` corrective seam (upgraded from the
+2.2.4.1 sibling-only reader) and exposed as `Retriever.hierarchical_expand`. All
+store reads fail soft per item — a query never errors because an expansion read
+failed. Feature flag: `enable_hierarchical_retrieval` (off by default).
+
+### Authoritative CompanyFacts preference
+
+When `configs/sec_companyfacts.yaml` is enabled, `Store.companyfacts_evidence`
+projects filed GAAP observations into structured fact-evidence rows and
+`evidence.reconcile_structured_facts` merges them into structured retrieval:
+an exact SEC concept/unit/period/as-of match wins for filed GAAP facts,
+estimates never overwrite realized facts, and legacy Yahoo fundamentals fill
+unsupported or more-current market fields. Conflicting values remain **separate
+evidence items** with source/period/unit; the grader discloses the conflict and
+never averages. The merge happens only at retrieval/evidence normalization — the
+legacy `fundamentals` table is never rewritten, so rollback stays possible.
+
+### Backfill, promotion gates, and rollback
+
+`scripts/index_sec_filing_text.py` migrates existing parsed artifacts into the
+section index (dry-run-first, pilotable, resumable via a source-hash manifest,
+idempotent, and `--backup`-reversible; no parser-model call). The offline
+long-document eval (`eval/run_eval.py::evaluate_long_document_configs` over
+`tests/fixtures/sec/hierarchical_corpus.json`) compares flat, flat-larger-top-k,
+and hierarchical retrieval.
+
+**Promotion gate** (`metrics.long_document_gate`) — enable hierarchical expansion
+by default only when, on the long-document corpus:
+
+- Recall@10 improves at least 8 points over the flat baseline;
+- context precision regresses no more than 0.02;
+- answer correctness regresses no more than 0.02;
+- packed prompt characters are no higher than the larger-top-k config (the
+  hierarchical path must reach that recall without the top-k prompt cost);
+- retrieval p95 adds no more than 20% and the backfill restore is tested;
+- no ingestion-time model call is added.
+
+**Rollback** — set `enable_hierarchical_retrieval: false` to return to the
+sibling-only corrective behavior; if the index itself must be reversed, restore
+the Chroma backup snapshot taken by the backfill's `--backup`. CompanyFacts is an
+independent additive source — disable it via `configs/sec_companyfacts.yaml`
+(`enabled: false`) with no effect on the hierarchy path or vice versa.
+
+---
+
 ## Model
 
 | Attribute | Value |

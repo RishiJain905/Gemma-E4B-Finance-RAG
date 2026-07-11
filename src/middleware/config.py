@@ -119,6 +119,22 @@ class MiddlewareConfig:
         # placeholder, so legacy behavior is byte-identical until promotion.
         self.enable_query_decomposition: bool = False
 
+        # Phase 2.2.5.3 — bounded hierarchical (filing → section → child) retrieval.
+        # When enable_hierarchical_retrieval is on, a precise SEC child hit is
+        # expanded with at most hierarchy_max_siblings same-section neighbors (to
+        # complete a sentence/table) and at most hierarchy_max_adjacent_sections
+        # adjacent sections (only on an obligation-heading match or a grader
+        # missing-context signal) under the shared context character budget. An
+        # entire filing parent is never injected. Off by default: the corrective
+        # EXPAND_PARENT_SECTION seam keeps its 2.2.4.1 sibling-only behavior until
+        # the long-document eval gates pass. hierarchy_max_expanded_items caps the
+        # total added neighbors regardless of budget (0 = bounded only by the
+        # context packer). Env: ENABLE_HIERARCHICAL_RETRIEVAL, HIERARCHY_MAX_*.
+        self.enable_hierarchical_retrieval: bool = False
+        self.hierarchy_max_siblings: int = 2
+        self.hierarchy_max_adjacent_sections: int = 1
+        self.hierarchy_max_expanded_items: int = 12
+
         # Phase 2.1.6 — fetch-on-miss ingestion controls.
         self.enable_fetch_on_miss: bool = True
         self.fetch_on_miss_timeout_s: float = 10.0
@@ -159,6 +175,7 @@ class MiddlewareConfig:
         self._clamp_conversation_limits()
         self._clamp_adaptive_limits()
         self._clamp_corrective_limits()
+        self._clamp_hierarchy_limits()
         self._normalize_answer_validation()
 
     def _load_from_file(self, path: Path):
@@ -236,6 +253,10 @@ class MiddlewareConfig:
         _bool("ENABLE_CORRECTIVE_RETRY", "enable_corrective_retry")
         _int("MAX_CORRECTIVE_RETRIES", "max_corrective_retries")
         _bool("ENABLE_QUERY_DECOMPOSITION", "enable_query_decomposition")
+        _bool("ENABLE_HIERARCHICAL_RETRIEVAL", "enable_hierarchical_retrieval")
+        _int("HIERARCHY_MAX_SIBLINGS", "hierarchy_max_siblings")
+        _int("HIERARCHY_MAX_ADJACENT_SECTIONS", "hierarchy_max_adjacent_sections")
+        _int("HIERARCHY_MAX_EXPANDED_ITEMS", "hierarchy_max_expanded_items")
         _str("ANSWER_VALIDATION", "answer_validation")
         _bool("REQUIRE_EVIDENCE_IDS", "require_evidence_ids")
 
@@ -292,6 +313,33 @@ class MiddlewareConfig:
         if clamped:
             logger.warning(
                 "Clamped adaptive limits to safe ranges: %s", ", ".join(clamped))
+
+    def _clamp_hierarchy_limits(self) -> None:
+        """Clamp hierarchical-expansion caps to documented safe ranges (2.2.5.3).
+
+        Bounds the per-hit sibling / adjacent-section fan-out and the total
+        expanded-item cap so a misconfiguration can never reconstruct an entire
+        filing. An invalid value clamps toward the safe bound with one warning.
+        """
+        clamped: list[str] = []
+
+        def _clamp(attr: str, lo: int, hi: int) -> None:
+            try:
+                val = int(getattr(self, attr))
+            except (TypeError, ValueError):
+                val = hi
+            bounded = max(lo, min(hi, val))
+            if bounded != val:
+                clamped.append(f"{attr}={val}->{bounded}")
+            setattr(self, attr, bounded)
+
+        _clamp("hierarchy_max_siblings", 0, 4)
+        _clamp("hierarchy_max_adjacent_sections", 0, 3)
+        _clamp("hierarchy_max_expanded_items", 0, 50)
+
+        if clamped:
+            logger.warning(
+                "Clamped hierarchy limits to safe ranges: %s", ", ".join(clamped))
 
     def _normalize_answer_validation(self) -> None:
         """Coerce answer_validation to off|report|enforce (invalid -> off)."""

@@ -1501,3 +1501,67 @@ class TestCitationValidationGate:
 
     def test_inert_without_block(self):
         assert gate.citation_validation_checks({"n_cases": 1}, {}) == []
+
+
+# ── Long-document / hierarchical retrieval eval (2.2.5.3) ───────────────
+
+class TestLongDocumentEval:
+    """Deterministic flat-vs-hierarchical comparison over the fixture corpus."""
+
+    def test_corpus_covers_seven_case_types(self):
+        corpus = R.load_hierarchical_corpus()
+        types = {c["case_type"] for c in corpus["cases"]}
+        required = {
+            "exact_child", "heading_plus_child", "adjacent_table",
+            "two_distant_sections", "fact_plus_explanation",
+            "annual_and_quarterly", "missing_evidence", "conflicting_evidence",
+        }
+        assert required <= types
+
+    def test_recall_primitive(self):
+        assert M.recall_at_k(["a", "b", "c"], ["b"], 5) == 1.0
+        assert M.recall_at_k(["a", "b"], ["c"], 5) == 0.0
+        assert M.recall_at_k(["a"], ["a", "b"], 5) == 0.5
+        # No relevant evidence → excluded from the recall denominator.
+        assert M.recall_at_k(["a"], [], 5) is None
+
+    def test_context_precision_primitive(self):
+        assert M.context_precision(["a", "b"], ["a"]) == 0.5
+        assert M.context_precision([], ["a"]) is None
+
+    def test_hierarchical_beats_flat_recall(self):
+        res = R.evaluate_long_document_configs()
+        s = res["summary"]
+        assert s["hierarchical"]["recall_at_10"] >= s["flat"]["recall_at_10"]
+        # Bounded expansion actually fired on the context-requiring cases.
+        assert s["hierarchical"]["expansion_count"] > 0
+
+    def test_hierarchical_cheaper_than_large_k(self):
+        s = R.evaluate_long_document_configs()["summary"]
+        # Reaches larger-top-k recall without the larger-top-k prompt cost.
+        assert s["hierarchical"]["prompt_chars"] <= s["flat_large_k"]["prompt_chars"]
+
+    def test_hierarchical_precision_not_worse(self):
+        s = R.evaluate_long_document_configs()["summary"]
+        assert (s["hierarchical"]["context_precision"]
+                >= s["flat_large_k"]["context_precision"])
+
+    def test_promotion_gate_passes_on_fixture(self):
+        res = R.evaluate_long_document_configs()
+        gate_result = res["gate"]
+        assert gate_result["passed"], gate_result["checks"]
+
+    def test_reports_all_scalar_metrics(self):
+        res = R.evaluate_long_document_configs()
+        for config in ("flat", "flat_large_k", "hierarchical"):
+            block = res["summary"][config]
+            for key in M.LONG_DOC_SCALARS:
+                assert key in block
+
+    def test_unanswerable_case_flags_no_fabricated_numbers(self):
+        # The missing-evidence case retrieves nothing relevant, so its clean
+        # (no-fabrication) count stays low; hierarchical never invents figures.
+        res = R.evaluate_long_document_configs()
+        rows = [r for r in res["per_case"]
+                if r["id"] == "hd-missing-evidence" and r["config"] == "hierarchical"]
+        assert rows and rows[0]["unsupported_numeric_claims"] == 0

@@ -31,6 +31,12 @@ htmlcov/
 # Eval harness — per-run artifacts (the golden set IS committed)
 eval/runs/
 
+# SEC filing-text backfill (Phase 2.2.5.3) — generated manifests + Chroma
+# collection snapshots produced by scripts/index_sec_filing_text.py.
+chroma-backup-*/
+*.backfill-manifest.json
+sec-backfill-manifest*.json
+
 # IDE
 .vscode/
 .idea/

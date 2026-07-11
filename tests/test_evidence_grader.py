@@ -311,3 +311,90 @@ def test_corrective_config_defaults_off_and_retry_limit_is_hard_clamped(tmp_path
 
     config_file.write_text("max_corrective_retries: -3\n", encoding="utf-8")
     assert MiddlewareConfig(config_path=config_file).max_corrective_retries == 0
+
+
+# ── CompanyFacts conflict disclosure (Phase 2.2.5.3) ───────
+
+def test_conflicting_filed_values_disclosed_never_averaged():
+    """Two different filed values for one slot surface a conflict, no correction."""
+    plan = _plan(metrics=("total_revenue",), periods=("2025-12-31",))
+    facts = [
+        _fact(metric="total_revenue", value=26000000000.0, period="2025-12-31",
+              source_type="sec_companyfacts", unit="USD"),
+        _fact(metric="total_revenue", value=30000000000.0, period="2025-12-31",
+              source_type="yfinance", unit="USD", conflict=True,
+              conflict_reason="legacy_vs_companyfacts"),
+    ]
+    result = grade_evidence(plan, {"facts": facts, "documents": []})
+    assert any(c["type"] == "conflicting_values" for c in result.conflicts)
+    assert result.status is not SufficiencyStatus.SUFFICIENT
+    # On a conflict the grader must not attempt a corrective action (no averaging).
+    assert result.allowed_action is CorrectiveAction.NONE
+
+
+def test_single_flagged_row_still_discloses_conflict():
+    """A lone CompanyFacts row flagged conflict=True is still disclosed."""
+    plan = _plan(metrics=("total_revenue",), periods=("2025-12-31",))
+    facts = [
+        _fact(metric="total_revenue", value=26000000000.0, period="2025-12-31",
+              source_type="sec_companyfacts", unit="USD", conflict=True,
+              conflict_reason="companyfacts_multiple_filed_values"),
+    ]
+    result = grade_evidence(plan, {"facts": facts, "documents": []})
+    assert any(c["type"] == "conflicting_values" for c in result.conflicts)
+
+
+# ── Reconciliation + projection helpers (Phase 2.2.5.3) ────
+
+def test_reconcile_prefers_authoritative_and_flags_conflict():
+    from src.middleware.evidence import reconcile_structured_facts
+    legacy = [
+        {"ticker": "NVDA", "metric": "total_revenue", "period": "2025-12-31",
+         "value": 30.0, "unit": "USD", "source_type": "yfinance"},
+        {"ticker": "NVDA", "metric": "pe_ratio", "period": None, "value": 55.0,
+         "unit": "ratio", "source_type": "yfinance"},
+    ]
+    authoritative = [
+        {"ticker": "NVDA", "metric": "total_revenue", "period": "2025-12-31",
+         "value": 26.0, "unit": "USD", "source_type": "sec_companyfacts"},
+    ]
+    merged = reconcile_structured_facts(legacy, authoritative)
+    # Authoritative first; conflicting legacy kept & flagged; market-only pe kept.
+    assert merged[0]["source_type"] == "sec_companyfacts"
+    disputed = [f for f in merged if f.get("conflict")]
+    assert disputed and disputed[0]["value"] == 30.0
+    assert any(f["metric"] == "pe_ratio" for f in merged)
+
+
+def test_reconcile_drops_agreeing_legacy():
+    from src.middleware.evidence import reconcile_structured_facts
+    legacy = [{"ticker": "NVDA", "metric": "total_revenue", "period": "2025-12-31",
+               "value": 26.0, "unit": "USD", "source_type": "yfinance"}]
+    authoritative = [{"ticker": "NVDA", "metric": "total_revenue",
+                      "period": "2025-12-31", "value": 26.0, "unit": "USD",
+                      "source_type": "sec_companyfacts"}]
+    merged = reconcile_structured_facts(legacy, authoritative)
+    rev = [f for f in merged if f["metric"] == "total_revenue"]
+    assert len(rev) == 1 and rev[0]["source_type"] == "sec_companyfacts"
+
+
+def test_companyfacts_projection_expands_alternatives():
+    from src.storage.store import companyfacts_rows_to_evidence
+    rows = [{
+        "ticker": "NVDA", "metric": "total_revenue", "value": 26.0,
+        "value_text": "26.0", "unit": "USD", "period": "2025-12-31",
+        "period_start": "2025-01-01", "period_type": "annual",
+        "source_type": "sec_companyfacts", "source_url": "u1",
+        "as_of": "2026-07-01", "taxonomy": "us-gaap", "concept": "Revenues",
+        "accession": "a1", "form": "10-K", "filed_at": "2026-02-01",
+        "conflict": True,
+        "alternatives": [{"value_text": "26.5", "taxonomy": "us-gaap",
+                          "concept": "SalesRevenueNet", "accession": "a2",
+                          "form": "10-K/A", "filed_at": "2026-03-01",
+                          "source_url": "u2"}],
+    }]
+    evidence = companyfacts_rows_to_evidence(rows)
+    assert len(evidence) == 2
+    assert evidence[0]["value"] == 26.0 and evidence[0]["conflict"] is True
+    assert evidence[1]["value"] == 26.5 and evidence[1]["conflict"] is True
+    assert evidence[1]["conflict_reason"] == "companyfacts_alternative_value"
