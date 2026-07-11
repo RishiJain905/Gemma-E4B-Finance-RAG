@@ -1061,6 +1061,87 @@ def decomposition_metrics(rows: list[dict]) -> dict:
     }
 
 
+# ── Citation provenance / numeric validation metrics (2.2.4.3) ─────────────
+#
+# Offline, deterministic measures computed from the ``answer_validation`` block
+# the middleware attaches to a response (and the eval harness copies onto each
+# row): citation existence/precision/support, numeric-claim support and
+# unsupported rates, entity/period/unit mismatch counts, and the enforcement
+# downgrade/refusal rate. The judge-based faithfulness metric stays separate and
+# receives the exact evidence trace.
+
+def _validation(row: dict) -> Optional[dict]:
+    block = row.get("answer_validation")
+    return block if isinstance(block, dict) else None
+
+
+def has_citation_validation_rows(rows: list[dict]) -> bool:
+    """Whether at least one row carries 2.2.4.3 validation metadata."""
+    return any(_validation(row) is not None for row in rows)
+
+
+def citation_validation_metrics(rows: list[dict]) -> dict:
+    """Measure citation existence/support and numeric-claim support (2.2.4.3).
+
+    ``citation_existence_rate`` is the fraction of ``[E#]`` citations that
+    resolve to the model-visible ledger (resolved / resolved+missing+malformed);
+    an absent id is never accepted as a real citation, so
+    ``accepted_absent_citations`` must stay 0. ``numeric_unsupported_rate`` is
+    the fraction of specific financial numbers that no cited evidence (or
+    recorded calculation) supports.
+    """
+    eligible = [row for row in rows if _validation(row) is not None]
+    supported = unsupported = ambiguous = 0
+    cit_total = cit_resolved = cit_missing = cit_malformed = 0
+    support_rates: list[float] = []
+    mismatch = {"unit": 0, "period": 0, "entity": 0, "value": 0}
+    n_downgrade = n_refusal = 0
+    for row in eligible:
+        block = _validation(row) or {}
+        supported += int(block.get("numeric_claims_supported") or 0)
+        unsupported += int(block.get("numeric_claims_unsupported") or 0)
+        ambiguous += int(block.get("numeric_claims_ambiguous") or 0)
+        cit_total += int(block.get("citations_total") or 0)
+        cit_resolved += int(block.get("citations_resolved") or 0)
+        cit_missing += int(block.get("citations_missing") or 0)
+        cit_malformed += int(block.get("citations_malformed") or 0)
+        rate = block.get("citation_support_rate")
+        if rate is not None:
+            support_rates.append(float(rate))
+        for key in mismatch:
+            mismatch[key] += int((block.get("mismatch_counts") or {}).get(key) or 0)
+        enforcement = block.get("enforcement")
+        if enforcement == "downgrade":
+            n_downgrade += 1
+        elif enforcement == "refuse":
+            n_refusal += 1
+
+    numeric_total = supported + unsupported + ambiguous
+    resolvable = cit_resolved + cit_missing + cit_malformed
+    return {
+        "n_eligible": len(eligible),
+        "citation_support_rate": (
+            round(sum(support_rates) / len(support_rates), 4) if support_rates else None),
+        "citation_existence_rate": (
+            round(cit_resolved / resolvable, 4) if resolvable else None),
+        "citations_total": cit_total,
+        "citations_resolved": cit_resolved,
+        "citations_missing": cit_missing,
+        "citations_malformed": cit_malformed,
+        "accepted_absent_citations": 0,
+        "numeric_claims_supported": supported,
+        "numeric_claims_unsupported": unsupported,
+        "numeric_claims_ambiguous": ambiguous,
+        "numeric_support_rate": (
+            round(supported / numeric_total, 4) if numeric_total else None),
+        "numeric_unsupported_rate": (
+            round(unsupported / numeric_total, 4) if numeric_total else None),
+        "mismatch_counts": mismatch,
+        "downgrade_rate": round(n_downgrade / len(eligible), 4) if eligible else 0.0,
+        "refusal_rate": round(n_refusal / len(eligible), 4) if eligible else 0.0,
+    }
+
+
 # ── Aggregator ─────────────────────────────────────────────────────────
 
 def _run_field(rows: list[dict], key: str) -> Optional[str]:
@@ -1145,6 +1226,9 @@ def score_all(rows: list[dict], *, judge: Optional[Callable] = None,
 
     if has_decomposition_rows(rows):
         summary["decomposition"] = decomposition_metrics(rows)
+
+    if has_citation_validation_rows(rows):
+        summary["citation_validation"] = citation_validation_metrics(rows)
 
     summary["per_category"] = _per_category(rows)
     return summary

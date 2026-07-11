@@ -161,6 +161,16 @@ def console_table(summary: dict) -> str:
                      "subquery_cap_violations", "retrieval_round_cap_violations"):
             lines.append(f"{name:<38} {_fmt(decomposition.get(name))}")
 
+    validation = summary.get("citation_validation")
+    if isinstance(validation, dict):
+        lines.append("")
+        lines.append("=== Citation & numeric validation (Phase 2.2.4.3) ===")
+        for name in ("citation_support_rate", "citation_existence_rate",
+                     "numeric_support_rate", "numeric_unsupported_rate",
+                     "accepted_absent_citations", "downgrade_rate", "refusal_rate"):
+            lines.append(f"{name:<38} {_fmt(validation.get(name))}")
+        lines.append(f"{'mismatch_counts':<38} {validation.get('mismatch_counts', {})}")
+
     # Per-category table.
     per = summary.get("per_category") or {}
     if per:

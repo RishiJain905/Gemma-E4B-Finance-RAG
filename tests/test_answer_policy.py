@@ -304,6 +304,101 @@ async def test_response_reports_grounding(monkeypatch):
     assert response.grounding == "general"
 
 
+def test_answer_validation_config_default_and_normalization(monkeypatch, tmp_path):
+    """MiddlewareConfig ships answer_validation=report; unknown values -> off."""
+    from src.middleware.config import MiddlewareConfig
+
+    # Default from the committed configs/middleware.yaml.
+    assert MiddlewareConfig().answer_validation == "report"
+
+    # An env override with an unknown value normalizes to off (fail-safe).
+    monkeypatch.setenv("ANSWER_VALIDATION", "nonsense")
+    assert MiddlewareConfig().answer_validation == "off"
+
+    monkeypatch.setenv("ANSWER_VALIDATION", "enforce")
+    assert MiddlewareConfig().answer_validation == "enforce"
+
+
+def test_answer_validation_mode_helper(monkeypatch):
+    monkeypatch.setattr(middleware_app, "config", _config(answer_validation="enforce"))
+    assert middleware_app._answer_validation_mode() == "enforce"
+    assert middleware_app._evidence_ids_enabled() is True
+
+    monkeypatch.setattr(middleware_app, "config", _config(answer_validation="off"))
+    assert middleware_app._answer_validation_mode() == "off"
+    assert middleware_app._evidence_ids_enabled() is False
+
+    # A config lacking the attribute (older SimpleNamespace) falls back to off.
+    monkeypatch.setattr(middleware_app, "config", SimpleNamespace())
+    assert middleware_app._answer_validation_mode() == "off"
+
+
+@pytest.mark.asyncio
+async def test_query_exposes_validation_metadata_in_report_mode(monkeypatch):
+    """report mode attaches validation metadata + evidence citations without
+    changing the answer text or grounding."""
+    parser = MagicMock()
+    parser.parse.return_value = {
+        "ticker": "NVDA", "ticker_confidence": 1.0, "question_type": "fact_lookup",
+    }
+    monkeypatch.setattr(
+        "src.middleware.intent_parser.IntentParser", MagicMock(return_value=parser))
+    monkeypatch.setattr(middleware_app, "store", object())
+    monkeypatch.setattr(middleware_app, "config", _config(answer_validation="report"))
+    monkeypatch.setattr(
+        middleware_app, "retriever",
+        SimpleNamespace(retrieve=lambda **_kwargs: {
+            "facts": [{"metric": "total_revenue", "value": 26.0,
+                       "unit": "billion_usd", "ticker": "NVDA", "period": "2026-Q1",
+                       "source_type": "sec_10q"}],
+            "documents": [], "retrieval_strategy": "facts_only",
+        }))
+    monkeypatch.setattr(middleware_app, "_check_model_health", AsyncMock(return_value=True))
+    monkeypatch.setattr(middleware_app, "_evaluate_and_refresh", MagicMock(return_value={}))
+    monkeypatch.setattr(
+        middleware_app, "_call_model",
+        AsyncMock(return_value=("Revenue was $26.0 billion [E1].", [])))
+
+    response = await middleware_app.query(QueryRequest(question="NVDA revenue?"))
+
+    assert response.answer == "Revenue was $26.0 billion [E1]."
+    assert response.answer_validation["validation_status"] == "supported"
+    assert response.answer_validation["numeric_claims_supported"] == 1
+    assert response.answer_validation["enforcement"] == "none"
+    assert response.evidence_citations[0].evidence_id == "E1"
+    assert response.grounding in ("grounded", "partial")
+
+
+@pytest.mark.asyncio
+async def test_query_off_mode_omits_validation_metadata(monkeypatch):
+    """off mode leaves the response free of any 2.2.4.3 validation fields."""
+    parser = MagicMock()
+    parser.parse.return_value = {
+        "ticker": "NVDA", "ticker_confidence": 1.0, "question_type": "fact_lookup",
+    }
+    monkeypatch.setattr(
+        "src.middleware.intent_parser.IntentParser", MagicMock(return_value=parser))
+    monkeypatch.setattr(middleware_app, "store", object())
+    monkeypatch.setattr(middleware_app, "config", _config(answer_validation="off"))
+    monkeypatch.setattr(
+        middleware_app, "retriever",
+        SimpleNamespace(retrieve=lambda **_kwargs: {
+            "facts": [{"metric": "total_revenue", "value": 26.0,
+                       "unit": "billion_usd", "ticker": "NVDA"}],
+            "documents": [], "retrieval_strategy": "facts_only",
+        }))
+    monkeypatch.setattr(middleware_app, "_check_model_health", AsyncMock(return_value=True))
+    monkeypatch.setattr(middleware_app, "_evaluate_and_refresh", MagicMock(return_value={}))
+    monkeypatch.setattr(
+        middleware_app, "_call_model",
+        AsyncMock(return_value=("Revenue was $26.0 billion.", [])))
+
+    response = await middleware_app.query(QueryRequest(question="NVDA revenue?"))
+    dumped = response.model_dump()
+    assert "answer_validation" not in dumped
+    assert "evidence_citations" not in dumped
+
+
 @pytest.mark.asyncio
 async def test_no_fabricated_numbers_rule_present(monkeypatch):
     client = SimpleNamespace(post=AsyncMock(return_value=_response("answer")))

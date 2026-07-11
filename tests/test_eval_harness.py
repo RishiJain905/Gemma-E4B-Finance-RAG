@@ -1414,3 +1414,90 @@ class TestRunEvalOrchestrationCapture:
         assert row["evidence_sufficiency"]["covered_subqueries"] == ["sq0"]
         # config_label defaults None until main() denormalizes the run label.
         assert row["config_label"] is None
+
+
+# ── Phase 2.2.4.3 — citation provenance / numeric validation eval ───────────
+
+class TestCitationValidationMetrics:
+    @staticmethod
+    def _val_row(row_id, **av):
+        row = _row(row_id)
+        row["answer_validation"] = {
+            "validation_status": av.get("status", "supported"),
+            "citation_support_rate": av.get("support_rate", 1.0),
+            "numeric_claims_supported": av.get("supported", 0),
+            "numeric_claims_unsupported": av.get("unsupported", 0),
+            "numeric_claims_ambiguous": av.get("ambiguous", 0),
+            "citations_total": av.get("cit_total", 0),
+            "citations_resolved": av.get("cit_resolved", 0),
+            "citations_missing": av.get("cit_missing", 0),
+            "citations_malformed": av.get("cit_malformed", 0),
+            "mismatch_counts": av.get(
+                "mismatch", {"unit": 0, "period": 0, "entity": 0, "value": 0}),
+            "enforcement": av.get("enforcement", "none"),
+        }
+        return row
+
+    def test_metrics_measure_citation_and_numeric_support(self):
+        rows = [
+            self._val_row("a", supported=3, unsupported=0, cit_total=3,
+                          cit_resolved=3, support_rate=1.0),
+            self._val_row("b", supported=1, unsupported=1, cit_total=2,
+                          cit_resolved=1, cit_missing=1, support_rate=0.5,
+                          enforcement="downgrade",
+                          mismatch={"unit": 1, "period": 0, "entity": 0, "value": 1}),
+        ]
+        block = M.citation_validation_metrics(rows)
+        assert block["n_eligible"] == 2
+        assert block["numeric_claims_supported"] == 4
+        assert block["numeric_claims_unsupported"] == 1
+        assert block["numeric_support_rate"] == round(4 / 5, 4)
+        assert block["numeric_unsupported_rate"] == round(1 / 5, 4)
+        assert block["citation_support_rate"] == 0.75          # mean(1.0, 0.5)
+        assert block["citation_existence_rate"] == 0.8         # 4 resolved / 5 resolvable
+        assert block["accepted_absent_citations"] == 0
+        assert block["downgrade_rate"] == 0.5
+        assert block["mismatch_counts"]["unit"] == 1
+
+    def test_score_all_emits_block_only_when_present(self):
+        assert "citation_validation" not in M.score_all([_row("legacy")], run_judge=False)
+        row = self._val_row("x", supported=1, cit_total=1, cit_resolved=1)
+        assert "citation_validation" in M.score_all([row], run_judge=False)
+
+    def test_row_from_endpoint_captures_answer_validation(self):
+        case = {"id": "c1", "question": "NVDA revenue"}
+        data = {
+            "answer": "Revenue was $26B [E1].", "model_available": True,
+            "evidence_trace": _trace(),
+            "answer_validation": {
+                "validation_status": "supported", "numeric_claims_total": 1,
+                "numeric_claims_unsupported": 0},
+            "evidence_citations": [{"evidence_id": "E1", "support_status": "supported"}],
+        }
+        row = R._row_from_endpoint(case, data, latency_s=0.02)
+        assert row["answer_validation"]["validation_status"] == "supported"
+        # Bridges into the 2.2.4.1 sufficiency unsupported-number rate.
+        assert row["numerical_claim_count"] == 1
+        assert row["unsupported_number_count"] == 0
+
+
+class TestCitationValidationGate:
+    def test_absolute_and_relative_gates(self):
+        baseline = {"citation_validation": {"numeric_unsupported_rate": 0.20}}
+        passing = {"citation_validation": {
+            "citation_support_rate": 0.96,
+            "accepted_absent_citations": 0,
+            "numeric_unsupported_rate": 0.10,
+        }}
+        assert gate.citation_validation_checks(passing, baseline) == []
+
+        failing = {"citation_validation": {
+            "citation_support_rate": 0.90,          # < 0.95
+            "accepted_absent_citations": 2,          # must be 0
+            "numeric_unsupported_rate": 0.18,        # only 10% relative reduction
+        }}
+        failures = gate.citation_validation_checks(failing, baseline)
+        assert len(failures) == 3
+
+    def test_inert_without_block(self):
+        assert gate.citation_validation_checks({"n_cases": 1}, {}) == []

@@ -93,6 +93,22 @@ class MiddlewareConfig:
         self.enable_corrective_retry: bool = False
         self.max_corrective_retries: int = 1  # hard clamp 0–1
 
+        # Phase 2.2.4.3 — citation provenance & deterministic numerical
+        # validation. answer_validation selects the policy:
+        #   off     — legacy behavior, byte-identical (no evidence ids, no
+        #             validator, no extra response metadata);
+        #   report  — render [E#] evidence ids, run the deterministic validator,
+        #             attach validation metadata + log unsupported claims (no
+        #             answer/grounding change);
+        #   enforce — additionally downgrade grounded->partial (or refuse a
+        #             wholly-unsupported answer) with a short support warning.
+        # require_evidence_ids tightens enforcement during the rollout window so
+        # a specific-figure answer with no resolving [E#] is treated as a
+        # violation. The validator never makes a model call and always fails
+        # soft to report_unavailable. Env: ANSWER_VALIDATION, REQUIRE_EVIDENCE_IDS.
+        self.answer_validation: str = "report"  # off | report | enforce
+        self.require_evidence_ids: bool = False
+
         # Phase 2.2.4.2 — selective query decomposition & weighted fusion. When
         # on (and the complex lane is reached), a genuinely compound / low-
         # coverage plan is decomposed into at most two derived, drift-validated
@@ -143,6 +159,7 @@ class MiddlewareConfig:
         self._clamp_conversation_limits()
         self._clamp_adaptive_limits()
         self._clamp_corrective_limits()
+        self._normalize_answer_validation()
 
     def _load_from_file(self, path: Path):
         with open(path) as f:
@@ -219,6 +236,8 @@ class MiddlewareConfig:
         _bool("ENABLE_CORRECTIVE_RETRY", "enable_corrective_retry")
         _int("MAX_CORRECTIVE_RETRIES", "max_corrective_retries")
         _bool("ENABLE_QUERY_DECOMPOSITION", "enable_query_decomposition")
+        _str("ANSWER_VALIDATION", "answer_validation")
+        _bool("REQUIRE_EVIDENCE_IDS", "require_evidence_ids")
 
     def _clamp_conversation_limits(self) -> None:
         """Clamp conversation budgets to documented safe maxima (2.2.2.1).
@@ -273,6 +292,17 @@ class MiddlewareConfig:
         if clamped:
             logger.warning(
                 "Clamped adaptive limits to safe ranges: %s", ", ".join(clamped))
+
+    def _normalize_answer_validation(self) -> None:
+        """Coerce answer_validation to off|report|enforce (invalid -> off)."""
+        value = str(getattr(self, "answer_validation", "report") or "").strip().lower()
+        if value not in ("off", "report", "enforce"):
+            logger.warning(
+                "Unknown answer_validation=%r; falling back to 'off'",
+                self.answer_validation)
+            value = "off"
+        self.answer_validation = value
+        self.require_evidence_ids = bool(getattr(self, "require_evidence_ids", False))
 
     def _clamp_corrective_limits(self) -> None:
         """Hard-clamp corrective retries to the documented zero-or-one range."""

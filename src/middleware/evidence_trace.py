@@ -39,6 +39,11 @@ class EvidenceTrace:
     facts: list[dict] = field(default_factory=list)
     documents: list[dict] = field(default_factory=list)
     tool_results: list[dict] = field(default_factory=list)
+    # Request-local [E#] evidence ledger (2.2.4.3). Schema-additive: empty on
+    # the legacy / validation-off path, so the 2.2.1.2 trace shape and
+    # SCHEMA_VERSION stay unchanged. Each entry is an EvidenceItem.to_dict()
+    # carrying the E# id alongside the durable store id.
+    evidence_items: list[dict] = field(default_factory=list)
     # ── Adaptive orchestration extensions (2.2.3.4) ──
     # Schema-additive: every field defaults to None/empty, so a legacy
     # (non-adaptive) trace is byte-compatible with the 2.2.1.2 shape and
@@ -96,6 +101,19 @@ class EvidenceTraceCollector:
         self._user_prompt: Optional[str] = None
         self._tool_results: list[dict] = []
         self._orchestration: Optional[dict] = None
+        self._evidence_items: list[dict] = []
+
+    def record_evidence_ledger(self, items) -> None:
+        """Attach the request-local ``[E#]`` evidence ledger (2.2.4.3).
+
+        ``items`` is a list of :class:`~src.middleware.evidence.EvidenceItem`.
+        No-op when empty (the validation-off / legacy path records none).
+        """
+        if items:
+            self._evidence_items = [
+                item.to_dict() if hasattr(item, "to_dict") else dict(item)
+                for item in items
+            ]
 
     def record_orchestration(self, orchestration: Optional[dict]) -> None:
         """Attach the adaptive route trace (2.2.3.4) for this request.
@@ -148,5 +166,6 @@ class EvidenceTraceCollector:
             facts=list(self._facts),
             documents=list(self._documents),
             tool_results=list(self._tool_results),
+            evidence_items=list(self._evidence_items),
             orchestration=dict(self._orchestration) if self._orchestration else None,
         )

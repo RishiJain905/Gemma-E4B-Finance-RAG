@@ -21,6 +21,7 @@ from .evidence import document_body, evidence_counts, usable_documents
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
+    from .evidence import EvidenceItem
     from .evidence_grader import SufficiencyResult
 
 
@@ -79,6 +80,7 @@ class PromptAugmenter:
         grounding_level: Optional[str] = None,
         preselected: Optional[dict] = None,
         evidence_sufficiency: Optional["SufficiencyResult"] = None,
+        evidence_ledger: Optional[list["EvidenceItem"]] = None,
     ) -> str:
         """
         Build the full augmented prompt.
@@ -97,6 +99,11 @@ class PromptAugmenter:
                 truncation). When ``None``, behavior is byte-for-byte identical
                 to the pre-2.2.3.3 path.
             evidence_sufficiency: Optional deterministic obligation coverage.
+            evidence_ledger: Optional request-local ``[E#]`` evidence items
+                (2.2.4.3). When non-empty, an ``## Evidence`` header with each
+                item's ``[E#]`` id is prepended so answers can cite them.
+                Passed only when ``answer_validation`` is report|enforce, so the
+                ``off`` path stays byte-for-byte identical.
 
         Returns:
             The complete prompt string ready to send to the model
@@ -127,6 +134,12 @@ class PromptAugmenter:
             realized_facts = [f for f in facts if not self._is_estimate_fact(f)]
 
         sections = []
+
+        # 0. Evidence ledger with [E#] ids (2.2.4.3). Only rendered when the
+        # caller supplied a non-empty ledger (answer_validation != off), so the
+        # legacy prompt is byte-for-byte unchanged when validation is off.
+        if evidence_ledger:
+            sections.append(self._format_evidence_ledger(evidence_ledger))
 
         if evidence_sufficiency is not None:
             sections.append(self._format_evidence_coverage(evidence_sufficiency))
@@ -162,9 +175,35 @@ class PromptAugmenter:
         sections.append(f"## User Question\n\n{question}")
 
         # 7. Output format
-        sections.append(self._build_output_format(question_type))
+        sections.append(self._build_output_format(
+            question_type, evidence_ids=bool(evidence_ledger)))
 
         return "\n\n".join(sections)
+
+    def _format_evidence_ledger(self, items: list["EvidenceItem"]) -> str:
+        """Render the request-local ``[E#]`` evidence index (2.2.4.3)."""
+        lines = [
+            "## Evidence",
+            "",
+            "Each item below has a stable id. Cite the evidence you use inline "
+            "with its id, e.g. [E1].",
+        ]
+        for item in items:
+            parts = [f"[{item.evidence_id}]", item.kind]
+            if item.ticker:
+                parts.append(str(item.ticker))
+            if item.metric is not None and item.value is not None:
+                value_str = self._format_value(item.value)
+                unit_str = f" {item.unit}" if item.unit else ""
+                parts.append(f"{item.metric}={value_str}{unit_str}")
+            elif item.store_id:
+                parts.append(str(item.store_id))
+            if item.period:
+                parts.append(f"({item.period})")
+            if item.source_type:
+                parts.append(f"source:{item.source_type}")
+            lines.append(" | ".join(parts))
+        return "\n".join(lines)
 
     def _format_evidence_coverage(self, result: "SufficiencyResult") -> str:
         """Expose exact covered/missing obligations to the answer model."""
@@ -388,15 +427,23 @@ class PromptAugmenter:
 
     # ── Output Format ─────────────────────────────────
 
-    def _build_output_format(self, question_type: str) -> str:
+    def _build_output_format(self, question_type: str,
+                             evidence_ids: bool = False) -> str:
         """Build the output format instruction."""
+        # When an [E#] ledger is present, prefer those ids for citations while
+        # legacy [Source: type/ticker] labels remain accepted (compat window).
+        id_hint = (
+            " When an ## Evidence list is shown, cite each figure with its "
+            "bracketed id, e.g. [E1]."
+            if evidence_ids else ""
+        )
         if getattr(self.config, "answer_policy", "graded") != "strict":
             return (
                 "## Output Format\n\n"
                 "Provide your answer in plain text. Use inline citations like "
                 "[Source: sec_10k/NVDA] or [Source: yfinance/NVDA] for each "
-                "retrieved fact you reference. If you use multiple sources, cite "
-                "each one.\n\n"
+                f"retrieved fact you reference.{id_hint} If you use multiple "
+                "sources, cite each one.\n\n"
                 "For general fallback answers, start with: "
                 '"Not from your data - general knowledge:" and include a '
                 "primary-source verification caveat. If you refuse, briefly say "
@@ -406,7 +453,7 @@ class PromptAugmenter:
             "## Output Format\n\n"
             "Provide your answer in plain text. Use inline citations like "
             "[Source: sec_10k/NVDA] or [Source: yfinance/NVDA] for each "
-            "fact you reference. If you use multiple sources, cite each one.\n\n"
+            f"fact you reference.{id_hint} If you use multiple sources, cite each one.\n\n"
             "If the data is insufficient, say: "
             '"I don\'t have enough data in my knowledge base to answer this fully."'
         )

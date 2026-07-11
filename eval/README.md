@@ -156,6 +156,41 @@ python eval/gate.py                       # adaptive_safety_checks + baseline ga
 `summary` JSONs and record the per-lane metrics + promotion-gate verdicts in
 `RESULTS.md`.
 
+### Citation provenance & numeric validation (2.2.4.3)
+
+When `answer_validation` is `report` or `enforce`, the middleware assigns a
+request-local `[E#]` id to every model-visible fact/document, runs a
+deterministic (stdlib + `Decimal`, no model call) validator over the answer, and
+attaches an `answer_validation` block to each `/query` response; the runner
+copies it onto each row. `score.py` then emits a `summary["citation_validation"]`
+block (`metrics.citation_validation_metrics`):
+
+- `citation_support_rate` — mean fraction of an answer's citations that are
+  supported (`[E#]` resolving to the ledger, plus legacy `[Source: …]` labels
+  during the compatibility window);
+- `citation_existence_rate` — of the `[E#]` citations, the fraction that resolve
+  to the model-visible ledger (`resolved / resolved+missing+malformed`);
+- `accepted_absent_citations` — citations to ids absent from the ledger that were
+  accepted as real (**must be 0** — an absent/malformed id is never converted
+  into a source citation);
+- `numeric_support_rate` / `numeric_unsupported_rate` — of the specific financial
+  numbers (currency / percentage / signed / ratio / K-M-B-T-scaled), the fraction
+  a cited evidence item or recorded calculation supports vs. leaves unsupported;
+- `mismatch_counts` — per-reason (`unit`/`period`/`entity`/`value`) unsupported
+  counts;
+- `downgrade_rate` / `refusal_rate` — the enforce-mode grounding downgrade and
+  honest-refusal rates.
+
+Dates, evidence labels, and clearly-marked general examples are excluded from
+number extraction, so they never create false positives. The unsupported-number
+counts also bridge into the 2.2.4.1 `evidence_sufficiency.unsupported_number_rate`.
+
+`gate.py::citation_validation_checks` fails the gate (inert unless the summary
+carries the block) on: `accepted_absent_citations > 0`, `citation_support_rate <
+0.95`, or an unsupported-number relative reduction below 0.30 vs. the baseline.
+The false-positive-on-non-claims (< 0.02) and validator-p95 (< 10 ms) promotion
+gates are live-run measurements recorded in `RESULTS.md`, not single-summary.
+
 ### From the chat client (2.2.2.3)
 
 `scripts/chat.py` wraps this harness for convenience — it only shells out to

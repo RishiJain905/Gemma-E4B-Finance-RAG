@@ -245,3 +245,64 @@ class TestPromptAugmenter:
         estimate = augmenter.estimate_tokens(text)
         assert estimate > 0
         assert estimate < len(text)  # Should be less than char count
+
+
+# ── Evidence ledger header (2.2.4.3) ───────────────────────────────────────
+
+class TestEvidenceLedgerHeader:
+    """The [E#] evidence header renders only when a ledger is supplied."""
+
+    def _augmenter(self):
+        from types import SimpleNamespace
+        from src.middleware.prompt_augmenter import PromptAugmenter
+        return PromptAugmenter(config=SimpleNamespace(answer_policy="graded"))
+
+    def _retrieval(self):
+        return {
+            "facts": [{"metric": "total_revenue", "value": 26.0,
+                       "unit": "billion_usd", "period": "2026-Q1",
+                       "source_type": "sec_10q", "ticker": "NVDA"}],
+            "documents": [{"id": "sec_10k/NVDA/2025",
+                           "document": "NVIDIA datacenter revenue grew.",
+                           "metadata": {"ticker": "NVDA", "source": "sec_10k"}}],
+            "ticker": "NVDA",
+        }
+
+    def test_no_ledger_means_no_header(self):
+        """Without a ledger the prompt is the legacy prompt (no ## Evidence)."""
+        prompt = self._augmenter().build_prompt(
+            question="What is NVDA revenue?",
+            intent={"ticker": "NVDA", "question_type": "fact_lookup"},
+            retrieval=self._retrieval(),
+        )
+        assert "## Evidence\n" not in prompt
+        assert "[E1]" not in prompt
+
+    def test_ledger_renders_header_and_ids(self):
+        from src.middleware.evidence import assign_evidence_ids, build_evidence_items
+        retrieval = self._retrieval()
+        ledger = assign_evidence_ids(
+            build_evidence_items(retrieval["facts"], retrieval["documents"]))
+        prompt = self._augmenter().build_prompt(
+            question="What is NVDA revenue?",
+            intent={"ticker": "NVDA", "question_type": "fact_lookup"},
+            retrieval=retrieval,
+            evidence_ledger=ledger,
+        )
+        assert "## Evidence" in prompt
+        assert "[E1]" in prompt and "[E2]" in prompt
+        assert "total_revenue=26.00 billion_usd" in prompt
+        # The output-format section now hints at [E#] citations.
+        assert "cite each figure with its bracketed id" in prompt
+        # Legacy sections still render underneath.
+        assert "## Retrieved Financial Facts" in prompt
+        assert "## Retrieved Documents" in prompt
+
+    def test_empty_ledger_renders_no_header(self):
+        prompt = self._augmenter().build_prompt(
+            question="Test?",
+            intent={"ticker": "NVDA", "question_type": "fact_lookup"},
+            retrieval={"facts": [], "documents": [], "ticker": "NVDA"},
+            evidence_ledger=[],
+        )
+        assert "## Evidence" not in prompt
