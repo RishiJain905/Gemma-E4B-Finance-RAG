@@ -300,6 +300,18 @@ def _conflicts(facts: list[dict], obligation: EvidenceObligation) -> list[dict]:
         if len(values) > 1:
             conflicts.append({"type": "conflicting_values", "slot": key,
                               "values": sorted(values)})
+            continue
+        # Authoritative CompanyFacts folds multiple filed values into one row
+        # flagged ``conflict`` (2.2.5.3): disclose it even when a single value
+        # survived retrieval, so the grader never hides a filed-value dispute.
+        flagged = [row for rows in units.values() for row in rows if row.get("conflict")]
+        if flagged:
+            reasons = sorted({
+                str(row.get("conflict_reason") or "conflicting_filed_values")
+                for row in flagged
+            })
+            conflicts.append({"type": "conflicting_values", "slot": key,
+                              "reasons": reasons})
     return conflicts
 
 

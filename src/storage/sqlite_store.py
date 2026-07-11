@@ -6,6 +6,7 @@ SQLite storage layer for structured financial data.
 import logging
 import sqlite3
 import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -36,13 +37,28 @@ class SQLiteStore:
     def _init_schema(self):
         """Create all tables and indexes if they don't exist."""
         if self.SCHEMA_SQL.exists():
-            with open(self.SCHEMA_SQL) as f:
+            with open(self.SCHEMA_SQL, encoding="utf-8") as f:
                 sql = f.read()
         else:
             sql = self._inline_schema()
 
         with self._connect() as conn:
             conn.executescript(sql)
+            existing = {
+                row[1] for row in conn.execute("PRAGMA table_info(filings)").fetchall()
+            }
+            migrations = {
+                "index_error": "ALTER TABLE filings ADD COLUMN index_error TEXT",
+                "index_section_count": (
+                    "ALTER TABLE filings ADD COLUMN index_section_count INTEGER DEFAULT 0"
+                ),
+                "index_chunk_count": (
+                    "ALTER TABLE filings ADD COLUMN index_chunk_count INTEGER DEFAULT 0"
+                ),
+            }
+            for column, statement in migrations.items():
+                if column not in existing:
+                    conn.execute(statement)
             conn.commit()
 
     @staticmethod
@@ -65,6 +81,36 @@ CREATE TABLE IF NOT EXISTS fundamentals (
     UNIQUE(ticker, metric, period)
 );
 
+-- â”€â”€ SEC CompanyFacts â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+CREATE TABLE IF NOT EXISTS sec_companyfacts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ticker TEXT NOT NULL,
+    cik TEXT NOT NULL,
+    taxonomy TEXT NOT NULL,
+    concept TEXT NOT NULL,
+    label TEXT,
+    description TEXT,
+    value_text TEXT NOT NULL,
+    value_numeric REAL NOT NULL,
+    unit TEXT NOT NULL,
+    period_start TEXT NOT NULL DEFAULT '',
+    period_end TEXT NOT NULL,
+    period_kind TEXT NOT NULL,
+    fiscal_year INTEGER,
+    fiscal_period TEXT,
+    form TEXT NOT NULL,
+    filed_at TEXT NOT NULL,
+    accession TEXT NOT NULL,
+    frame TEXT NOT NULL DEFAULT '',
+    source_url TEXT NOT NULL,
+    source_accessed_at TEXT NOT NULL,
+    ingested_at TEXT NOT NULL DEFAULT (datetime('now')),
+    UNIQUE (
+        ticker, taxonomy, concept, unit, period_start,
+        period_end, accession, frame
+    )
+);
+
 -- ── Filing Index ────────────────────────────────────
 CREATE TABLE IF NOT EXISTS filings (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -78,6 +124,9 @@ CREATE TABLE IF NOT EXISTS filings (
     status TEXT DEFAULT 'unprocessed',
     parsed_at TEXT,
     summary_embedding_id TEXT,
+    index_error TEXT,
+    index_section_count INTEGER DEFAULT 0,
+    index_chunk_count INTEGER DEFAULT 0,
     ingested_at TEXT DEFAULT (datetime('now'))
 );
 
@@ -114,6 +163,14 @@ CREATE INDEX IF NOT EXISTS idx_fundamentals_ticker ON fundamentals(ticker);
 CREATE INDEX IF NOT EXISTS idx_fundamentals_metric ON fundamentals(metric);
 CREATE INDEX IF NOT EXISTS idx_fundamentals_ticker_metric ON fundamentals(ticker, metric);
 CREATE INDEX IF NOT EXISTS idx_fundamentals_period ON fundamentals(period);
+CREATE INDEX IF NOT EXISTS idx_sec_companyfacts_ticker_concept_period
+    ON sec_companyfacts(ticker, concept, period_end);
+CREATE INDEX IF NOT EXISTS idx_sec_companyfacts_ticker_filed_at
+    ON sec_companyfacts(ticker, filed_at);
+CREATE INDEX IF NOT EXISTS idx_sec_companyfacts_accession
+    ON sec_companyfacts(accession);
+CREATE INDEX IF NOT EXISTS idx_sec_companyfacts_ticker_kind_period
+    ON sec_companyfacts(ticker, period_kind, period_end);
 CREATE INDEX IF NOT EXISTS idx_filings_ticker ON filings(ticker);
 CREATE INDEX IF NOT EXISTS idx_filings_status ON filings(status);
 CREATE INDEX IF NOT EXISTS idx_cache_meta_status ON cache_meta(status);
@@ -192,6 +249,116 @@ CREATE INDEX IF NOT EXISTS idx_ingestion_log_run ON ingestion_log(run_id);
             rows = conn.execute(sql, params).fetchall()
             return {row["metric"]: row["value"] for row in rows}
 
+    # â”€â”€ SEC CompanyFacts CRUD â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+    def upsert_sec_companyfacts(self, rows: list[dict]) -> dict:
+        """Insert or refresh CompanyFacts observations in one transaction."""
+        if not rows:
+            return {"rows_received": 0, "rows_written": 0}
+        sql = """
+        INSERT INTO sec_companyfacts (
+            ticker, cik, taxonomy, concept, label, description,
+            value_text, value_numeric, unit, period_start, period_end,
+            period_kind, fiscal_year, fiscal_period, form, filed_at,
+            accession, frame, source_url, source_accessed_at
+        ) VALUES (
+            :ticker, :cik, :taxonomy, :concept, :label, :description,
+            :value_text, :value_numeric, :unit, :period_start, :period_end,
+            :period_kind, :fiscal_year, :fiscal_period, :form, :filed_at,
+            :accession, :frame, :source_url, :source_accessed_at
+        )
+        ON CONFLICT(
+            ticker, taxonomy, concept, unit, period_start,
+            period_end, accession, frame
+        ) DO UPDATE SET
+            cik = excluded.cik,
+            label = excluded.label,
+            description = excluded.description,
+            value_text = excluded.value_text,
+            value_numeric = excluded.value_numeric,
+            period_kind = excluded.period_kind,
+            fiscal_year = excluded.fiscal_year,
+            fiscal_period = excluded.fiscal_period,
+            form = excluded.form,
+            filed_at = excluded.filed_at,
+            source_url = excluded.source_url,
+            source_accessed_at = excluded.source_accessed_at,
+            ingested_at = datetime('now')
+        """
+        normalized_rows = [
+            {**row, "period_start": row.get("period_start") or "", "frame": row.get("frame") or ""}
+            for row in rows
+        ]
+        with self._connect() as conn:
+            conn.executemany(sql, normalized_rows)
+            conn.commit()
+        return {"rows_received": len(rows), "rows_written": len(rows)}
+
+    @staticmethod
+    def _validate_as_of(as_of: Optional[str]) -> str:
+        """Validate an ISO date before constructing or executing SQL."""
+        value = as_of or datetime.now(timezone.utc).date().isoformat()
+        if not isinstance(value, str):
+            raise ValueError("as_of must be an ISO date in YYYY-MM-DD format")
+        try:
+            parsed = datetime.strptime(value, "%Y-%m-%d").date()
+        except ValueError as exc:
+            raise ValueError("as_of must be an ISO date in YYYY-MM-DD format") from exc
+        if parsed.isoformat() != value:
+            raise ValueError("as_of must be an ISO date in YYYY-MM-DD format")
+        return value
+
+    def query_sec_companyfacts(
+        self,
+        ticker: str,
+        concepts: list[str],
+        *,
+        units: Optional[list[str]] = None,
+        period_kinds: Optional[list[str]] = None,
+        period_end: Optional[str] = None,
+        as_of: Optional[str] = None,
+    ) -> list[dict]:
+        """Return provenance-preserving CompanyFacts rows eligible as of a date."""
+        cutoff = self._validate_as_of(as_of)
+        if not concepts or units == [] or period_kinds == []:
+            return []
+
+        conditions = ["ticker = ?", "filed_at <= ?"]
+        params: list = [ticker.upper(), cutoff]
+        concept_placeholders = ",".join("?" for _ in concepts)
+        conditions.append(f"concept IN ({concept_placeholders})")
+        params.extend(concepts)
+        if units is not None:
+            placeholders = ",".join("?" for _ in units)
+            conditions.append(f"unit IN ({placeholders})")
+            params.extend(units)
+        if period_kinds is not None:
+            placeholders = ",".join("?" for _ in period_kinds)
+            conditions.append(f"period_kind IN ({placeholders})")
+            params.extend(period_kinds)
+        if period_end is not None:
+            conditions.append("period_end = ?")
+            params.append(period_end)
+
+        sql = f"""
+            SELECT * FROM sec_companyfacts
+            WHERE {' AND '.join(conditions)}
+            ORDER BY period_end DESC, concept ASC, filed_at DESC,
+                     accession DESC, source_accessed_at DESC, id ASC
+        """
+        with self._connect() as conn:
+            return [dict(row) for row in conn.execute(sql, params).fetchall()]
+
+    def count_sec_companyfacts(self, ticker: Optional[str] = None) -> int:
+        """Count stored CompanyFacts observations, optionally for one ticker."""
+        sql = "SELECT COUNT(*) FROM sec_companyfacts"
+        params: tuple = ()
+        if ticker is not None:
+            sql += " WHERE ticker = ?"
+            params = (ticker.upper(),)
+        with self._connect() as conn:
+            return int(conn.execute(sql, params).fetchone()[0])
+
     # ── Filing Tracking ───────────────────────────────
 
     def register_filing(self, ticker: str, filing_type: str,
@@ -208,20 +375,43 @@ CREATE INDEX IF NOT EXISTS idx_ingestion_log_run ON ingestion_log(run_id);
             conn.commit()
             return cursor.rowcount > 0
 
-    def mark_filing_parsed(self, accession: str, embedding_id: str = None):
+    def mark_filing_parsed(
+        self,
+        accession: str,
+        embedding_id: str = None,
+        file_path: str = None,
+        section_count: int = 0,
+        chunk_count: int = 0,
+    ):
         """Mark a filing as successfully parsed by TraceAlchemy."""
         sql = """
-        UPDATE filings SET status='parsed', parsed_at=datetime('now'), summary_embedding_id=?
+        UPDATE filings SET status='parsed', parsed_at=datetime('now'),
+            summary_embedding_id=?, file_path=COALESCE(?, file_path), index_error=NULL,
+            index_section_count=?, index_chunk_count=?
         WHERE accession=?
         """
         with self._connect() as conn:
-            conn.execute(sql, (embedding_id, accession))
+            conn.execute(
+                sql, (embedding_id, file_path, section_count, chunk_count, accession),
+            )
+            conn.commit()
+
+    def mark_filing_index_pending(
+        self, accession: str, *, file_path: str, error: str,
+    ) -> None:
+        """Record a durable parsed artifact whose vector indexing must retry."""
+        sql = """
+        UPDATE filings SET status='index_pending', file_path=?, index_error=?
+        WHERE accession=?
+        """
+        with self._connect() as conn:
+            conn.execute(sql, (file_path, error, accession))
             conn.commit()
 
     def get_unprocessed_filings(self, limit: int = 10) -> list[dict]:
         """Get filings that haven't been parsed yet."""
         sql = (
-            "SELECT * FROM filings WHERE status='unprocessed' "
+            "SELECT * FROM filings WHERE status IN ('unprocessed', 'index_pending') "
             "ORDER BY filing_date DESC LIMIT ?"
         )
         with self._connect() as conn:

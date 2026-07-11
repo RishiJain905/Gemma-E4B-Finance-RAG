@@ -953,6 +953,205 @@ def load_conversations(path: Path = CONVERSATIONS) -> list[dict]:
     return convs
 
 
+# ── Long-document / hierarchical retrieval eval (2.2.5.3) ──────────────
+#
+# A self-contained, deterministic comparison of three retrieval strategies over
+# the checked-in synthetic corpus — flat child retrieval, flat with a larger
+# top-k, and hierarchical child retrieval plus bounded expansion. No model, no
+# embeddings, no network: chunks are ranked by lexical query-term overlap and the
+# real ``expand_filing_hits`` expander runs against an in-memory section store.
+
+HIERARCHICAL_CORPUS = EVAL_DIR.parent / "tests" / "fixtures" / "sec" / "hierarchical_corpus.json"
+
+# A financial-figure shape used to flag unsupported numbers a missing/answerless
+# case might mis-cite (magnitudes, percents, multi-digit amounts).
+_LONGDOC_FIGURE = re.compile(
+    r"\b\d{3,}\b|\b\d+(?:\.\d+)?\s*(?:percent|million|billion|%)", re.IGNORECASE)
+
+
+class _CorpusSectionStore:
+    """In-memory section-family reader over the fixture corpus (mirrors Store)."""
+
+    def __init__(self, chunks: list[dict]):
+        self._chunks = [self._as_row(c) for c in chunks]
+
+    @staticmethod
+    def _as_row(chunk: dict) -> dict:
+        return {
+            "id": chunk["id"],
+            "document": chunk["text"],
+            "metadata": {
+                "accession": chunk["accession"],
+                "parent_id": chunk["parent_id"],
+                "section_key": chunk.get("section_key"),
+                "section_heading": chunk.get("section_heading"),
+                "section_index": chunk.get("section_index"),
+                "chunk_index": chunk.get("chunk_index"),
+                "ticker": chunk.get("ticker"),
+                "source": "sec_filing",
+            },
+        }
+
+    def get_section_chunks(self, parent_id, *, limit, offset=0):
+        rows = [c for c in self._chunks if c["metadata"]["parent_id"] == parent_id]
+        rows = sorted(rows, key=lambda c: c["metadata"].get("chunk_index", 0))
+        return [dict(c) for c in rows[offset:offset + limit]]
+
+    def get_adjacent_sections(self, accession, section_index, *, before=1, after=1):
+        lo, hi = section_index - before, section_index + after
+        rows = [
+            c for c in self._chunks
+            if c["metadata"]["accession"] == accession
+            and lo <= (c["metadata"].get("section_index") or -999) <= hi
+        ]
+        return sorted(rows, key=lambda c: (
+            c["metadata"].get("section_index", 0),
+            c["metadata"].get("chunk_index", 0)))
+
+
+class _Obligation:
+    """Minimal obligation for heading matching in the offline expander."""
+
+    def __init__(self, metrics=(), operations=()):
+        self.metrics = tuple(metrics)
+        self.operations = tuple(operations)
+
+
+def load_hierarchical_corpus(path: Path = HIERARCHICAL_CORPUS) -> dict:
+    """Load the checked-in long-document corpus (chunks + labeled cases)."""
+    return json.loads(Path(path).read_text(encoding="utf-8"))
+
+
+def _lexical_score(query_terms: list[str], text: str) -> int:
+    tokens = set(re.findall(r"[a-z0-9]+", (text or "").lower()))
+    return sum(1 for term in query_terms if str(term).lower() in tokens)
+
+
+def _rank_chunks(query_terms: list[str], chunks: list[dict]) -> list[dict]:
+    """Positive-overlap chunks ranked by lexical score (stable on ties).
+
+    Only chunks that share at least one query term are "retrieved" — a larger
+    top-k therefore recovers lower-ranked *relevant* chunks but never a
+    zero-overlap context chunk (that is exactly what hierarchical expansion is
+    for), so the three strategies stay cleanly separated.
+    """
+    scored = [
+        (index, _lexical_score(query_terms, c["text"]), c)
+        for index, c in enumerate(chunks)
+    ]
+    scored = [row for row in scored if row[1] > 0]
+    scored.sort(key=lambda row: (-row[1], row[0]))
+    return [row[2] for row in scored]
+
+
+def _figure_count(text: str) -> int:
+    return len(_LONGDOC_FIGURE.findall(text or ""))
+
+
+def _chunk_row(chunk: dict) -> dict:
+    """Retrieval-shaped hit dict for the expander (id + body + metadata + score)."""
+    row = _CorpusSectionStore._as_row(chunk)
+    row["fusion_score"] = 1.0
+    return row
+
+
+def _evaluate_case(case: dict, chunks: list[dict], store: _CorpusSectionStore,
+                   *, top_k: int, large_k: int, budget: int,
+                   siblings: int, adjacent: int) -> list[dict]:
+    """Return one per-config metric row for a single long-document case."""
+    from eval import metrics as M  # lazy: metrics imports run_eval at module load
+
+    relevant = list(case.get("relevant_ids") or [])
+    query_terms = list(case.get("query_terms") or [])
+    ranked = _rank_chunks(query_terms, chunks)
+    by_id = {c["id"]: c for c in chunks}
+
+    def _metrics(config: str, retrieved: list[dict], expansions: int,
+                 latency_ms: float) -> dict:
+        retrieved_ids = [r["id"] for r in retrieved]
+        texts = " ".join(
+            (by_id.get(rid, {}).get("text") or r.get("document") or "")
+            for rid, r in zip(retrieved_ids, retrieved))
+        prompt_chars = sum(
+            len(by_id.get(rid, {}).get("text") or r.get("document") or "")
+            for rid, r in zip(retrieved_ids, retrieved))
+        r5 = M.recall_at_k(retrieved_ids, relevant, 5)
+        r10 = M.recall_at_k(retrieved_ids, relevant, 10)
+        precision = M.context_precision(retrieved_ids, relevant)
+        if not relevant:
+            correctness = 1.0  # unanswerable — correct = surface no false evidence
+        else:
+            correctness = M.recall_at_k(retrieved_ids, relevant, max(large_k, 10))
+        unsupported = _figure_count(texts) if case.get("answerability") == "unanswerable" else 0
+        return {
+            "id": case["id"], "config": config, "case_type": case.get("case_type"),
+            "retrieved_ids": retrieved_ids,
+            "recall_at_5": r5, "recall_at_10": r10,
+            "context_precision": precision,
+            "subquestion_coverage": (
+                M.recall_at_k(retrieved_ids, relevant, len(retrieved_ids) or 1)
+                if relevant else None),
+            "answer_correctness": correctness,
+            "prompt_chars": prompt_chars,
+            "prompt_tokens": prompt_chars // 4,
+            "expansion_count": expansions,
+            "retrieval_latency_ms": round(latency_ms, 3),
+            "unsupported_numeric_claims": unsupported,
+        }
+
+    rows: list[dict] = []
+
+    # (a) flat child retrieval.
+    t0 = time.perf_counter()
+    flat = ranked[:top_k]
+    rows.append(_metrics("flat", flat, 0, (time.perf_counter() - t0) * 1000))
+
+    # (b) flat with a larger top-k.
+    t0 = time.perf_counter()
+    flat_large = ranked[:large_k]
+    rows.append(_metrics("flat_large_k", flat_large, 0,
+                         (time.perf_counter() - t0) * 1000))
+
+    # (c) hierarchical child retrieval + bounded expansion.
+    t0 = time.perf_counter()
+    hits = [_chunk_row(c) for c in ranked[:top_k]]
+    obligation_terms = case.get("obligation_terms") or query_terms
+    obligations = [_Obligation(metrics=obligation_terms)]
+    from src.middleware.hierarchical_retrieval import expand_filing_hits
+    expanded = expand_filing_hits(
+        hits, store, obligations, budget,
+        max_siblings=siblings, max_adjacent_sections=adjacent)
+    latency = (time.perf_counter() - t0) * 1000
+    exp_count = sum(1 for d in expanded if d.get("expansion_reason") != "root_hit")
+    rows.append(_metrics("hierarchical", expanded, exp_count, latency))
+    return rows
+
+
+def evaluate_long_document_configs(
+    corpus: Optional[dict] = None, *, top_k: int = 5, large_k: int = 10,
+    budget: int = 6000, siblings: int = 2, adjacent: int = 1,
+) -> dict:
+    """Run flat / flat-large-k / hierarchical over the corpus and summarize.
+
+    Returns ``{"per_case": [...], "summary": {config: {...}}, "gate": {...}}`` —
+    deterministic and offline. The summary/gate feed RESULTS.md and the 2.2.5.3
+    promotion decision.
+    """
+    from eval import metrics as M  # lazy: metrics imports run_eval at module load
+
+    corpus = corpus or load_hierarchical_corpus()
+    chunks = list(corpus.get("corpus") or [])
+    store = _CorpusSectionStore(chunks)
+    per_case: list[dict] = []
+    for case in corpus.get("cases") or []:
+        per_case.extend(_evaluate_case(
+            case, chunks, store, top_k=top_k, large_k=large_k, budget=budget,
+            siblings=siblings, adjacent=adjacent))
+    summary = M.long_document_summary(per_case)
+    gate = M.long_document_gate(summary)
+    return {"per_case": per_case, "summary": summary, "gate": gate}
+
+
 # ── Fixture validation report (2.2.1.3 Step 2) ─────────────────────────
 
 # Minimum coverage the challenge set must hit, per dimension.

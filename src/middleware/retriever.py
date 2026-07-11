@@ -342,6 +342,43 @@ class Retriever:
                     expanded.append(dict(sibling))
         return expanded
 
+    def hierarchical_expand(self, documents: list[dict], plan=None, *,
+                            missing_local_context: bool = False) -> list[dict]:
+        """Bounded filing → section → child expansion of precise hits (2.2.5.3).
+
+        Delegates to :func:`hierarchical_retrieval.expand_filing_hits` using this
+        retriever's store and the configured hierarchy caps. Returns the root hits
+        plus their in-budget same-section / adjacent-section neighbors, each
+        annotated with ``expansion_reason`` / ``root_hit_id`` and the root hit's
+        score. An entire filing parent is never returned. Fails soft to the
+        original documents on any error so it can never break a query.
+        """
+        try:
+            from .hierarchical_retrieval import expand_filing_hits
+
+            obligations: tuple = ()
+            if plan is not None:
+                try:
+                    from .evidence_grader import build_obligations
+                    obligations = build_obligations(plan)
+                except Exception:  # noqa: BLE001 - heading match is best-effort
+                    obligations = ()
+            max_items = int(getattr(self.config, "hierarchy_max_expanded_items", 0) or 0)
+            return expand_filing_hits(
+                list(documents or []),
+                self.store,
+                obligations,
+                int(getattr(self.config, "adaptive_max_context_chars", 18000)),
+                max_siblings=int(getattr(self.config, "hierarchy_max_siblings", 2)),
+                max_adjacent_sections=int(
+                    getattr(self.config, "hierarchy_max_adjacent_sections", 1)),
+                max_expanded_items=max_items or None,
+                missing_local_context=missing_local_context,
+            )
+        except Exception as e:  # noqa: BLE001 - expansion must never fail a query
+            logger.warning("Hierarchical expansion failed, keeping hits: %s", e)
+            return list(documents or [])
+
     def _run_retrieval(self, query: str, intent: dict,
                        top_k_documents: int, top_k_facts: int,
                        *, pool: bool) -> dict:
@@ -539,7 +576,32 @@ class Retriever:
                 if not any(f.get("metric") == r.get("metric") for f in facts):
                     facts.append(dict(r))
 
+        # Prefer authoritative SEC CompanyFacts for supported GAAP metrics
+        # (2.2.5.3). No-op when CompanyFacts ingestion is disabled; conflicts
+        # stay as separate evidence rows rather than being averaged/dropped.
+        facts = self._merge_companyfacts(ticker, metrics, facts)
+
         return facts[:limit]
+
+    def _merge_companyfacts(self, ticker: str, metrics: list[str],
+                            facts: list[dict]) -> list[dict]:
+        """Reconcile legacy facts with authoritative CompanyFacts (fail-soft).
+
+        Only runs for explicitly requested metrics; returns ``facts`` unchanged
+        when CompanyFacts is disabled/empty or on any lookup error, so the legacy
+        fact path is preserved byte-for-byte until the source is enabled.
+        """
+        if not metrics:
+            return facts
+        try:
+            authoritative = self.store.companyfacts_evidence(ticker, list(metrics))
+        except Exception as e:  # noqa: BLE001 - authoritative merge is best-effort
+            logger.warning("CompanyFacts lookup failed for %s: %s", ticker, e)
+            return facts
+        if not authoritative:
+            return facts
+        from .evidence import reconcile_structured_facts
+        return reconcile_structured_facts(facts, authoritative)
 
     def _merge_projection_facts(self, ticker: str, facts: list[dict]) -> list[dict]:
         """Add full estimate rows for projection queries, failing per metric."""

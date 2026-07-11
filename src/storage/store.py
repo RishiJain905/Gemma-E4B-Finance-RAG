@@ -18,6 +18,8 @@ Usage:
 """
 
 import logging
+from datetime import datetime, timezone
+from decimal import Decimal
 from pathlib import Path
 from typing import Optional
 
@@ -27,11 +29,204 @@ from .sqlite_store import SQLiteStore
 logger = logging.getLogger(__name__)
 
 
+def _companyfacts_cutoff(as_of: Optional[str]) -> str:
+    value = as_of or datetime.now(timezone.utc).date().isoformat()
+    if not isinstance(value, str):
+        raise ValueError("as_of must be an ISO date in YYYY-MM-DD format")
+    try:
+        parsed = datetime.strptime(value, "%Y-%m-%d").date()
+    except ValueError as exc:
+        raise ValueError("as_of must be an ISO date in YYYY-MM-DD format") from exc
+    if parsed.isoformat() != value:
+        raise ValueError("as_of must be an ISO date in YYYY-MM-DD format")
+    return value
+
+
+def _candidate_sort_key(row: dict, concept_order: dict[str, int]) -> tuple:
+    return (
+        concept_order.get(row.get("concept", ""), len(concept_order)),
+        -int(str(row.get("filed_at", "0000-00-00")).replace("-", "") or 0),
+        str(row.get("accession", "")),
+        str(row.get("source_accessed_at", "")),
+        str(row.get("value_text", "")),
+    )
+
+
+def select_companyfacts(
+    rows: list[dict],
+    metric_rules: dict,
+    metrics: list[str],
+    *,
+    periods: Optional[list[str]] = None,
+    as_of: Optional[str] = None,
+) -> list[dict]:
+    """Pure, stable canonical selection over raw CompanyFacts candidates."""
+    cutoff = _companyfacts_cutoff(as_of)
+    requested_periods = set(periods) if periods is not None else None
+    results: list[dict] = []
+
+    for metric_position, metric in enumerate(metrics):
+        rule = metric_rules.get(metric)
+        if not isinstance(rule, dict):
+            continue
+        concepts = list(rule.get("concepts", []))
+        concept_order = {concept: index for index, concept in enumerate(concepts)}
+        allowed_units = set(rule.get("units", []))
+        allowed_kinds = set(rule.get("period_kinds", []))
+        eligible = [
+            row
+            for row in rows
+            if row.get("concept") in concept_order
+            and (not allowed_units or row.get("unit") in allowed_units)
+            and (not allowed_kinds or row.get("period_kind") in allowed_kinds)
+            and (requested_periods is None or row.get("period_end") in requested_periods)
+            and str(row.get("filed_at", "")) <= cutoff
+        ]
+
+        groups: dict[tuple[str, str], list[dict]] = {}
+        for row in eligible:
+            groups.setdefault((row["unit"], row["period_end"]), []).append(row)
+
+        for (unit, period_end), candidates in groups.items():
+            newest_by_concept: dict[str, dict] = {}
+            for row in sorted(candidates, key=lambda item: _candidate_sort_key(item, concept_order)):
+                newest_by_concept.setdefault(row["concept"], row)
+            selected = min(
+                newest_by_concept.values(),
+                key=lambda item: _candidate_sort_key(item, concept_order),
+            )
+
+            alternatives = []
+            seen_values = {Decimal(selected["value_text"])}
+            for candidate in sorted(
+                candidates,
+                key=lambda item: _candidate_sort_key(item, concept_order),
+            ):
+                value_text = candidate["value_text"]
+                decimal_value = Decimal(value_text)
+                if decimal_value in seen_values:
+                    continue
+                seen_values.add(decimal_value)
+                alternatives.append(
+                    {
+                        "value_text": value_text,
+                        "taxonomy": candidate["taxonomy"],
+                        "concept": candidate["concept"],
+                        "accession": candidate["accession"],
+                        "form": candidate["form"],
+                        "filed_at": candidate["filed_at"],
+                        "source_url": candidate["source_url"],
+                    }
+                )
+
+            results.append(
+                {
+                    "ticker": selected["ticker"],
+                    "metric": metric,
+                    "value": selected["value_numeric"],
+                    "value_text": selected["value_text"],
+                    "unit": unit,
+                    "period": period_end,
+                    "period_start": selected["period_start"],
+                    "period_type": selected["period_kind"],
+                    "source_type": "sec_companyfacts",
+                    "source_url": selected["source_url"],
+                    "source_accessed_at": selected["source_accessed_at"],
+                    "taxonomy": selected["taxonomy"],
+                    "concept": selected["concept"],
+                    "accession": selected["accession"],
+                    "form": selected["form"],
+                    "filed_at": selected["filed_at"],
+                    "as_of": cutoff,
+                    "conflict": bool(alternatives),
+                    "alternatives": alternatives,
+                    "_metric_position": metric_position,
+                }
+            )
+
+    results.sort(key=lambda item: (item["unit"], item["concept"]))
+    results.sort(key=lambda item: item["period"], reverse=True)
+    results.sort(key=lambda item: item["_metric_position"])
+    for result in results:
+        result.pop("_metric_position")
+    return results
+
+
+def _companyfacts_alt_value(value_text: str):
+    """Best-effort numeric value for a CompanyFacts alternative observation."""
+    try:
+        return float(Decimal(str(value_text)))
+    except Exception:  # noqa: BLE001 - keep the raw text if it will not parse
+        return value_text
+
+
+def companyfacts_rows_to_evidence(rows: list[dict]) -> list[dict]:
+    """Project canonical CompanyFacts rows into structured fact-evidence rows.
+
+    Each selected observation becomes one authoritative fact-evidence row
+    (``source_type="sec_companyfacts"``) carrying full provenance (taxonomy /
+    concept / accession / filed_at / as_of / source_url). Every distinct
+    ``alternatives`` value is emitted as its OWN separate evidence row flagged
+    ``conflict=True`` — conflicting filed values are never averaged or collapsed,
+    so the evidence grader can disclose them. Order is preserved (primary row
+    first, then its alternatives).
+    """
+    evidence: list[dict] = []
+    for row in rows or []:
+        primary = {
+            "metric": row.get("metric"),
+            "value": row.get("value"),
+            "value_text": row.get("value_text"),
+            "ticker": row.get("ticker"),
+            "period": row.get("period"),
+            "period_start": row.get("period_start"),
+            "period_type": row.get("period_type"),
+            "unit": row.get("unit"),
+            "source_type": "sec_companyfacts",
+            "source_url": row.get("source_url"),
+            "as_of": row.get("as_of"),
+            "taxonomy": row.get("taxonomy"),
+            "concept": row.get("concept"),
+            "accession": row.get("accession"),
+            "form": row.get("form"),
+            "filed_at": row.get("filed_at"),
+            "conflict": bool(row.get("conflict")),
+        }
+        if row.get("conflict"):
+            primary["conflict_reason"] = "companyfacts_multiple_filed_values"
+        evidence.append(primary)
+        for alt in row.get("alternatives") or []:
+            evidence.append({
+                "metric": row.get("metric"),
+                "value": _companyfacts_alt_value(alt.get("value_text")),
+                "value_text": alt.get("value_text"),
+                "ticker": row.get("ticker"),
+                "period": row.get("period"),
+                "period_type": row.get("period_type"),
+                "unit": row.get("unit"),
+                "source_type": "sec_companyfacts",
+                "source_url": alt.get("source_url"),
+                "as_of": row.get("as_of"),
+                "taxonomy": alt.get("taxonomy"),
+                "concept": alt.get("concept"),
+                "accession": alt.get("accession"),
+                "form": alt.get("form"),
+                "filed_at": alt.get("filed_at"),
+                "conflict": True,
+                "conflict_reason": "companyfacts_alternative_value",
+            })
+    return evidence
+
+
 class Store:
     """
     Unified storage layer combining structured (SQLite) and
     semantic (ChromaDB) storage.
     """
+
+    COMPANYFACTS_CONFIG_PATH = (
+        Path(__file__).parent.parent.parent / "configs/sec_companyfacts.yaml"
+    )
 
     def __init__(self,
                  db_path: Optional[Path] = None,
@@ -90,6 +285,80 @@ class Store:
         """Get multiple metrics for a ticker at once."""
         return self.sqlite.get_fundamentals_batch(ticker, metrics)
 
+    def get_companyfacts(
+        self,
+        ticker: str,
+        metrics: list[str],
+        *,
+        periods: Optional[list[str]] = None,
+        as_of: Optional[str] = None,
+    ) -> list[dict]:
+        """Project raw SEC observations into configured canonical metrics."""
+        import yaml
+
+        with open(self.COMPANYFACTS_CONFIG_PATH, encoding="utf-8") as config_file:
+            config = yaml.safe_load(config_file) or {}
+        if not config.get("enabled", False):
+            return []
+
+        cutoff = _companyfacts_cutoff(as_of)
+        metric_rules = config.get("metrics", {}) or {}
+        requested_rules = [metric_rules[name] for name in metrics if name in metric_rules]
+        concepts = list(
+            dict.fromkeys(
+                concept
+                for rule in requested_rules
+                for concept in rule.get("concepts", [])
+            )
+        )
+        if not concepts:
+            return []
+        raw_rows = self.sqlite.query_sec_companyfacts(
+            ticker,
+            concepts,
+            as_of=cutoff,
+        )
+        return select_companyfacts(
+            raw_rows,
+            metric_rules,
+            metrics,
+            periods=periods,
+            as_of=cutoff,
+        )
+
+    def companyfacts_evidence(
+        self,
+        ticker: str,
+        metrics: list[str],
+        *,
+        periods: Optional[list[str]] = None,
+        as_of: Optional[str] = None,
+        latest_only: bool = True,
+    ) -> list[dict]:
+        """Authoritative CompanyFacts as structured fact-evidence rows.
+
+        Returns ``[]`` when CompanyFacts ingestion is disabled (the config gate in
+        :meth:`get_companyfacts`) so a disabled source is a strict no-op. When
+        ``latest_only`` and no explicit ``periods`` are requested, keeps only the
+        most recent filed period per (metric, unit) so a "latest revenue" style
+        query is not flooded with every historical quarter; conflicting filed
+        values within the kept period remain separate evidence rows.
+        """
+        rows = self.get_companyfacts(ticker, metrics, periods=periods, as_of=as_of)
+        if latest_only and not periods:
+            newest: dict[tuple, str] = {}
+            for row in rows:
+                key = (row.get("metric"), row.get("unit"))
+                period = str(row.get("period") or "")
+                if key not in newest or period > newest[key]:
+                    newest[key] = period
+            rows = [
+                row for row in rows
+                if str(row.get("period") or "") == newest.get(
+                    (row.get("metric"), row.get("unit")))
+            ]
+        return companyfacts_rows_to_evidence(rows)
+
     # ── Document Storage (ChromaDB) ──────────────────
 
     def save_document(self,
@@ -129,6 +398,65 @@ class Store:
                              metadatas: list[dict] = None):
         """Store multiple documents at once."""
         self.chroma.add_documents_batch(ids, texts, metadatas)
+
+    def add_filing_sections(self, sections: list) -> dict[str, int]:
+        """Replace and index SEC section families through Chroma's chunker."""
+        counts = {
+            "sections_written": 0,
+            "chunks_written": 0,
+            "replacements": 0,
+            "skipped": 0,
+        }
+        for section in sections:
+            if not section.text.strip():
+                counts["skipped"] += 1
+                continue
+            existing_count = self.chroma.count_filing_section_chunks(section.document_id)
+            self.chroma.delete_filing_section_family(section.document_id)
+            self.chroma.add_document(
+                document_id=section.document_id,
+                text=section.text,
+                ticker=section.ticker,
+                source="sec_filing",
+                date=section.filing_date,
+                metadata={
+                    "accession": section.accession,
+                    "form": section.form,
+                    "filing_date": section.filing_date,
+                    "report_period": section.report_period,
+                    "section_key": section.section_key,
+                    "section_heading": section.section_heading,
+                    "section_index": section.section_index,
+                    "parent_id": section.document_id,
+                    "source_url": section.source_url,
+                    "parsed_path": section.parsed_path,
+                },
+            )
+            stored_count = self.chroma.count_filing_section_chunks(section.document_id)
+            if not stored_count:
+                raise RuntimeError(f"No chunks stored for {section.document_id}")
+            counts["sections_written"] += 1
+            counts["chunks_written"] += stored_count
+            counts["replacements"] += int(existing_count > 0)
+        return counts
+
+    def get_section_chunks(
+        self, parent_id: str, *, limit: int, offset: int = 0,
+    ) -> list[dict]:
+        return self.chroma.get_section_chunks(parent_id, limit=limit, offset=offset)
+
+    def get_adjacent_sections(
+        self, accession: str, section_index: int, *, before: int = 1, after: int = 1,
+    ) -> list[dict]:
+        return self.chroma.get_adjacent_sections(
+            accession, section_index, before=before, after=after,
+        )
+
+    def count_filing_sections(self, accession: Optional[str] = None) -> int:
+        return self.chroma.count_filing_sections(accession)
+
+    def delete_filing_section_family(self, parent_id: str) -> None:
+        self.chroma.delete_filing_section_family(parent_id)
 
     # ── Hybrid Search ─────────────────────────────────
 
@@ -204,7 +532,10 @@ class Store:
 
     def process_filing(self, filing_record: dict,
                        extracted_text: str,
-                       extracted_facts: list[dict]):
+                       extracted_facts: list[dict],
+                       *,
+                       index_document: bool = True,
+                       mark_parsed: bool = True):
         """
         Process a full filing through the model-as-parser pipeline.
 
@@ -222,13 +553,14 @@ class Store:
             f"{filing_record['source_type']}/{filing_record['ticker']}/"
             f"{filing_record['filing_type']}-{filing_record['period']}"
         )
-        self.save_document(
-            document_id=doc_id,
-            text=extracted_text,
-            ticker=filing_record["ticker"],
-            source=filing_record["filing_type"],
-            date=filing_record["filing_date"],
-        )
+        if index_document:
+            self.save_document(
+                document_id=doc_id,
+                text=extracted_text,
+                ticker=filing_record["ticker"],
+                source=filing_record["filing_type"],
+                date=filing_record["filing_date"],
+            )
 
         # 2. Save each extracted fact
         for fact in extracted_facts:
@@ -243,10 +575,11 @@ class Store:
             )
 
         # 3. Mark as parsed
-        self.sqlite.mark_filing_parsed(
-            filing_record["accession"],
-            embedding_id=doc_id
-        )
+        if mark_parsed:
+            self.sqlite.mark_filing_parsed(
+                filing_record["accession"],
+                embedding_id=doc_id
+            )
 
     # ── Cache Management ──────────────────────────────
 
@@ -274,6 +607,7 @@ class Store:
         "yfinance_fundamentals": {"cache_source": "yfinance_fundamentals", "ttl_key": "fundamentals"},
         "yfinance_news":         {"cache_source": "yfinance_news",         "ttl_key": "news"},
         "sec_filings":           {"cache_source": "sec_filings_discovery", "ttl_key": "sec_filings"},
+        "sec_companyfacts":      {"cache_source": "sec_companyfacts",      "ttl_key": "sec_companyfacts"},
         "gdelt_news":            {"cache_source": "gdelt_news",            "ttl_key": "gdelt_news"},
         "earnings_transcripts":  {"cache_source": "earnings_transcripts",  "ttl_key": "transcripts"},
         "ir_pages":              {"cache_source": "ir_pages",              "ttl_key": "ir_pages"},
@@ -282,6 +616,7 @@ class Store:
 
     _DEFAULT_TTLS = {
         "fundamentals": 24, "news": 6, "macro": 24, "sec_filings": 12,
+        "sec_companyfacts": 24,
         "gdelt_news": 6, "transcripts": 168, "ir_pages": 24, "estimates": 24,
     }
 

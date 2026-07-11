@@ -58,35 +58,42 @@ class UnifiedScheduler:
             "ttl_key": "sec_filings",
             "weight": 2,
         },
+        "sec_companyfacts": {
+            "class": "SECCompanyFactsIngestor",
+            "ttl_key": "sec_companyfacts",
+            "weight": 3,
+        },
         "fred": {
             "class": "FREDIngestor",
             "ttl_key": "macro",
-            "weight": 3,
+            "weight": 4,
         },
         "gdelt": {
             "class": "GDELTIngestor",
             "ttl_key": "gdelt_news",
-            "weight": 4,
+            "weight": 5,
         },
         "earnings_transcripts": {
             "class": "EarningsTranscriptIngestor",
             "ttl_key": "transcripts",
-            "weight": 5,
+            "weight": 6,
         },
         "ir_pages": {
             "class": "IRIngestor",
             "ttl_key": "ir_pages",
-            "weight": 6,
+            "weight": 7,
         },
         "estimates": {
             "class": "EstimatesIngestor",
             "ttl_key": "estimates",
-            "weight": 7,
+            "weight": 8,
         },
     }
 
     # Run-mode source selections.
-    DAILY_SOURCES = ["yfinance", "fred", "sec_filings", "ir_pages", "estimates"]
+    DAILY_SOURCES = [
+        "yfinance", "fred", "sec_filings", "sec_companyfacts", "ir_pages", "estimates",
+    ]
     HOURLY_SOURCES = ["gdelt"]
     WEEKLY_SOURCES = ["earnings_transcripts", "sec_filings"]
 
@@ -110,6 +117,7 @@ class UnifiedScheduler:
         """Load the schedule TTL map (hours) from watchlist.yaml."""
         defaults = {
             "fundamentals": 24, "news": 6, "macro": 24, "sec_filings": 12,
+            "sec_companyfacts": 24,
             "gdelt_news": 6, "transcripts": 168, "ir_pages": 24,
             "estimates": 24,
         }
@@ -181,6 +189,9 @@ class UnifiedScheduler:
                 return sched.run_full_pipeline(force=force)
             return sched.run_discovery(force=force)
 
+        if name == "sec_companyfacts":
+            return self._run_sec_companyfacts()
+
         if name == "fred":
             from src.macros.fred_ingestor import FREDIngestor
             results = FREDIngestor(store=self.store).fetch_all_indicators()
@@ -210,6 +221,76 @@ class UnifiedScheduler:
             return {"tickers_processed": len(results), "facts_stored": stored}
 
         raise ValueError(f"Unknown source: {name}")
+
+    def _load_core_tickers(self) -> list[str]:
+        """Load normalized core tickers without constructing another ingestor."""
+        try:
+            import yaml
+
+            with open(self.watchlist_path, encoding="utf-8") as watchlist_file:
+                config = yaml.safe_load(watchlist_file) or {}
+            return [str(ticker).upper() for ticker in config.get("core", [])]
+        except Exception as exc:  # noqa: BLE001
+            raise ValueError(f"Could not load core tickers: {exc}") from exc
+
+    def _run_sec_companyfacts(self) -> dict:
+        """Ingest core tickers independently and update per-ticker freshness."""
+        from src.sec import SECCompanyFactsIngestor
+
+        ingestor = SECCompanyFactsIngestor(store=self.store)
+        if not ingestor.enabled:
+            return {"enabled": False, "tickers_processed": 0}
+
+        tickers = self._load_core_tickers()
+        results: dict[str, dict] = {}
+        failed = 0
+        totals = {"facts_seen": 0, "facts_written": 0, "facts_skipped": 0}
+        ttl_hours = self._ttl_for("sec_companyfacts")
+
+        for ticker in tickers:
+            try:
+                summary = ingestor.fetch_for_ticker(ticker)
+                results[ticker] = summary
+                for key in totals:
+                    totals[key] += int(summary.get(key, 0))
+                errors = summary.get("errors", [])
+                if errors:
+                    failed += 1
+                    self._mark_companyfacts_stale(
+                        ticker,
+                        "; ".join(str(error) for error in errors),
+                    )
+                else:
+                    self.store.mark_source_fresh(
+                        ticker,
+                        "sec_companyfacts",
+                        ttl_hours,
+                    )
+            except Exception as exc:  # noqa: BLE001 - isolate each ticker
+                failed += 1
+                error = str(exc)
+                logger.error("CompanyFacts ticker %s failed: %s", ticker, error)
+                results[ticker] = {"ticker": ticker, "errors": [error]}
+                self._mark_companyfacts_stale(ticker, error)
+
+        return {
+            "enabled": True,
+            "tickers_processed": len(tickers),
+            "tickers_failed": failed,
+            **totals,
+            "tickers": results,
+        }
+
+    def _mark_companyfacts_stale(self, ticker: str, error: str) -> None:
+        """Record a ticker failure without compromising ticker isolation."""
+        try:
+            self.store.mark_source_stale(ticker, "sec_companyfacts", error)
+        except Exception as stale_error:  # noqa: BLE001
+            logger.error(
+                "Could not mark CompanyFacts stale for %s: %s",
+                ticker,
+                stale_error,
+            )
 
     def _run_sources(
         self, names: list[str], force: bool = False, deep_sec: bool = False,
@@ -313,6 +394,24 @@ class UnifiedScheduler:
                 "ttl_hours": ttl,
                 "error": status.get("error_message"),
             }
+
+        # Persisted counters only: status must never invoke an embedding call.
+        with self.store.sqlite._connect() as conn:
+            filing_index = dict(
+                conn.execute(
+                    "SELECT "
+                    "SUM(CASE WHEN status='index_pending' THEN 1 ELSE 0 END) "
+                    "AS pending, "
+                    "COALESCE(SUM(index_section_count), 0) AS sections, "
+                    "COALESCE(SUM(index_chunk_count), 0) AS chunks "
+                    "FROM filings"
+                ).fetchone()
+            )
+        sources.setdefault("sec_filings", {})["filing_text_index"] = {
+            "pending": int(filing_index.get("pending") or 0),
+            "sections": int(filing_index.get("sections") or 0),
+            "chunks": int(filing_index.get("chunks") or 0),
+        }
 
         return {
             "sources": sources,

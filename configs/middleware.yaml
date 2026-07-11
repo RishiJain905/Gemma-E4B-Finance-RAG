@@ -79,6 +79,22 @@ max_corrective_retries: 1
 answer_validation: report        # off | report | enforce
 require_evidence_ids: false
 
+# Phase 2.2.5.3 — bounded hierarchical (filing → section → child) retrieval.
+# When enable_hierarchical_retrieval is on, a precise SEC child hit is expanded
+# with at most hierarchy_max_siblings same-section neighbors (to complete a
+# sentence/table) and at most hierarchy_max_adjacent_sections adjacent sections
+# (only on an obligation-heading match or a grader missing-context signal),
+# always under the shared context character budget and never injecting an entire
+# filing parent. Off by default until the long-document eval gates pass; the
+# corrective EXPAND_PARENT_SECTION seam keeps its 2.2.4.1 sibling-only behavior.
+# hierarchy_max_expanded_items caps total added neighbors (0 = budget-bounded
+# only). Env: ENABLE_HIERARCHICAL_RETRIEVAL, HIERARCHY_MAX_SIBLINGS,
+# HIERARCHY_MAX_ADJACENT_SECTIONS, HIERARCHY_MAX_EXPANDED_ITEMS.
+enable_hierarchical_retrieval: false
+hierarchy_max_siblings: 2            # clamp 0–4
+hierarchy_max_adjacent_sections: 1  # clamp 0–3
+hierarchy_max_expanded_items: 12    # clamp 0–50 (0 = bounded only by the budget)
+
 # Phase 2.1.6 — fetch-on-miss ingestion.
 enable_fetch_on_miss: true
 fetch_on_miss_timeout_s: 10.0

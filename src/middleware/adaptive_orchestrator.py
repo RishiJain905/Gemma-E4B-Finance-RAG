@@ -919,7 +919,20 @@ def _apply_evidence_sufficiency(
     r = _get_retriever(retriever, store, config)
     if first.allowed_action is CorrectiveAction.EXPAND_PARENT_SECTION:
         facts: list[dict] = []
-        documents = r.expand_parent_sections(result.merged_documents)
+        if getattr(config, "enable_hierarchical_retrieval", False):
+            # Bounded filing → section → child expansion (2.2.5.3). Returns the
+            # annotated root hits plus their in-budget neighbors, so it REPLACES
+            # the document set (annotations must win over the un-annotated roots).
+            expanded = r.hierarchical_expand(
+                result.merged_documents, plan, missing_local_context=True)
+            result.merged_facts = _merge_facts(result.merged_facts, facts)
+            result.merged_documents = _dedupe_docs(expanded)
+            result.add_reason("hierarchical_expansion_applied")
+        else:
+            documents = r.expand_parent_sections(result.merged_documents)
+            result.merged_facts = _merge_facts(result.merged_facts, facts)
+            result.merged_documents = _dedupe_docs(
+                [*result.merged_documents, *documents])
     else:
         facts, documents = _retrieve_round(
             r, plan, config, budget, result.lane, result,
@@ -928,8 +941,9 @@ def _apply_evidence_sufficiency(
                 field for row in first.coverage for field in row.missing_fields
             ),
         )
-    result.merged_facts = _merge_facts(result.merged_facts, facts)
-    result.merged_documents = _dedupe_docs([*result.merged_documents, *documents])
+        result.merged_facts = _merge_facts(result.merged_facts, facts)
+        result.merged_documents = _dedupe_docs(
+            [*result.merged_documents, *documents])
     result.sufficiency = grade_evidence(plan, {
         "facts": result.merged_facts,
         "documents": result.merged_documents,

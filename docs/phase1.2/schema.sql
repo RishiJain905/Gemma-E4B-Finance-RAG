@@ -22,6 +22,36 @@ CREATE TABLE IF NOT EXISTS fundamentals (
     UNIQUE(ticker, metric, period)                   -- One fact per ticker per metric per period
 );
 
+-- â”€â”€ SEC CompanyFacts â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+CREATE TABLE IF NOT EXISTS sec_companyfacts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ticker TEXT NOT NULL,
+    cik TEXT NOT NULL,
+    taxonomy TEXT NOT NULL,
+    concept TEXT NOT NULL,
+    label TEXT,
+    description TEXT,
+    value_text TEXT NOT NULL,
+    value_numeric REAL NOT NULL,
+    unit TEXT NOT NULL,
+    period_start TEXT NOT NULL DEFAULT '',
+    period_end TEXT NOT NULL,
+    period_kind TEXT NOT NULL,
+    fiscal_year INTEGER,
+    fiscal_period TEXT,
+    form TEXT NOT NULL,
+    filed_at TEXT NOT NULL,
+    accession TEXT NOT NULL,
+    frame TEXT NOT NULL DEFAULT '',
+    source_url TEXT NOT NULL,
+    source_accessed_at TEXT NOT NULL,
+    ingested_at TEXT NOT NULL DEFAULT (datetime('now')),
+    UNIQUE (
+        ticker, taxonomy, concept, unit, period_start,
+        period_end, accession, frame
+    )
+);
+
 -- ── Filing Index ────────────────────────────────────
 -- Tracks which SEC filings / documents have been processed.
 -- Prevents re-processing the same document on subsequent runs.
@@ -34,9 +64,12 @@ CREATE TABLE IF NOT EXISTS filings (
     accession TEXT UNIQUE,                           -- SEC accession number (or doc hash for other sources)
     source_url TEXT,                                 -- EDGAR URL or source link
     file_path TEXT,                                  -- Local cached copy path
-    status TEXT DEFAULT 'unprocessed',               -- 'unprocessed', 'parsed', 'failed'
+    status TEXT DEFAULT 'unprocessed',               -- 'unprocessed', 'index_pending', 'parsed', 'failed'
     parsed_at TEXT,                                  -- When TraceAlchemy finished parsing
     summary_embedding_id TEXT,                       -- Link to ChromaDB embedding
+    index_error TEXT,                                -- Retryable filing-text index failure reason
+    index_section_count INTEGER DEFAULT 0,           -- Verified section parents written
+    index_chunk_count INTEGER DEFAULT 0,             -- Verified child chunks written
     ingested_at TEXT DEFAULT (datetime('now'))
 );
 
@@ -76,6 +109,14 @@ CREATE INDEX IF NOT EXISTS idx_fundamentals_ticker ON fundamentals(ticker);
 CREATE INDEX IF NOT EXISTS idx_fundamentals_metric ON fundamentals(metric);
 CREATE INDEX IF NOT EXISTS idx_fundamentals_ticker_metric ON fundamentals(ticker, metric);
 CREATE INDEX IF NOT EXISTS idx_fundamentals_period ON fundamentals(period);
+CREATE INDEX IF NOT EXISTS idx_sec_companyfacts_ticker_concept_period
+    ON sec_companyfacts(ticker, concept, period_end);
+CREATE INDEX IF NOT EXISTS idx_sec_companyfacts_ticker_filed_at
+    ON sec_companyfacts(ticker, filed_at);
+CREATE INDEX IF NOT EXISTS idx_sec_companyfacts_accession
+    ON sec_companyfacts(accession);
+CREATE INDEX IF NOT EXISTS idx_sec_companyfacts_ticker_kind_period
+    ON sec_companyfacts(ticker, period_kind, period_end);
 CREATE INDEX IF NOT EXISTS idx_filings_ticker ON filings(ticker);
 CREATE INDEX IF NOT EXISTS idx_filings_status ON filings(status);
 CREATE INDEX IF NOT EXISTS idx_cache_meta_status ON cache_meta(status);

@@ -94,6 +94,107 @@ def evidence_counts(retrieval: Optional[dict]) -> tuple[int, int]:
     return len(usable_facts(retrieval)), len(usable_documents(retrieval))
 
 
+# ── Authoritative structured-fact reconciliation (2.2.5.3) ────────────────
+#
+# Merge legacy (Yahoo / stored fundamentals + analyst estimates) facts with
+# authoritative SEC CompanyFacts at retrieval normalization only — the durable
+# ``fundamentals`` table is never rewritten, so a CompanyFacts rollback stays
+# possible. Policy (spec 2.2.5.3 Step 2):
+#   - an exact SEC CompanyFacts concept/unit/period/as-of match wins for filed
+#     GAAP facts (authoritative rows come first and are never dropped);
+#   - estimates never overwrite a realized fact (they carry distinct metric names
+#     / source types, so they never share a slot);
+#   - legacy fundamentals fill unsupported or more-current market slots (a
+#     different metric name or a different period is kept as its own item);
+#   - a legacy value that DISAGREES with the authoritative value for the exact
+#     same (ticker, metric, period) stays as a separate, conflict-flagged
+#     evidence item — never averaged, never silently dropped.
+
+def _norm_metric_key(value) -> str:
+    return str(value or "").strip().lower()
+
+
+def _norm_unit_key(value) -> str:
+    return str(value or "").strip().upper()
+
+
+def _numeric_equalish(a, b) -> Optional[bool]:
+    """Compare two values numerically. ``None`` when either is non-numeric."""
+    try:
+        from decimal import Decimal
+
+        da, db = Decimal(str(a)), Decimal(str(b))
+    except Exception:  # noqa: BLE001 - non-numeric values are compared elsewhere
+        return None
+    if da == db:
+        return True
+    scale = max(abs(da), abs(db), Decimal(1))
+    return (abs(da - db) / scale) <= Decimal("0.0001")
+
+
+def _values_conflict(legacy: dict, authoritative: dict) -> bool:
+    """True when a legacy fact contradicts the authoritative filed value."""
+    if _norm_unit_key(legacy.get("unit")) and _norm_unit_key(authoritative.get("unit")):
+        if _norm_unit_key(legacy.get("unit")) != _norm_unit_key(authoritative.get("unit")):
+            return True
+    equalish = _numeric_equalish(legacy.get("value"), authoritative.get("value"))
+    if equalish is None:
+        return str(legacy.get("value")) != str(authoritative.get("value"))
+    return not equalish
+
+
+def reconcile_structured_facts(
+    legacy_facts: Optional[list[dict]],
+    authoritative_facts: Optional[list[dict]],
+) -> list[dict]:
+    """Merge legacy + authoritative structured facts under the 2.2.5.3 policy.
+
+    Authoritative (SEC CompanyFacts) rows lead and are always preserved. A legacy
+    fact for the exact same (ticker, metric, period) is dropped when it agrees
+    with the authoritative value, and kept as a separate ``conflict``-flagged item
+    when it disagrees. Any legacy fact whose (metric, period) slot has no
+    authoritative match (a different metric name, a more-current period, or a
+    market-only field such as ``pe_ratio``/``market_cap``) is kept unchanged.
+    """
+    authoritative = [f for f in (authoritative_facts or []) if isinstance(f, dict)]
+    legacy = [f for f in (legacy_facts or []) if isinstance(f, dict)]
+    if not authoritative:
+        return legacy
+
+    # Group authoritative rows by (ticker, metric), preserving order — the
+    # companyfacts projection lists the newest filed period first.
+    by_metric: dict[tuple, list[dict]] = {}
+    for fact in authoritative:
+        key = (_norm_metric_key(fact.get("ticker")), _norm_metric_key(fact.get("metric")))
+        by_metric.setdefault(key, []).append(fact)
+
+    merged: list[dict] = list(authoritative)
+    for fact in legacy:
+        key = (_norm_metric_key(fact.get("ticker")), _norm_metric_key(fact.get("metric")))
+        candidates = by_metric.get(key)
+        if not candidates:
+            merged.append(fact)  # unsupported / market-only field → keep legacy
+            continue
+        legacy_period = str(fact.get("period") or "")
+        if legacy_period:
+            target = next(
+                (c for c in candidates if str(c.get("period") or "") == legacy_period),
+                None,
+            )
+            if target is None:
+                merged.append(fact)  # different (more-current) period → keep legacy
+                continue
+        else:
+            target = candidates[0]  # unspecified period reconciles to the newest
+        if _values_conflict(fact, target):
+            disputed = dict(fact)
+            disputed["conflict"] = True
+            disputed.setdefault("conflict_reason", "legacy_vs_companyfacts")
+            merged.append(disputed)
+        # else: legacy duplicates the authoritative value — CompanyFacts wins.
+    return merged
+
+
 # ── Stable model-visible evidence ids (2.2.4.3) ───────────────────────────
 #
 # ``EvidenceItem`` is the request-local contract for one model-visible fact,

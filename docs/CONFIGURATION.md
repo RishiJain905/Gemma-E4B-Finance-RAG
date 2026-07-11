@@ -88,6 +88,61 @@ sec:
 
 ---
 
+## `configs/sec.yaml`
+
+SEC filing-text indexing is independently rollout-controlled. The default is
+off, so filing processing retains its legacy behavior until explicitly enabled.
+
+```yaml
+sec:
+  index_filing_text: false
+  max_sections_per_filing: 200
+  max_section_chars: 2000000
+  index_forms: [10-K, 10-Q, 8-K]
+```
+
+| Field | Default | Meaning |
+|-------|---------|---------|
+| `sec.index_filing_text` | `false` | Persist and index actual SEC filing sections through the existing Chroma structural chunker. When false, the legacy filing path is unchanged. |
+| `sec.max_sections_per_filing` | `200` | Safety bound on section parents accepted from one filing (hard-capped at 500). Excess sections are logged and skipped. |
+| `sec.max_section_chars` | `2000000` | Parser sanity cap per section (hard-capped at 10,000,000). Oversized sections are skipped and logged; text is never silently truncated. |
+| `sec.index_forms` | `[10-K, 10-Q, 8-K]` | Filing forms eligible for section indexing when the rollout flag is enabled. |
+
+Parsed artifacts are stored beside the configured SQLite database under
+`sec/parsed/`. A successful artifact whose vector write fails remains in the
+additive `index_pending` state with its failure reason and is selected for a
+later retry. Scheduler status reads persisted pending/section/chunk counters;
+it does not call the embedding service.
+
+### Backfill: `scripts/index_sec_filing_text.py` (Phase 2.2.5.3)
+
+Migrates the **existing** parsed artifacts under `sec/parsed/` into the section
+index — no parser-model call is made. `index_forms` above gates which forms are
+eligible.
+
+```bash
+python scripts/index_sec_filing_text.py                     # dry run (default)
+python scripts/index_sec_filing_text.py --ticker NVDA --limit 1 --apply
+python scripts/index_sec_filing_text.py --apply \
+    --resume-manifest data/sec/backfill-manifest.json --backup data/sec/backups
+```
+
+| Flag | Meaning |
+|------|---------|
+| *(none)* / `--dry-run` | Report eligible filings, parsed artifacts, estimated parent sections/chunks, missing files, and currently indexed section count. Writes nothing. |
+| `--apply` | Index eligible filings one at a time through `Store.add_filing_sections`. |
+| `--ticker` / `--accession` / `--limit` | Slice a pilot subset. |
+| `--resume-manifest <path>` | Record each completed accession + source-file hash. A re-run skips unchanged input; a changed artifact replaces its section family. |
+| `--backup <dir>` | Snapshot the Chroma collection directory (as `chroma-backup-<ts>/`) before the first write. |
+
+Manifests (`*.backfill-manifest.json`) and backup snapshots (`chroma-backup-*/`)
+are gitignored. An interruption leaves the last filing retryable and every prior
+filing valid (the manifest is flushed after each filing; each family replace is
+atomic). Rollback: disable `enable_hierarchical_retrieval` and, if the index
+itself must be reversed, restore the Chroma backup snapshot.
+
+---
+
 ## `configs/middleware.yaml`
 
 Loaded by `MiddlewareConfig` (`src/middleware/config.py`). Only keys that match
@@ -114,6 +169,32 @@ enable_citations: true
 | `top_k_documents` | `5` | Max ChromaDB documents retrieved per query. |
 | `top_k_facts` | `10` | Max SQLite facts retrieved per query. |
 | `enable_citations` | `true` | Whether citation extraction is enabled. |
+
+### Hierarchical retrieval (Phase 2.2.5.3)
+
+Bounded filing → section → child expansion of precise SEC hits. Off by default;
+the corrective `EXPAND_PARENT_SECTION` seam keeps its 2.2.4.1 sibling-only
+behavior until the long-document eval gates pass. An entire filing parent is
+never injected into a prompt.
+
+```yaml
+enable_hierarchical_retrieval: false
+hierarchy_max_siblings: 2            # clamp 0–4
+hierarchy_max_adjacent_sections: 1  # clamp 0–3
+hierarchy_max_expanded_items: 12    # clamp 0–50 (0 = bounded only by the budget)
+```
+
+| Field | Default | Meaning |
+|-------|---------|---------|
+| `enable_hierarchical_retrieval` | `false` | When on, a precise child hit is expanded with same-section neighbors and (obligation- or grader-gated) adjacent sections under the shared context character budget. |
+| `hierarchy_max_siblings` | `2` | Max preceding/following same-section children added per hit to complete a sentence/table (clamp 0–4). |
+| `hierarchy_max_adjacent_sections` | `1` | Max adjacent sections added per hit, only on an obligation-heading match or a grader missing-context signal (clamp 0–3). |
+| `hierarchy_max_expanded_items` | `12` | Hard cap on total added neighbors across all hits, regardless of budget (clamp 0–50; `0` = bounded only by `adaptive_max_context_chars`). |
+
+CompanyFacts preference (2.2.5.3) is governed by `configs/sec_companyfacts.yaml`
+(`enabled: false` by default) and needs no middleware flag — when the source is
+enabled, authoritative filed GAAP facts are merged into structured retrieval and
+conflicting values are surfaced as separate evidence, never averaged.
 
 ---
 

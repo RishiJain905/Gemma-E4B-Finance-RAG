@@ -279,7 +279,7 @@ class SECEdgarFilingFetcher:
 
     # ── Internal Helpers ───────────────────────────────
 
-    def _resolve_cik(self, ticker: str) -> Optional[str]:
+    def resolve_cik(self, ticker: str) -> Optional[str]:
         """Resolve a ticker symbol to its zero-padded 10-digit CIK.
 
         Fetches SEC's company_tickers.json once and caches it on the instance.
@@ -292,6 +292,10 @@ class SECEdgarFilingFetcher:
         if not cik:
             logger.warning("Ticker %s not found in SEC company_tickers map", ticker)
         return cik
+
+    def _resolve_cik(self, ticker: str) -> Optional[str]:
+        """Compatibility wrapper for callers using the former private API."""
+        return self.resolve_cik(ticker)
 
     def _load_ticker_cik_map(self) -> dict:
         """Download and parse company_tickers.json into a ticker -> CIK map."""

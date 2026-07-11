@@ -213,3 +213,69 @@ def test_retrieve_omits_channel_ids_from_legacy_dict():
     # Legacy retrieve() shape is unchanged — no channel-id keys leak in.
     assert "vector_ids" not in legacy
     assert "lexical_ids" not in legacy
+
+
+# ── CompanyFacts integration (Phase 2.2.5.3) ───────────────
+
+class TestCompanyFactsMerge:
+    """Authoritative SEC CompanyFacts prefer/merge into structured retrieval."""
+
+    def _authoritative(self, value=26000000000.0, unit="USD", period="2025-12-31",
+                       conflict=False, alternatives=None):
+        return [{
+            "metric": "total_revenue", "value": value, "value_text": str(value),
+            "ticker": "NVDA", "period": period, "period_type": "annual",
+            "unit": unit, "source_type": "sec_companyfacts",
+            "source_url": "https://sec.gov/x", "as_of": "2026-07-01",
+            "taxonomy": "us-gaap", "concept": "Revenues",
+            "accession": "0001-25", "form": "10-K", "filed_at": "2026-02-01",
+            "conflict": conflict,
+        }]
+
+    def test_disabled_source_is_noop(self, store):
+        from src.middleware.retriever import Retriever
+        store.save_fundamental("NVDA", "total_revenue", 25.0, "usd", "FY2025",
+                               source_type="yfinance")
+        store.companyfacts_evidence = MagicMock(return_value=[])
+        r = Retriever(store=store)
+        facts = r._retrieve_facts("NVDA", ["total_revenue"], None, 10)
+        # Legacy fact preserved; no CompanyFacts rows added.
+        assert any(f.get("source_type") in ("yfinance", "sqlite") for f in facts)
+        assert not any(f.get("source_type") == "sec_companyfacts" for f in facts)
+
+    def test_authoritative_fact_included(self, store):
+        from src.middleware.retriever import Retriever
+        store.companyfacts_evidence = MagicMock(return_value=self._authoritative())
+        r = Retriever(store=store)
+        facts = r._retrieve_facts("NVDA", ["total_revenue"], None, 10)
+        auth = [f for f in facts if f.get("source_type") == "sec_companyfacts"]
+        assert len(auth) == 1
+        assert auth[0]["value"] == 26000000000.0
+        assert auth[0]["concept"] == "Revenues"
+
+    def test_conflicting_legacy_value_kept_separate(self, store):
+        from src.middleware.retriever import Retriever
+        # Legacy fundamental for the exact same metric+period, different value.
+        store.save_fundamental("NVDA", "total_revenue", 30000000000.0, "usd",
+                               "2025-12-31", source_type="yfinance")
+        store.companyfacts_evidence = MagicMock(return_value=self._authoritative())
+        r = Retriever(store=store)
+        facts = r._retrieve_facts("NVDA", ["total_revenue"], None, 10)
+        auth = [f for f in facts if f.get("source_type") == "sec_companyfacts"]
+        disputed = [f for f in facts if f.get("conflict")]
+        assert auth and disputed
+        # Never averaged: both distinct values survive as separate items.
+        values = {f["value"] for f in facts if f.get("metric") == "total_revenue"}
+        assert 26000000000.0 in values and 30000000000.0 in values
+
+    def test_agreeing_legacy_value_deduped(self, store):
+        from src.middleware.retriever import Retriever
+        store.save_fundamental("NVDA", "total_revenue", 26000000000.0, "usd",
+                               "2025-12-31", source_type="yfinance")
+        store.companyfacts_evidence = MagicMock(return_value=self._authoritative())
+        r = Retriever(store=store)
+        facts = r._retrieve_facts("NVDA", ["total_revenue"], None, 10)
+        rev = [f for f in facts if f.get("metric") == "total_revenue"]
+        # CompanyFacts wins; the duplicate legacy value is dropped.
+        assert len(rev) == 1
+        assert rev[0]["source_type"] == "sec_companyfacts"

@@ -1,0 +1,65 @@
+# configs/sec_companyfacts.yaml
+# SEC CompanyFacts ingestion and canonical metric projection.
+
+enabled: false
+user_agent: "TraceAlchemy Research contact@tracealchemy.example.com"
+allowed_taxonomies:
+  - us-gaap
+allowed_forms:
+  - 10-K
+  - 10-K/A
+  - 10-Q
+  - 10-Q/A
+timeout_seconds: 30
+retries: 3
+backoff_factor: 0.5
+request_delay_seconds: 0.2
+
+# Concept order is selection priority. Raw accepted observations remain stored
+# independently of these projection aliases.
+metrics:
+  total_revenue:
+    concepts:
+      - RevenueFromContractWithCustomerExcludingAssessedTax
+      - Revenues
+      - SalesRevenueNet
+    units: [USD]
+    period_kinds: [quarterly, ytd, annual]
+  net_income:
+    concepts:
+      - NetIncomeLoss
+      - ProfitLoss
+    units: [USD]
+    period_kinds: [quarterly, ytd, annual]
+  diluted_eps:
+    concepts:
+      - EarningsPerShareDiluted
+    units: [USD/shares]
+    period_kinds: [quarterly, ytd, annual]
+  total_assets:
+    concepts:
+      - Assets
+    units: [USD]
+    period_kinds: [instant]
+  total_liabilities:
+    concepts:
+      - Liabilities
+    units: [USD]
+    period_kinds: [instant]
+  stockholders_equity:
+    concepts:
+      - StockholdersEquity
+      - StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest
+    units: [USD]
+    period_kinds: [instant]
+  operating_cash_flow:
+    concepts:
+      - NetCashProvidedByUsedInOperatingActivities
+    units: [USD]
+    period_kinds: [quarterly, ytd, annual]
+  shares_outstanding:
+    concepts:
+      - EntityCommonStockSharesOutstanding
+      - CommonStockSharesOutstanding
+    units: [shares]
+    period_kinds: [instant]
