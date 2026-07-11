@@ -1,52 +1,35 @@
-# CLAUDE.md
+# AGENTS.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+This file provides guidance to Codex (Codex.ai/code) when working with code in this repository.
 
 ## Picking the right models for workflows and subagents
 
 Rankings, higher = better. Cost reflects what I actually pay (OpenAI has really generous limits), not list price. Intelligence is how hard a problem you can handle the model unsupervised. Taste covers UI/UX, code quality, API design, and copy.
 
-### Claude models
-
 | model | cost | intelligence | taste |
 |-------|------|--------------|-------|
+| gpt-5.5 | 9 | 8 | 5 |
 | sonnet-5 | 5 | 5 | 7 |
 | opus-4.8 | 4 | 7 | 8 |
 | fable-5 | 2 | 9 | 9 |
 
-### Codex models
-
-| model | cost | intelligence | taste | effort |
-|-------|------|--------------|-------|--------|
-| gpt-5.6-luna | 10 | 7 | 7 | max |
-| gpt-5.6-terra | 8 | 8 | 7 | max |
-| gpt-5.6-sol | 8 | 8 | 8 | high |
-| gpt-5.6-sol | 6 | 9 | 8 | max |
-
 How to apply:
 - These are defaults, not limits. You have standing permission to override them: if a cheaper model's output doesn't meet the bar, rerun or redo the work with a smarter model without asking. Judge the output, not the price tag. Escalating costs less than shipping mediocre work.
 - Cost is a tie-breaker only; when axes conflict for anything that ships, intelligence > taste > cost.
-- Bulk/mechanical work (clear-spec implementation, data analysis, migrations): use a GPT-5.6 Codex model; the specific model and effort are defined in the delegation section.
+- Bulk/mechanical work (clear-spec implementation, data analysis, migrations): gpt-5.5 — it's effectively free.
 - Anything user-facing (UI, copy, API design) needs taste ≥ 7.
-- When the factor comes down to taste and design always utilize Claude models first with codex models only being used a fallback in that specific scenario. 
-- Reviews of plans/implementations: fable-5 or opus-4.8, optionally a GPT-5.6 Codex model as an extra independent perspective.
+- Reviews of plans/implementations: fable-5 or opus-4.8, optionally gpt-5.5 as an extra independent perspective.
 - Never use Haiku.
-- Mechanics: GPT-5.6 Codex models are accessed from Claude Code through the Codex plugin. For implementation, debugging, investigation, data analysis, or other delegated work, use `/codex:rescue --model <model> --effort <effort> <task>`. Add `--background` for longer-running work, then use `/codex:status` and `/codex:result` to monitor it and retrieve the result. For reviews, use `/codex:review` or `/codex:adversarial-review`.
-- Claude models (sonnet-5, opus-4.8, fable-5) run via the Agent/Workflow model parameter.
+- Mechanics: gpt-5.5 is accessed from Codex through the Codex plugin. For implementation, debugging, investigation, data analysis, or other delegated work, use `/codex:rescue --model gpt-5.5 --effort high <task>`. Add `--background` for longer-running work, then use `/codex:status` and `/codex:result` to monitor it and retrieve the result. For reviews, use `/codex:review` or `/codex:adversarial-review`; these use the model selected by the Codex configuration, so gpt-5.5 should be configured as the default model in `~/.codex/config.toml` or the repository's `.codex/config.toml`.
+- Codex models (sonnet-5, opus-4.8, fable-5) run via the Agent/Workflow model parameter.
 
 Using gpt-5.5 inside workflows and subagents:
-- The Agent/Workflow `model` parameter only accepts Claude models. To delegate work to gpt-5.5, use the Codex plugin's bundled `codex:codex-rescue` subagent rather than creating a custom Claude wrapper. If a wrapper is needed and is a must only then spawn a Claude wrapper agent with `model: 'sonnet', effort: 'low'` whose prompt instructs it to write a self-contained codex prompt. Plugin is priority and first target as it is setup with this intent and workflow in mind. 
+- The Agent/Workflow `model` parameter only accepts Codex models. To delegate work to gpt-5.5, use the Codex plugin's bundled `codex:codex-rescue` subagent rather than creating a custom Codex wrapper. If a wrapper is needed and is a must only then spawn a Codex wrapper agent with `model: 'sonnet', effort: 'low'` whose prompt instructs it to write a self-contained codex prompt. Plugin is priority and first target as it is setup with this intent and workflow in mind. 
 - For implementation or investigation, invoke `/codex:rescue --model gpt-5.5 --effort high --background <self-contained task>`.
 - Use `/codex:status` to check progress and `/codex:result` to retrieve the completed response.
 - For an independent code review, run `/codex:review --background`.
 - For a review focused on challenging design decisions, assumptions, or specific risk areas, run `/codex:adversarial-review --background <focus>`.
-- Claude may also delegate naturally by being instructed to ask Codex to complete a task.
-
-Understanding which codex model + Effort to use: 
-- To be created
-
-Fallback handling: 
-- When codex is not responding due to usage limits being used, utilize going Claude models only. Refrence the Table and delegate accordingly. 
+- Codex may also delegate naturally by being instructed to ask Codex to complete a task.
 
 When Using Plan mode:
 - Inherited / current model the user is using will be the model that is used to create the plan for the task at hand. This will likely be Fable 5 or Opus 4.8
@@ -63,7 +46,7 @@ Route by task size; never a bigger loop than the task needs:
 
 - **Short** (one file / obvious fix, ~≤3 turns): plain turn-based work. No /goal, no subagents, no background jobs. Run the gate once before reporting done; read only the verdict + failures.
 - **Medium** (multi-file feature/bugfix with a checkable done-state): best run as `/goal <task>. Done when scripts\verify.ps1 prints VERIFY: PASS. Stop after 4 tries.` Iterate on the scoped gate (`-TestPath tests\test_x.py`) while fixing; the full gate is the exit check. Bulk/mechanical diffs → gpt-5.5 via `/codex:rescue` (table above); close with `/codex:review --background` for a fresh-context review. If a medium task arrives as a plain prompt, still enforce the gate, and put the ready-to-paste /goal one-liner in the final summary so the next run can be hands-off.
-- **Long** (multi-phase, hours, or waiting on external systems): plan mode first (rules above), then each phase runs as its own medium /goal loop with its own PASS exit — never one giant loop. Watching external state (CI, PR reviews) → `/loop` with the interval matched to how fast the target changes (~4m for active CI; ≥20m for idle watching — avoid ~5m, it's the worst cache breakpoint), or interval-free `/loop` so Claude self-paces. Recurring repo upkeep (ingestion/scheduler health) → `/schedule` routine, not a live session.
+- **Long** (multi-phase, hours, or waiting on external systems): plan mode first (rules above), then each phase runs as its own medium /goal loop with its own PASS exit — never one giant loop. Watching external state (CI, PR reviews) → `/loop` with the interval matched to how fast the target changes (~4m for active CI; ≥20m for idle watching — avoid ~5m, it's the worst cache breakpoint), or interval-free `/loop` so Codex self-paces. Recurring repo upkeep (ingestion/scheduler health) → `/schedule` routine, not a live session.
 - **Every size**: deterministic steps go in scripts, not reasoning; the same failure surviving two fix attempts means stop patching — change approach or escalate the model; pilot one slice before any fan-out; audit burn with `/usage` and `/goal` (no args).
 
 ## What this is
