@@ -211,6 +211,58 @@ def test_arg_validation_error():
 
 
 @pytest.mark.asyncio
+async def test_tools_fallback_records_only_successful_plain_path(monkeypatch):
+    """2.2.1.2: the tools-unsupported fallback must record only the final
+    plain-call messages in the evidence trace — not the abandoned tool-mode
+    attempt's system prompt, and not any tool results dispatched before the
+    fallback was triggered."""
+    register(
+        Tool(
+            name="query_facts",
+            description="Query facts",
+            parameters={"type": "object", "properties": {}, "required": []},
+            handler=lambda _store: {"ok": True},
+        )
+    )
+    fallback = _response("plain answer [Source: sqlite/NVDA]")
+    request = httpx.Request("POST", "http://test/v1/chat/completions")
+    response = httpx.Response(400, request=request, text="tools not supported")
+    first = httpx.HTTPStatusError("bad request", request=request, response=response)
+
+    client = SimpleNamespace(post=AsyncMock(side_effect=[first, fallback]))
+    monkeypatch.setattr(middleware_app, "model_client", client)
+    monkeypatch.setattr(middleware_app, "config", _config())
+    monkeypatch.setattr(middleware_app, "store", object())
+
+    from src.middleware import prompt_policy
+    from src.middleware.evidence_trace import EvidenceTraceCollector
+
+    collector = EvidenceTraceCollector(
+        answer_policy="graded", grounding_level="grounded",
+        raw_question="q", retrieval_query="q", facts=[], documents=[],
+    )
+    # Simulate a tool result recorded by an earlier (abandoned) attempt —
+    # the fallback must discard it, not carry it into the successful trace.
+    collector.record_tool_result("stale_tool", {"a": 1}, {"stale": True})
+    token = middleware_app._evidence_trace_var.set(collector)
+    try:
+        answer, citations = await middleware_app._call_model("prompt", 0.1, 100)
+    finally:
+        middleware_app._evidence_trace_var.reset(token)
+
+    assert answer == "plain answer [Source: sqlite/NVDA]"
+    trace = collector.finalize()
+    assert trace is not None
+    assert trace.tool_results == []
+    assert trace.user_prompt == "prompt"
+    # The recorded system prompt is the plain (tools_enabled=False) variant —
+    # not the tools-enabled prompt from the abandoned attempt.
+    assert trace.system_prompt == prompt_policy.build_system_prompt(
+        answer_policy="graded", allow_general_fallback=True, intent=None,
+        grounding_level="grounded", tools_enabled=False)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("mode", ["http_error", "empty_200"])
 async def test_tools_unsupported_fallback(monkeypatch, mode):
     register(

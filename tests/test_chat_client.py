@@ -283,6 +283,92 @@ def test_query_stream_endpoint_emits_tokens_and_terminal_metadata_includes_groun
     assert "event: metadata" in text
     assert '"grounding": "grounded"' in text
     assert '"retrieval_strategy": "vector"' in text
+    # Evidence trace (2.2.1.2) is opt-in — omitted (null) by default.
+    assert '"evidence_trace": null' in text
+
+
+def test_query_stream_terminal_metadata_includes_evidence_trace_when_requested(monkeypatch):
+    """2.2.1.2: streaming terminal metadata follows the same opt-in behavior
+    as /query — include_evidence_trace=true populates it with the exact
+    system/user prompt and usable facts/documents."""
+    config = SimpleNamespace(
+        model_name="tracealchemy",
+        llama_endpoint="http://test/v1/chat/completions",
+        default_temperature=0.3,
+        max_tokens=256,
+        top_k_documents=5,
+        top_k_facts=10,
+        enable_tools=False,
+        enable_streaming=True,
+        enable_fetch_on_miss=False,
+        answer_policy="graded",
+        allow_general_fallback=True,
+        return_timings=True,
+    )
+    parser = MagicMock()
+    parser.parse.return_value = {
+        "ticker": "NVDA",
+        "ticker_confidence": 1.0,
+        "question_type": "fact_lookup",
+        "metrics": ["total_revenue"],
+    }
+    monkeypatch.setattr("src.middleware.intent_parser.IntentParser", MagicMock(return_value=parser))
+    monkeypatch.setattr(middleware_app, "config", config)
+    monkeypatch.setattr(middleware_app, "store", object())
+    monkeypatch.setattr(
+        middleware_app,
+        "retriever",
+        SimpleNamespace(
+            retrieve=lambda **_kwargs: {
+                "facts": [
+                    {"metric": "total_revenue", "value": 26.0, "ticker": "NVDA",
+                     "period": "2026-Q1", "source_type": "yfinance"},
+                    {"metric": "gross_margin", "value": 75.0, "ticker": "NVDA",
+                     "period": "2026-Q1", "source_type": "yfinance"},
+                ],
+                "documents": [{"id": "doc-1", "document": "NVIDIA revenue context"}],
+                "retrieval_strategy": "vector",
+                "timings": {"embedding": 1.0, "chroma": 2.0, "sqlite": 3.0},
+            }
+        ),
+    )
+    monkeypatch.setattr(
+        middleware_app,
+        "_evaluate_and_refresh",
+        MagicMock(return_value={"overall": "fresh", "fetched_on_miss": []}),
+    )
+    monkeypatch.setattr(middleware_app, "_check_model_health", AsyncMock(return_value=True))
+    monkeypatch.setattr(middleware_app, "_task_params", lambda _task: {})
+
+    class AsyncModelStream:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return False
+
+        async def aiter_lines(self):
+            yield 'data: {"choices": [{"delta": {"content": "26B"}}]}'
+            yield "data: [DONE]"
+
+    class FakeModelClient:
+        def stream(self, method, url, json=None):
+            return AsyncModelStream()
+
+    monkeypatch.setattr(middleware_app, "model_client", FakeModelClient())
+
+    client = TestClient(middleware_app.app)
+    response = client.post(
+        "/query/stream",
+        json={"question": "What is NVDA revenue?", "include_evidence_trace": True},
+    )
+
+    assert response.status_code == 200
+    text = response.text
+    assert "event: metadata" in text
+    assert '"evidence_trace": null' not in text
+    assert '"total_revenue"' in text
+    assert '"NVIDIA revenue context"' in text
 
 
 # ── 2.1.8.3: answer-renderer coverage ──────────────────

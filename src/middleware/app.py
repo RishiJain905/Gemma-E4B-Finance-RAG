@@ -25,7 +25,10 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse
 
 from src.storage.store import Store
+from . import prompt_policy
 from .config import MiddlewareConfig
+from .evidence import evidence_counts, usable_documents, usable_facts
+from .evidence_trace import EvidenceTraceCollector
 from .models import (
     FreshnessResponse,
     HealthResponse,
@@ -42,27 +45,11 @@ from .models import (
 
 logger = logging.getLogger(__name__)
 
-SYSTEM_PROMPT = (
-    "You are a financial research assistant. Answer the user's "
-    "question using ONLY the provided context. If the context "
-    "doesn't contain enough information, say so. "
-    "Cite sources inline using [Source: type/ticker] notation."
-)
-
-# Used instead of SYSTEM_PROMPT when tool-calling is enabled. The base
-# prompt's "ONLY the provided context ... say so" rule contradicts tool use
-# and makes the model refuse instead of calling a tool, so the tools-mode
-# prompt replaces (not appends to) it. Tools-off requests never see this.
-TOOLS_SYSTEM_PROMPT = (
-    "You are a financial research assistant with callable tools. Answer using "
-    "the provided context and your tools. When the context does not already "
-    "contain the answer — especially for ranking, filtering, or aggregating "
-    "across stocks (use query_facts), targeted lookups (get_fundamentals), or "
-    "data freshness (check_freshness) — call the appropriate tool rather than "
-    "refusing. Only say the data is unavailable if the context and your tools "
-    "cannot provide it. Answer strictly from context and tool results; never "
-    "invent numbers. Cite sources inline using [Source: type/ticker] notation."
-)
+# Backward-compatible aliases — prompt_policy.py is now the single owner of
+# these strings (src/middleware/prompt_policy.py). Kept here so older
+# imports/tests referencing middleware_app.SYSTEM_PROMPT still resolve.
+SYSTEM_PROMPT = prompt_policy.STRICT_SYSTEM_PROMPT
+TOOLS_SYSTEM_PROMPT = prompt_policy.STRICT_TOOLS_SYSTEM_PROMPT
 
 GENERAL_FALLBACK_PREFIX = "Not from your data - general knowledge:"
 GENERAL_FALLBACK_CAVEAT = "Please verify against a primary source before relying on it."
@@ -98,11 +85,19 @@ _tools_used_var: contextvars.ContextVar[Optional[list[str]]] = contextvars.Conte
 _answer_policy_override_var: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar(
     "answer_policy_override", default=None
 )
+_evidence_trace_var: contextvars.ContextVar[Optional[EvidenceTraceCollector]] = contextvars.ContextVar(
+    "evidence_trace", default=None
+)
 
 
 def _grounding_level(retrieval: dict) -> str:
-    """Return the graded grounding level from retrieved facts/documents."""
-    n = len(retrieval.get("facts", [])) + len(retrieval.get("documents", []))
+    """Return the graded grounding level from usable facts/documents.
+
+    Blank document bodies and None-valued facts are not usable evidence
+    (see src/middleware/evidence.py) and must not inflate grounding.
+    """
+    n_facts, n_docs = evidence_counts(retrieval)
+    n = n_facts + n_docs
     return "grounded" if n >= 3 else "partial" if n >= 1 else "none"
 
 
@@ -116,8 +111,10 @@ def _answer_policy() -> str:
 
 
 def _reset_request_scoped_state(answer_policy: Optional[str]) -> None:
-    """Reset per-request contextvars: tool-call log and answer-policy override."""
+    """Reset per-request contextvars: tool-call log, answer-policy override,
+    and evidence-trace collector."""
     _tools_used_var.set([])
+    _evidence_trace_var.set(None)
     normalized = str(answer_policy or "").strip().lower()
     _answer_policy_override_var.set(normalized if normalized in ("strict", "graded") else None)
 
@@ -133,6 +130,33 @@ def _get_tools_used() -> Optional[list[str]]:
     """Return the current request's dispatched tool names, or None if empty."""
     used = _tools_used_var.get()
     return list(used) if used else None
+
+
+def _record_trace_prompt(system_prompt: str, user_prompt: str) -> None:
+    """Record the exact system/user messages for the request's evidence trace
+    (2.2.1.2). No-op when no trace was requested for this request."""
+    collector = _evidence_trace_var.get()
+    if collector is not None:
+        collector.record_prompt(system_prompt=system_prompt, user_prompt=user_prompt)
+
+
+def _record_trace_tool_result(name: str, arguments: dict, result: dict) -> None:
+    """Append one dispatched tool call to the request's evidence trace, if any."""
+    collector = _evidence_trace_var.get()
+    if collector is not None:
+        collector.record_tool_result(name, arguments, result)
+
+
+def _discard_trace_tool_results() -> None:
+    """Drop any tool results recorded so far on the request's evidence trace.
+
+    Called before a plain-call fallback (tools unsupported / empty tool-mode
+    response) records its messages, so the abandoned tool attempt's results
+    never leak into the successful answer path's trace.
+    """
+    collector = _evidence_trace_var.get()
+    if collector is not None:
+        collector.discard_tool_results()
 
 
 def _resolved_ticker_field(intent: dict) -> Optional[dict]:
@@ -153,80 +177,23 @@ def _allow_general_fallback() -> bool:
     return bool(getattr(config, "allow_general_fallback", True))
 
 
-def _graded_system_prompt(
-    intent: Optional[dict],
-    grounding_level: str,
-    tools_enabled: bool = False,
-) -> str:
-    """Build the intent-aware graded answer-policy system prompt."""
-    question_type = (intent or {}).get("question_type", "general")
-    mode_guidance = {
-        "grounded": (
-            "Mode: grounded. Answer using ONLY the retrieved facts/documents — "
-            "every factual claim must come from them. Cite sourced claims "
-            "inline using [Source: type/ticker]. Do not add outside knowledge "
-            "and do not use the 'Not from your data' prefix."
-        ),
-        "partial": (
-            "Mode: partial. Answer only the parts supported by retrieved data, "
-            "explicitly name what is missing, and do not fill the gaps with "
-            "outside knowledge or the 'Not from your data' prefix."
-        ),
-        "none": (
-            "Mode: general fallback. No relevant stored facts/documents were "
-            "retrieved. If the request is answerable from stable background "
-            "knowledge, prefix the answer exactly with 'Not from your data - "
-            "general knowledge:' and include a caveat to verify against a "
-            "primary source. Refuse if the request is unsafe or genuinely "
-            "unknowable."
-        ),
-    }
-    if grounding_level == "none" and not _allow_general_fallback():
-        mode_guidance["none"] = (
-            "Mode: refuse. No relevant stored facts/documents were retrieved "
-            "and general fallback is disabled. Say you do not have enough data "
-            "instead of using background knowledge."
-        )
-
-    tool_guidance = ""
-    if tools_enabled:
-        tool_guidance = (
-            "\n- Tools are available. Prefer calling the appropriate tool for "
-            "targeted facts, ranking/filtering, or freshness before refusing."
-        )
-
-    return (
-        "You are a financial research assistant.\n\n"
-        "## Answer policy\n"
-        "Choose one response mode from the grounding level provided.\n"
-        "- Grounded: sufficient facts/docs -> answer and cite [Source: ...].\n"
-        "- Partial: some relevant data -> answer what is supported and state "
-        "what is missing.\n"
-        "- General fallback: no relevant data -> clearly label general "
-        "knowledge and include a primary-source verification caveat.\n"
-        "- Refuse: only for genuinely unknowable or unsafe asks.\n\n"
-        "Hard rule in every mode: never invent specific numbers such as "
-        "prices, P/E, targets, revenue, margins, growth rates, dates, or "
-        "counts. Specific figures must come from context or tools.\n"
-        "The 'Not from your data - general knowledge:' prefix is reserved for "
-        "the general-fallback mode only — never use it when any relevant data "
-        "was retrieved.\n\n"
-        f"Intent: {question_type}\n"
-        f"Grounding level: {grounding_level}\n"
-        f"{mode_guidance.get(grounding_level, mode_guidance['none'])}"
-        f"{tool_guidance}"
-    )
-
-
 def _system_prompt_for_request(
     intent: Optional[dict],
     grounding_level: str,
     tools_enabled: bool = False,
 ) -> str:
-    """Return the strict regression prompt or graded policy prompt."""
-    if _answer_policy() == "strict":
-        return TOOLS_SYSTEM_PROMPT if tools_enabled else SYSTEM_PROMPT
-    return _graded_system_prompt(intent, grounding_level, tools_enabled)
+    """Return this request's system prompt via the shared prompt_policy builder.
+
+    Shared by the plain, streaming, and tool-loop call sites so they cannot
+    silently enforce different rules (2.2.1.1).
+    """
+    return prompt_policy.build_system_prompt(
+        answer_policy=_answer_policy(),
+        allow_general_fallback=_allow_general_fallback(),
+        intent=intent,
+        grounding_level=grounding_level,
+        tools_enabled=tools_enabled,
+    )
 
 
 def _is_declined_answer(answer: str) -> bool:
@@ -599,6 +566,22 @@ async def _build_query_context(request: QueryRequest) -> dict:
     }
     grounding_level = _grounding_level(retrieval)
 
+    # Request-scoped evidence-trace collector (2.2.1.2), created right after
+    # evidence normalization so facts/documents are the exact usable rows
+    # (see src/middleware/evidence.py) — untruncated, full provenance. Left
+    # None (and thus omitted from the response) unless explicitly requested.
+    trace_collector: Optional[EvidenceTraceCollector] = None
+    if request.include_evidence_trace:
+        trace_collector = EvidenceTraceCollector(
+            answer_policy=_answer_policy(),
+            grounding_level=grounding_level,
+            raw_question=request.question,
+            retrieval_query=request.question,
+            facts=usable_facts(retrieval),
+            documents=usable_documents(retrieval),
+        )
+    _evidence_trace_var.set(trace_collector)
+
     stage_start = time.perf_counter()
     from .prompt_augmenter import PromptAugmenter
 
@@ -619,6 +602,7 @@ async def _build_query_context(request: QueryRequest) -> dict:
         "retrieval": retrieval,
         "grounding_level": grounding_level,
         "augmented_prompt": augmented_prompt,
+        "include_evidence_trace": request.include_evidence_trace,
     }
 
 
@@ -641,18 +625,31 @@ def _build_query_response(
     intent = context["intent"]
     retrieval = context["retrieval"]
     elapsed_ms = round((time.time() - context["start"]) * 1000, 1)
+    # Usable-evidence counts (2.2.1.1) — shared by /query and the
+    # /query/stream terminal metadata event since both call this function.
+    n_facts, n_docs = evidence_counts(retrieval)
+
+    # Evidence trace (2.2.1.2) — opt-in, and only ever non-None when a model
+    # call actually recorded a prompt (never for the degraded path).
+    evidence_trace = None
+    if context.get("include_evidence_trace"):
+        collector = _evidence_trace_var.get()
+        trace = collector.finalize() if collector is not None else None
+        if trace is not None:
+            evidence_trace = trace.to_dict()
 
     return QueryResponse(
         answer=answer_text,
         citations=citations,
         detected_ticker=intent.get("ticker"),
         detected_intent=intent.get("question_type"),
-        facts_used=len(retrieval.get("facts", [])),
-        documents_used=len(retrieval.get("documents", [])),
+        facts_used=n_facts,
+        documents_used=n_docs,
         grounding=_response_grounding(answer_text, context["grounding_level"]),
         latency_ms=elapsed_ms,
         timings=context["timings"] if _return_timings_enabled() else None,
         model_available=model_available,
+        evidence_trace=evidence_trace,
         freshness=context["freshness"],
         retrieval_strategy=retrieval.get("retrieval_strategy"),
         tools_used=_get_tools_used(),
@@ -820,6 +817,17 @@ async def query_stream(request: QueryRequest):
                 context["grounding_level"],
             )
             citations = _extract_citations(answer_text)
+            # Streaming is always tools_enabled=False (see the guard above),
+            # so the exact system prompt is reproducible here for the
+            # evidence trace (2.2.1.2) without a second model call.
+            _record_trace_prompt(
+                _system_prompt_for_request(
+                    intent=context["intent"],
+                    grounding_level=context["grounding_level"],
+                    tools_enabled=False,
+                ),
+                context["augmented_prompt"],
+            )
             if context["intent"].get("question_type") == "projection":
                 from .guardrails import apply_projection_guardrail
 
@@ -1193,9 +1201,10 @@ async def _call_model(
 
     if not tools_on:
         answer, citations = await _post_and_parse(base_payload)
+        _record_trace_prompt(messages[0]["content"], prompt)
         return _apply_answer_policy(answer, grounding_level), citations
 
-    from .tools import ToolContext, dispatch_tool, openai_schema
+    from .tools import ToolContext, dispatch_tool_traced, openai_schema
 
     # The tool loop keeps its own messages list so every fallback to
     # _post_and_parse(base_payload) still sends the exact pre-tools prompt.
@@ -1229,6 +1238,8 @@ async def _call_model(
                 logger.warning("Model tools unsupported; falling back to plain calls")
                 _tools_supported = False
                 answer, citations = await _post_and_parse(base_payload)
+                _discard_trace_tool_results()
+                _record_trace_prompt(base_payload["messages"][0]["content"], prompt)
                 return _apply_answer_policy(answer, grounding_level), citations
             logger.error("Model call failed: %s", e)
             return f"Error calling model: {e}", []
@@ -1247,9 +1258,12 @@ async def _call_model(
             logger.warning("Model returned empty content with tools; disabling tools")
             _tools_supported = False
             answer, citations = await _post_and_parse(base_payload)
+            _discard_trace_tool_results()
+            _record_trace_prompt(base_payload["messages"][0]["content"], prompt)
             return _apply_answer_policy(answer, grounding_level), citations
         if not tool_calls:
             answer = _apply_answer_policy(content, grounding_level)
+            _record_trace_prompt(messages[0]["content"], prompt)
             return answer, _extract_citations(answer)
 
         messages.append(msg)
@@ -1257,7 +1271,12 @@ async def _call_model(
             tool_name = (call.get("function") or {}).get("name")
             if tool_name:
                 _record_tool_used(tool_name)
-            result = await asyncio.to_thread(dispatch_tool, call, store, ctx)
+            result, dispatched_name, dispatched_args = await asyncio.to_thread(
+                dispatch_tool_traced, call, store, ctx
+            )
+            # Recorded immediately after dispatch returns and before the
+            # matching role=tool message is appended (2.2.1.2 Step 2).
+            _record_trace_tool_result(dispatched_name or tool_name or "", dispatched_args, result)
             messages.append(
                 {
                     "role": "tool",
@@ -1267,6 +1286,7 @@ async def _call_model(
             )
 
     answer, citations = await _post_and_parse({**base_payload, "messages": messages})
+    _record_trace_prompt(messages[0]["content"], prompt)
     return _apply_answer_policy(answer, grounding_level), citations
 
 

@@ -1,0 +1,63 @@
+{
+  "schema_version": 1,
+  "score_schema_version": 1,
+  "trace_schema_version": 1,
+  "answer_policy": "strict",
+  "dataset_digest": "87971fd81cbdf440fafddd985a50be9ac9b980fbdf9ca006214ef5c8426cf03d",
+  "generated_at": null,
+  "source_run": null,
+  "is_baseline": true,
+  "note": "Placeholder baseline (2.2.1.2, 2.2.1.3). No strict-policy run has ever been scored against the exact-evidence-trace metrics. 2.2.1.3 folded the conversation golden set into dataset_digest (finance_qa.jsonl + finance_conversations.jsonl) and added the Phase 2.2 conversational metrics; their acceptance thresholds are absolute floors/ceilings enforced by eval/gate.py::phase22_checks and activate as soon as a run scores them (they are not baseline-relative). Populate this file for real with `ANSWER_POLICY=strict python eval/run_eval.py && python eval/score.py --set-baseline --policy strict` against a live middleware + model, then commit the result as a deliberate, reviewed re-baseline.",
+  "n_cases": null,
+  "n_trace_errors": null,
+  "intent_accuracy": null,
+  "ticker_accuracy": null,
+  "retrieval_hit_rate": null,
+  "keyword_coverage": null,
+  "refusal_rate": null,
+  "grounded_faithfulness": {
+    "score": null, "n_scored": 0, "n_eligible": 0, "n_skipped": 0,
+    "model_available": false, "per_case": []
+  },
+  "policy_compliance": {
+    "score": null, "n_scored": 0, "n_eligible": 0, "n_skipped": 0,
+    "model_available": false, "per_case": []
+  },
+  "answer_relevance": {
+    "score": null, "n_scored": 0, "n_eligible": 0, "n_skipped": 0,
+    "model_available": false, "per_case": []
+  },
+  "entity_carryover_accuracy": {"score": null, "n_eligible": 0, "n_pass": 0},
+  "metric_carryover_accuracy": {"score": null, "n_eligible": 0, "n_pass": 0},
+  "timeframe_carryover_accuracy": {"score": null, "n_eligible": 0, "n_pass": 0},
+  "verbose_paraphrase_parity": {"score": null, "n_eligible": 0, "n_pass": 0},
+  "compound_subquestion_coverage": {"score": null, "n_eligible": 0, "n_pass": 0},
+  "stale_disclosure_rate": {"score": null, "n_eligible": 0, "n_pass": 0},
+  "unanswerable_numeric_hallucination_rate": {"score": null, "n_eligible": 0, "n_pass": 0},
+  "cross_session_leakage_rate": {"score": null, "n_eligible": 0, "n_pass": 0},
+  "phase22_thresholds": {
+    "entity_carryover_accuracy": {"direction": "min", "threshold": 0.90},
+    "metric_carryover_accuracy": {"direction": "min", "threshold": 0.90},
+    "timeframe_carryover_accuracy": {"direction": "min", "threshold": 0.90},
+    "verbose_paraphrase_parity": {"direction": "min", "threshold": 0.90},
+    "compound_subquestion_coverage": {"direction": "min", "threshold": 0.85},
+    "stale_disclosure_rate": {"direction": "min", "threshold": 1.00},
+    "unanswerable_numeric_hallucination_rate": {"direction": "max", "threshold": 0.00},
+    "cross_session_leakage_rate": {"direction": "max", "threshold": 0.00}
+  },
+  "eligible_counts": {
+    "grounded_faithfulness": 0,
+    "policy_compliance": 0,
+    "answer_relevance": 0
+  },
+  "tolerances": {
+    "intent_accuracy": 0.05,
+    "ticker_accuracy": 0.05,
+    "retrieval_hit_rate": 0.05,
+    "keyword_coverage": 0.05,
+    "refusal_rate": 0.05,
+    "grounded_faithfulness": 0.05,
+    "policy_compliance": 0.05,
+    "answer_relevance": 0.05
+  }
+}

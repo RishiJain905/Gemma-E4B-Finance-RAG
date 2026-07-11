@@ -16,18 +16,24 @@ import logging
 from typing import Optional
 
 from .config import MiddlewareConfig
+from .evidence import document_body, evidence_counts, usable_documents
 
 logger = logging.getLogger(__name__)
 
 
 class PromptAugmenter:
     """
-    Builds structured, grounded prompts for the TraceAlchemy model.
+    Builds the augmented USER message for the TraceAlchemy model — retrieved
+    evidence, intent-specific task guidance, the raw question, and output
+    format. Authoritative answer-policy rules (grounding modes, citation
+    requirements, the "no fabricated numbers" rule) are not duplicated here;
+    they live solely in the system message built by
+    ``src/middleware/prompt_policy.py``.
 
     Prompt structure:
-      1. System instruction (role + rules)
-      2. Retrieved facts (structured data from SQLite)
-      3. Retrieved documents (semantic context from ChromaDB)
+      1. Retrieved facts (structured data from SQLite)
+      2. Retrieved documents (semantic context from ChromaDB)
+      3. Question-type-specific task guidance
       4. User question
       5. Output format instruction
 
@@ -83,9 +89,12 @@ class PromptAugmenter:
         question_type = intent.get("question_type", "general")
         ticker = intent.get("ticker")
         facts = retrieval.get("facts", [])
-        documents = retrieval.get("documents", [])
+        # Filter unusable rows before prompt assembly so an empty
+        # "## Retrieved Documents" section is never emitted (2.2.1.1).
+        documents = usable_documents(retrieval)
         if grounding_level is None:
-            n = len(facts) + len(documents)
+            n_facts, n_docs = evidence_counts(retrieval)
+            n = n_facts + n_docs
             grounding_level = "grounded" if n >= 3 else "partial" if n >= 1 else "none"
         estimate_facts = facts if question_type == "projection" else []
         realized_facts = facts
@@ -94,19 +103,16 @@ class PromptAugmenter:
 
         sections = []
 
-        # 1. System instruction
-        sections.append(self._build_system_instruction(question_type, grounding_level))
-
-        # 2. Projection context (if any)
+        # 1. Projection context (if any)
         projection_section = self._format_projection_section(estimate_facts)
         if projection_section:
             sections.append(projection_section)
 
-        # 3. Retrieved realized facts (if any)
+        # 2. Retrieved realized facts (if any)
         if realized_facts:
             sections.append(self._format_facts_section(realized_facts, ticker))
 
-        # 3.5 Macro context (if any)
+        # 2.5 Macro context (if any)
         macro_section = self._format_macro_context(realized_facts)
         if macro_section:
             sections.append(macro_section)
@@ -130,98 +136,6 @@ class PromptAugmenter:
 
         return "\n\n".join(sections)
 
-    # ── System Instruction ─────────────────────────────
-
-    def _build_system_instruction(self, question_type: str, grounding_level: str) -> str:
-        """Build the system-level instruction for the model."""
-        base = (
-            "You are a financial research assistant powered by the TraceAlchemy model. "
-            "You answer questions about stocks, markets, and financial data using "
-            "the provided context below."
-        )
-
-        rules = [
-            "Answer using ONLY the provided context. Do not use your training data.",
-            "If the context doesn't contain enough information, say so clearly.",
-            "Cite sources inline using [Source: type/ticker] notation.",
-            "Use precise numbers from the context — do not approximate or round.",
-            "If a metric is not found in the context, state that it's unavailable.",
-            "Be concise but thorough. Prioritize accuracy over verbosity.",
-        ]
-
-        if getattr(self.config, "answer_policy", "graded") != "strict":
-            general_rule = (
-                "If no relevant data was retrieved, you may use general knowledge "
-                "only when clearly prefixed with 'Not from your data - general "
-                "knowledge:' and paired with a primary-source verification caveat."
-            )
-            if not getattr(self.config, "allow_general_fallback", True):
-                general_rule = (
-                    "If no relevant data was retrieved, do not use general knowledge; "
-                    "say the knowledge base does not have enough data."
-                )
-            rules = [
-                f"Intent: {question_type}. Grounding level: {grounding_level}.",
-                "Answer using ONLY the provided context when grounding level is grounded.",
-                "When grounding level is partial, answer supported parts, state what is "
-                "missing, and do not fill the gaps with outside knowledge.",
-                "The 'Not from your data - general knowledge:' prefix is reserved for "
-                "answers with no retrieved data.",
-                general_rule,
-                "Refuse only for genuinely unknowable or unsafe asks.",
-                "Never invent specific numbers. Specific figures must come from context or tools.",
-                "Cite sources inline using [Source: type/ticker] notation for retrieved facts.",
-                "Be concise but thorough. Prioritize accuracy over verbosity.",
-            ]
-
-        type_specific = {
-            "fact_lookup": (
-                "The user wants a specific financial metric. Provide the exact "
-                "value and the period it covers."
-            ),
-            "comparison": (
-                "The user wants a comparison. Present data for each ticker side-by-side "
-                "and highlight key differences."
-            ),
-            "trend": (
-                "The user wants to understand a trend over time. Present historical "
-                "data points and describe the trajectory."
-            ),
-            "explanation": (
-                "The user wants an explanation. Use the context to explain the "
-                "underlying factors or causes."
-            ),
-            "projection": (
-                "The user asks about future expectations. Report the analyst "
-                "consensus from the Analyst Consensus section, then interpret it "
-                "briefly. Clearly separate sourced figures from your "
-                "interpretation. These are analyst estimates, not guarantees, and "
-                "not financial advice. Never state a price target or forecast "
-                "figure of your own invention. If the Analyst Consensus section "
-                "is missing or empty, say the estimate data is not available "
-                "instead of guessing."
-            ),
-            "sentiment": (
-                "The user wants market sentiment or analyst views. Summarize the "
-                "tone and key opinions from the provided documents."
-            ),
-            "news": (
-                "The user wants recent news or developments. Summarize the key "
-                "events and their potential impact."
-            ),
-            "risk": (
-                "The user wants risk factors or concerns. Extract relevant risk "
-                "information from the provided documents."
-            ),
-        }
-
-        instruction = base + "\n\n## Rules\n" + "\n".join(f"- {r}" for r in rules)
-
-        if question_type in type_specific:
-            instruction += f"\n\n## Question Type Guidance\n{type_specific[question_type]}"
-
-        return instruction
-
     # ── Facts Section ─────────────────────────────────
 
     def _format_facts_section(self, facts: list[dict],
@@ -238,6 +152,10 @@ class PromptAugmenter:
             unit = fact.get("unit", "")
             period = fact.get("period", "")
             source = fact.get("source_type", "unknown")
+            # The request-level ticker is only a fallback for facts that
+            # lack their own — never overwrite a fact from a different
+            # ticker (comparison/macro retrieval mixes tickers per row).
+            fact_ticker = fact.get("ticker") or ticker or "unknown"
 
             # Format value nicely
             if value is not None:
@@ -259,7 +177,7 @@ class PromptAugmenter:
             period_str = f" ({period})" if period else ""
             lines.append(
                 f"- **{metric}**: {value_str}{unit_str}{period_str} "
-                f"[Source: {source}/{ticker or 'unknown'}]"
+                f"[Source: {source}/{fact_ticker}]"
             )
 
         return "\n".join(lines)
@@ -322,11 +240,16 @@ class PromptAugmenter:
     # ── Documents Section ──────────────────────────────
 
     def _format_documents_section(self, documents: list[dict]) -> str:
-        """Format retrieved documents into a readable context section."""
+        """Format retrieved documents into a readable context section.
+
+        ``documents`` must already be filtered to usable rows (see
+        ``evidence.usable_documents``) — this only renders bodies, it does
+        not re-check for blanks.
+        """
         lines = ["## Retrieved Documents\n"]
 
         for i, doc in enumerate(documents, 1):
-            text = doc.get("text", "")
+            text = document_body(doc)
             metadata = doc.get("metadata", {})
             doc_id = doc.get("id", f"doc_{i}")
             ticker = metadata.get("ticker", doc.get("ticker", "unknown"))
@@ -493,10 +416,14 @@ class PromptAugmenter:
             max_tokens, len(prompt),
         )
 
-        # Split into sections
-        sections = prompt.split("\n\n## ")
+        # Split into sections. Prepend a boundary marker first: the prompt
+        # may now start directly with a "## "-headed section (there is no
+        # mandatory non-"##" preamble since 2.2.1.1 removed the duplicated
+        # system instruction), and without this the leading section would
+        # keep its "## " prefix and fail the startswith() checks below.
+        sections = ("\n\n" + prompt).split("\n\n## ")
 
-        # Keep system instruction + question + output format
+        # Keep task guidance + question + output format
         keep = []
         docs_section = None
         facts_section = None

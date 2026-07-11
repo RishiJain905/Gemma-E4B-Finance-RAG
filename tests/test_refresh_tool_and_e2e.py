@@ -296,6 +296,130 @@ def test_end_to_end_tool_query(tmp_store, monkeypatch):
     assert tool_result["results"][0]["ticker"] == "META"
 
 
+def test_trace_contains_full_document_body_and_fact_provenance(tmp_store, monkeypatch):
+    """2.2.1.2: the evidence trace must carry the exact usable facts/documents
+    — untruncated document bodies (PromptAugmenter truncates the *prompt* at
+    2000 chars, but the trace must not) and full per-fact provenance
+    (ticker/period/source_type) across multiple tickers."""
+    long_body = "A" * 2500  # longer than PromptAugmenter's 2000-char truncation
+    facts = [
+        {"metric": "total_revenue", "value": 26.0, "ticker": "NVDA",
+         "period": "2026-Q1", "source_type": "yfinance", "unit": "B"},
+        {"metric": "total_revenue", "value": 5.0, "ticker": "AMD",
+         "period": "2026-Q1", "source_type": "yfinance", "unit": "B"},
+    ]
+    documents = [{
+        "id": "sec/NVDA/1", "document": long_body,
+        "metadata": {"source": "sec_10k", "ticker": "NVDA", "date": "2026-01-01"},
+    }]
+    client = SimpleNamespace(
+        get=AsyncMock(return_value=SimpleNamespace(status_code=200)),
+        aclose=AsyncMock(),
+        post=AsyncMock(return_value=_model_response(
+            "Revenue comparison. [Source: yfinance/NVDA]")),
+    )
+    with TestClient(app) as test_client:
+        monkeypatch.setattr(middleware_app, "store", tmp_store)
+        monkeypatch.setattr(middleware_app, "config", _config(enable_tools=False))
+        monkeypatch.setattr(middleware_app, "model_client", client)
+        monkeypatch.setattr(
+            middleware_app,
+            "retriever",
+            SimpleNamespace(
+                retrieve=lambda **_kwargs: {
+                    "facts": facts,
+                    "documents": documents,
+                    "retrieval_strategy": "test",
+                }
+            ),
+        )
+        response = test_client.post(
+            "/query",
+            json={
+                "question": "Compare NVDA and AMD revenue",
+                "refresh": False,
+                "include_evidence_trace": True,
+            },
+        )
+
+    assert response.status_code == 200
+    trace = response.json()["evidence_trace"]
+    assert trace is not None
+    assert trace["documents"][0]["document"] == long_body  # untruncated
+
+    got_facts = trace["facts"]
+    assert {(f["ticker"], f["metric"]) for f in got_facts} == {
+        ("NVDA", "total_revenue"), ("AMD", "total_revenue"),
+    }
+    for f in got_facts:
+        assert f["period"] == "2026-Q1"
+        assert f["source_type"] == "yfinance"
+
+
+def test_trace_contains_exact_tool_result(tmp_store, monkeypatch):
+    """2.2.1.2: the evidence trace's tool_results must record the exact
+    dispatched tool name, validated arguments, and JSON result — matching
+    the role=tool message actually sent to the model."""
+    _seed_forward_pe(tmp_store, "NVDA", 16.5)
+    _seed_forward_pe(tmp_store, "META", 15.9)
+    _seed_forward_pe(tmp_store, "MSFT", 19.6)
+
+    client = SimpleNamespace(
+        get=AsyncMock(return_value=SimpleNamespace(status_code=200)),
+        aclose=AsyncMock(),
+        post=AsyncMock(
+            side_effect=[
+                _model_response(
+                    tool_calls=[
+                        _tool_call(
+                            "query_facts",
+                            {"metric": "forward_pe", "order": "asc", "limit": 1},
+                        )
+                    ]
+                ),
+                _model_response("META has the lowest forward P/E."),
+            ]
+        ),
+    )
+    with TestClient(app) as test_client:
+        monkeypatch.setattr(middleware_app, "store", tmp_store)
+        monkeypatch.setattr(middleware_app, "config", _config(enable_tools=True))
+        monkeypatch.setattr(middleware_app, "model_client", client)
+        monkeypatch.setattr(
+            middleware_app,
+            "retriever",
+            SimpleNamespace(
+                retrieve=lambda **_kwargs: {
+                    "facts": [],
+                    "documents": [],
+                    "retrieval_strategy": "test",
+                }
+            ),
+        )
+        response = test_client.post(
+            "/query",
+            json={
+                "question": "Which stock has the lowest forward P/E?",
+                "refresh": False,
+                "include_evidence_trace": True,
+            },
+        )
+
+    assert response.status_code == 200
+    trace = response.json()["evidence_trace"]
+    assert trace is not None
+    assert len(trace["tool_results"]) == 1
+    tr = trace["tool_results"][0]
+    assert tr["name"] == "query_facts"
+    assert tr["arguments"] == {"metric": "forward_pe", "order": "asc", "limit": 1}
+    assert tr["result"]["metric"] == "forward_pe"
+    assert tr["result"]["results"][0]["ticker"] == "META"
+
+    second_payload = client.post.await_args_list[1].kwargs["json"]
+    tool_message = [m for m in second_payload["messages"] if m.get("role") == "tool"][0]
+    assert json.loads(tool_message["content"]) == tr["result"]
+
+
 def test_tools_off_regression(tmp_store, monkeypatch):
     client = SimpleNamespace(
         get=AsyncMock(return_value=SimpleNamespace(status_code=200)),

@@ -14,6 +14,28 @@ Rankings, higher = better. Cost reflects what I actually pay (OpenAI has really 
 | opus-4.8 | 4 | 7 | 8 |
 | fable-5 | 2 | 9 | 9 |
 
+### Claude subagent presets (model + effort)
+
+The Agent tool has no per-spawn effort parameter — effort is pinned in the agent definition. Five presets live in `.claude/agents/` (spawn via `subagent_type: "<preset>"`); Fable is spawned plainly with `model: 'fable'` and inherits the session's effort:
+
+| preset | model | effort | use for |
+|--------|-------|--------|---------|
+| `sonnet-low` | sonnet-5 | low | Trivial mechanical side tasks with zero design decisions: file sweeps, renames, doc/config tweaks, simple test fixes. |
+| `sonnet-xhigh` | sonnet-5 | xhigh | Default for **compact** well-specified work: single-file/single-feature implementation, test authoring, user-facing UI/copy at taste 7. Also the budget fallback when usage is tight. |
+| `sonnet-max` | sonnet-5 | max | Niche only: debugging with a known repro, or deep-but-mechanical work confined to one file/domain. Not a rung on the escalation ladder — at max effort on multi-file volume it burns more tokens than opus-xhigh finishing in one pass. |
+| `opus-xhigh` | opus-4.8 | xhigh | **Default implementer.** Multi-file features, cross-cutting integration, API design, plan/implementation reviews, subtle debugging. First choice once a task spans files/subsystems, regardless of how clear the spec is. |
+| `opus-max` | opus-4.8 | max | Heaviest delegation: architectural refactors, root-cause hunts that survived an opus-xhigh attempt, high-risk changes to shared pipelines. Last stop before Fable does it personally. |
+| *(fable, no preset)* | fable-5 | inherits session | Open-ended design and judgment calls the orchestrator would otherwise keep; rare — usually the orchestrator IS Fable. |
+
+Routing by complexity — ask three questions: *does the task span more than one file/subsystem?*, *what breaks if it's slightly wrong?*, and *does the task's true complexity sit within this preset's ceiling at its pinned effort?*
+- Route by ceiling, not ladder position: estimate the task's true complexity first and assign the preset whose ceiling comfortably covers it. If a task genuinely demands `opus-max` (architectural refactor, gnarly root-cause, high-risk shared-pipeline change) or Fable (open-ended design, novel judgment), start there on the first pass — never assign a first pass to a preset you expect to fail just because the ladder starts lower.
+- Spec explicit, scope compact, failure caught by the gate → `sonnet-low`/`sonnet-xhigh`.
+- Scope grows to multi-file — even with a crystal-clear spec → `opus-xhigh` directly. Don't ladder through sonnet-max; fewer smart tokens beat more cheap ones (max-effort Sonnet thinking plus extra gate iterations usually out-burns Opus finishing in one pass).
+- Ambiguity, judgment, taste ≥ 8, or cross-subsystem blast radius → `opus-xhigh`; add high-risk on top → `opus-max`.
+- Escalation is one-way and immediate: the same miss or failure twice on a preset → next tier (sonnet-xhigh → opus-xhigh → opus-max → Fable inline), never a retry at the same tier. sonnet-max sits off-ladder as a special-purpose tool, not an escalation step. Escalation corrects misjudged routing; it is not a substitute for honest first-pass ceiling matching.
+- These presets do not replace Codex routing: bulk/mechanical clear-spec diffs still go to a GPT-5.6 Codex model first; the presets cover work needing Claude judgment/taste, reviews, and the Codex-down fallback.
+- Presets fix only the floor (model, effort, verify-gate discipline); all task-specific steering — scope, approach, constraints, what a prior attempt got wrong, report format — goes in the spawn `prompt`, which layers on top of the preset's system prompt. Steer there; don't create new agent files for one-off specializations.
+
 ### Codex models
 
 | model | cost | intelligence | taste | effort |
@@ -32,7 +54,7 @@ How to apply:
 - Reviews of plans/implementations: fable-5 or opus-4.8, optionally a GPT-5.6 Codex model as an extra independent perspective.
 - Never use Haiku.
 - Mechanics: GPT-5.6 Codex models are accessed from Claude Code through the Codex plugin. For implementation, debugging, investigation, data analysis, or other delegated work, use `/codex:rescue --model <model> --effort <effort> <task>`. Add `--background` for longer-running work, then use `/codex:status` and `/codex:result` to monitor it and retrieve the result. For reviews, use `/codex:review` or `/codex:adversarial-review`.
-- Claude models (sonnet-5, opus-4.8, fable-5) run via the Agent/Workflow model parameter.
+- Claude models (sonnet-5, opus-4.8, fable-5) run via the Agent tool — prefer the effort presets above (`subagent_type: "sonnet-xhigh"` etc.) over a bare `model:` parameter, since a bare spawn cannot set effort.
 
 Using gpt-5.5 inside workflows and subagents:
 - The Agent/Workflow `model` parameter only accepts Claude models. To delegate work to gpt-5.5, use the Codex plugin's bundled `codex:codex-rescue` subagent rather than creating a custom Claude wrapper. If a wrapper is needed and is a must only then spawn a Claude wrapper agent with `model: 'sonnet', effort: 'low'` whose prompt instructs it to write a self-contained codex prompt. Plugin is priority and first target as it is setup with this intent and workflow in mind. 

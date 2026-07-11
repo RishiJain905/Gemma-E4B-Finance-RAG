@@ -385,8 +385,10 @@ class TestPromptAugmenter:
         assert "No data was found" in prompt
         assert "AAPL" in prompt
 
-    def test_prompt_includes_system_instruction(self):
-        """Prompt always includes system instruction with rules."""
+    def test_prompt_excludes_duplicated_policy_rules(self):
+        """The augmented user prompt no longer duplicates the authoritative
+        answer-policy rules — those live solely in the system message built
+        by prompt_policy.py (2.2.1.1 step 4)."""
         from src.middleware.prompt_augmenter import PromptAugmenter
         augmenter = PromptAugmenter()
 
@@ -396,9 +398,9 @@ class TestPromptAugmenter:
             retrieval={"facts": [], "documents": [], "ticker": None},
         )
 
-        assert "financial research assistant" in prompt
-        assert "Answer using ONLY the provided context" in prompt
-        assert "Cite sources inline" in prompt
+        assert "## Instructions" in prompt
+        assert "financial research assistant" not in prompt
+        assert "Answer using ONLY the provided context" not in prompt
 
     def test_question_type_instructions(self):
         """Question-type-specific instructions are included."""
