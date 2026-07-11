@@ -18,6 +18,8 @@ Usage:
 """
 
 import logging
+from datetime import datetime, timezone
+from decimal import Decimal
 from pathlib import Path
 from typing import Optional
 
@@ -27,11 +29,138 @@ from .sqlite_store import SQLiteStore
 logger = logging.getLogger(__name__)
 
 
+def _companyfacts_cutoff(as_of: Optional[str]) -> str:
+    value = as_of or datetime.now(timezone.utc).date().isoformat()
+    if not isinstance(value, str):
+        raise ValueError("as_of must be an ISO date in YYYY-MM-DD format")
+    try:
+        parsed = datetime.strptime(value, "%Y-%m-%d").date()
+    except ValueError as exc:
+        raise ValueError("as_of must be an ISO date in YYYY-MM-DD format") from exc
+    if parsed.isoformat() != value:
+        raise ValueError("as_of must be an ISO date in YYYY-MM-DD format")
+    return value
+
+
+def _candidate_sort_key(row: dict, concept_order: dict[str, int]) -> tuple:
+    return (
+        concept_order.get(row.get("concept", ""), len(concept_order)),
+        -int(str(row.get("filed_at", "0000-00-00")).replace("-", "") or 0),
+        str(row.get("accession", "")),
+        str(row.get("source_accessed_at", "")),
+        str(row.get("value_text", "")),
+    )
+
+
+def select_companyfacts(
+    rows: list[dict],
+    metric_rules: dict,
+    metrics: list[str],
+    *,
+    periods: Optional[list[str]] = None,
+    as_of: Optional[str] = None,
+) -> list[dict]:
+    """Pure, stable canonical selection over raw CompanyFacts candidates."""
+    cutoff = _companyfacts_cutoff(as_of)
+    requested_periods = set(periods) if periods is not None else None
+    results: list[dict] = []
+
+    for metric_position, metric in enumerate(metrics):
+        rule = metric_rules.get(metric)
+        if not isinstance(rule, dict):
+            continue
+        concepts = list(rule.get("concepts", []))
+        concept_order = {concept: index for index, concept in enumerate(concepts)}
+        allowed_units = set(rule.get("units", []))
+        allowed_kinds = set(rule.get("period_kinds", []))
+        eligible = [
+            row
+            for row in rows
+            if row.get("concept") in concept_order
+            and (not allowed_units or row.get("unit") in allowed_units)
+            and (not allowed_kinds or row.get("period_kind") in allowed_kinds)
+            and (requested_periods is None or row.get("period_end") in requested_periods)
+            and str(row.get("filed_at", "")) <= cutoff
+        ]
+
+        groups: dict[tuple[str, str], list[dict]] = {}
+        for row in eligible:
+            groups.setdefault((row["unit"], row["period_end"]), []).append(row)
+
+        for (unit, period_end), candidates in groups.items():
+            newest_by_concept: dict[str, dict] = {}
+            for row in sorted(candidates, key=lambda item: _candidate_sort_key(item, concept_order)):
+                newest_by_concept.setdefault(row["concept"], row)
+            selected = min(
+                newest_by_concept.values(),
+                key=lambda item: _candidate_sort_key(item, concept_order),
+            )
+
+            alternatives = []
+            seen_values = {Decimal(selected["value_text"])}
+            for candidate in sorted(
+                candidates,
+                key=lambda item: _candidate_sort_key(item, concept_order),
+            ):
+                value_text = candidate["value_text"]
+                decimal_value = Decimal(value_text)
+                if decimal_value in seen_values:
+                    continue
+                seen_values.add(decimal_value)
+                alternatives.append(
+                    {
+                        "value_text": value_text,
+                        "taxonomy": candidate["taxonomy"],
+                        "concept": candidate["concept"],
+                        "accession": candidate["accession"],
+                        "form": candidate["form"],
+                        "filed_at": candidate["filed_at"],
+                        "source_url": candidate["source_url"],
+                    }
+                )
+
+            results.append(
+                {
+                    "ticker": selected["ticker"],
+                    "metric": metric,
+                    "value": selected["value_numeric"],
+                    "value_text": selected["value_text"],
+                    "unit": unit,
+                    "period": period_end,
+                    "period_start": selected["period_start"],
+                    "period_type": selected["period_kind"],
+                    "source_type": "sec_companyfacts",
+                    "source_url": selected["source_url"],
+                    "source_accessed_at": selected["source_accessed_at"],
+                    "taxonomy": selected["taxonomy"],
+                    "concept": selected["concept"],
+                    "accession": selected["accession"],
+                    "form": selected["form"],
+                    "filed_at": selected["filed_at"],
+                    "as_of": cutoff,
+                    "conflict": bool(alternatives),
+                    "alternatives": alternatives,
+                    "_metric_position": metric_position,
+                }
+            )
+
+    results.sort(key=lambda item: (item["unit"], item["concept"]))
+    results.sort(key=lambda item: item["period"], reverse=True)
+    results.sort(key=lambda item: item["_metric_position"])
+    for result in results:
+        result.pop("_metric_position")
+    return results
+
+
 class Store:
     """
     Unified storage layer combining structured (SQLite) and
     semantic (ChromaDB) storage.
     """
+
+    COMPANYFACTS_CONFIG_PATH = (
+        Path(__file__).parent.parent.parent / "configs/sec_companyfacts.yaml"
+    )
 
     def __init__(self,
                  db_path: Optional[Path] = None,
@@ -89,6 +218,47 @@ class Store:
                                metrics: list[str] = None) -> dict:
         """Get multiple metrics for a ticker at once."""
         return self.sqlite.get_fundamentals_batch(ticker, metrics)
+
+    def get_companyfacts(
+        self,
+        ticker: str,
+        metrics: list[str],
+        *,
+        periods: Optional[list[str]] = None,
+        as_of: Optional[str] = None,
+    ) -> list[dict]:
+        """Project raw SEC observations into configured canonical metrics."""
+        import yaml
+
+        with open(self.COMPANYFACTS_CONFIG_PATH, encoding="utf-8") as config_file:
+            config = yaml.safe_load(config_file) or {}
+        if not config.get("enabled", False):
+            return []
+
+        cutoff = _companyfacts_cutoff(as_of)
+        metric_rules = config.get("metrics", {}) or {}
+        requested_rules = [metric_rules[name] for name in metrics if name in metric_rules]
+        concepts = list(
+            dict.fromkeys(
+                concept
+                for rule in requested_rules
+                for concept in rule.get("concepts", [])
+            )
+        )
+        if not concepts:
+            return []
+        raw_rows = self.sqlite.query_sec_companyfacts(
+            ticker,
+            concepts,
+            as_of=cutoff,
+        )
+        return select_companyfacts(
+            raw_rows,
+            metric_rules,
+            metrics,
+            periods=periods,
+            as_of=cutoff,
+        )
 
     # ── Document Storage (ChromaDB) ──────────────────
 
@@ -274,6 +444,7 @@ class Store:
         "yfinance_fundamentals": {"cache_source": "yfinance_fundamentals", "ttl_key": "fundamentals"},
         "yfinance_news":         {"cache_source": "yfinance_news",         "ttl_key": "news"},
         "sec_filings":           {"cache_source": "sec_filings_discovery", "ttl_key": "sec_filings"},
+        "sec_companyfacts":      {"cache_source": "sec_companyfacts",      "ttl_key": "sec_companyfacts"},
         "gdelt_news":            {"cache_source": "gdelt_news",            "ttl_key": "gdelt_news"},
         "earnings_transcripts":  {"cache_source": "earnings_transcripts",  "ttl_key": "transcripts"},
         "ir_pages":              {"cache_source": "ir_pages",              "ttl_key": "ir_pages"},
@@ -282,6 +453,7 @@ class Store:
 
     _DEFAULT_TTLS = {
         "fundamentals": 24, "news": 6, "macro": 24, "sec_filings": 12,
+        "sec_companyfacts": 24,
         "gdelt_news": 6, "transcripts": 168, "ir_pages": 24, "estimates": 24,
     }
 

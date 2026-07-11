@@ -71,15 +71,15 @@ class TestUnifiedSchedulerInit:
 
     def test_init(self, scheduler):
         assert set(scheduler.SOURCES) == {
-            "yfinance", "sec_filings", "fred", "gdelt", "earnings_transcripts",
-            "ir_pages", "estimates",
+            "yfinance", "sec_filings", "sec_companyfacts", "fred", "gdelt",
+            "earnings_transcripts", "ir_pages", "estimates",
         }
 
     def test_source_ordering(self, scheduler):
         ordered = [name for name, _ in scheduler._ordered_sources()]
         assert ordered == [
-            "yfinance", "sec_filings", "fred", "gdelt", "earnings_transcripts",
-            "ir_pages", "estimates",
+            "yfinance", "sec_filings", "sec_companyfacts", "fred", "gdelt",
+            "earnings_transcripts", "ir_pages", "estimates",
         ]
 
     def test_ttl_loading(self, scheduler):
@@ -124,10 +124,12 @@ class TestUnifiedSchedulerRunModes:
     def test_run_daily(self, scheduler):
         m = _stub_run_source(scheduler)
         result = scheduler.run_daily()
-        assert set(result) == {"yfinance", "fred", "sec_filings", "ir_pages", "estimates"}
+        assert set(result) == {
+            "yfinance", "fred", "sec_filings", "sec_companyfacts", "ir_pages", "estimates",
+        }
         assert "gdelt" not in result
         assert "earnings_transcripts" not in result
-        assert m.call_count == 5
+        assert m.call_count == 6
 
     def test_run_hourly(self, scheduler):
         m = _stub_run_source(scheduler)

@@ -1,0 +1,124 @@
+{
+  "cik": 1045810,
+  "entityName": "NVIDIA CORP",
+  "facts": {
+    "us-gaap": {
+      "RevenueFromContractWithCustomerExcludingAssessedTax": {
+        "label": "Revenue",
+        "description": "Revenue from contracts with customers.",
+        "units": {
+          "USD": [
+            {
+              "start": "2024-01-29",
+              "end": "2025-01-26",
+              "val": 60922000000,
+              "accn": "0001045810-25-000023",
+              "fy": 2025,
+              "fp": "FY",
+              "form": "10-K",
+              "filed": "2025-02-26",
+              "frame": "CY2024"
+            },
+            {
+              "start": "2024-01-29",
+              "end": "2025-01-26",
+              "val": 61000000000,
+              "accn": "0001045810-25-000099",
+              "fy": 2025,
+              "fp": "FY",
+              "form": "10-K/A",
+              "filed": "2025-03-10",
+              "frame": "CY2024"
+            },
+            {
+              "start": "2025-01-27",
+              "end": "2025-04-27",
+              "val": 25000000000,
+              "accn": "0001045810-25-000050",
+              "fy": 2026,
+              "fp": "Q1",
+              "form": "10-Q",
+              "filed": "2025-05-20",
+              "frame": "CY2025Q1"
+            },
+            {
+              "start": "2025-01-27",
+              "end": "2025-10-26",
+              "val": 80000000000,
+              "accn": "0001045810-25-000080",
+              "fy": 2026,
+              "fp": "Q3",
+              "form": "10-Q",
+              "filed": "2025-11-19"
+            },
+            {
+              "start": "2025-01-27",
+              "end": "2025-04-27",
+              "val": 1,
+              "fy": 2026,
+              "fp": "Q1",
+              "form": "10-Q",
+              "filed": "2025-05-20"
+            }
+          ]
+        }
+      },
+      "Revenues": {
+        "label": "Revenues",
+        "description": "Legacy revenue concept.",
+        "units": {
+          "USD": [
+            {
+              "start": "2024-01-29",
+              "end": "2025-01-26",
+              "val": 60000000000,
+              "accn": "0001045810-25-000023",
+              "fy": 2025,
+              "fp": "FY",
+              "form": "10-K",
+              "filed": "2025-02-26",
+              "frame": "CY2024"
+            }
+          ]
+        }
+      },
+      "Assets": {
+        "label": "Assets",
+        "description": "Total assets.",
+        "units": {
+          "USD": [
+            {
+              "end": "2025-01-26",
+              "val": 111601000000,
+              "accn": "0001045810-25-000023",
+              "fy": 2025,
+              "fp": "FY",
+              "form": "10-K",
+              "filed": "2025-02-26",
+              "frame": "CY2024Q4I"
+            }
+          ]
+        }
+      },
+      "EarningsPerShareDiluted": {
+        "label": "Diluted EPS",
+        "description": "Diluted earnings per share.",
+        "units": {
+          "USD/shares": [
+            {
+              "start": "2025-01-27",
+              "end": "2025-04-27",
+              "val": 1.2300,
+              "accn": "0001045810-25-000050",
+              "fy": 2026,
+              "fp": "Q1",
+              "form": "10-Q",
+              "filed": "2025-05-20",
+              "frame": "CY2025Q1"
+            }
+          ]
+        }
+      }
+    }
+  }
+}

@@ -27,7 +27,9 @@ def test_init_creates_db(tmp_path: Path):
                 "SELECT name FROM sqlite_master WHERE type='table'"
             ).fetchall()
         }
-    assert {"fundamentals", "filings", "cache_meta", "ingestion_log"} <= tables
+    assert {
+        "fundamentals", "sec_companyfacts", "filings", "cache_meta", "ingestion_log",
+    } <= tables
 
 
 def test_wal_mode(store: SQLiteStore):
@@ -265,6 +267,7 @@ def test_inline_schema(store: SQLiteStore):
     schema = store._inline_schema()
     assert isinstance(schema, str)
     assert "CREATE TABLE IF NOT EXISTS fundamentals" in schema
+    assert "CREATE TABLE IF NOT EXISTS sec_companyfacts" in schema
     assert "CREATE TABLE IF NOT EXISTS filings" in schema
     assert "CREATE TABLE IF NOT EXISTS cache_meta" in schema
     assert "CREATE TABLE IF NOT EXISTS ingestion_log" in schema
