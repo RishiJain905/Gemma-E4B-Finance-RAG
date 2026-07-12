@@ -509,6 +509,8 @@ def orchestrate(
     corrective_retry: Optional[CorrectiveFn] = None,
     route_fn: Optional[RouteFn] = None,
     execute_fn: Optional[ExecuteFn] = None,
+    retrieval_cache: Optional[Any] = None,
+    refresh: bool = False,
 ) -> OrchestrationResult:
     """Run one bounded adaptive-RAG request over ``plan``.
 
@@ -541,6 +543,7 @@ def orchestrate(
             retriever=retriever, available_metrics=available_metrics,
             planning_client=planning_client, decompose=decompose,
             corrective_retry=corrective_retry, route_fn=route_fn, execute_fn=execute_fn,
+            retrieval_cache=retrieval_cache, refresh=refresh,
         )
     except Exception:  # noqa: BLE001 - orchestrate() must never raise into /query
         logger.exception("Adaptive orchestration failed; falling back to retrieve()")
@@ -559,6 +562,8 @@ def _run_adaptive(
     corrective_retry: Optional[CorrectiveFn],
     route_fn: Optional[RouteFn],
     execute_fn: Optional[ExecuteFn],
+    retrieval_cache: Optional[Any] = None,
+    refresh: bool = False,
 ) -> OrchestrationResult:
     """Adaptive body under one shared budget. Wrapped by :func:`orchestrate`'s
     fail-soft boundary; the inner lane try/except keeps the specific
@@ -566,6 +571,7 @@ def _run_adaptive(
     route_fn = route_fn or dr.route
     execute_fn = execute_fn or dr.execute_route
     budget = ExecutionBudget.from_config(config)
+    available_metrics = tuple(available_metrics)  # materialize (may feed key + router)
 
     try:
         decision = route_fn(plan, available_metrics)
@@ -577,6 +583,27 @@ def _run_adaptive(
     result = OrchestrationResult(lane=lane, plan=plan)
     for code in lane_reasons:
         result.add_reason(code)
+
+    # ── Versioned retrieval-cache probe (2.2.6.2) ──
+    # Look up ONLY normalized pre-prompt evidence (never a final answer), keyed on
+    # the plan + config/model fingerprint + store revision. A hit reuses the
+    # cached evidence and skips all retrieval; the cheap deterministic tail
+    # (re-grade + context budget) still runs so hit and miss produce the same
+    # response shape. An explicit refresh never looks up (but still stores the
+    # fresh result). Any cache/revision error is a miss, never a failure.
+    cache_key = _retrieval_cache_key(
+        retrieval_cache, store, plan, config, lane, available_metrics)
+    if cache_key is not None and not refresh:
+        cached = retrieval_cache.get(cache_key)
+        if cached is not None:
+            _load_cached_evidence(result, cached)
+            result.add_reason("retrieval_cache_hit")
+            if getattr(config, "enable_evidence_sufficiency", False):
+                _grade_cached_evidence(result, result.plan)
+            _apply_context_budget(result, result.plan, config, lane)
+            result.retrieval = _as_retrieval_dict(result.plan, result)
+            return result
+        result.add_reason("retrieval_cache_miss")
 
     try:
         if lane is Lane.FAST:
@@ -604,6 +631,11 @@ def _run_adaptive(
     if getattr(config, "enable_evidence_sufficiency", False):
         _apply_evidence_sufficiency(
             result, result.plan, store, config, budget, retriever)
+
+    # Store the FINAL evidence (post any corrective round) so a later hit reuses
+    # exactly what this request retrieved, without re-running any retrieval.
+    if cache_key is not None:
+        _store_cached_evidence(retrieval_cache, cache_key, result)
 
     _apply_context_budget(result, result.plan, config, lane)
     result.retrieval = _as_retrieval_dict(result.plan, result)
@@ -1440,6 +1472,107 @@ def _apply_context_budget(
     result.context = selection
     result.context_size = selection.context_chars
     result.estimated_tokens = selection.estimated_tokens
+
+
+# ── Versioned retrieval cache seam (2.2.6.2) ──────────────
+
+
+def _retrieval_cache_key(
+    cache: Optional[Any],
+    store: Any,
+    plan: QueryPlan,
+    config: "MiddlewareConfig",
+    lane: Lane,
+    available_metrics: tuple,
+) -> Optional[str]:
+    """Build this request's retrieval-cache key, or ``None`` to bypass the cache.
+
+    Bypasses (returns ``None``) when the cache is absent/disabled, the store
+    exposes no revision (or reading it raised), or the key cannot be built — any
+    of which means "do not cache", never an error. Reading the revision here binds
+    the key to the exact data version, so an ingestion write between two identical
+    requests forces a fresh retrieval.
+    """
+    if cache is None or not getattr(config, "enable_retrieval_cache", False):
+        return None
+    try:
+        from .retrieval_cache import build_cache_key, config_fingerprint
+
+        revision_fn = getattr(store, "retrieval_revision", None)
+        if not callable(revision_fn):
+            return None  # store has no revision -> cannot invalidate safely
+        # Drop the whole cache if the config/model fingerprint changed since the
+        # last request (a redeploy that swapped the model or a retrieval toggle).
+        cache.check_fingerprint(config_fingerprint(config))
+        return build_cache_key(
+            plan=plan, config=config, lane=lane, revision=int(revision_fn()),
+            available_metrics=available_metrics,
+            as_of=getattr(plan, "as_of", None),
+        )
+    except Exception:  # noqa: BLE001 - inability to key means bypass, never fail
+        logger.warning("Retrieval-cache key build failed; bypassing cache", exc_info=True)
+        return None
+
+
+def _load_cached_evidence(result: OrchestrationResult, cached: dict) -> None:
+    """Populate ``result`` from a cached pre-prompt evidence snapshot (2.2.6.2)."""
+    result.merged_facts = list(cached.get("merged_facts", []))
+    result.merged_documents = list(cached.get("merged_documents", []))
+    result.retrieval_strategy = cached.get("retrieval_strategy")
+    result.subqueries_executed = list(cached.get("subqueries_executed", []))
+    result.retrieval_rounds_used = int(cached.get("retrieval_rounds_used", 0))
+    result.derived_subqueries = list(cached.get("derived_subqueries", []))
+    for code in cached.get("reason_codes", []):
+        result.add_reason(code)
+
+
+def _store_cached_evidence(
+    cache: Any, cache_key: str, result: OrchestrationResult
+) -> None:
+    """Cache ONLY the normalized pre-prompt evidence + retrieval metadata.
+
+    Never stores a final answer, the context selection, or grader objects — just
+    the merged facts/documents and the retrieval telemetry needed to reproduce
+    the same response shape on a hit. Fail-soft: a store failure is ignored.
+    """
+    try:
+        snapshot = {
+            "merged_facts": result.merged_facts,
+            "merged_documents": result.merged_documents,
+            "retrieval_strategy": result.retrieval_strategy,
+            "subqueries_executed": list(result.subqueries_executed),
+            "retrieval_rounds_used": int(result.retrieval_rounds_used),
+            "derived_subqueries": list(result.derived_subqueries),
+            # Exclude this-request cache-status codes so a later hit does not
+            # replay a stale "miss" marker alongside its own "hit".
+            "reason_codes": [
+                c for c in result.reason_codes if not c.startswith("retrieval_cache_")
+            ],
+        }
+        cache.set(cache_key, snapshot)
+    except Exception:  # noqa: BLE001 - caching must never fail a request
+        logger.warning("Retrieval-cache store failed; continuing", exc_info=True)
+
+
+def _grade_cached_evidence(result: OrchestrationResult, plan: QueryPlan) -> None:
+    """Re-grade cached evidence so a hit reports the same sufficiency as a miss.
+
+    Grading is a pure function of (plan, evidence); the cached evidence is the
+    final set the original request produced, so this reproduces the verdict
+    without any (expensive) corrective retrieval. NOTE: with query decomposition
+    enabled the miss path may grade against a decomposed plan while a hit grades
+    the original plan — an accepted, documented minor divergence for an opt-in
+    cache; with decomposition off (default) the verdicts are identical.
+    """
+    verdict = grade_evidence(plan, {
+        "facts": result.merged_facts,
+        "documents": result.merged_documents,
+    })
+    result.sufficiency = verdict
+    result.corrective_action = verdict.allowed_action
+    result.add_reason(f"evidence_{verdict.status.value}")
+    for code in verdict.reason_codes:
+        result.add_reason(code)
 
 
 def _get_retriever(

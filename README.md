@@ -156,9 +156,10 @@ curl -X POST http://127.0.0.1:8000/query \
 
 For a single, centralized entry point, use the interactive client. It
 **auto-starts the middleware** if it isn't already running, gives you a chat
-loop over `/query` (streamed by default), and surfaces every Phase 2.1
-feature — grounding mode, tool calls, retrieval strategy, fetch-on-miss, and
-resolved-ticker confirmation — in one consistent answer renderer:
+loop over `/query` (streamed by default), and surfaces every Phase 2.1/2.2
+feature — grounding mode, tool calls, retrieval strategy, fetch-on-miss,
+resolved-ticker confirmation, bounded conversation history, multiline questions,
+and streamed progress events — in one consistent answer renderer:
 
 ```bash
 python scripts/chat.py
@@ -304,8 +305,9 @@ The middleware exposes the following endpoints (full schemas and examples in
 | Method | Path                   | Purpose                                          |
 |--------|------------------------|--------------------------------------------------|
 | GET    | `/`                    | Service info + links                             |
-| GET    | `/health`              | Storage, model, scheduler, freshness status      |
+| GET    | `/health`              | Storage, model, scheduler, freshness, capabilities |
 | POST   | `/query`               | Full RAG pipeline — grounded, cited answer       |
+| POST   | `/query/stream`        | SSE variant of `/query` (streamed final answer, 2.2.6.1) |
 | POST   | `/search`              | Raw hybrid search (bypasses the model)           |
 | GET    | `/freshness/{ticker}`  | Per-source freshness report for a ticker         |
 | POST   | `/refresh/{ticker}`    | On-demand re-ingestion of stale sources          |

@@ -262,6 +262,40 @@ class Store:
             logger.error("SQLite heartbeat failed: %s", e)
             return False
 
+    # ── Data Revision (2.2.6.2) ────────────────────────
+    #
+    # A single cross-process monotonic integer that the versioned retrieval
+    # cache (src/middleware/retrieval_cache.py) keys on. Every facade mutation
+    # below that can change model-visible facts/documents calls ``_bump_revision``
+    # BEFORE the mutation begins, so a cache entry captured at revision N can
+    # never be served after any ingestion write advanced the revision. A failed
+    # mutation may leave the revision advanced (an extra cache miss) but never
+    # leaves a stale entry valid. Direct SQLite writers that bypass this facade
+    # (e.g. the SEC CompanyFacts ingestor calling ``sqlite.upsert_sec_companyfacts``
+    # directly) MUST call :meth:`bump_retrieval_revision` themselves — it is the
+    # one documented helper for that.
+
+    def retrieval_revision(self) -> int:
+        """Return the current monotonic data revision (0 when never bumped)."""
+        return self.sqlite.get_store_revision()
+
+    def bump_retrieval_revision(self, reason: str = "") -> int:
+        """Advance the data revision and return the new value (documented helper)."""
+        return self.sqlite.bump_store_revision(reason)
+
+    def _bump_revision(self, reason: str) -> None:
+        """Bump the revision before a model-visible mutation begins.
+
+        Best-effort so a revision-store hiccup never crashes ingestion, but it
+        runs BEFORE the mutation: if it fails, the worst case is that a cache
+        entry that predates this mutation is *not* invalidated — which is why the
+        retrieval cache also fails soft to a miss on any revision-read error.
+        """
+        try:
+            self.sqlite.bump_store_revision(reason)
+        except Exception:  # noqa: BLE001 - revision bookkeeping must never crash a write
+            logger.warning("Failed to bump store revision (%s)", reason, exc_info=True)
+
     # ─── Structured Facts (SQLite) ────────────────────
 
     def save_fundamental(self, ticker: str, metric: str, value: float,
@@ -270,6 +304,7 @@ class Store:
                          source_type: str = "yfinance",
                          source_url: str = None) -> bool:
         """Save or update a single financial metric."""
+        self._bump_revision("save_fundamental")
         return bool(self.sqlite.upsert_fundamental(
             ticker, metric, value, unit, period,
             period_type, source_type, source_url
@@ -382,6 +417,7 @@ class Store:
         Returns:
             The document ID (confirmation of storage)
         """
+        self._bump_revision("save_document")
         self.chroma.add_document(
             document_id=document_id,
             text=text,
@@ -397,10 +433,14 @@ class Store:
                              texts: list[str],
                              metadatas: list[dict] = None):
         """Store multiple documents at once."""
+        self._bump_revision("save_documents_batch")
         self.chroma.add_documents_batch(ids, texts, metadatas)
 
     def add_filing_sections(self, sections: list) -> dict[str, int]:
         """Replace and index SEC section families through Chroma's chunker."""
+        # Bump before any delete/add: a same-count section replacement changes
+        # the model-visible documents even though Chroma's count is unchanged.
+        self._bump_revision("add_filing_sections")
         counts = {
             "sections_written": 0,
             "chunks_written": 0,
@@ -456,6 +496,7 @@ class Store:
         return self.chroma.count_filing_sections(accession)
 
     def delete_filing_section_family(self, parent_id: str) -> None:
+        self._bump_revision("delete_filing_section_family")
         self.chroma.delete_filing_section_family(parent_id)
 
     # ── Hybrid Search ─────────────────────────────────
@@ -858,6 +899,7 @@ class Store:
 
     def reset(self):
         """Clear all data (for testing)."""
+        self._bump_revision("reset")
         self.chroma.reset_collection()
         # For SQLite, just drop and recreate tables
         with self.sqlite._connect() as conn:

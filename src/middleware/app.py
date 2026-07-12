@@ -17,6 +17,7 @@ import json
 import logging
 import time
 from contextlib import asynccontextmanager
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
@@ -76,6 +77,11 @@ MACRO_SNAPSHOT_METRICS = ["GDP", "CPIAUCSL", "FEDFUNDS", "UNRATE", "DGS10", "T10
 _MODEL_TASKS_CACHE: Optional[dict] = None
 FETCH_ON_MISS_MIN_CONFIDENCE = 0.9
 retriever = None  # Shared Retriever (built on startup) — Phase 2.1.2
+# Phase 2.2.6.2 — process-global versioned retrieval cache (built lazily when
+# enable_retrieval_cache is on) and the llama-server prompt-reuse capability flag
+# (flipped off for the process if the backend rejects cache_prompt once).
+_retrieval_cache = None
+_prompt_cache_supported: bool = True
 _MODEL_HEALTH_TTL_S = 10.0
 _HEALTH_SUMMARY_TTL_S = 3.0
 _model_health = {"ok": False, "ts": 0.0}
@@ -96,6 +102,44 @@ _answer_policy_override_var: contextvars.ContextVar[Optional[str]] = contextvars
 _evidence_trace_var: contextvars.ContextVar[Optional[EvidenceTraceCollector]] = contextvars.ContextVar(
     "evidence_trace", default=None
 )
+
+# Request-scoped progress-event emitter (2.2.6.1). Non-None only for a
+# /query/stream request that has stream progress events enabled; every other
+# request path (including /query) leaves it None so the _emit_* helpers are
+# no-ops and behavior is byte-identical. Set in the stream endpoint BEFORE
+# _build_query_context so context-build stages can record into it, and never
+# touched by _reset_request_scoped_state.
+_stream_emitter_var: contextvars.ContextVar[Optional["object"]] = contextvars.ContextVar(
+    "stream_emitter", default=None
+)
+
+
+def _stream_emitter():
+    """Return the current request's progress-event emitter, or None."""
+    return _stream_emitter_var.get()
+
+
+def _emit_stage(name: str, phase: str, *, elapsed_ms=None, reason=None) -> None:
+    """Record one pipeline stage progress event, if an emitter is installed."""
+    emitter = _stream_emitter_var.get()
+    if emitter is not None:
+        emitter.stage(name, phase, elapsed_ms=elapsed_ms, reason=reason)
+
+
+def _emit_tool_started(name: str, *, subquery_id=None) -> None:
+    """Record a tool-started progress event, if an emitter is installed."""
+    emitter = _stream_emitter_var.get()
+    if emitter is not None:
+        emitter.tool_started(name, subquery_id=subquery_id)
+
+
+def _emit_tool_completed(name: str, status: str, *, count=None, elapsed_ms=None,
+                         subquery_id=None) -> None:
+    """Record a tool-completed progress event, if an emitter is installed."""
+    emitter = _stream_emitter_var.get()
+    if emitter is not None:
+        emitter.tool_completed(
+            name, status, count=count, elapsed_ms=elapsed_ms, subquery_id=subquery_id)
 
 
 def _grounding_level(retrieval: dict) -> str:
@@ -423,9 +467,20 @@ async def health():
 
     capabilities = None
     if config:
+        # Effective streaming capability (2.2.6.1): whether this deployment can
+        # serve the /query/stream endpoint at all. With tools enabled, streaming
+        # is available only when tool-final streaming is on; otherwise the
+        # endpoint 404s. streaming_tool_final is advertised (true) only when that
+        # path is actually active, so a client learns tools-enabled requests can
+        # still stream their final synthesis.
+        streaming_enabled = bool(getattr(config, "enable_streaming", True))
+        tool_final_on = bool(getattr(config, "enable_tool_final_streaming", False))
+        tools_on = bool(config.enable_tools)
+        streaming_capable = streaming_enabled and (not tools_on or tool_final_on)
         capabilities = {
-            "tools": bool(config.enable_tools),
-            "streaming": bool(getattr(config, "enable_streaming", True)),
+            "tools": tools_on,
+            "streaming": streaming_capable,
+            "streaming_tool_final": bool(streaming_enabled and tools_on and tool_final_on),
             "answer_policy": str(getattr(config, "answer_policy", "graded") or "graded").lower(),
             # Bounded adaptive-RAG (2.2.3.4) effective booleans. Clients/eval
             # read these to know whether the adaptive route + deterministic tool
@@ -602,7 +657,9 @@ async def _build_query_context(request: QueryRequest) -> dict:
     timings: dict[str, object] = {}
     _reset_request_scoped_state(request.answer_policy)
 
-    stage_start = time.perf_counter()
+    compile_start = time.perf_counter()
+    _emit_stage("compile", "started")
+    stage_start = compile_start
     from .intent_parser import IntentParser
 
     parser = IntentParser()
@@ -653,6 +710,9 @@ async def _build_query_context(request: QueryRequest) -> dict:
         if conversation_meta is not None:
             conversation_meta["topic_reset"] = bool(compiled.topic_reset)
 
+    _emit_stage("compile", "completed",
+                elapsed_ms=(time.perf_counter() - compile_start) * 1000)
+
     shared = {
         "request": request,
         "start": start,
@@ -671,6 +731,7 @@ async def _build_query_context(request: QueryRequest) -> dict:
             return await _build_adaptive_query_context(shared)
         except Exception:  # noqa: BLE001 - adaptive layer must never fail a query
             logger.exception("Adaptive context build failed; using legacy path")
+            _emit_stage("route", "fallback", reason="adaptive_fallback")
             return await _build_legacy_query_context(
                 shared, orchestration={"lane": None, "fallback_reason": "adaptive_fallback"}
             )
@@ -725,6 +786,7 @@ async def _build_legacy_query_context(
     freshness_meta = await _freshness_stage(retrieval_intent, request.refresh, timings)
 
     stage_start = time.perf_counter()
+    _emit_stage("retrieve", "started")
     from .retriever import Retriever
 
     r = retriever or Retriever(store=store, config=config)
@@ -735,6 +797,7 @@ async def _build_legacy_query_context(
         top_k_facts=config.top_k_facts,
     )
     retrieval_ms = _stage_timing(timings, "retrieval", stage_start)
+    _emit_stage("retrieve", "completed", elapsed_ms=retrieval_ms)
     retrieval_timings = retrieval.get("timings", {}) if isinstance(retrieval, dict) else {}
     timings["retrieval"] = {
         "total": retrieval_ms,
@@ -766,6 +829,7 @@ async def _build_legacy_query_context(
     _evidence_trace_var.set(trace_collector)
 
     stage_start = time.perf_counter()
+    _emit_stage("pack", "started")
     from .prompt_augmenter import PromptAugmenter
 
     # Prompt/answer use the RAW question and the effective (carried) intent;
@@ -778,7 +842,12 @@ async def _build_legacy_query_context(
         grounding_level=grounding_level,
         evidence_ledger=evidence_ledger or None,
     )
-    _stage_timing(timings, "prompt_build", stage_start)
+    timings["prompt"] = _prompt_efficiency_metrics(
+        augmented_prompt=augmented_prompt, intent=retrieval_intent,
+        grounding_level=grounding_level,
+        facts=usable_facts(retrieval), documents=usable_documents(retrieval))
+    _emit_stage("pack", "completed",
+                elapsed_ms=_stage_timing(timings, "prompt_build", stage_start))
 
     return {
         "start": shared["start"],
@@ -809,6 +878,110 @@ def _adaptive_available_metrics() -> tuple:
         return tuple(store.sqlite.list_metrics())
     except Exception:  # noqa: BLE001 - metric catalog is best-effort
         return ()
+
+
+def _get_retrieval_cache():
+    """Return the process-global versioned retrieval cache, or None when off.
+
+    Built lazily from config the first time it is needed. Behind
+    ``enable_retrieval_cache`` (off by default) so the default path never
+    allocates it. See src/middleware/retrieval_cache.py for the invalidation
+    contract (store revision + config/model fingerprint + TTL).
+    """
+    global _retrieval_cache
+    if not bool(getattr(config, "enable_retrieval_cache", False)):
+        return None
+    if _retrieval_cache is None:
+        from .retrieval_cache import RetrievalCache, config_fingerprint
+
+        _retrieval_cache = RetrievalCache(
+            max_entries=int(getattr(config, "retrieval_cache_max_entries", 256)),
+            ttl_s=float(getattr(config, "retrieval_cache_ttl_s", 300.0)),
+            max_value_chars=int(getattr(config, "retrieval_cache_max_value_chars", 200_000)),
+            fingerprint=config_fingerprint(config),
+        )
+    return _retrieval_cache
+
+
+def _prompt_efficiency_metrics(
+    *, augmented_prompt: str, intent: Optional[dict], grounding_level: str,
+    facts: list, documents: list,
+) -> dict:
+    """Record prompt-prefix efficiency telemetry (2.2.6.2 Step 3).
+
+    Captures the augmented-prompt characters + estimated tokens, the rendered
+    evidence characters, and a short digest of the FIXED system-policy prefix (the
+    reusable prompt prefix). Pure measurement — it never changes the prompt.
+    """
+    from .prompt_augmenter import PromptAugmenter
+
+    system_prompt = _system_prompt_for_request(
+        intent=intent, grounding_level=grounding_level,
+        tools_enabled=bool(getattr(config, "enable_tools", False)),
+    )
+    prompt_chars = len(augmented_prompt)
+    return {
+        "prompt_chars": prompt_chars,
+        "estimated_tokens": prompt_chars // 4,
+        "evidence_chars": PromptAugmenter.evidence_char_count(facts, documents),
+        "fixed_prefix_digest": prompt_policy.fixed_prefix_digest(system_prompt),
+    }
+
+
+def _tool_result_count(result) -> Optional[int]:
+    """Best-effort row/item count from a tool result for a progress event.
+
+    Reads only the shape/length of the standard read-tool result envelopes
+    (``results`` list, ``fundamentals``/``estimates``/``price_targets`` maps) —
+    never the values themselves. Returns None when no count is meaningful, so a
+    count is emitted only when it genuinely reflects rows/items retrieved.
+    """
+    if not isinstance(result, dict) or result.get("error"):
+        return None
+    rows = result.get("results")
+    if isinstance(rows, list):
+        return len(rows)
+    for key in ("fundamentals", "estimates", "price_targets", "guidance"):
+        value = result.get(key)
+        if isinstance(value, dict):
+            return len(value)
+    articles = result.get("article_count")
+    if isinstance(articles, int):
+        return articles
+    return None
+
+
+def _emit_adaptive_progress(result) -> None:
+    """Emit grade/correct stages and deterministic-tool events from a result.
+
+    Called after orchestration completes so the progress stream reflects the
+    ACTUAL bounded work done (grader verdict, one corrective round if it ran, and
+    each deterministic read tool the router dispatched). Redaction is inherent:
+    only stage names/phases, safe tool names, statuses, and row/item counts are
+    emitted — never plan text, arguments, or tool result bodies. No-op when no
+    emitter is installed.
+    """
+    if _stream_emitter_var.get() is None:
+        return
+    # Deterministic tool invocations (skip model tool-planning on the stream path).
+    if result.tool_execution is not None:
+        for inv in result.tool_execution.invocations:
+            if not inv.name:
+                continue
+            _emit_tool_started(inv.name, subquery_id=inv.subquery_id)
+            status = "error" if inv.error else "ok"
+            _emit_tool_completed(
+                inv.name, status,
+                count=_tool_result_count(inv.result),
+                subquery_id=inv.subquery_id,
+            )
+    # Grader verdict (once), then the one corrective round if it actually ran.
+    if result.sufficiency is not None:
+        status = getattr(result.sufficiency.status, "value", str(result.sufficiency.status))
+        _emit_stage("grade", "completed", reason=str(status))
+    if getattr(result, "retry_performed", False):
+        action = getattr(result.corrective_action, "value", str(result.corrective_action))
+        _emit_stage("correct", "completed", reason=str(action))
 
 
 def _orchestration_metadata(result) -> dict:
@@ -946,17 +1119,20 @@ async def _build_adaptive_query_context(shared: dict) -> dict:
     # Build + validate the plan from the compiled standalone query (2.2.2). A
     # QueryPlanError propagates to the caller's legacy fallback.
     stage_start = time.perf_counter()
+    _emit_stage("route", "started")
     plan = parser.parse_plan(
         request.question,
         retrieval_query=(retrieval_query if retrieval_query != request.question else None),
         override_ticker=request.ticker,
     )
-    _stage_timing(timings, "query_plan", stage_start)
+    _emit_stage("route", "completed",
+                elapsed_ms=_stage_timing(timings, "query_plan", stage_start))
 
     intent = plan.to_legacy_intent()
     freshness_meta = await _freshness_stage(intent, request.refresh, timings)
 
     stage_start = time.perf_counter()
+    _emit_stage("retrieve", "started")
     from .adaptive_orchestrator import orchestrate
     from .retriever import Retriever
 
@@ -967,8 +1143,12 @@ async def _build_adaptive_query_context(shared: dict) -> dict:
         config,
         retriever=r,
         available_metrics=_adaptive_available_metrics(),
+        retrieval_cache=_get_retrieval_cache(),
+        refresh=bool(getattr(request, "refresh", False)),
     )
-    _stage_timing(timings, "orchestration", stage_start)
+    _emit_stage("retrieve", "completed",
+                elapsed_ms=_stage_timing(timings, "orchestration", stage_start))
+    _emit_adaptive_progress(result)
 
     # Build a retrieve()-compatible view from the single budgeted context so
     # grounding, evidence counts, degraded answers, and the response builder all
@@ -1020,6 +1200,7 @@ async def _build_adaptive_query_context(shared: dict) -> dict:
     _evidence_trace_var.set(trace_collector)
 
     stage_start = time.perf_counter()
+    _emit_stage("pack", "started")
     from .prompt_augmenter import PromptAugmenter
 
     # Prompt uses the RAW question, the legacy-projected plan intent, and the
@@ -1034,7 +1215,11 @@ async def _build_adaptive_query_context(shared: dict) -> dict:
         evidence_sufficiency=result.sufficiency,
         evidence_ledger=evidence_ledger or None,
     )
-    _stage_timing(timings, "prompt_build", stage_start)
+    timings["prompt"] = _prompt_efficiency_metrics(
+        augmented_prompt=augmented_prompt, intent=intent,
+        grounding_level=grounding_level, facts=sel_facts, documents=sel_docs)
+    _emit_stage("pack", "completed",
+                elapsed_ms=_stage_timing(timings, "prompt_build", stage_start))
 
     return {
         "start": shared["start"],
@@ -1321,31 +1506,35 @@ def _sse(event: str, data: dict) -> str:
     return f"event: {event}\ndata: {json.dumps(data, default=str)}\n\n"
 
 
-async def _stream_model_tokens(
-    *,
-    prompt: str,
-    temperature: float,
-    max_tokens: int,
-    intent: dict,
-    grounding_level: str,
-):
-    """Yield token deltas from llama-server's OpenAI-compatible stream."""
+def _model_messages(
+    prompt: str, intent: Optional[dict], grounding_level: str, *, tools_enabled: bool
+) -> list[dict]:
+    """Build the [system, user] chat messages for one model request."""
+    return [
+        {
+            "role": "system",
+            "content": _system_prompt_for_request(
+                intent=intent, grounding_level=grounding_level, tools_enabled=tools_enabled,
+            ),
+        },
+        {"role": "user", "content": prompt},
+    ]
+
+
+async def _stream_chat_tokens(*, messages: list[dict], temperature: float, max_tokens: int):
+    """Yield token deltas from llama-server for a prebuilt chat messages list.
+
+    The single low-level streaming primitive: the plain (no-tools) path and the
+    tool-final path (which streams the accumulated tool messages) both go through
+    here so the SSE parsing is shared. No ``tools`` key is ever sent — the final
+    answer request must not re-enter tool planning.
+    """
     if not model_client or not config:
         raise RuntimeError("model client unavailable")
 
     payload = {
         "model": config.model_name,
-        "messages": [
-            {
-                "role": "system",
-                "content": _system_prompt_for_request(
-                    intent=intent,
-                    grounding_level=grounding_level,
-                    tools_enabled=False,
-                ),
-            },
-            {"role": "user", "content": prompt},
-        ],
+        "messages": messages,
         "temperature": temperature,
         "max_tokens": max_tokens,
         "stream": True,
@@ -1377,89 +1566,263 @@ async def _stream_model_tokens(
     _mark_model_health(True)
 
 
+async def _stream_model_tokens(
+    *,
+    prompt: str,
+    temperature: float,
+    max_tokens: int,
+    intent: dict,
+    grounding_level: str,
+):
+    """Yield token deltas for the plain (tools-disabled) final answer path."""
+    messages = _model_messages(prompt, intent, grounding_level, tools_enabled=False)
+    async for token in _stream_chat_tokens(
+        messages=messages, temperature=temperature, max_tokens=max_tokens
+    ):
+        yield token
+
+
+def _stream_progress_enabled() -> bool:
+    """Whether versioned/redacted pipeline progress events are emitted (2.2.6.1)."""
+    return bool(getattr(config, "enable_stream_progress_events", False))
+
+
+def _tool_final_streaming_enabled() -> bool:
+    """Whether a tools-enabled request may stream its final answer (2.2.6.1)."""
+    return bool(getattr(config, "enable_tool_final_streaming", False))
+
+
+def _context_used_deterministic_tools(context: dict) -> bool:
+    """True when the adaptive route already dispatched deterministic tools.
+
+    In that case the evidence is already packed into the prompt (2.2.3.2), so the
+    stream path skips the model tool-planning rounds and streams the final answer
+    directly.
+    """
+    orch = context.get("orchestration") or {}
+    return bool(orch.get("deterministic_tools"))
+
+
+def _drain_progress(emitter):
+    """Yield SSE strings for any buffered progress events (sync generator)."""
+    if emitter is None:
+        return
+    from .stream_events import iter_chat_sse
+
+    for name, data in iter_chat_sse(emitter.drain(), include_counts=emitter.include_counts):
+        yield _sse(name, data)
+
+
 @app.post("/query/stream")
 async def query_stream(request: QueryRequest):
-    """Stream token deltas as SSE, followed by terminal query metadata."""
+    """Stream the final answer as SSE token deltas, then terminal metadata.
+
+    Tool planning (2.2.6.1) — when ``enable_tools`` and
+    ``enable_tool_final_streaming`` are both on — runs as bounded NON-streaming
+    rounds first; only the final synthesis streams. With ``enable_tools`` on but
+    the flag off, streaming stays disabled (404) exactly as before. When
+    ``enable_stream_progress_events`` is on, versioned/redacted stage + tool
+    progress events precede the tokens. Both flags off -> byte-identical to the
+    pre-2.2.6 behavior.
+    """
     if not bool(getattr(config, "enable_streaming", True)):
         raise HTTPException(status_code=404, detail="Streaming disabled")
-    if bool(getattr(config, "enable_tools", False)):
+
+    tools_enabled = bool(getattr(config, "enable_tools", False))
+    tool_final = tools_enabled and _tool_final_streaming_enabled()
+    if tools_enabled and not tool_final:
+        # Legacy capability: streaming is genuinely unavailable while the tool
+        # loop is active and tool-final streaming is off (404 -> client caches).
         raise HTTPException(status_code=404, detail="Streaming disabled while tools are enabled")
+
+    # Install a request-scoped progress emitter BEFORE building the context so
+    # the compile/route/retrieve/grade/correct/pack stages are captured. None
+    # (progress off) leaves the _emit_* helpers as no-ops -> zero overhead.
+    emitter = None
+    if _stream_progress_enabled():
+        from .stream_events import QueryEventEmitter
+
+        emitter = QueryEventEmitter(
+            include_counts=bool(getattr(config, "stream_progress_include_counts", True)))
+        _stream_emitter_var.set(emitter)
+        emitter.query_started()
 
     context = await _build_query_context(request)
     model_available = await _check_model_health()
-    if not model_available:
+
+    run_tool_final = (
+        tool_final and _tools_supported and not _context_used_deterministic_tools(context)
+    )
+
+    # Model-unavailable: the pre-2.2.6 legacy path returns 404 (byte-identical).
+    # The new paths (progress events or tool-final) degrade gracefully to a
+    # streamed degraded answer instead, so a transient model outage never
+    # poisons the client's streaming capability.
+    if not model_available and emitter is None and not run_tool_final:
         raise HTTPException(status_code=404, detail="Streaming unavailable when model is unavailable")
 
-    async def events():
-        stage_start = time.perf_counter()
-        answer_parts: list[str] = []
-        citations: list[SourceCitation] = []
-        validation: Optional[dict] = None
-        evidence_citations: Optional[list] = None
-        try:
-            temperature, max_tokens = _task_settings(request, context["intent"])
-            async for token in _stream_model_tokens(
-                prompt=context["augmented_prompt"],
-                temperature=temperature,
-                max_tokens=max_tokens,
-                intent=context["intent"],
-                grounding_level=context["grounding_level"],
-            ):
-                answer_parts.append(token)
-                yield _sse("token", {"token": token})
+    return StreamingResponse(
+        _query_stream_events(request, context, emitter, run_tool_final, model_available),
+        media_type="text/event-stream",
+    )
 
-            answer_text = _apply_answer_policy(
-                "".join(answer_parts),
-                context["grounding_level"],
-            )
-            citations = _extract_citations(answer_text)
-            # Streaming is always tools_enabled=False (see the guard above),
-            # so the exact system prompt is reproducible here for the
-            # evidence trace (2.2.1.2) without a second model call.
-            _record_trace_prompt(
-                _system_prompt_for_request(
-                    intent=context["intent"],
-                    grounding_level=context["grounding_level"],
-                    tools_enabled=False,
-                ),
-                context["augmented_prompt"],
-            )
-            if context["intent"].get("question_type") == "projection":
-                from .guardrails import apply_projection_guardrail
 
-                answer_text, _flagged = apply_projection_guardrail(
-                    answer_text,
-                    context["augmented_prompt"],
-                )
-            # Deterministic citation/numeric validation (2.2.4.3). Enforced
-            # downgrades/refusals reach the terminal metadata event; already-
-            # streamed tokens are not rewritten (a known streaming limitation).
-            answer_text, context["grounding_level"], validation, evidence_citations = \
-                _apply_answer_validation(context, answer_text, context["grounding_level"])
-        except Exception as exc:  # noqa: BLE001 - streaming must never fail a query
-            logger.warning("Streaming model call failed; falling back server-side: %s", exc)
-            fallback = await _answer_query_context(request, context)
-            if fallback.answer:
-                yield _sse("token", {"token": fallback.answer})
-            metadata = _response_to_dict(fallback)
-            metadata.pop("answer", None)
-            yield _sse("metadata", metadata)
+async def _stream_degraded_answer(request: QueryRequest, context: dict):
+    """Stream a single degraded (model-unavailable) answer + terminal metadata."""
+    fallback = await _answer_query_context(request, context)
+    if fallback.answer:
+        yield _sse("token", {"token": fallback.answer})
+    metadata = _response_to_dict(fallback)
+    metadata.pop("answer", None)
+    yield _sse("metadata", metadata)
+
+
+async def _plan_tools_for_stream(context: dict, temperature: float, max_tokens: int):
+    """Run the bounded non-streaming tool/planning rounds for the stream path.
+
+    Returns ``(final_messages, kind)``. ``kind`` is the planning outcome:
+    ``answered``/``final``/``plain_fallback`` all yield a messages list to stream
+    (no ``tools`` key); ``error`` yields ``(None, "error")`` so the caller fails
+    soft to the full non-streaming answer.
+    """
+    intent = context["intent"]
+    grounding_level = context["grounding_level"]
+    prompt = context["augmented_prompt"]
+    plain_messages = _model_messages(prompt, intent, grounding_level, tools_enabled=False)
+    base_payload = {
+        "model": config.model_name,
+        "messages": plain_messages,
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+    }
+    tool_messages = _model_messages(prompt, intent, grounding_level, tools_enabled=True)
+    outcome = await _run_tool_planning_rounds(
+        base_payload=base_payload, messages=tool_messages, prompt=prompt)
+    if outcome.kind == "error":
+        return None, "error"
+    if outcome.kind == "plain_fallback":
+        _discard_trace_tool_results()
+        return plain_messages, outcome.kind
+    return outcome.messages, outcome.kind  # answered | final
+
+
+async def _query_stream_events(
+    request: QueryRequest,
+    context: dict,
+    emitter,
+    run_tool_final: bool,
+    model_available: bool,
+):
+    """SSE generator: flush progress, stream the final answer, emit metadata."""
+    # 1. Flush the buffered context-build progress (query_started + stages).
+    for chunk in _drain_progress(emitter):
+        yield chunk
+
+    stage_start = time.perf_counter()
+    temperature, max_tokens = _task_settings(request, context["intent"])
+
+    # 2. Model unavailable (new paths only — legacy 404'd already): degrade.
+    if not model_available:
+        _emit_stage("generate", "fallback", reason="model_unavailable")
+        for chunk in _drain_progress(emitter):
+            yield chunk
+        async for chunk in _stream_degraded_answer(request, context):
+            yield chunk
+        return
+
+    # 3. Select the final-answer token source.
+    trace_system: Optional[str] = None
+    if run_tool_final:
+        final_messages, kind = await _plan_tools_for_stream(context, temperature, max_tokens)
+        for chunk in _drain_progress(emitter):  # flush tool_started/tool_completed
+            yield chunk
+        if kind == "error":
+            _emit_stage("generate", "fallback", reason="tool_planning_error")
+            for chunk in _drain_progress(emitter):
+                yield chunk
+            async for chunk in _stream_degraded_answer(request, context):
+                yield chunk
             return
-
-        _stage_timing(context["timings"], "model_call", stage_start)
-        response = _build_query_response(
-            context=context,
-            answer_text=answer_text,
-            citations=citations,
-            model_available=True,
-            validation=validation,
-            evidence_citations=evidence_citations,
+        token_source = _stream_chat_tokens(
+            messages=final_messages, temperature=temperature, max_tokens=max_tokens)
+        trace_system = final_messages[0]["content"]
+    else:
+        token_source = _stream_model_tokens(
+            prompt=context["augmented_prompt"],
+            temperature=temperature,
+            max_tokens=max_tokens,
+            intent=context["intent"],
+            grounding_level=context["grounding_level"],
         )
-        metadata = _response_to_dict(response)
-        metadata.pop("answer", None)
-        yield _sse("metadata", metadata)
+        trace_system = _system_prompt_for_request(
+            intent=context["intent"],
+            grounding_level=context["grounding_level"],
+            tools_enabled=False,
+        )
 
-    return StreamingResponse(events(), media_type="text/event-stream")
+    # 4. Stream the final synthesis.
+    _emit_stage("generate", "started")
+    for chunk in _drain_progress(emitter):
+        yield chunk
+    answer_parts: list[str] = []
+    try:
+        async for token in token_source:
+            answer_parts.append(token)
+            yield _sse("token", {"token": token})
+    except Exception as exc:  # noqa: BLE001 - streaming must never fail a query
+        if answer_parts:
+            # Tokens already emitted: send a terminal error, never a second
+            # conflicting answer (2.2.6.1 Step 2).
+            logger.warning("Final answer stream interrupted after tokens: %s", exc)
+            if emitter is not None:
+                emitter.error("final answer stream interrupted", terminal=True)
+                for chunk in _drain_progress(emitter):
+                    yield chunk
+            else:
+                yield _sse("error", {"message": "final answer stream interrupted", "terminal": True})
+            return
+        # Pre-token failure: fall back once to the non-streaming final answer.
+        logger.warning("Streaming model call failed; falling back server-side: %s", exc)
+        _emit_stage("generate", "fallback", reason="stream_failed")
+        for chunk in _drain_progress(emitter):
+            yield chunk
+        async for chunk in _stream_degraded_answer(request, context):
+            yield chunk
+        return
+    _emit_stage("generate", "completed")
+    for chunk in _drain_progress(emitter):
+        yield chunk
+
+    # 5. Finalize: answer policy, trace, projection guardrail, validation.
+    answer_text = _apply_answer_policy("".join(answer_parts), context["grounding_level"])
+    citations = _extract_citations(answer_text)
+    _record_trace_prompt(trace_system, context["augmented_prompt"])
+    if context["intent"].get("question_type") == "projection":
+        from .guardrails import apply_projection_guardrail
+
+        answer_text, _flagged = apply_projection_guardrail(answer_text, context["augmented_prompt"])
+    _emit_stage("validate", "started")
+    # Deterministic citation/numeric validation (2.2.4.3). Enforced downgrades/
+    # refusals reach the terminal metadata event; already-streamed tokens are
+    # not rewritten (a known streaming limitation).
+    answer_text, context["grounding_level"], validation, evidence_citations = \
+        _apply_answer_validation(context, answer_text, context["grounding_level"])
+    _emit_stage("validate", "completed")
+    for chunk in _drain_progress(emitter):
+        yield chunk
+
+    _stage_timing(context["timings"], "model_call", stage_start)
+    response = _build_query_response(
+        context=context,
+        answer_text=answer_text,
+        citations=citations,
+        model_available=True,
+        validation=validation,
+        evidence_citations=evidence_citations,
+    )
+    metadata = _response_to_dict(response)
+    metadata.pop("answer", None)
+    yield _sse("metadata", metadata)
 
 
 def _format_degraded_answer(
@@ -1785,58 +2148,47 @@ async def refresh_ticker(ticker: str, body: Optional[RefreshRequest] = None):
     )
 
 
-async def _call_model(
-    prompt: str,
-    temperature: float,
-    max_tokens: int,
-    intent: Optional[dict] = None,
-    grounding_level: str = "grounded",
-) -> tuple[str, list[SourceCitation]]:
-    """Send the augmented prompt to TraceAlchemy and parse the response."""
+@dataclass
+class _ToolPlanningOutcome:
+    """How the bounded tool/planning rounds ended (2.2.6.1 Step 2).
+
+    ``kind`` selects the caller's final-answer branch:
+      - ``answered``       — the model returned content with no tool call; the
+                             non-streaming caller uses ``content`` directly, the
+                             stream caller re-requests ``messages`` streamed.
+      - ``final``          — the iteration budget was consumed with tool results;
+                             the caller issues one final answer request over
+                             ``messages``.
+      - ``plain_fallback`` — tools were unsupported / returned empty; the caller
+                             answers from the plain (no-tools) base payload.
+      - ``error``          — a transport/malformed error; the non-streaming caller
+                             returns ``error_message``.
+    ``messages`` is the (mutated) tool-loop messages list including any assistant
+    tool-call turns and role=tool results.
+    """
+
+    kind: str
+    messages: list = field(default_factory=list)
+    content: str = ""
+    error_message: str = ""
+
+
+async def _run_tool_planning_rounds(
+    *, base_payload: dict, messages: list, prompt: str
+) -> _ToolPlanningOutcome:
+    """Run the bounded, NON-streaming tool/planning rounds shared by both paths.
+
+    Executes tools until the model stops requesting them or the iteration budget
+    is spent; it never produces the final answer itself. ``messages`` is mutated
+    in place with assistant tool-call turns and role=tool results. Mirrors the
+    pre-2.2.6 tool loop exactly (tools-unsupported / empty-first-response
+    fallbacks, malformed/transport errors, evidence-trace + tools_used recording)
+    so the non-streaming ``/query`` path is byte-for-byte unchanged; the stream
+    path reuses the same rounds and then streams a final request.
+    """
     global _tools_supported
-
-    if not model_client or not config:
-        return "Model unavailable. Please ensure llama-server is running.", []
-
-    tools_on = bool(getattr(config, "enable_tools", False)) and _tools_supported
-    messages = [
-        {
-            "role": "system",
-            "content": _system_prompt_for_request(
-                intent=intent,
-                grounding_level=grounding_level,
-                tools_enabled=False,
-            ),
-        },
-        {"role": "user", "content": prompt},
-    ]
-    base_payload = {
-        "model": config.model_name,
-        "messages": messages,
-        "temperature": temperature,
-        "max_tokens": max_tokens,
-    }
-
-    if not tools_on:
-        answer, citations = await _post_and_parse(base_payload)
-        _record_trace_prompt(messages[0]["content"], prompt)
-        return _apply_answer_policy(answer, grounding_level), citations
-
     from .tools import ToolContext, dispatch_tool_traced, openai_schema
 
-    # The tool loop keeps its own messages list so every fallback to
-    # _post_and_parse(base_payload) still sends the exact pre-tools prompt.
-    messages = [
-        {
-            "role": "system",
-            "content": _system_prompt_for_request(
-                intent=intent,
-                grounding_level=grounding_level,
-                tools_enabled=True,
-            ),
-        },
-        {"role": "user", "content": prompt},
-    ]
     schema = openai_schema()
     ctx = ToolContext(
         allow_write=config.allow_write_tools,
@@ -1855,15 +2207,14 @@ async def _call_model(
             if status in (400, 404, 500) and "tool" in body.lower():
                 logger.warning("Model tools unsupported; falling back to plain calls")
                 _tools_supported = False
-                answer, citations = await _post_and_parse(base_payload)
-                _discard_trace_tool_results()
-                _record_trace_prompt(base_payload["messages"][0]["content"], prompt)
-                return _apply_answer_policy(answer, grounding_level), citations
+                return _ToolPlanningOutcome(kind="plain_fallback", messages=messages)
             logger.error("Model call failed: %s", e)
-            return f"Error calling model: {e}", []
+            return _ToolPlanningOutcome(
+                kind="error", messages=messages, error_message=f"Error calling model: {e}")
         except Exception as e:  # noqa: BLE001
             logger.error("Model call failed: %s", e)
-            return f"Error calling model: {e}", []
+            return _ToolPlanningOutcome(
+                kind="error", messages=messages, error_message=f"Error calling model: {e}")
 
         try:
             msg = (data.get("choices") or [{}])[0].get("message") or {}
@@ -1871,26 +2222,31 @@ async def _call_model(
             tool_calls = msg.get("tool_calls") or []
         except (AttributeError, IndexError, TypeError) as e:
             logger.error("Malformed model response in tool loop: %s", e)
-            return f"Error calling model: malformed response ({e})", []
+            return _ToolPlanningOutcome(
+                kind="error", messages=messages,
+                error_message=f"Error calling model: malformed response ({e})")
         if iteration == 0 and not tool_calls and not content.strip():
             logger.warning("Model returned empty content with tools; disabling tools")
             _tools_supported = False
-            answer, citations = await _post_and_parse(base_payload)
-            _discard_trace_tool_results()
-            _record_trace_prompt(base_payload["messages"][0]["content"], prompt)
-            return _apply_answer_policy(answer, grounding_level), citations
+            return _ToolPlanningOutcome(kind="plain_fallback", messages=messages)
         if not tool_calls:
-            answer = _apply_answer_policy(content, grounding_level)
-            _record_trace_prompt(messages[0]["content"], prompt)
-            return answer, _extract_citations(answer)
+            return _ToolPlanningOutcome(kind="answered", messages=messages, content=content)
 
         messages.append(msg)
         for call in tool_calls:
             tool_name = (call.get("function") or {}).get("name")
             if tool_name:
                 _record_tool_used(tool_name)
+            _emit_tool_started(tool_name or "")
+            tool_start = time.perf_counter()
             result, dispatched_name, dispatched_args = await asyncio.to_thread(
                 dispatch_tool_traced, call, store, ctx
+            )
+            _emit_tool_completed(
+                dispatched_name or tool_name or "",
+                "error" if (isinstance(result, dict) and result.get("error")) else "ok",
+                count=_tool_result_count(result),
+                elapsed_ms=(time.perf_counter() - tool_start) * 1000,
             )
             # Recorded immediately after dispatch returns and before the
             # matching role=tool message is appended (2.2.1.2 Step 2).
@@ -1903,18 +2259,103 @@ async def _call_model(
                 }
             )
 
-    answer, citations = await _post_and_parse({**base_payload, "messages": messages})
-    _record_trace_prompt(messages[0]["content"], prompt)
+    return _ToolPlanningOutcome(kind="final", messages=messages)
+
+
+async def _call_model(
+    prompt: str,
+    temperature: float,
+    max_tokens: int,
+    intent: Optional[dict] = None,
+    grounding_level: str = "grounded",
+) -> tuple[str, list[SourceCitation]]:
+    """Send the augmented prompt to TraceAlchemy and parse the response.
+
+    Non-streaming path. When tools are enabled it runs the bounded tool/planning
+    rounds (:func:`_run_tool_planning_rounds`) and then produces the final
+    non-streaming answer; the stream path shares those same rounds.
+    """
+    if not model_client or not config:
+        return "Model unavailable. Please ensure llama-server is running.", []
+
+    tools_on = bool(getattr(config, "enable_tools", False)) and _tools_supported
+    plain_messages = _model_messages(prompt, intent, grounding_level, tools_enabled=False)
+    base_payload = {
+        "model": config.model_name,
+        "messages": plain_messages,
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+    }
+
+    if not tools_on:
+        answer, citations = await _post_and_parse(base_payload)
+        _record_trace_prompt(plain_messages[0]["content"], prompt)
+        return _apply_answer_policy(answer, grounding_level), citations
+
+    # The tool loop keeps its own messages list so every fallback to
+    # _post_and_parse(base_payload) still sends the exact pre-tools prompt.
+    tool_messages = _model_messages(prompt, intent, grounding_level, tools_enabled=True)
+    outcome = await _run_tool_planning_rounds(
+        base_payload=base_payload, messages=tool_messages, prompt=prompt)
+
+    if outcome.kind == "error":
+        return outcome.error_message, []
+    if outcome.kind == "plain_fallback":
+        answer, citations = await _post_and_parse(base_payload)
+        _discard_trace_tool_results()
+        _record_trace_prompt(base_payload["messages"][0]["content"], prompt)
+        return _apply_answer_policy(answer, grounding_level), citations
+    if outcome.kind == "answered":
+        answer = _apply_answer_policy(outcome.content, grounding_level)
+        _record_trace_prompt(outcome.messages[0]["content"], prompt)
+        return answer, _extract_citations(answer)
+
+    # kind == "final": the budget was consumed with tool results — one final call.
+    answer, citations = await _post_and_parse({**base_payload, "messages": outcome.messages})
+    _record_trace_prompt(outcome.messages[0]["content"], prompt)
     return _apply_answer_policy(answer, grounding_level), citations
 
 
-async def _post_and_parse(payload: dict) -> tuple[str, list[SourceCitation]]:
-    """POST a chat payload and parse content plus inline citations."""
+def _prompt_cache_enabled() -> bool:
+    """Whether llama-server prompt reuse (cache_prompt) is active for this process."""
+    return bool(getattr(config, "llama_cache_prompt", False)) and _prompt_cache_supported
+
+
+def _capture_prompt_reuse_timings(data: dict) -> None:
+    """Log llama-server's reused-token timings when present (2.2.6.2 Step 3).
+
+    llama-server returns a ``timings`` object (``cached_n``/``prompt_n``) when
+    prompt reuse is active. Recorded only; live TTFT measurement is separate.
+    """
     try:
-        resp = await model_client.post(config.llama_endpoint, json=payload)
+        timings = data.get("timings") if isinstance(data, dict) else None
+        if isinstance(timings, dict) and ("cached_n" in timings or "prompt_n" in timings):
+            logger.info(
+                "llama prompt reuse: cached_n=%s prompt_n=%s",
+                timings.get("cached_n"), timings.get("prompt_n"))
+    except Exception:  # noqa: BLE001 - telemetry only, never fail a call
+        pass
+
+
+async def _post_and_parse(payload: dict) -> tuple[str, list[SourceCitation]]:
+    """POST a chat payload and parse content plus inline citations.
+
+    When ``llama_cache_prompt`` is on and still supported this sends the official
+    llama-server prompt-reuse field (``cache_prompt: true``) on the request. If
+    the backend rejects it, prompt reuse is disabled for the process and the
+    plain payload is retried once (fail-soft capability behavior); with the flag
+    off the payload is byte-identical to the pre-2.2.6.2 request.
+    """
+    global _prompt_cache_supported
+    use_cache_prompt = _prompt_cache_enabled()
+    send_payload = {**payload, "cache_prompt": True} if use_cache_prompt else payload
+    try:
+        resp = await model_client.post(config.llama_endpoint, json=send_payload)
         resp.raise_for_status()
         _mark_model_health(True)
         data = resp.json()
+        if use_cache_prompt:
+            _capture_prompt_reuse_timings(data)
         content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
 
         # Parse citations from the response (simple heuristic)
@@ -1922,6 +2363,16 @@ async def _post_and_parse(payload: dict) -> tuple[str, list[SourceCitation]]:
 
         return content, citations
     except Exception as e:
+        # Capability fallback: if the backend rejected cache_prompt, disable it
+        # for the process and retry the plain payload exactly once. The retry runs
+        # with _prompt_cache_supported=False, so _prompt_cache_enabled() is False
+        # and no cache_prompt key is sent — there is no second retry.
+        if use_cache_prompt:
+            logger.warning(
+                "llama-server rejected cache_prompt (%s); disabling prompt reuse "
+                "for this process and retrying plain once", e)
+            _prompt_cache_supported = False
+            return await _post_and_parse(payload)
         logger.error("Model call failed: %s", e)
         return f"Error calling model: {e}", []
 

@@ -2,9 +2,10 @@
 
 `scripts/chat.py` is the interactive terminal client for the middleware. It
 auto-starts the middleware if needed, streams `/query` answers by default,
-and is the single front door for every Phase 2.1 feature: tool calls,
-grounding mode, retrieval strategy, fetch-on-miss, and resolved-ticker
-confirmation.
+and is the single front door for every Phase 2.1/2.2 feature: tool calls,
+grounding mode, retrieval strategy, fetch-on-miss, resolved-ticker
+confirmation, bounded conversation history (2.2.2), multiline questions
+(2.2.2.3), and streamed progress events (2.2.6.1).
 
 Every field in this doc is optional — the renderer is defensive, so
 `chat.py` also works unchanged against an older middleware that doesn't
@@ -77,6 +78,28 @@ includes, in this order:
 8. **`timings: …`** (only with `/verbose on`) — the server's per-stage
    latency breakdown, including retrieval sub-timings
    (`retrieval.embedding`, `retrieval.chroma`, `retrieval.sqlite`).
+
+## Streaming progress (2.2.6.1)
+
+When the server has `enable_stream_progress_events` on, a streamed answer is
+preceded by redacted, versioned progress events (pipeline stages plus safe
+tool starts/completions). On a terminal the client renders them as a single
+line updated **in place**, then clears it when the answer begins:
+
+```text
+  resolve -> hybrid retrieval -> query_facts (12 rows) -> answer
+```
+
+Progress events carry only stage names, safe tool names, statuses, and row/item
+counts — never prompts, tool arguments, or retrieved document text. The events
+are cosmetic: piped/redirected (non-TTY) output shows **no** progress line and
+no ANSI escapes, only the terminal answer and metadata. Under `/verbose on` the
+single line is replaced by a per-event dim log that also shows stage timings and
+corrective reasons. Unknown future event types are ignored.
+
+With tools enabled and tool-final streaming on, the bounded tool/planning rounds
+run non-streaming first (you may see `tool_started`/`tool_completed` progress),
+and only the final answer synthesis streams token by token.
 
 ## Conversation memory (2.2.2.1)
 
@@ -178,9 +201,12 @@ At startup, and any time you run `/health`, the client reads (or shows)
 `capabilities` from `GET /health`:
 
 - `tools` — whether the model can call middleware tools this deployment.
-- `streaming` — whether `/query/stream` is enabled (note: streaming is
-  unavailable whenever tools are enabled, since the tool loop is
-  multi-turn).
+- `streaming` — whether this deployment can serve `/query/stream` at all. With
+  tools enabled it is available only when tool-final streaming is on (2.2.6.1);
+  otherwise the endpoint is disabled and the client uses `POST /query`.
+- `streaming_tool_final` — present and `true` when a tools-enabled request runs
+  its bounded tool/planning rounds non-streaming and then streams only the final
+  answer synthesis. Absent/false means tools and streaming don't combine here.
 - `answer_policy` — the server's configured default answer policy
   (`strict` or `graded`), before any per-session `/grounding` override.
 - `history` / `multiline` — whether this build honors bounded conversation

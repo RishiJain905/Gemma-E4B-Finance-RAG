@@ -51,6 +51,25 @@ class MiddlewareConfig:
         self.enable_streaming: bool = True
         self.embedding_cache_size: int = 256
 
+        # Phase 2.2.6.1 — tool-aware streaming & progress events. Both feature
+        # flags default off so behavior is byte-identical to the pre-2.2.6
+        # streaming path until promotion:
+        #   enable_tool_final_streaming  — allow /query/stream to serve a
+        #       tools-enabled request by running the bounded tool/planning
+        #       rounds non-streaming, then streaming ONLY the final answer.
+        #       Off -> /query/stream still 404s while tools are enabled.
+        #   enable_stream_progress_events — emit versioned, redacted pipeline
+        #       stage / tool progress events on the SSE stream (query_started,
+        #       stage, tool_started, tool_completed, error). Off -> only the
+        #       legacy token/metadata events are sent.
+        #   stream_progress_include_counts — include row/item counts on
+        #       retrieve/tool_completed progress events (default on).
+        # Env: ENABLE_TOOL_FINAL_STREAMING, ENABLE_STREAM_PROGRESS_EVENTS,
+        # STREAM_PROGRESS_INCLUDE_COUNTS.
+        self.enable_tool_final_streaming: bool = False
+        self.enable_stream_progress_events: bool = False
+        self.stream_progress_include_counts: bool = True
+
         # Phase 2.1.4 — analytical tool-calling controls.
         self.enable_tools: bool = False
         self.max_tool_iterations: int = 3
@@ -134,6 +153,32 @@ class MiddlewareConfig:
         self.hierarchy_max_siblings: int = 2
         self.hierarchy_max_adjacent_sections: int = 1
         self.hierarchy_max_expanded_items: int = 12
+
+        # Phase 2.2.6.2 — versioned retrieval cache & prompt efficiency.
+        #   enable_retrieval_cache — reuse a request's normalized PRE-PROMPT
+        #     evidence (facts/documents + retrieval metadata, never a final
+        #     answer) when an identical planned request recurs at the SAME store
+        #     data revision. Keyed on the compiled query + validated plan +
+        #     config/model fingerprint + store revision, so any ingestion write
+        #     (including a same-count document replacement) invalidates it. Off by
+        #     default -> byte-identical behavior; a cache miss/failure never fails
+        #     a query. NO semantic final-answer cache exists — volatile finance
+        #     answers (prices/news/estimates/"latest") must never be reused.
+        #   retrieval_cache_ttl_s is a SECONDARY staleness bound below the
+        #     revision key; retrieval_cache_max_value_chars refuses to store a
+        #     single oversized evidence snapshot so memory stays bounded.
+        #   llama_cache_prompt — when on AND the backend supports it, send
+        #     llama-server's official prompt-reuse field (cache_prompt: true) on
+        #     the final answer request and capture reused-token timings; on
+        #     backend rejection it disables for the process and retries plain once
+        #     (fail-soft capability behavior). Off -> the request JSON is unchanged.
+        # Env: ENABLE_RETRIEVAL_CACHE, RETRIEVAL_CACHE_MAX_ENTRIES,
+        # RETRIEVAL_CACHE_TTL_S, RETRIEVAL_CACHE_MAX_VALUE_CHARS, LLAMA_CACHE_PROMPT.
+        self.enable_retrieval_cache: bool = False
+        self.retrieval_cache_max_entries: int = 256
+        self.retrieval_cache_ttl_s: float = 300.0
+        self.retrieval_cache_max_value_chars: int = 200_000
+        self.llama_cache_prompt: bool = False
 
         # Phase 2.1.6 — fetch-on-miss ingestion controls.
         self.enable_fetch_on_miss: bool = True
@@ -235,6 +280,9 @@ class MiddlewareConfig:
         _bool("ALLOW_GENERAL_FALLBACK", "allow_general_fallback")
         _bool("RETURN_TIMINGS", "return_timings")
         _bool("ENABLE_STREAMING", "enable_streaming")
+        _bool("ENABLE_TOOL_FINAL_STREAMING", "enable_tool_final_streaming")
+        _bool("ENABLE_STREAM_PROGRESS_EVENTS", "enable_stream_progress_events")
+        _bool("STREAM_PROGRESS_INCLUDE_COUNTS", "stream_progress_include_counts")
         _int("EMBEDDING_CACHE_SIZE", "embedding_cache_size")
         _int("CONVERSATION_MAX_TURNS", "conversation_max_turns")
         _int("CONVERSATION_MAX_HISTORY_CHARS", "conversation_max_history_chars")
@@ -259,6 +307,11 @@ class MiddlewareConfig:
         _int("HIERARCHY_MAX_EXPANDED_ITEMS", "hierarchy_max_expanded_items")
         _str("ANSWER_VALIDATION", "answer_validation")
         _bool("REQUIRE_EVIDENCE_IDS", "require_evidence_ids")
+        _bool("ENABLE_RETRIEVAL_CACHE", "enable_retrieval_cache")
+        _int("RETRIEVAL_CACHE_MAX_ENTRIES", "retrieval_cache_max_entries")
+        _float("RETRIEVAL_CACHE_TTL_S", "retrieval_cache_ttl_s")
+        _int("RETRIEVAL_CACHE_MAX_VALUE_CHARS", "retrieval_cache_max_value_chars")
+        _bool("LLAMA_CACHE_PROMPT", "llama_cache_prompt")
 
     def _clamp_conversation_limits(self) -> None:
         """Clamp conversation budgets to documented safe maxima (2.2.2.1).

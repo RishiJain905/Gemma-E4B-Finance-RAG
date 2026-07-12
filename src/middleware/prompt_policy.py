@@ -14,10 +14,23 @@ message: retrieved evidence, intent-specific task guidance, the raw
 question, and output format — it must not duplicate these rules.
 """
 
+import hashlib
 import logging
 from typing import Optional
 
 logger = logging.getLogger(__name__)
+
+
+def fixed_prefix_digest(system_prompt: str) -> str:
+    """Short stable digest of the fixed system-policy prefix (2.2.6.2 Step 3).
+
+    The system message built here is the reusable prompt prefix. Exposing a
+    digest lets latency telemetry confirm the prefix stayed byte-stable across
+    turns (a prerequisite for llama-server prompt reuse) without logging the
+    prompt text. This module is the single owner of that prefix, so it owns its
+    digest too.
+    """
+    return hashlib.sha256((system_prompt or "").encode("utf-8")).hexdigest()[:16]
 
 # Byte-for-byte identical to the pre-2.2.1.1 middleware SYSTEM_PROMPT
 # constant. Pinned by tests/test_answer_policy.py::test_strict_policy_is_unchanged

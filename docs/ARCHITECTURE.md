@@ -203,6 +203,110 @@ overrides:
 The `/query` response reports the actual answer path as `grounding`:
 `grounded`, `partial`, `general`, or `refused`.
 
+> **Phase 2.2.4 augmentations (additive, flag-gated).** When
+> `enable_evidence_sufficiency` is on, the count-based grounding hint above is
+> replaced by a deterministic, route-aware sufficiency assessment
+> (`sufficient|borderline|missing`) that can trigger one bounded corrective
+> retrieval (`enable_corrective_retry`); the response carries an
+> `evidence_sufficiency` block. When `answer_validation` is `report`/`enforce`,
+> every model-visible fact/document is assigned a request-local `[E#]` id, a
+> deterministic (stdlib + `Decimal`, no model call) validator checks citation
+> support and specific financial numbers, and `evidence_citations` +
+> `answer_validation` blocks are attached (see *Corrective Retrieval &
+> Provenance* below). With every flag off, the answer path is byte-identical to
+> the graded policy described here.
+
+---
+
+## Conversational & Adaptive Query Path (Phase 2.2.2–2.2.4)
+
+These layers wrap the existing retrieval/answer pipeline. Each is feature-flagged
+and falls soft to the legacy single-turn, single-plan path; all are **off by
+default** (except `answer_validation: report`, which is metadata-only).
+
+### Conversational query understanding (2.2.2)
+
+The middleware stays stateless: the client (`scripts/chat.py`) owns a bounded
+conversation history and sends it per request (`QueryRequest.history`, a flat
+list of `ChatTurn`). The server uses at most `conversation_max_turns` /
+`conversation_max_history_chars` of it and never persists anything; `session_id`
+is tracing metadata only, never a server-side lookup key. The current question
+has its own independent 16,000-char cap and is **never silently truncated** — an
+over-limit question is an HTTP 422. When `enable_conversation_rewrite` is on and
+history is present, the current turn + bounded history are compiled into a
+**separate** standalone retrieval query (`retrieval_query`) while the raw
+question is left byte-for-byte unchanged; deterministic entity/metric/timeframe
+carryover populates `carried_context` / `resolved_*`, and
+`enable_llm_rewrite_fallback` adds at most one bounded model call only when a
+slot stays ambiguous. Responses carry a `conversation` block
+(`history_turns_received/used`, `history_truncated`, `topic_reset`).
+
+### Adaptive orchestration (2.2.3)
+
+When `enable_adaptive_rag` is on, `src/middleware/adaptive_orchestrator.py`
+routes a request through **fast / standard / complex** lanes under one shared
+execution budget (≤ 3 subqueries incl. sq0, ≤ 2 retrieval rounds, ≤ 1 planning
+call, ≤ 1 re-rank call, deterministic-tool cap) and one context-character
+budget. Fast and standard lanes make no pre-answer model call; only the complex
+lane may make one optional compact planning call
+(`adaptive_enable_planning_call`). Deterministically recognized safe finance
+operations are routed to the existing read-only tools **before** any model call
+(`enable_deterministic_tool_routing`), and a write tool can never be selected by
+that router. Every adaptive stage falls soft to `Retriever.retrieve()`; the
+response carries an `orchestration` block of the **actual executed** counters
+(not configured maxima).
+
+### Corrective retrieval & provenance (2.2.4)
+
+- **Evidence sufficiency & bounded retry (2.2.4.1).** A deterministic grader
+  classifies coverage of the plan's obligations as `sufficient|borderline|
+  missing`, answering immediately when covered, allowing **one** internal
+  corrective retrieval when borderline, and returning an honest partial/refusal
+  when missing. Total retrieval rounds stay ≤ 2.
+- **Selective decomposition & weighted fusion (2.2.4.2).** In the complex lane,
+  a genuinely compound or low-coverage plan is decomposed into at most two
+  derived, drift-validated subqueries, retrieved through their appropriate
+  modality and fused by weighted RRF (original query the strongest signal:
+  `sq0=1.0`, derived `0.8`, planner `0.6`) with slot reservation.
+- **Citation provenance & numeric validation (2.2.4.3).** Every model-visible
+  fact/document/tool result/calculation gets a stable request-local `[E#]` id;
+  the answer is expected to cite those ids. A stdlib+`Decimal` validator (never
+  a model call) resolves `[E#]` and legacy `[Source: …]` citations and checks
+  specific financial numbers (currency/percent/signed/ratio/K-M-B-T-scaled)
+  against cited evidence. `answer_validation: report` attaches metadata without
+  changing the answer; `enforce` additionally downgrades grounded→partial or
+  refuses a wholly-unsupported answer. The validator always fails soft to
+  `validation_status=report_unavailable`.
+
+---
+
+## Runtime: Streaming & Caching (Phase 2.2.6)
+
+Additive, flag-gated, and local-safe; all off by default.
+
+- **Tool-aware final streaming & progress events (2.2.6.1).** The bounded
+  tool/planning rounds run non-streaming, then only the final answer synthesis
+  is streamed, so enabling tools no longer disables streaming for the whole
+  request. `enable_tool_final_streaming` makes `POST /query/stream` serve a
+  tools-enabled request (off → it 404s while tools are enabled).
+  `enable_stream_progress_events` emits versioned, **redacted** SSE progress
+  events (`query_started`, `stage`, `tool_started`, `tool_completed`, `error`) —
+  stage names, safe tool names, statuses, and optional row counts only, never
+  prompts, tool arguments, or document text. `/health` advertises the honest
+  effective capability (`streaming`, `streaming_tool_final`).
+- **Versioned retrieval cache & prompt efficiency (2.2.6.2).** A monotonic
+  `store_revision` is bumped before every model-visible mutation. When
+  `enable_retrieval_cache` is on, a thread-safe LRU+TTL cache reuses a planned
+  request's **pre-prompt** evidence keyed on the compiled query + validated plan
+  + config/model fingerprint + revision, so any ingestion write (including a
+  same-count section replacement) invalidates it exactly; a miss or internal
+  error is always just a miss. Prompt sections are emitted in a stable order with
+  a prefix digest for reuse, and `llama_cache_prompt` optionally sends
+  llama-server's `cache_prompt: true` with a capability fallback. **No semantic
+  final-answer cache exists** — volatile finance answers are never reused by
+  similarity; only versioned retrieval evidence and immutable date-bounded
+  results are cacheable.
+
 ---
 
 ## Data Sources
@@ -299,11 +403,17 @@ DDL in `SQLiteStore._inline_schema()`.
 - Embeddings are produced by `TraceAlchemyEmbeddingFunction`, which POSTs text
   to the llama-server `/v1/embeddings` endpoint (`model: tracealchemy`,
   mean-pooled) in batches of 10.
-- Documents longer than `DEFAULT_CHUNK_CHARS` (1000 chars, 150-char overlap)
-  are split into overlapping windows on whitespace boundaries; each chunk is
-  stored as `"{id}#{i}"` with `parent_id`, `chunk_index`, and `chunk_count`
-  metadata. Shorter documents are stored as a single entry under their original
-  id.
+- Chunking is **structure-aware by default** (Phase 2.1.3,
+  `chunking.strategy: structural` in `configs/storage.yaml`): text is split on
+  SEC section markers / markdown headings and whole sentences are packed up to
+  `max_chars` (1000) with sentence-based overlap — no mid-sentence cuts. The
+  legacy `fixed` strategy (a ~1000-char sliding window with 150-char overlap on
+  whitespace boundaries) remains available for rollback. Each chunk is stored as
+  `"{id}#{i}"` with `parent_id`, `chunk_index`, `chunk_count`, and (under the
+  structural strategy) `section` metadata. Shorter documents are stored as a
+  single entry under their original id, except SEC section families
+  (`source == "sec_filing"`), which always keep the `#i` child scheme so the
+  filing → section → child hierarchy (2.2.5.2) stays addressable.
 - The embedding vector dimension is determined at runtime by the model served
   on `:8087` (ChromaDB infers it from the embedding function's first response).
   The `embedding_dimension` field in `configs/storage.yaml` is descriptive
@@ -430,10 +540,21 @@ The embeddings endpoint requires `--embeddings --pooling mean` on the server.
    retrieved facts and documents into a grounded prompt.
 5. **Model call** — if `/health` on the model server returns 200, the prompt
    is sent to `/v1/chat/completions` with a finance-assistant system prompt.
-   Inline `[Source: type/ticker]` citations are parsed out of the response.
+   Inline `[Source: type/ticker]` citations are parsed out of the response; when
+   `answer_validation` is on, request-local `[E#]` evidence-id citations are
+   resolved and validated as well.
 6. **Response** — `QueryResponse` returns the answer, citations, detected
    ticker/intent, counts of facts/documents used, latency, `model_available`,
-   and the freshness metadata block.
+   and the freshness metadata block, plus any flag-gated additive blocks
+   (`conversation`, `orchestration`, `evidence_sufficiency`,
+   `evidence_citations`, `answer_validation`, `retrieval_query`).
+
+The steps above describe the legacy single-turn path, which remains the default.
+When the Phase 2.2 flags are enabled, a conversational query compiler (2.2.2)
+runs before step 1, adaptive lane selection (2.2.3) wraps steps 3–5, and the
+evidence sufficiency grader / corrective retry / citation-numeric validator
+(2.2.4) wrap steps 4–6 — see *Conversational & Adaptive Query Path* above.
+`POST /query/stream` runs the same pipeline and streams the final answer (2.2.6.1).
 
 ---
 
