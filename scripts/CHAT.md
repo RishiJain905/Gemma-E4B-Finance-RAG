@@ -2,9 +2,10 @@
 
 `scripts/chat.py` is the interactive terminal client for the middleware. It
 auto-starts the middleware if needed, streams `/query` answers by default,
-and is the single front door for every Phase 2.1 feature: tool calls,
-grounding mode, retrieval strategy, fetch-on-miss, and resolved-ticker
-confirmation.
+and is the single front door for every Phase 2.1/2.2 feature: tool calls,
+grounding mode, retrieval strategy, fetch-on-miss, resolved-ticker
+confirmation, bounded conversation history (2.2.2), multiline questions
+(2.2.2.3), and streamed progress events (2.2.6.1).
 
 Every field in this doc is optional — the renderer is defensive, so
 `chat.py` also works unchanged against an older middleware that doesn't

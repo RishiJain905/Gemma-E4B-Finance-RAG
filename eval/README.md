@@ -123,7 +123,7 @@ promotion gates (`gate.PROMOTION_GATES`: plan/router accuracy ≥ 0.90,
 deterministic route accuracy ≥ 0.95, ≥ 10 pp complex-query correctness and
 multi-turn Recall@10 improvement, ≤ 0.02 single-turn nDCG@10 regression, ≤ 10 %
 simple-query p95 latency regression) are computed **across two summaries** in
-`docs/plans/phase2.2/2.2.3-adaptive-rag-orchestration/RESULTS.md`, since a gate
+`docs/phase2.2/2.2.3-adaptive-rag-orchestration/RESULTS.md`, since a gate
 over one summary cannot see a cross-config delta.
 
 **Three-configuration comparison** (run only with the GPU/model available — this
@@ -190,6 +190,22 @@ carries the block) on: `accepted_absent_citations > 0`, `citation_support_rate <
 0.95`, or an unsupported-number relative reduction below 0.30 vs. the baseline.
 The false-positive-on-non-claims (< 0.02) and validator-p95 (< 10 ms) promotion
 gates are live-run measurements recorded in `RESULTS.md`, not single-summary.
+
+### Long-document / hierarchical retrieval (2.2.5.3)
+
+`eval/run_eval.py::evaluate_long_document_configs` runs a **three-arm** offline
+comparison over `tests/fixtures/sec/hierarchical_corpus.json` — flat retrieval,
+flat with a larger top-k, and bounded hierarchical expansion — and
+`metrics.long_document_gate` enforces the promotion gate: Recall@10 improves ≥ 8
+points over the flat baseline, context precision regresses ≤ 0.02, answer
+correctness regresses ≤ 0.02, packed prompt characters are no higher than the
+larger-top-k arm (recall without the top-k prompt cost), retrieval p95 adds ≤ 20 %,
+and no ingestion-time model call is added. This runs offline against fixtures;
+the live long-document run against a **populated** section corpus (after the
+`scripts/index_sec_filing_text.py` backfill) is a separately scheduled GPU
+activity — until then, `enable_hierarchical_retrieval` stays off. See
+`docs/ARCHITECTURE.md` (*Hierarchical Retrieval & Authoritative Facts*) and
+`docs/CONFIGURATION.md` for the flags and rollback.
 
 ### From the chat client (2.2.2.3)
 
