@@ -87,6 +87,22 @@ CREATE TABLE IF NOT EXISTS cache_meta (
     PRIMARY KEY (ticker, source, metric_scope)
 );
 
+-- ── Store Revision (2.2.6.2) ───────────────────────
+-- Single-row monotonic data revision. Every Store facade mutation that can
+-- change model-visible facts/documents bumps `revision` BEFORE the mutation
+-- begins, so the versioned retrieval cache (src/middleware/retrieval_cache.py)
+-- can key on it and never serve evidence from before an ingestion write. A
+-- failed mutation may leave the revision advanced (an extra cache miss) but can
+-- never leave a stale cache entry valid. Same-count document replacements bump
+-- the revision even though Chroma's document count is unchanged, so count alone
+-- is never used for invalidation.
+CREATE TABLE IF NOT EXISTS store_revision (
+    id INTEGER PRIMARY KEY CHECK (id = 1),           -- single row, always id=1
+    revision INTEGER NOT NULL DEFAULT 0,             -- monotonically increasing
+    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+INSERT OR IGNORE INTO store_revision (id, revision) VALUES (1, 0);
+
 -- ── Ingestion Log ──────────────────────────────────
 -- Audit trail of every ingestion run.
 CREATE TABLE IF NOT EXISTS ingestion_log (

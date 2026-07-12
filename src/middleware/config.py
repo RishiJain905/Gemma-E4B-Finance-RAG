@@ -154,6 +154,32 @@ class MiddlewareConfig:
         self.hierarchy_max_adjacent_sections: int = 1
         self.hierarchy_max_expanded_items: int = 12
 
+        # Phase 2.2.6.2 — versioned retrieval cache & prompt efficiency.
+        #   enable_retrieval_cache — reuse a request's normalized PRE-PROMPT
+        #     evidence (facts/documents + retrieval metadata, never a final
+        #     answer) when an identical planned request recurs at the SAME store
+        #     data revision. Keyed on the compiled query + validated plan +
+        #     config/model fingerprint + store revision, so any ingestion write
+        #     (including a same-count document replacement) invalidates it. Off by
+        #     default -> byte-identical behavior; a cache miss/failure never fails
+        #     a query. NO semantic final-answer cache exists — volatile finance
+        #     answers (prices/news/estimates/"latest") must never be reused.
+        #   retrieval_cache_ttl_s is a SECONDARY staleness bound below the
+        #     revision key; retrieval_cache_max_value_chars refuses to store a
+        #     single oversized evidence snapshot so memory stays bounded.
+        #   llama_cache_prompt — when on AND the backend supports it, send
+        #     llama-server's official prompt-reuse field (cache_prompt: true) on
+        #     the final answer request and capture reused-token timings; on
+        #     backend rejection it disables for the process and retries plain once
+        #     (fail-soft capability behavior). Off -> the request JSON is unchanged.
+        # Env: ENABLE_RETRIEVAL_CACHE, RETRIEVAL_CACHE_MAX_ENTRIES,
+        # RETRIEVAL_CACHE_TTL_S, RETRIEVAL_CACHE_MAX_VALUE_CHARS, LLAMA_CACHE_PROMPT.
+        self.enable_retrieval_cache: bool = False
+        self.retrieval_cache_max_entries: int = 256
+        self.retrieval_cache_ttl_s: float = 300.0
+        self.retrieval_cache_max_value_chars: int = 200_000
+        self.llama_cache_prompt: bool = False
+
         # Phase 2.1.6 — fetch-on-miss ingestion controls.
         self.enable_fetch_on_miss: bool = True
         self.fetch_on_miss_timeout_s: float = 10.0
@@ -281,6 +307,11 @@ class MiddlewareConfig:
         _int("HIERARCHY_MAX_EXPANDED_ITEMS", "hierarchy_max_expanded_items")
         _str("ANSWER_VALIDATION", "answer_validation")
         _bool("REQUIRE_EVIDENCE_IDS", "require_evidence_ids")
+        _bool("ENABLE_RETRIEVAL_CACHE", "enable_retrieval_cache")
+        _int("RETRIEVAL_CACHE_MAX_ENTRIES", "retrieval_cache_max_entries")
+        _float("RETRIEVAL_CACHE_TTL_S", "retrieval_cache_ttl_s")
+        _int("RETRIEVAL_CACHE_MAX_VALUE_CHARS", "retrieval_cache_max_value_chars")
+        _bool("LLAMA_CACHE_PROMPT", "llama_cache_prompt")
 
     def _clamp_conversation_limits(self) -> None:
         """Clamp conversation budgets to documented safe maxima (2.2.2.1).

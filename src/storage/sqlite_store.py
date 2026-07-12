@@ -142,6 +142,14 @@ CREATE TABLE IF NOT EXISTS cache_meta (
     PRIMARY KEY (ticker, source, metric_scope)
 );
 
+-- ── Store Revision (2.2.6.2) ───────────────────────
+CREATE TABLE IF NOT EXISTS store_revision (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    revision INTEGER NOT NULL DEFAULT 0,
+    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+INSERT OR IGNORE INTO store_revision (id, revision) VALUES (1, 0);
+
 -- ── Ingestion Log ──────────────────────────────────
 CREATE TABLE IF NOT EXISTS ingestion_log (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -508,6 +516,38 @@ CREATE INDEX IF NOT EXISTS idx_ingestion_log_run ON ingestion_log(run_id);
         with self._connect() as conn:
             conn.execute(sql, (status, items, new, updated, run_id))
             conn.commit()
+
+    # ── Store Revision (2.2.6.2) ───────────────────────
+
+    def get_store_revision(self) -> int:
+        """Return the current monotonic data revision (0 if never bumped)."""
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT revision FROM store_revision WHERE id=1"
+            ).fetchone()
+        return int(row[0]) if row else 0
+
+    def bump_store_revision(self, reason: Optional[str] = None) -> int:
+        """Increment the data revision and return the new value.
+
+        Called BEFORE any model-visible mutation begins so the versioned
+        retrieval cache keyed on this revision can never serve pre-mutation
+        evidence. ``reason`` is diagnostic only (logged, never persisted).
+        """
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT INTO store_revision (id, revision, updated_at) "
+                "VALUES (1, 1, datetime('now')) "
+                "ON CONFLICT(id) DO UPDATE SET "
+                "    revision = revision + 1, updated_at = datetime('now')"
+            )
+            conn.commit()
+            row = conn.execute(
+                "SELECT revision FROM store_revision WHERE id=1"
+            ).fetchone()
+        revision = int(row[0]) if row else 0
+        logger.debug("Store revision bumped to %d (%s)", revision, reason or "")
+        return revision
 
     # ── Query Support (for middleware) ─────────────────
 

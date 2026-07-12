@@ -464,6 +464,19 @@ class PromptAugmenter:
         """Rough estimate of token count (4 chars ≈ 1 token)."""
         return len(prompt) // 4
 
+    @staticmethod
+    def evidence_char_count(facts: list, documents: list) -> int:
+        """Total characters of the rendered evidence (2.2.6.2 Step 3 telemetry).
+
+        Sums fact reprs and document bodies so latency reporting can track how
+        much of the prompt is retrieved evidence vs the fixed prefix. Pure
+        measurement — never mutates or reshapes the prompt.
+        """
+        fact_chars = sum(len(str(f)) for f in (facts or []))
+        doc_chars = sum(
+            len(document_body(d)) for d in (documents or []) if isinstance(d, dict))
+        return fact_chars + doc_chars
+
     def _is_estimate_fact(self, fact: dict) -> bool:
         metric = str(fact.get("metric", ""))
         return (

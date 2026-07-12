@@ -305,6 +305,38 @@ def test_cache_delegates(fully_mocked_store):
     assert entries == [{"ticker": "NVDA"}]
 
 
+# ── Data Revision (2.2.6.2) ──────────────────────────
+
+def test_retrieval_revision_delegates(fully_mocked_store):
+    s, sqlite, _chroma = fully_mocked_store
+    sqlite.get_store_revision.return_value = 7
+    sqlite.bump_store_revision.return_value = 8
+
+    assert s.retrieval_revision() == 7
+    assert s.bump_retrieval_revision("ingest") == 8
+    sqlite.get_store_revision.assert_called_once_with()
+    sqlite.bump_store_revision.assert_called_once_with("ingest")
+
+
+def test_facade_mutations_bump_revision_before_writing(store):
+    """Every model-visible facade write advances the revision (real SQLite)."""
+    r0 = store.retrieval_revision()
+    store.save_fundamental("NVDA", "revenue", 26.0, period="2026-Q1")
+    r1 = store.retrieval_revision()
+    assert r1 > r0
+    store.save_document("sec/NVDA/10-K", "body", ticker="NVDA")
+    assert store.retrieval_revision() > r1
+
+
+def test_bump_failure_never_crashes_mutation(store, monkeypatch):
+    """A revision-store hiccup must not crash the write it precedes (fail-soft)."""
+    monkeypatch.setattr(
+        store.sqlite, "bump_store_revision",
+        MagicMock(side_effect=RuntimeError("locked")))
+    # Still writes the fact; only the (best-effort) revision bump is skipped.
+    assert store.save_fundamental("NVDA", "eps", 2.5, period="2026-Q1") is True
+
+
 # ── Reset ────────────────────────────────────────────
 
 def test_reset(store, mock_chroma, tmp_path: Path):

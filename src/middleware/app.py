@@ -77,6 +77,11 @@ MACRO_SNAPSHOT_METRICS = ["GDP", "CPIAUCSL", "FEDFUNDS", "UNRATE", "DGS10", "T10
 _MODEL_TASKS_CACHE: Optional[dict] = None
 FETCH_ON_MISS_MIN_CONFIDENCE = 0.9
 retriever = None  # Shared Retriever (built on startup) — Phase 2.1.2
+# Phase 2.2.6.2 — process-global versioned retrieval cache (built lazily when
+# enable_retrieval_cache is on) and the llama-server prompt-reuse capability flag
+# (flipped off for the process if the backend rejects cache_prompt once).
+_retrieval_cache = None
+_prompt_cache_supported: bool = True
 _MODEL_HEALTH_TTL_S = 10.0
 _HEALTH_SUMMARY_TTL_S = 3.0
 _model_health = {"ok": False, "ts": 0.0}
@@ -837,6 +842,10 @@ async def _build_legacy_query_context(
         grounding_level=grounding_level,
         evidence_ledger=evidence_ledger or None,
     )
+    timings["prompt"] = _prompt_efficiency_metrics(
+        augmented_prompt=augmented_prompt, intent=retrieval_intent,
+        grounding_level=grounding_level,
+        facts=usable_facts(retrieval), documents=usable_documents(retrieval))
     _emit_stage("pack", "completed",
                 elapsed_ms=_stage_timing(timings, "prompt_build", stage_start))
 
@@ -869,6 +878,54 @@ def _adaptive_available_metrics() -> tuple:
         return tuple(store.sqlite.list_metrics())
     except Exception:  # noqa: BLE001 - metric catalog is best-effort
         return ()
+
+
+def _get_retrieval_cache():
+    """Return the process-global versioned retrieval cache, or None when off.
+
+    Built lazily from config the first time it is needed. Behind
+    ``enable_retrieval_cache`` (off by default) so the default path never
+    allocates it. See src/middleware/retrieval_cache.py for the invalidation
+    contract (store revision + config/model fingerprint + TTL).
+    """
+    global _retrieval_cache
+    if not bool(getattr(config, "enable_retrieval_cache", False)):
+        return None
+    if _retrieval_cache is None:
+        from .retrieval_cache import RetrievalCache, config_fingerprint
+
+        _retrieval_cache = RetrievalCache(
+            max_entries=int(getattr(config, "retrieval_cache_max_entries", 256)),
+            ttl_s=float(getattr(config, "retrieval_cache_ttl_s", 300.0)),
+            max_value_chars=int(getattr(config, "retrieval_cache_max_value_chars", 200_000)),
+            fingerprint=config_fingerprint(config),
+        )
+    return _retrieval_cache
+
+
+def _prompt_efficiency_metrics(
+    *, augmented_prompt: str, intent: Optional[dict], grounding_level: str,
+    facts: list, documents: list,
+) -> dict:
+    """Record prompt-prefix efficiency telemetry (2.2.6.2 Step 3).
+
+    Captures the augmented-prompt characters + estimated tokens, the rendered
+    evidence characters, and a short digest of the FIXED system-policy prefix (the
+    reusable prompt prefix). Pure measurement — it never changes the prompt.
+    """
+    from .prompt_augmenter import PromptAugmenter
+
+    system_prompt = _system_prompt_for_request(
+        intent=intent, grounding_level=grounding_level,
+        tools_enabled=bool(getattr(config, "enable_tools", False)),
+    )
+    prompt_chars = len(augmented_prompt)
+    return {
+        "prompt_chars": prompt_chars,
+        "estimated_tokens": prompt_chars // 4,
+        "evidence_chars": PromptAugmenter.evidence_char_count(facts, documents),
+        "fixed_prefix_digest": prompt_policy.fixed_prefix_digest(system_prompt),
+    }
 
 
 def _tool_result_count(result) -> Optional[int]:
@@ -1086,6 +1143,8 @@ async def _build_adaptive_query_context(shared: dict) -> dict:
         config,
         retriever=r,
         available_metrics=_adaptive_available_metrics(),
+        retrieval_cache=_get_retrieval_cache(),
+        refresh=bool(getattr(request, "refresh", False)),
     )
     _emit_stage("retrieve", "completed",
                 elapsed_ms=_stage_timing(timings, "orchestration", stage_start))
@@ -1156,6 +1215,9 @@ async def _build_adaptive_query_context(shared: dict) -> dict:
         evidence_sufficiency=result.sufficiency,
         evidence_ledger=evidence_ledger or None,
     )
+    timings["prompt"] = _prompt_efficiency_metrics(
+        augmented_prompt=augmented_prompt, intent=intent,
+        grounding_level=grounding_level, facts=sel_facts, documents=sel_docs)
     _emit_stage("pack", "completed",
                 elapsed_ms=_stage_timing(timings, "prompt_build", stage_start))
 
@@ -2254,13 +2316,46 @@ async def _call_model(
     return _apply_answer_policy(answer, grounding_level), citations
 
 
-async def _post_and_parse(payload: dict) -> tuple[str, list[SourceCitation]]:
-    """POST a chat payload and parse content plus inline citations."""
+def _prompt_cache_enabled() -> bool:
+    """Whether llama-server prompt reuse (cache_prompt) is active for this process."""
+    return bool(getattr(config, "llama_cache_prompt", False)) and _prompt_cache_supported
+
+
+def _capture_prompt_reuse_timings(data: dict) -> None:
+    """Log llama-server's reused-token timings when present (2.2.6.2 Step 3).
+
+    llama-server returns a ``timings`` object (``cached_n``/``prompt_n``) when
+    prompt reuse is active. Recorded only; live TTFT measurement is separate.
+    """
     try:
-        resp = await model_client.post(config.llama_endpoint, json=payload)
+        timings = data.get("timings") if isinstance(data, dict) else None
+        if isinstance(timings, dict) and ("cached_n" in timings or "prompt_n" in timings):
+            logger.info(
+                "llama prompt reuse: cached_n=%s prompt_n=%s",
+                timings.get("cached_n"), timings.get("prompt_n"))
+    except Exception:  # noqa: BLE001 - telemetry only, never fail a call
+        pass
+
+
+async def _post_and_parse(payload: dict) -> tuple[str, list[SourceCitation]]:
+    """POST a chat payload and parse content plus inline citations.
+
+    When ``llama_cache_prompt`` is on and still supported this sends the official
+    llama-server prompt-reuse field (``cache_prompt: true``) on the request. If
+    the backend rejects it, prompt reuse is disabled for the process and the
+    plain payload is retried once (fail-soft capability behavior); with the flag
+    off the payload is byte-identical to the pre-2.2.6.2 request.
+    """
+    global _prompt_cache_supported
+    use_cache_prompt = _prompt_cache_enabled()
+    send_payload = {**payload, "cache_prompt": True} if use_cache_prompt else payload
+    try:
+        resp = await model_client.post(config.llama_endpoint, json=send_payload)
         resp.raise_for_status()
         _mark_model_health(True)
         data = resp.json()
+        if use_cache_prompt:
+            _capture_prompt_reuse_timings(data)
         content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
 
         # Parse citations from the response (simple heuristic)
@@ -2268,6 +2363,16 @@ async def _post_and_parse(payload: dict) -> tuple[str, list[SourceCitation]]:
 
         return content, citations
     except Exception as e:
+        # Capability fallback: if the backend rejected cache_prompt, disable it
+        # for the process and retry the plain payload exactly once. The retry runs
+        # with _prompt_cache_supported=False, so _prompt_cache_enabled() is False
+        # and no cache_prompt key is sent — there is no second retry.
+        if use_cache_prompt:
+            logger.warning(
+                "llama-server rejected cache_prompt (%s); disabling prompt reuse "
+                "for this process and retrying plain once", e)
+            _prompt_cache_supported = False
+            return await _post_and_parse(payload)
         logger.error("Model call failed: %s", e)
         return f"Error calling model: {e}", []
 

@@ -50,6 +50,8 @@ def reset_latency_caches(monkeypatch):
     monkeypatch.setattr(middleware_app, "_model_health", {"ok": False, "ts": 0.0}, raising=False)
     monkeypatch.setattr(middleware_app, "_health_cache", {"ts": 0.0, "value": None}, raising=False)
     monkeypatch.setattr(middleware_app, "_scheduler", None, raising=False)
+    monkeypatch.setattr(middleware_app, "_prompt_cache_supported", True, raising=False)
+    monkeypatch.setattr(middleware_app, "_retrieval_cache", None, raising=False)
 
 
 def _patch_query_dependencies(monkeypatch, *, config=None):
@@ -250,3 +252,83 @@ async def test_adaptive_path_records_plan_and_orchestration_timings(monkeypatch)
     assert "query_plan" in response.timings
     assert "orchestration" in response.timings
     assert response.orchestration["lane"] == "standard"
+
+
+# ── Phase 2.2.6.2 — prompt efficiency + llama prompt-reuse capability ─────
+
+
+@pytest.mark.asyncio
+async def test_prompt_efficiency_metrics_recorded(monkeypatch):
+    """The pack stage records prompt chars/tokens, evidence chars, and a stable
+    fixed-prefix digest (2.2.6.2 Step 3), additively under timings['prompt']."""
+    _patch_query_dependencies(monkeypatch)
+    monkeypatch.setattr(middleware_app, "_check_model_health", AsyncMock(return_value=True))
+    monkeypatch.setattr(
+        middleware_app, "_call_model", AsyncMock(return_value=("answer", [])))
+
+    response = await middleware_app.query(QueryRequest(question="What is NVDA revenue?"))
+
+    metrics = response.timings["prompt"]
+    assert metrics["prompt_chars"] > 0
+    assert metrics["estimated_tokens"] == metrics["prompt_chars"] // 4
+    assert metrics["evidence_chars"] >= 0
+    assert len(metrics["fixed_prefix_digest"]) == 16
+
+
+@pytest.mark.asyncio
+async def test_cache_prompt_off_is_byte_identical_payload(monkeypatch):
+    """With llama_cache_prompt off, no cache_prompt field is ever sent."""
+    monkeypatch.setattr(middleware_app, "config", _config(llama_cache_prompt=False))
+    captured = {}
+
+    async def fake_post(url, json):
+        captured["json"] = json
+        return _response("ok")
+
+    monkeypatch.setattr(
+        middleware_app, "model_client", SimpleNamespace(post=AsyncMock(side_effect=fake_post)))
+
+    await middleware_app._post_and_parse({"model": "m", "messages": []})
+    assert "cache_prompt" not in captured["json"]
+
+
+@pytest.mark.asyncio
+async def test_cache_prompt_on_sends_reuse_field(monkeypatch):
+    monkeypatch.setattr(middleware_app, "config", _config(llama_cache_prompt=True))
+    captured = {}
+
+    async def fake_post(url, json):
+        captured["json"] = json
+        return _response("ok")
+
+    monkeypatch.setattr(
+        middleware_app, "model_client", SimpleNamespace(post=AsyncMock(side_effect=fake_post)))
+
+    content, _ = await middleware_app._post_and_parse({"model": "m", "messages": []})
+    assert content == "ok"
+    assert captured["json"]["cache_prompt"] is True
+
+
+@pytest.mark.asyncio
+async def test_cache_prompt_backend_rejection_disables_and_retries_plain(monkeypatch):
+    """A backend that rejects cache_prompt disables it for the process and the
+    plain payload is retried exactly once (fail-soft capability fallback)."""
+    monkeypatch.setattr(middleware_app, "config", _config(llama_cache_prompt=True))
+    calls: list = []
+
+    async def fake_post(url, json):
+        calls.append(dict(json))
+        if "cache_prompt" in json:
+            raise RuntimeError("unknown field: cache_prompt")
+        return _response("recovered")
+
+    monkeypatch.setattr(
+        middleware_app, "model_client", SimpleNamespace(post=AsyncMock(side_effect=fake_post)))
+
+    content, _ = await middleware_app._post_and_parse({"model": "m", "messages": []})
+
+    assert content == "recovered"
+    assert len(calls) == 2
+    assert "cache_prompt" in calls[0]
+    assert "cache_prompt" not in calls[1]
+    assert middleware_app._prompt_cache_supported is False

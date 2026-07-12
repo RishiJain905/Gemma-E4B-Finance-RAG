@@ -261,6 +261,26 @@ def test_search_facts_empty(store: SQLiteStore):
     assert results == []
 
 
+# ── Store Revision (2.2.6.2) ──────────────────────
+
+def test_store_revision_starts_at_zero(store: SQLiteStore):
+    assert store.get_store_revision() == 0
+
+
+def test_bump_store_revision_is_monotonic(store: SQLiteStore):
+    assert store.bump_store_revision("first") == 1
+    assert store.bump_store_revision("second") == 2
+    assert store.get_store_revision() == 2
+
+
+def test_store_revision_persists_across_connections(tmp_path: Path):
+    db = tmp_path / "rev.db"
+    SQLiteStore(db).bump_store_revision("write")
+    # A fresh SQLiteStore over the same file re-runs the schema (INSERT OR IGNORE
+    # keeps the row) and must read the persisted revision, not reset it.
+    assert SQLiteStore(db).get_store_revision() == 1
+
+
 # ── Schema ────────────────────────────────────────
 
 def test_inline_schema(store: SQLiteStore):
@@ -271,3 +291,14 @@ def test_inline_schema(store: SQLiteStore):
     assert "CREATE TABLE IF NOT EXISTS filings" in schema
     assert "CREATE TABLE IF NOT EXISTS cache_meta" in schema
     assert "CREATE TABLE IF NOT EXISTS ingestion_log" in schema
+    assert "CREATE TABLE IF NOT EXISTS store_revision" in schema
+
+
+def test_init_creates_store_revision_table(tmp_path: Path):
+    s = SQLiteStore(tmp_path / "test.db")
+    with s._connect() as conn:
+        tables = {
+            row[0] for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'").fetchall()
+        }
+    assert "store_revision" in tables

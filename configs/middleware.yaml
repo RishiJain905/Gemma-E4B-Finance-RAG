@@ -113,6 +113,42 @@ hierarchy_max_siblings: 2            # clamp 0–4
 hierarchy_max_adjacent_sections: 1  # clamp 0–3
 hierarchy_max_expanded_items: 12    # clamp 0–50 (0 = bounded only by the budget)
 
+# Phase 2.2.6.2 — versioned retrieval cache & prompt efficiency.
+# enable_retrieval_cache reuses a planned request's normalized PRE-PROMPT evidence
+# (facts/documents + retrieval metadata — NEVER a final generated answer) when the
+# identical request recurs at the same store data revision. The cache key includes
+# the compiled query, the validated plan, the config/model fingerprint, and the
+# monotonic store revision, so any ingestion write (a fact insert/update or a
+# document add/replace/delete, INCLUDING a same-count section replacement)
+# invalidates it exactly. Off by default -> behavior is byte-identical; a cache
+# miss or internal cache error is always just a miss, never a query failure.
+# retrieval_cache_ttl_s is a SECONDARY staleness bound beneath the revision key;
+# retrieval_cache_max_value_chars refuses to store a single oversized evidence
+# snapshot so memory stays bounded. Explicit-refresh requests never look up the
+# cache.
+#
+# DELIBERATELY NOT IMPLEMENTED: a semantic final-answer cache. Volatile finance
+# answers (prices, news, sentiment, freshness, estimates, guidance, "latest" asks)
+# must never be reused via embedding similarity — nearby embeddings for different
+# tickers/periods would serve wrong or stale figures. Only exact retrieval evidence,
+# invalidated on every revision change, is cached here. An exact answer cache for
+# immutable, explicitly date-bounded requests is out of scope and would need its
+# own evidence-watermark + citation contract.
+#
+# llama_cache_prompt (off by default) sends llama-server's official prompt-reuse
+# field (cache_prompt: true) on the final answer request when the backend supports
+# it, and captures reused-token timings; on backend rejection it disables itself
+# for the process and retries the plain payload once (fail-soft). Off -> the
+# request JSON is byte-identical. Live TTFT / prompt-reuse measurement is a
+# separately authorized activity.
+# Env: ENABLE_RETRIEVAL_CACHE, RETRIEVAL_CACHE_MAX_ENTRIES, RETRIEVAL_CACHE_TTL_S,
+# RETRIEVAL_CACHE_MAX_VALUE_CHARS, LLAMA_CACHE_PROMPT.
+enable_retrieval_cache: false
+retrieval_cache_max_entries: 256
+retrieval_cache_ttl_s: 300         # seconds; secondary bound under the revision key
+retrieval_cache_max_value_chars: 200000  # refuse to cache a single larger snapshot
+llama_cache_prompt: false
+
 # Phase 2.1.6 — fetch-on-miss ingestion.
 enable_fetch_on_miss: true
 fetch_on_miss_timeout_s: 10.0
