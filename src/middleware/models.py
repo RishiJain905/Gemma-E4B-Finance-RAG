@@ -259,8 +259,12 @@ class HealthResponse(BaseModel):
     capabilities: Optional[dict] = Field(
         None,
         description="Active deployment capabilities and effective limits. Always "
-                    "includes {'tools','streaming','answer_policy'}; on servers that "
-                    "support conversation memory (2.2.2) it also advertises "
+                    "includes {'tools','streaming','answer_policy'}. 'streaming' is the "
+                    "EFFECTIVE capability (2.2.6.1): whether /query/stream can be served "
+                    "at all — false when tools are enabled but tool-final streaming is "
+                    "off. 'streaming_tool_final' is true only when a tools-enabled request "
+                    "streams its final synthesis after bounded non-streaming tool rounds. "
+                    "On servers that support conversation memory (2.2.2) it also advertises "
                     "{'history','multiline','max_question_chars','conversation_max_turns',"
                     "'conversation_max_history_chars'} so clients can read the real "
                     "limits instead of guessing. Older servers omit the extra keys and "

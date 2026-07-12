@@ -254,6 +254,100 @@ def _payload(
     return payload
 
 
+class _StreamProgress:
+    """Restrained in-place progress renderer for SSE stage/tool events (2.2.6.1).
+
+    Consumes the redacted progress events (``stage``, ``tool_started``,
+    ``tool_completed``) and renders the pipeline as a single line updated in
+    place — e.g. ``resolve -> hybrid retrieval -> query_facts (12 rows) -> answer``.
+
+    Rendering is TTY-only: on a non-terminal stdout every method is a no-op, so
+    piped/redirected output carries only the terminal answer and metadata (and no
+    ANSI escapes are ever emitted). Under ``/verbose`` the single line is replaced
+    by a per-event dim log that also surfaces stage timings and corrective
+    reasons. Unknown event types never reach here (the caller filters them), and
+    an unrecognized stage name falls back to its raw label rather than raising.
+    """
+
+    _STAGE_LABELS = {
+        "compile": "resolve",
+        "route": "route",
+        "retrieve": "retrieval",
+        "grade": "grade",
+        "correct": "correct",
+        "pack": "pack",
+        "generate": "answer",
+        "validate": "validate",
+    }
+
+    def __init__(self, *, tty: bool, verbose: bool) -> None:
+        self.tty = tty
+        self.verbose = verbose
+        self.steps: list[str] = []
+        self._width = 0
+
+    def _label(self, name) -> str:
+        return self._STAGE_LABELS.get(name, str(name or "?"))
+
+    def handle(self, event: str, data: dict) -> None:
+        if not self.tty:
+            return
+        if event == "stage":
+            self._stage(data)
+        elif event == "tool_completed":
+            self._tool(data)
+        # tool_started carries no count; the matching tool_completed renders it.
+        # query_started / unknown -> nothing to show.
+
+    def _stage(self, data: dict) -> None:
+        name = data.get("stage")
+        phase = data.get("phase")
+        if self.verbose:
+            if phase in ("completed", "fallback"):
+                extra = ""
+                if data.get("elapsed_ms") is not None:
+                    extra += f" {data['elapsed_ms']}ms"
+                if data.get("reason"):
+                    extra += f" ({data['reason']})"
+                if phase == "fallback":
+                    extra += " [fallback]"
+                print(col(f"  · {self._label(name)}{extra}", C.DIM))
+            return
+        if phase == "started":
+            self.steps.append(self._label(name))
+            self._render()
+        elif phase == "fallback":
+            self.steps.append(f"{self._label(name)}!")
+            self._render()
+
+    def _tool(self, data: dict) -> None:
+        tool = data.get("tool")
+        count = data.get("count")
+        label = f"{tool} ({count} rows)" if count is not None else str(tool)
+        if self.verbose:
+            status = data.get("status")
+            print(col(f"  · {label} [{status}]", C.DIM))
+            return
+        self.steps.append(label)
+        self._render()
+
+    def _render(self) -> None:
+        if not self.tty or self.verbose:
+            return
+        line = "  " + " -> ".join(self.steps)
+        pad = max(0, self._width - len(line))
+        sys.stdout.write("\r" + line + (" " * pad))
+        sys.stdout.flush()
+        self._width = max(self._width, len(line))
+
+    def finish(self) -> None:
+        """Clear the in-place progress line (before the answer starts)."""
+        if self.tty and not self.verbose and self._width:
+            sys.stdout.write("\r" + (" " * self._width) + "\r")
+            sys.stdout.flush()
+        self._width = 0
+
+
 def _iter_sse_events(lines) -> object:
     event = "message"
     data_parts: list[str] = []
@@ -650,7 +744,9 @@ class ChatSession:
         """
         metadata: dict | None = None
         printed_token = False
+        answer_started = False
         answer_parts: list[str] = []
+        progress = _StreamProgress(tty=sys.stdout.isatty(), verbose=self.verbose)
         try:
             with self.client.stream("POST", "/query/stream", json=payload) as resp:
                 if resp.status_code != 200:
@@ -659,20 +755,36 @@ class ChatSession:
                     # (POST /query surfaces the structured detail) but keep
                     # streaming available for subsequent questions.
                     return False, None, resp.status_code in (404, 405)
-                print()
                 for event, raw_data in _iter_sse_events(resp.iter_lines()):
                     if event == "token":
                         data = json.loads(raw_data)
                         token = data.get("token") or ""
                         if token:
+                            if not answer_started:
+                                progress.finish()
+                                print()
+                                answer_started = True
                             printed_token = True
                             answer_parts.append(token)
                             print(token, end="", flush=True)
                     elif event == "metadata":
                         metadata = json.loads(raw_data)
                     elif event == "error":
+                        progress.finish()
+                        data = json.loads(raw_data) if raw_data else {}
+                        message = data.get("message") if isinstance(data, dict) else None
+                        if message:
+                            print(col(f"\n  stream error: {message}", C.YE))
                         return printed_token, None, False
+                    elif event in ("stage", "tool_started", "tool_completed", "query_started"):
+                        # Redacted progress events (2.2.6.1). Ignored on non-TTY;
+                        # unknown future event types fall through and are ignored.
+                        try:
+                            progress.handle(event, json.loads(raw_data))
+                        except (ValueError, TypeError):
+                            pass
         except Exception as e:
+            progress.finish()
             if printed_token:
                 print(col(f"\n  stream ended early: {e}", C.YE))
                 return True, None, False

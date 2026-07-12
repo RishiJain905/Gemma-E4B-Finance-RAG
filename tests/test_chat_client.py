@@ -937,3 +937,103 @@ def test_conversation_eval_command_uses_expected_runner_arguments():
     calls.clear()
     chat.do_eval(10, runner=fake_runner)
     assert calls == [[str(chat.RUN_EVAL), "--limit", "10", "--no-conversations"]]
+
+
+# ── 2.2.6.1: streaming progress rendering ──────────────
+
+
+def test_stream_progress_renders_single_inplace_line(capsys):
+    progress = chat._StreamProgress(tty=True, verbose=False)
+    progress.handle("query_started", {})
+    progress.handle("stage", {"stage": "compile", "phase": "started"})
+    progress.handle("stage", {"stage": "retrieve", "phase": "started"})
+    progress.handle("tool_completed", {"tool": "query_facts", "status": "ok", "count": 12})
+    progress.handle("stage", {"stage": "generate", "phase": "started"})
+
+    out = capsys.readouterr().out
+    # A single in-place line built from the pipeline stages + tool (with count).
+    assert "resolve -> retrieval -> query_facts (12 rows) -> answer" in out
+    # Rendered in place with carriage returns, not as a growing log.
+    assert "\r" in out
+    assert "\n" not in out
+
+
+def test_stream_progress_is_silent_on_non_tty(capsys):
+    progress = chat._StreamProgress(tty=False, verbose=False)
+    progress.handle("stage", {"stage": "compile", "phase": "started"})
+    progress.handle("tool_completed", {"tool": "query_facts", "status": "ok", "count": 3})
+    progress.finish()
+    assert capsys.readouterr().out == ""
+
+
+def test_stream_progress_verbose_logs_timings_and_reasons(capsys):
+    progress = chat._StreamProgress(tty=True, verbose=True)
+    progress.handle("stage", {"stage": "retrieve", "phase": "completed",
+                              "elapsed_ms": 12.5})
+    progress.handle("stage", {"stage": "correct", "phase": "completed",
+                              "reason": "run_derived_subqueries"})
+    progress.handle("tool_completed", {"tool": "query_facts", "status": "ok", "count": 7})
+
+    out = capsys.readouterr().out
+    assert "retrieval" in out and "12.5ms" in out
+    assert "correct" in out and "run_derived_subqueries" in out
+    assert "query_facts (7 rows)" in out and "[ok]" in out
+
+
+def test_stream_ignores_unknown_and_progress_events(capsys):
+    """Unknown event types and progress events never break token/metadata
+    handling, and no progress line is drawn on a non-TTY test stdout."""
+    class FakeClient:
+        def stream(self, method, path, json=None):
+            return FakeStreamResponse([
+                "event: query_started",
+                'data: {"schema_version": 1, "query_id": "q", "sequence": 0}',
+                "",
+                "event: stage",
+                'data: {"stage": "retrieve", "phase": "started", "sequence": 1}',
+                "",
+                "event: some_future_event",
+                'data: {"anything": true}',
+                "",
+                "event: token",
+                'data: {"token": "answer text"}',
+                "",
+                "event: metadata",
+                'data: {"grounding": "grounded", "detected_ticker": "NVDA", '
+                '"detected_intent": "fact_lookup", "facts_used": 1, '
+                '"documents_used": 1, "model_available": true, '
+                '"latency_ms": 8.0, "retrieval_strategy": "vector"}',
+                "",
+            ])
+
+    session = _bare_session(FakeClient(), stream_enabled=True, stream_unavailable=False)
+    session.query("hello", ticker=None, refresh=False)
+
+    out = capsys.readouterr().out
+    assert "answer text" in out
+    assert "grounding=grounded" in out
+    # The turn was recorded (complete stream), proving metadata parsed cleanly.
+    assert session.history[-1]["content"] == "answer text"
+
+
+def test_health_reports_streaming_tool_final_capability(monkeypatch):
+    config = SimpleNamespace(
+        enable_tools=True,
+        enable_streaming=True,
+        enable_tool_final_streaming=True,
+        answer_policy="graded",
+        conversation_max_turns=8,
+        conversation_max_history_chars=8000,
+    )
+    monkeypatch.setattr(middleware_app, "config", config)
+    monkeypatch.setattr(
+        middleware_app, "store", SimpleNamespace(heartbeat=lambda: {"sqlite": True, "chroma": True}))
+    monkeypatch.setattr(middleware_app, "_check_model_health", AsyncMock(return_value=True))
+    monkeypatch.setattr(
+        middleware_app, "_cached_health_summary", lambda: {"scheduler": None, "freshness": {}})
+
+    client = TestClient(middleware_app.app)
+    caps = client.get("/health").json()["capabilities"]
+    # Tools + tool-final streaming -> streaming is genuinely available here.
+    assert caps["streaming"] is True
+    assert caps["streaming_tool_final"] is True

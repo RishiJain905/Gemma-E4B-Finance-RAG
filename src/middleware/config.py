@@ -51,6 +51,25 @@ class MiddlewareConfig:
         self.enable_streaming: bool = True
         self.embedding_cache_size: int = 256
 
+        # Phase 2.2.6.1 — tool-aware streaming & progress events. Both feature
+        # flags default off so behavior is byte-identical to the pre-2.2.6
+        # streaming path until promotion:
+        #   enable_tool_final_streaming  — allow /query/stream to serve a
+        #       tools-enabled request by running the bounded tool/planning
+        #       rounds non-streaming, then streaming ONLY the final answer.
+        #       Off -> /query/stream still 404s while tools are enabled.
+        #   enable_stream_progress_events — emit versioned, redacted pipeline
+        #       stage / tool progress events on the SSE stream (query_started,
+        #       stage, tool_started, tool_completed, error). Off -> only the
+        #       legacy token/metadata events are sent.
+        #   stream_progress_include_counts — include row/item counts on
+        #       retrieve/tool_completed progress events (default on).
+        # Env: ENABLE_TOOL_FINAL_STREAMING, ENABLE_STREAM_PROGRESS_EVENTS,
+        # STREAM_PROGRESS_INCLUDE_COUNTS.
+        self.enable_tool_final_streaming: bool = False
+        self.enable_stream_progress_events: bool = False
+        self.stream_progress_include_counts: bool = True
+
         # Phase 2.1.4 — analytical tool-calling controls.
         self.enable_tools: bool = False
         self.max_tool_iterations: int = 3
@@ -235,6 +254,9 @@ class MiddlewareConfig:
         _bool("ALLOW_GENERAL_FALLBACK", "allow_general_fallback")
         _bool("RETURN_TIMINGS", "return_timings")
         _bool("ENABLE_STREAMING", "enable_streaming")
+        _bool("ENABLE_TOOL_FINAL_STREAMING", "enable_tool_final_streaming")
+        _bool("ENABLE_STREAM_PROGRESS_EVENTS", "enable_stream_progress_events")
+        _bool("STREAM_PROGRESS_INCLUDE_COUNTS", "stream_progress_include_counts")
         _int("EMBEDDING_CACHE_SIZE", "embedding_cache_size")
         _int("CONVERSATION_MAX_TURNS", "conversation_max_turns")
         _int("CONVERSATION_MAX_HISTORY_CHARS", "conversation_max_history_chars")

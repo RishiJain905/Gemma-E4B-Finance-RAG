@@ -15,6 +15,24 @@ return_timings: true
 enable_streaming: true
 embedding_cache_size: 256
 
+# Phase 2.2.6.1 — tool-aware streaming & progress events.
+# Both feature flags default off so the streaming/tool behavior is byte-identical
+# to the pre-2.2.6 path until promotion:
+#   enable_tool_final_streaming   — allow /query/stream to serve a tools-enabled
+#       request by running the bounded tool/planning rounds non-streaming, then
+#       streaming ONLY the final answer. Off -> /query/stream 404s while tools
+#       are enabled (current behavior).
+#   enable_stream_progress_events — emit versioned, redacted pipeline stage/tool
+#       progress events (query_started, stage, tool_started, tool_completed,
+#       error) on the SSE stream. Off -> only the legacy token/metadata events.
+#   stream_progress_include_counts — include row/item counts on retrieve and
+#       tool_completed progress events (default on).
+# Env: ENABLE_TOOL_FINAL_STREAMING, ENABLE_STREAM_PROGRESS_EVENTS,
+# STREAM_PROGRESS_INCLUDE_COUNTS.
+enable_tool_final_streaming: false
+enable_stream_progress_events: false
+stream_progress_include_counts: true
+
 # Phase 2.1.4 — structured analytical tooling.
 # Disabled by default until concrete tools are registered and validated.
 enable_tools: true

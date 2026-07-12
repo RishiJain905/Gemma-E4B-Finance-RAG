@@ -297,6 +297,93 @@ async def test_tools_unsupported_fallback(monkeypatch, mode):
 
 
 @pytest.mark.asyncio
+async def test_planning_rounds_answered_outcome(monkeypatch):
+    """The model returning content with no tool call ends planning as 'answered'
+    without executing tools or issuing a final call (the caller decides next)."""
+    register(
+        Tool(
+            name="query_facts",
+            description="Query facts",
+            parameters={"type": "object", "properties": {}, "required": []},
+            handler=lambda _store: {"ok": True},
+        )
+    )
+    client = SimpleNamespace(post=AsyncMock(return_value=_response("direct answer", None)))
+    monkeypatch.setattr(middleware_app, "model_client", client)
+    monkeypatch.setattr(middleware_app, "config", _config())
+    monkeypatch.setattr(middleware_app, "store", object())
+
+    base = {"model": "m", "messages": [{"role": "system", "content": "s"},
+                                       {"role": "user", "content": "p"}]}
+    tool_messages = [{"role": "system", "content": "s"}, {"role": "user", "content": "p"}]
+    outcome = await middleware_app._run_tool_planning_rounds(
+        base_payload=base, messages=tool_messages, prompt="p")
+
+    assert outcome.kind == "answered"
+    assert outcome.content == "direct answer"
+    assert client.post.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_planning_rounds_final_outcome_after_iteration_cap(monkeypatch):
+    """When the model keeps requesting tools, planning stops at the cap and
+    returns 'final' with the accumulated tool results (no final call yet)."""
+    register(
+        Tool(
+            name="query_facts",
+            description="Query facts",
+            parameters={"type": "object", "properties": {}, "required": []},
+            handler=lambda _store: {"results": [{"ticker": "NVDA", "value": 1}]},
+        )
+    )
+    tool_call = {"id": "c1", "type": "function",
+                 "function": {"name": "query_facts", "arguments": "{}"}}
+    client = SimpleNamespace(
+        post=AsyncMock(side_effect=[_response("", [tool_call]) for _ in range(4)]))
+    monkeypatch.setattr(middleware_app, "model_client", client)
+    monkeypatch.setattr(middleware_app, "config", _config(max_tool_iterations=2))
+    monkeypatch.setattr(middleware_app, "store", object())
+
+    base = {"model": "m", "messages": [{"role": "system", "content": "s"},
+                                       {"role": "user", "content": "p"}]}
+    tool_messages = [{"role": "system", "content": "s"}, {"role": "user", "content": "p"}]
+    outcome = await middleware_app._run_tool_planning_rounds(
+        base_payload=base, messages=tool_messages, prompt="p")
+
+    assert outcome.kind == "final"
+    assert client.post.await_count == 2  # bounded to the cap
+    # Tool results were appended for the final generation to consume.
+    assert any(m.get("role") == "tool" for m in outcome.messages)
+
+
+@pytest.mark.asyncio
+async def test_planning_rounds_plain_fallback_on_tools_unsupported(monkeypatch):
+    register(
+        Tool(
+            name="query_facts",
+            description="Query facts",
+            parameters={"type": "object", "properties": {}, "required": []},
+            handler=lambda _store: {"ok": True},
+        )
+    )
+    request = httpx.Request("POST", "http://test/v1/chat/completions")
+    response = httpx.Response(400, request=request, text="tools not supported")
+    err = httpx.HTTPStatusError("bad request", request=request, response=response)
+    client = SimpleNamespace(post=AsyncMock(side_effect=[err]))
+    monkeypatch.setattr(middleware_app, "model_client", client)
+    monkeypatch.setattr(middleware_app, "config", _config())
+    monkeypatch.setattr(middleware_app, "store", object())
+
+    base = {"model": "m", "messages": [{"role": "system", "content": "s"},
+                                       {"role": "user", "content": "p"}]}
+    outcome = await middleware_app._run_tool_planning_rounds(
+        base_payload=base, messages=list(base["messages"]), prompt="p")
+
+    assert outcome.kind == "plain_fallback"
+    assert middleware_app._tools_supported is False
+
+
+@pytest.mark.asyncio
 async def test_malformed_200_fails_soft(monkeypatch):
     """A 200 with empty/malformed choices must not raise out of _call_model."""
     register(
