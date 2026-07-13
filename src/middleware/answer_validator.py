@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import logging
 import re
+from time import perf_counter
 from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation
 from typing import Any, Optional
@@ -105,6 +106,17 @@ class CitationRecord:
             "metric": self.metric,
             "period": self.period,
             "source_url": self.source_url,
+            "support_status": self.support_status,
+        }
+
+    def graph_reference(self) -> dict:
+        """Return the allowlisted provenance fields used by graph citations."""
+        return {
+            "evidence_id": self.evidence_id,
+            "source_type": self.source_type,
+            "ticker": self.ticker,
+            "metric": self.metric,
+            "period": self.period,
             "support_status": self.support_status,
         }
 
@@ -515,6 +527,12 @@ def validate_answer(
     of recorded deterministic calculation dicts (``result``/``value``, ``unit``,
     ``id``). Never raises for well-formed input — malformed rows are skipped.
     """
+    from .stream_events import current_emitter
+
+    emitter = current_emitter()
+    started_at = perf_counter()
+    if emitter is not None:
+        emitter.stage("validate", "started")
     items = _as_items(ledger)
     by_id = {it.evidence_id: it for it in items if it.evidence_id}
     all_tickers = {str(it.ticker).upper() for it in items if it.ticker}
@@ -563,7 +581,7 @@ def validate_answer(
     else:
         status = "supported"
 
-    return AnswerValidation(
+    result = AnswerValidation(
         status=status,
         citation_support_rate=citation_support_rate,
         numeric_claims_supported=n_sup,
@@ -573,6 +591,13 @@ def validate_answer(
         claims=tuple(claims),
         mismatch_counts=mismatch,
     )
+    if emitter is not None:
+        emitter.stage(
+            "validate", "completed",
+            elapsed_ms=(perf_counter() - started_at) * 1000,
+            reason=result.status,
+        )
+    return result
 
 
 def _classify_claim(

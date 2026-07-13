@@ -70,6 +70,17 @@ class MiddlewareConfig:
         self.enable_stream_progress_events: bool = False
         self.stream_progress_include_counts: bool = True
 
+        # Phase 2.2.7.1 — local, read-only live retrieval graph. Disabled by
+        # default. The in-memory TraceHub is bounded and never persists traces.
+        # Question text is stored only as this bounded preview plus a SHA-256
+        # digest. Env: ENABLE_GRAPH_OBSERVER, GRAPH_*.
+        self.enable_graph_observer: bool = False
+        self.graph_trace_limit: int = 100
+        self.graph_element_limit: int = 5000
+        self.graph_trace_ttl_s: int = 3600
+        self.graph_excerpt_chars: int = 1000
+        self.graph_question_preview_chars: int = 200
+
         # Phase 2.1.4 — analytical tool-calling controls.
         self.enable_tools: bool = False
         self.max_tool_iterations: int = 3
@@ -283,6 +294,12 @@ class MiddlewareConfig:
         _bool("ENABLE_TOOL_FINAL_STREAMING", "enable_tool_final_streaming")
         _bool("ENABLE_STREAM_PROGRESS_EVENTS", "enable_stream_progress_events")
         _bool("STREAM_PROGRESS_INCLUDE_COUNTS", "stream_progress_include_counts")
+        _bool("ENABLE_GRAPH_OBSERVER", "enable_graph_observer")
+        _int("GRAPH_TRACE_LIMIT", "graph_trace_limit")
+        _int("GRAPH_ELEMENT_LIMIT", "graph_element_limit")
+        _int("GRAPH_TRACE_TTL_S", "graph_trace_ttl_s")
+        _int("GRAPH_EXCERPT_CHARS", "graph_excerpt_chars")
+        _int("GRAPH_QUESTION_PREVIEW_CHARS", "graph_question_preview_chars")
         _int("EMBEDDING_CACHE_SIZE", "embedding_cache_size")
         _int("CONVERSATION_MAX_TURNS", "conversation_max_turns")
         _int("CONVERSATION_MAX_HISTORY_CHARS", "conversation_max_history_chars")

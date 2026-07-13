@@ -273,6 +273,42 @@ class HealthResponse(BaseModel):
     version: str = "1.0.0"
 
 
+class GraphTraceSummary(BaseModel):
+    """Read-only summary of one bounded in-memory query graph trace."""
+
+    schema_version: int = 1
+    query_id: str
+    created_at: float
+    updated_at: float
+    complete: bool = False
+    node_count: int = 0
+    edge_count: int = 0
+    question_preview: str = ""
+    question_digest: Optional[str] = None
+
+
+class GraphTraceSnapshot(GraphTraceSummary):
+    """Current graph nodes and edges reconstructed from stored deltas."""
+
+    nodes: list[dict] = Field(default_factory=list)
+    edges: list[dict] = Field(default_factory=list)
+    last_sequence: int = -1
+
+
+class GraphHealthResponse(BaseModel):
+    """Bounded TraceHub state exposed by the local read-only health endpoint."""
+
+    enabled: bool
+    trace_count: int = 0
+    element_count: int = 0
+    subscriber_count: int = 0
+    limits: dict = Field(default_factory=dict)
+    oldest_sequence: Optional[int] = None
+    newest_sequence: Optional[int] = None
+    dropped_events: int = 0
+    reset_count: int = 0
+
+
 class SearchRequest(BaseModel):
     """Raw search request (bypasses model, returns retrieved data only)."""
 

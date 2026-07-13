@@ -36,6 +36,7 @@ from .evidence import (
     usable_facts,
 )
 from .evidence_trace import EvidenceTraceCollector
+from .graph_api import create_graph_router
 from .models import (
     EvidenceCitation,
     FreshnessResponse,
@@ -87,6 +88,7 @@ _HEALTH_SUMMARY_TTL_S = 3.0
 _model_health = {"ok": False, "ts": 0.0}
 _health_cache = {"ts": 0.0, "value": None}
 _scheduler = None
+graph_hub = None  # Process-local TraceHub; created only when observer is enabled.
 
 # Per-request state (Phase 2.1.8.3). Each incoming request runs in its own
 # asyncio Task, which copies the context at creation time, so these never
@@ -119,6 +121,39 @@ def _stream_emitter():
     return _stream_emitter_var.get()
 
 
+def _graph_observer_enabled() -> bool:
+    """Return whether the local query graph is enabled for this process."""
+    return bool(getattr(config, "enable_graph_observer", False))
+
+
+def _install_query_emitter(request: QueryRequest, *, chat_events: bool):
+    """Install the one request-scoped emitter used by chat and graph projections."""
+    progress = bool(chat_events and _stream_progress_enabled())
+    observe = _graph_observer_enabled() and graph_hub is not None
+    if not progress and not observe:
+        _stream_emitter_var.set(None)
+        from .stream_events import set_current_emitter
+
+        set_current_emitter(None)
+        return None
+    from .stream_events import QueryEventEmitter, set_current_emitter
+
+    observers = []
+    if observe:
+        from .graph_observer import make_event_observer
+
+        observers.append(make_event_observer(graph_hub))
+    emitter = QueryEventEmitter(
+        include_counts=bool(getattr(config, "stream_progress_include_counts", True)),
+        observers=observers,
+        buffer_events=progress,
+    )
+    _stream_emitter_var.set(emitter)
+    set_current_emitter(emitter)
+    emitter.query_started(question=request.question)
+    return emitter
+
+
 def _emit_stage(name: str, phase: str, *, elapsed_ms=None, reason=None) -> None:
     """Record one pipeline stage progress event, if an emitter is installed."""
     emitter = _stream_emitter_var.get()
@@ -140,6 +175,397 @@ def _emit_tool_completed(name: str, status: str, *, count=None, elapsed_ms=None,
     if emitter is not None:
         emitter.tool_completed(
             name, status, count=count, elapsed_ms=elapsed_ms, subquery_id=subquery_id)
+
+
+def _emit_graph_legacy_intent(intent: dict) -> None:
+    """Emit the compact legacy query -> intent -> retrieval route."""
+    emitter = _stream_emitter_var.get()
+    if emitter is None or not _graph_observer_enabled():
+        return
+    from .graph_observer import _edge_id, _node_id
+
+    query_id = emitter.query_id
+    query_node = _node_id(query_id, "query", "request")
+    intent_node = _node_id(query_id, "stage", "intent")
+    retrieve_node = _node_id(query_id, "stage", "retrieve")
+    emitter.graph_update(
+        nodes=[{
+            "id": intent_node,
+            "kind": "stage",
+            "label": "Intent",
+            "status": "complete",
+            "metadata": {
+                "ticker": intent.get("ticker"),
+                "metrics": list(intent.get("metrics") or ()),
+                "period": intent.get("timeframe"),
+                "kind": intent.get("question_type"),
+            },
+        }],
+        edges=[
+            {
+                "id": _edge_id(query_id, query_node, "compiled_to", intent_node),
+                "source": query_node,
+                "target": intent_node,
+                "relation": "compiled_to",
+            },
+            {
+                "id": _edge_id(query_id, intent_node, "routed_to", retrieve_node),
+                "source": intent_node,
+                "target": retrieve_node,
+                "relation": "routed_to",
+            },
+        ],
+    )
+
+
+def _emit_graph_plan(plan, *, lane: Optional[str] = None) -> None:
+    """Emit the validated plan and its actual request-local subqueries."""
+    emitter = _stream_emitter_var.get()
+    if emitter is None or not _graph_observer_enabled():
+        return
+    from .graph_observer import _edge_id, _node_id
+
+    query_id = emitter.query_id
+    query_node = _node_id(query_id, "query", "request")
+    plan_node = _node_id(query_id, "plan", "validated")
+    nodes = [{
+        "id": plan_node,
+        "kind": "plan",
+        "label": "Validated Query Plan",
+        "status": "complete",
+        "metadata": {
+            "tickers": list(plan.tickers),
+            "intents": list(plan.intents),
+            "metrics": list(plan.metrics),
+            "periods": list(plan.periods),
+            "lane": lane,
+        },
+    }]
+    edges = [{
+        "id": _edge_id(query_id, query_node, "compiled_to", plan_node),
+        "source": query_node,
+        "target": plan_node,
+        "relation": "compiled_to",
+    }]
+    for subquery in plan.subqueries:
+        subquery_node = _node_id(query_id, "subquery", subquery.id)
+        nodes.append({
+            "id": subquery_node,
+            "kind": "subquery",
+            "label": subquery.id,
+            "status": "complete",
+            "group_id": plan_node,
+            "metadata": {
+                "subquery_id": subquery.id,
+                "tickers": list(subquery.entity_tickers),
+                "intents": list(subquery.intents),
+                "metrics": list(subquery.metrics),
+                "periods": list(subquery.periods),
+                "derived": bool(subquery.derived),
+                "parent_id": subquery.parent_id,
+                "reason": subquery.reason_code,
+            },
+        })
+        edges.append({
+            "id": _edge_id(query_id, plan_node, "contains", subquery_node),
+            "source": plan_node,
+            "target": subquery_node,
+            "relation": "contains",
+        })
+        if subquery.derived and subquery.parent_id:
+            parent_node = _node_id(query_id, "subquery", subquery.parent_id)
+            edges.append({
+                "id": _edge_id(query_id, parent_node, "expanded_from", subquery_node),
+                "source": parent_node,
+                "target": subquery_node,
+                "relation": "expanded_from",
+            })
+    emitter.graph_update(nodes=nodes, edges=edges)
+
+
+def _emit_graph_adaptive_result(result) -> None:
+    """Emit actual adaptive lane, grader, and correction outcome counters."""
+    emitter = _stream_emitter_var.get()
+    if emitter is None or not _graph_observer_enabled():
+        return
+    from .graph_observer import _edge_id, _node_id
+
+    query_id = emitter.query_id
+    plan_node = _node_id(query_id, "plan", "validated")
+    route_node = _node_id(query_id, "stage", "route")
+    nodes = [{
+        "id": route_node,
+        "kind": "stage",
+        "label": "Route",
+        "status": "fallback" if result.fallback_reason else "complete",
+        "metadata": result.graph_trace_metadata(),
+    }]
+    edges = [{
+        "id": _edge_id(query_id, plan_node, "routed_to", route_node),
+        "source": plan_node,
+        "target": route_node,
+        "relation": "routed_to",
+    }]
+    if result.sufficiency is not None:
+        grade_node = _node_id(query_id, "stage", "grade")
+        nodes.append({
+            "id": grade_node,
+            "kind": "stage",
+            "label": "Evidence Grade",
+            "status": "complete",
+            "metadata": result.sufficiency.graph_trace_metadata(),
+        })
+        edges.append({
+            "id": _edge_id(query_id, route_node, "returned", grade_node),
+            "source": route_node,
+            "target": grade_node,
+            "relation": "returned",
+        })
+    if result.retry_performed:
+        correct_node = _node_id(query_id, "stage", "correct")
+        nodes.append({
+            "id": correct_node,
+            "kind": "stage",
+            "label": "Corrective Retrieval",
+            "status": "complete",
+            "metadata": {"reason": result.corrective_action.value},
+        })
+        edges.append({
+            "id": _edge_id(query_id, route_node, "corrected_by", correct_node),
+            "source": route_node,
+            "target": correct_node,
+            "relation": "corrected_by",
+        })
+    emitter.graph_update(nodes=nodes, edges=edges)
+
+
+def _emit_graph_evidence(
+    retrieval: dict, ledger: list, *, status: str = "complete"
+) -> list[str]:
+    """Emit only the actual normalized evidence selected for prompt packing."""
+    emitter = _stream_emitter_var.get()
+    if emitter is None or not _graph_observer_enabled():
+        return []
+    items = list(ledger) if ledger else build_evidence_items(
+        usable_facts(retrieval), usable_documents(retrieval))
+    reference_by_store_id = {
+        str(item.store_id): str(item.evidence_id or item.store_id)
+        for item in items
+        if item.store_id and (item.evidence_id or item.store_id)
+    }
+    references: list[str] = []
+    excerpt_limit = int(getattr(config, "graph_excerpt_chars", 1000))
+    for rank, item in enumerate(items, 1):
+        reference = item.evidence_id or item.store_id
+        if not reference:
+            continue
+        reference = str(reference)
+        references.append(reference)
+        if item.kind == "document":
+            excerpt = item.document[:excerpt_limit]
+        else:
+            excerpt = " ".join(str(value) for value in (
+                item.metric, item.value, item.unit, item.period
+            ) if value not in (None, ""))[:excerpt_limit]
+        score = next(iter(item.scores.values()), None)
+        metadata = {
+            "ticker": item.ticker,
+            "metric": item.metric,
+            "period": item.period,
+            "freshness": item.freshness,
+            "score": score,
+            "store_id": item.store_id,
+            "section": item.section,
+            "parent_id": item.parent_id,
+        }
+        retrieved_from = None
+        if item.subquery_ids:
+            from .graph_observer import _node_id
+
+            retrieved_from = _node_id(emitter.query_id, "subquery", item.subquery_ids[0])
+        emitter.graph_evidence(
+            evidence_id=reference,
+            kind=item.kind,
+            excerpt=excerpt,
+            metadata=metadata,
+            source_type=item.source_type or "unknown",
+            rank=rank,
+            retrieved_from=retrieved_from,
+            status=status,
+        )
+        parent_reference = reference_by_store_id.get(str(item.parent_id))
+        if parent_reference:
+            from .graph_observer import _edge_id, _node_id
+
+            parent_node = _node_id(emitter.query_id, "evidence", parent_reference)
+            evidence_node = _node_id(emitter.query_id, "evidence", reference)
+            emitter.graph_update(edges=[{
+                "id": _edge_id(
+                    emitter.query_id, parent_node, "expanded_from", evidence_node
+                ),
+                "source": parent_node,
+                "target": evidence_node,
+                "relation": "expanded_from",
+            }])
+    return references
+
+
+def _emit_graph_dropped_evidence(result, selected_retrieval: dict) -> None:
+    """Emit actual retrieved rows excluded by the adaptive context budget."""
+    if result.context is None:
+        return
+    selected = build_evidence_items(
+        usable_facts(selected_retrieval), usable_documents(selected_retrieval))
+    selected_ids = {(item.kind, item.store_id) for item in selected}
+    candidates = build_evidence_items(result.merged_facts, result.merged_documents)
+    dropped_facts = []
+    dropped_documents = []
+    for item, row in zip(candidates, [*result.merged_facts, *result.merged_documents]):
+        if (item.kind, item.store_id) in selected_ids:
+            continue
+        if item.kind == "fact":
+            dropped_facts.append(row)
+        else:
+            dropped_documents.append(row)
+    if dropped_facts or dropped_documents:
+        _emit_graph_evidence(
+            {"facts": dropped_facts, "documents": dropped_documents},
+            [],
+            status="dropped",
+        )
+
+
+def _emit_graph_terminal(
+    context: dict,
+    *,
+    model_available: bool,
+    evidence_citations: Optional[list],
+    validation: Optional[dict],
+    citations: Optional[list] = None,
+) -> None:
+    """Emit answer/citation/validation nodes from the produced terminal result."""
+    emitter = _stream_emitter_var.get()
+    if emitter is None or not _graph_observer_enabled():
+        return
+    from .graph_observer import _edge_id, _node_id
+
+    query_id = emitter.query_id
+    answer_node = _node_id(query_id, "answer", "final")
+    nodes = [{
+        "id": answer_node,
+        "kind": "answer",
+        "label": "Final Answer",
+        "status": "complete" if model_available else "fallback",
+        "metadata": {
+            "status": context.get("grounding_level"),
+            "facts": len(usable_facts(context.get("retrieval"))),
+            "documents": len(usable_documents(context.get("retrieval"))),
+        },
+    }]
+    query_node = _node_id(query_id, "query", "request")
+    edges = [{
+        "id": _edge_id(query_id, query_node, "returned", answer_node),
+        "source": query_node,
+        "target": answer_node,
+        "relation": "returned",
+    }]
+    for reference in context.get("graph_evidence_ids") or []:
+        evidence_node = _node_id(query_id, "evidence", str(reference))
+        edges.append({
+            "id": _edge_id(query_id, evidence_node, "supports", answer_node),
+            "source": evidence_node,
+            "target": answer_node,
+            "relation": "supports",
+        })
+    for index, citation in enumerate(evidence_citations or (), 1):
+        data = citation.model_dump() if hasattr(citation, "model_dump") else citation.dict()
+        reference = data.get("evidence_id") or f"legacy-{index}"
+        citation_node = _node_id(query_id, "citation", str(reference))
+        nodes.append({
+            "id": citation_node,
+            "kind": "citation",
+            "label": f"Citation {reference}",
+            "status": "complete" if data.get("support_status") == "supported" else "error",
+            "metadata": {
+                "evidence_id": data.get("evidence_id"),
+                "source_type": data.get("source_type"),
+                "ticker": data.get("ticker"),
+                "metric": data.get("metric"),
+                "period": data.get("period"),
+                "support_status": data.get("support_status"),
+            },
+        })
+        if data.get("evidence_id"):
+            evidence_node = _node_id(query_id, "evidence", str(data["evidence_id"]))
+            edges.append({
+                "id": _edge_id(query_id, evidence_node, "cited_by", citation_node),
+                "source": evidence_node,
+                "target": citation_node,
+                "relation": "cited_by",
+            })
+        edges.append({
+            "id": _edge_id(query_id, citation_node, "supports", answer_node),
+            "source": citation_node,
+            "target": answer_node,
+            "relation": "supports",
+        })
+    if not evidence_citations:
+        for index, citation in enumerate(citations or (), 1):
+            data = citation.model_dump() if hasattr(citation, "model_dump") else citation.dict()
+            reference = f"legacy-{index}"
+            citation_node = _node_id(query_id, "citation", reference)
+            nodes.append({
+                "id": citation_node,
+                "kind": "citation",
+                "label": f"Citation {index}",
+                "status": "complete",
+                "metadata": {
+                    "source_type": data.get("source_type"),
+                    "ticker": data.get("ticker"),
+                    "metric": data.get("metric"),
+                    "period": data.get("period"),
+                    "support_status": "supported",
+                },
+            })
+            edges.append({
+                "id": _edge_id(query_id, citation_node, "supports", answer_node),
+                "source": citation_node,
+                "target": answer_node,
+                "relation": "supports",
+            })
+    validate_node = _node_id(query_id, "stage", "validate")
+    validation_status = (validation or {}).get("validation_status") or "off"
+    nodes.append({
+        "id": validate_node,
+        "kind": "stage",
+        "label": "Validate",
+        "status": (
+            "complete"
+            if validation_status in {"supported", "no_claims", "off"}
+            else "partial"
+        ),
+        "metadata": {
+            "validation_status": validation_status,
+            "citation_support_rate": (validation or {}).get("citation_support_rate"),
+            "numeric_claims_supported": (validation or {}).get("numeric_claims_supported"),
+            "numeric_claims_unsupported": (validation or {}).get("numeric_claims_unsupported"),
+        },
+    })
+    edges.append({
+        "id": _edge_id(query_id, answer_node, "validated_as", validate_node),
+        "source": answer_node,
+        "target": validate_node,
+        "relation": "validated_as",
+        "metadata": {"status": validation_status},
+    })
+    emitter.graph_update(nodes=nodes, edges=edges)
+    emitter.graph_update(
+        operation="trace_complete",
+        summary={
+            "status": context.get("grounding_level"),
+            "completed_at": time.time(),
+        },
+    )
 
 
 def _grounding_level(retrieval: dict) -> str:
@@ -369,12 +795,24 @@ async def _invoke_model(
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Startup and shutdown lifecycle."""
-    global config, store, model_client, retriever
+    global config, store, model_client, retriever, graph_hub
 
     logger.info("Starting middleware...")
     from src.utils.env import load_env
     load_env()  # load .env credentials before initializing components
     config = MiddlewareConfig()
+    if config.enable_graph_observer:
+        from .graph_observer import TraceHub
+
+        graph_hub = TraceHub(
+            trace_limit=config.graph_trace_limit,
+            element_limit=config.graph_element_limit,
+            trace_ttl_s=config.graph_trace_ttl_s,
+            excerpt_chars=config.graph_excerpt_chars,
+            question_preview_chars=config.graph_question_preview_chars,
+        )
+    else:
+        graph_hub = None
     store = Store(
         embedding_endpoint=config.embedding_endpoint,
         embedding_cache_size=config.embedding_cache_size,
@@ -393,6 +831,7 @@ async def lifespan(app: FastAPI):
     # Shutdown
     if model_client:
         await model_client.aclose()
+    graph_hub = None
     logger.info("Middleware shut down.")
 
 
@@ -403,6 +842,11 @@ app = FastAPI(
     version="1.0.0",
     lifespan=lifespan,
 )
+
+app.include_router(create_graph_router(
+    lambda: graph_hub,
+    _graph_observer_enabled,
+))
 
 
 def _find_tasks_block(node) -> dict:
@@ -782,6 +1226,7 @@ async def _build_legacy_query_context(
     timings = shared["timings"]
     retrieval_query = shared["retrieval_query"]
     retrieval_intent = shared["retrieval_intent"]
+    _emit_graph_legacy_intent(retrieval_intent)
 
     freshness_meta = await _freshness_stage(retrieval_intent, request.refresh, timings)
 
@@ -810,6 +1255,7 @@ async def _build_legacy_query_context(
     # Request-local [E#] evidence ledger (2.2.4.3). Empty when validation is
     # off, so the prompt and response stay byte-for-byte legacy.
     evidence_ledger = _build_evidence_ledger(retrieval) if _evidence_ids_enabled() else []
+    graph_evidence_ids = _emit_graph_evidence(retrieval, evidence_ledger)
 
     # Request-scoped evidence-trace collector (2.2.1.2), created right after
     # evidence normalization so facts/documents are the exact usable rows
@@ -864,6 +1310,7 @@ async def _build_legacy_query_context(
         "retrieval_query": retrieval_query,
         "orchestration": orchestration,
         "evidence_ledger": evidence_ledger,
+        "graph_evidence_ids": graph_evidence_ids,
         "calculations": [],
     }
 
@@ -936,19 +1383,9 @@ def _tool_result_count(result) -> Optional[int]:
     never the values themselves. Returns None when no count is meaningful, so a
     count is emitted only when it genuinely reflects rows/items retrieved.
     """
-    if not isinstance(result, dict) or result.get("error"):
-        return None
-    rows = result.get("results")
-    if isinstance(rows, list):
-        return len(rows)
-    for key in ("fundamentals", "estimates", "price_targets", "guidance"):
-        value = result.get(key)
-        if isinstance(value, dict):
-            return len(value)
-    articles = result.get("article_count")
-    if isinstance(articles, int):
-        return articles
-    return None
+    from .tools.base import tool_result_count
+
+    return tool_result_count(result)
 
 
 def _emit_adaptive_progress(result) -> None:
@@ -1125,6 +1562,7 @@ async def _build_adaptive_query_context(shared: dict) -> dict:
         retrieval_query=(retrieval_query if retrieval_query != request.question else None),
         override_ticker=request.ticker,
     )
+    _emit_graph_plan(plan)
     _emit_stage("route", "completed",
                 elapsed_ms=_stage_timing(timings, "query_plan", stage_start))
 
@@ -1148,7 +1586,8 @@ async def _build_adaptive_query_context(shared: dict) -> dict:
     )
     _emit_stage("retrieve", "completed",
                 elapsed_ms=_stage_timing(timings, "orchestration", stage_start))
-    _emit_adaptive_progress(result)
+    _emit_graph_plan(result.plan, lane=result.lane.value)
+    _emit_graph_adaptive_result(result)
 
     # Build a retrieve()-compatible view from the single budgeted context so
     # grounding, evidence counts, degraded answers, and the response builder all
@@ -1182,6 +1621,8 @@ async def _build_adaptive_query_context(shared: dict) -> dict:
 
     # Request-local [E#] evidence ledger over the pre-budgeted evidence.
     evidence_ledger = _build_evidence_ledger(retrieval) if _evidence_ids_enabled() else []
+    graph_evidence_ids = _emit_graph_evidence(retrieval, evidence_ledger)
+    _emit_graph_dropped_evidence(result, retrieval)
 
     # Evidence-trace collector (opt-in). The adaptive route trace records only
     # the successful answer path (2.2.3.4 Step 3).
@@ -1237,6 +1678,7 @@ async def _build_adaptive_query_context(shared: dict) -> dict:
         "orchestration": _orchestration_metadata(result),
         "evidence_sufficiency": sufficiency_meta,
         "evidence_ledger": evidence_ledger,
+        "graph_evidence_ids": graph_evidence_ids,
         "calculations": calculations,
     }
 
@@ -1277,15 +1719,9 @@ def _task_settings(request: QueryRequest, intent: dict) -> tuple[float, int]:
 
 def _evidence_citation_model(record) -> EvidenceCitation:
     """Map an answer_validator CitationRecord onto the response model."""
-    return EvidenceCitation(
-        evidence_id=record.evidence_id,
-        source_type=record.source_type,
-        ticker=record.ticker,
-        metric=record.metric,
-        period=record.period,
-        source_url=record.source_url,
-        support_status=record.support_status,
-    )
+    data = record.graph_reference()
+    data["source_url"] = record.source_url
+    return EvidenceCitation(**data)
 
 
 def _enforce_validation(answer_text: str, grounding_level: str, report) -> tuple[str, str, str]:
@@ -1432,6 +1868,7 @@ async def _answer_query_context(request: QueryRequest, context: dict) -> QueryRe
     retrieval = context["retrieval"]
     grounding_level = context["grounding_level"]
     stage_start = time.perf_counter()
+    _emit_stage("generate", "started")
     model_available = await _check_model_health()
     if model_available:
         temperature, max_tokens = _task_settings(request, intent)
@@ -1453,10 +1890,13 @@ async def _answer_query_context(request: QueryRequest, context: dict) -> QueryRe
             )
     else:
         logger.warning("Model unavailable - returning degraded answer")
+        _emit_stage("generate", "fallback", reason="model_unavailable")
         answer_text = _format_degraded_answer(
             retrieval, intent, context.get("evidence_sufficiency"))
         citations = []
     _stage_timing(context["timings"], "model_call", stage_start)
+    if model_available:
+        _emit_stage("generate", "completed")
 
     # Deterministic citation/numeric validation (2.2.4.3). off -> passthrough;
     # report -> metadata only; enforce -> may downgrade/refuse. Updates the
@@ -1464,6 +1904,13 @@ async def _answer_query_context(request: QueryRequest, context: dict) -> QueryRe
     answer_text, grounding_level, validation, evidence_citations = _apply_answer_validation(
         context, answer_text, grounding_level)
     context["grounding_level"] = grounding_level
+    _emit_graph_terminal(
+        context,
+        model_available=model_available,
+        evidence_citations=evidence_citations,
+        validation=validation,
+        citations=citations,
+    )
 
     return _build_query_response(
         context=context,
@@ -1490,8 +1937,14 @@ async def query(request: QueryRequest):
     Shares `_build_query_context` / `_answer_query_context` with
     `/query/stream` so the two paths cannot drift.
     """
-    context = await _build_query_context(request)
-    return await _answer_query_context(request, context)
+    emitter = _install_query_emitter(request, chat_events=False)
+    try:
+        context = await _build_query_context(request)
+        return await _answer_query_context(request, context)
+    except Exception:
+        if emitter is not None:
+            emitter.error("query failed", terminal=True)
+        raise
 
 
 def _response_to_dict(response: QueryResponse) -> dict:
@@ -1638,16 +2091,15 @@ async def query_stream(request: QueryRequest):
     # Install a request-scoped progress emitter BEFORE building the context so
     # the compile/route/retrieve/grade/correct/pack stages are captured. None
     # (progress off) leaves the _emit_* helpers as no-ops -> zero overhead.
-    emitter = None
-    if _stream_progress_enabled():
-        from .stream_events import QueryEventEmitter
+    request_emitter = _install_query_emitter(request, chat_events=True)
+    emitter = request_emitter if _stream_progress_enabled() else None
 
-        emitter = QueryEventEmitter(
-            include_counts=bool(getattr(config, "stream_progress_include_counts", True)))
-        _stream_emitter_var.set(emitter)
-        emitter.query_started()
-
-    context = await _build_query_context(request)
+    try:
+        context = await _build_query_context(request)
+    except Exception:
+        if request_emitter is not None:
+            request_emitter.error("query failed", terminal=True)
+        raise
     model_available = await _check_model_health()
 
     run_tool_final = (
@@ -1801,13 +2253,11 @@ async def _query_stream_events(
         from .guardrails import apply_projection_guardrail
 
         answer_text, _flagged = apply_projection_guardrail(answer_text, context["augmented_prompt"])
-    _emit_stage("validate", "started")
     # Deterministic citation/numeric validation (2.2.4.3). Enforced downgrades/
     # refusals reach the terminal metadata event; already-streamed tokens are
     # not rewritten (a known streaming limitation).
     answer_text, context["grounding_level"], validation, evidence_citations = \
         _apply_answer_validation(context, answer_text, context["grounding_level"])
-    _emit_stage("validate", "completed")
     for chunk in _drain_progress(emitter):
         yield chunk
 
@@ -1819,6 +2269,13 @@ async def _query_stream_events(
         model_available=True,
         validation=validation,
         evidence_citations=evidence_citations,
+    )
+    _emit_graph_terminal(
+        context,
+        model_available=True,
+        evidence_citations=evidence_citations,
+        validation=validation,
+        citations=citations,
     )
     metadata = _response_to_dict(response)
     metadata.pop("answer", None)
@@ -2237,16 +2694,8 @@ async def _run_tool_planning_rounds(
             tool_name = (call.get("function") or {}).get("name")
             if tool_name:
                 _record_tool_used(tool_name)
-            _emit_tool_started(tool_name or "")
-            tool_start = time.perf_counter()
             result, dispatched_name, dispatched_args = await asyncio.to_thread(
                 dispatch_tool_traced, call, store, ctx
-            )
-            _emit_tool_completed(
-                dispatched_name or tool_name or "",
-                "error" if (isinstance(result, dict) and result.get("error")) else "ok",
-                count=_tool_result_count(result),
-                elapsed_ms=(time.perf_counter() - tool_start) * 1000,
             )
             # Recorded immediately after dispatch returns and before the
             # matching role=tool message is appended (2.2.1.2 Step 2).

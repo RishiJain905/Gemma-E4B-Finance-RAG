@@ -33,6 +33,18 @@ enable_tool_final_streaming: false
 enable_stream_progress_events: false
 stream_progress_include_counts: true
 
+# Phase 2.2.7.1 — bounded in-memory query trace graph and localhost read API.
+# Disabled by default. No trace is persisted; questions are represented by a
+# bounded preview plus SHA-256 digest and evidence bodies by bounded excerpts.
+# Env: ENABLE_GRAPH_OBSERVER, GRAPH_TRACE_LIMIT, GRAPH_ELEMENT_LIMIT,
+# GRAPH_TRACE_TTL_S, GRAPH_EXCERPT_CHARS, GRAPH_QUESTION_PREVIEW_CHARS.
+enable_graph_observer: false
+graph_trace_limit: 100
+graph_element_limit: 5000
+graph_trace_ttl_s: 3600
+graph_excerpt_chars: 1000
+graph_question_preview_chars: 200
+
 # Phase 2.1.4 — structured analytical tooling.
 # Disabled by default until concrete tools are registered and validated.
 enable_tools: true

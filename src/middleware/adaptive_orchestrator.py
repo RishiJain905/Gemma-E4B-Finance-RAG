@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import json
 import logging
+from time import perf_counter
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import TYPE_CHECKING, Any, Callable, Iterable, Optional
@@ -485,6 +486,25 @@ class OrchestrationResult:
         if code not in self.reason_codes:
             self.reason_codes.append(code)
 
+    def graph_trace_metadata(self) -> dict:
+        """Return safe counters from this executed orchestration result."""
+        dropped = 0
+        if self.context is not None:
+            dropped = self.context.dropped_facts + self.context.dropped_documents
+        metadata = {
+            "lane": self.lane.value,
+            "retrieval_rounds": self.retrieval_rounds_used,
+            "planning_calls": 1 if self.planning_ran else 0,
+            "reranker_calls": 1 if self.rerank_ran else 0,
+            "context_chars": self.context_size,
+            "evidence_dropped": dropped,
+            "fallback_reason": self.fallback_reason,
+            "retrieval_strategy": self.retrieval_strategy,
+        }
+        if self.sufficiency is not None:
+            metadata.update(self.sufficiency.graph_trace_metadata())
+        return metadata
+
 
 # ── Public entry point ────────────────────────────────────
 
@@ -929,6 +949,13 @@ def _apply_evidence_sufficiency(
     ):
         return
 
+    from .stream_events import current_emitter
+
+    emitter = current_emitter()
+    correction_started = perf_counter()
+    if emitter is not None:
+        emitter.stage("correct", "started", reason=first.allowed_action.value)
+
     if first.allowed_action is CorrectiveAction.RUN_DERIVED_SUBQUERIES:
         # 2.2.4.2 wires this reserved 2.2.4.1 seam: execute the plan's
         # drift-validated derived subqueries through their specialized modalities
@@ -939,9 +966,17 @@ def _apply_evidence_sufficiency(
                 result, plan, store, config, budget, retriever, first)
         else:
             result.add_reason("run_derived_subqueries_deferred_2_2_4_2")
+        if emitter is not None:
+            emitter.stage(
+                "correct", "completed",
+                elapsed_ms=(perf_counter() - correction_started) * 1000,
+                reason=first.allowed_action.value,
+            )
         return
     if not budget.consume(RETRIEVAL_ROUND):
         result.add_reason("retrieval_round_budget_exhausted")
+        if emitter is not None:
+            emitter.stage("correct", "fallback", reason="retrieval_round_budget_exhausted")
         return
 
     result.retry_performed = True
@@ -982,6 +1017,12 @@ def _apply_evidence_sufficiency(
     })
     if result.sufficiency.status is not SufficiencyStatus.SUFFICIENT:
         result.add_reason("corrective_retry_exhausted")
+    if emitter is not None:
+        emitter.stage(
+            "correct", "completed",
+            elapsed_ms=(perf_counter() - correction_started) * 1000,
+            reason=first.allowed_action.value,
+        )
 
 
 # ── Selective decomposition + weighted fusion (2.2.4.2) ────

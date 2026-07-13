@@ -6,6 +6,7 @@ Deterministic, route-aware evidence sufficiency grading and corrective actions.
 from __future__ import annotations
 
 import logging
+from time import perf_counter
 from dataclasses import dataclass
 from enum import Enum
 from typing import Iterable
@@ -94,6 +95,15 @@ class SufficiencyResult:
             "covered_subqueries": list(self.covered_subqueries),
             "missing_subqueries": list(self.missing_subqueries),
             "corrective_action": self.allowed_action.value,
+        }
+
+    def graph_trace_metadata(self) -> dict:
+        """Return bounded grader facts for graph stage instrumentation."""
+        return {
+            "status": self.status.value,
+            "score": self.overall_score,
+            "count": len(self.covered_subqueries),
+            "reason": self.allowed_action.value,
         }
 
 
@@ -442,6 +452,12 @@ def _choose_action(
 
 def grade_evidence(plan: QueryPlan, retrieval: dict) -> SufficiencyResult:
     """Grade usable evidence against every obligation in a validated plan."""
+    from .stream_events import current_emitter
+
+    emitter = current_emitter()
+    started_at = perf_counter()
+    if emitter is not None:
+        emitter.stage("grade", "started")
     obligations = build_obligations(plan)
     facts, documents, base_reasons = _usable_rows(retrieval or {})
     coverage_rows: list[CoverageResult] = []
@@ -472,7 +488,7 @@ def grade_evidence(plan: QueryPlan, retrieval: dict) -> SufficiencyResult:
         status = (SufficiencyStatus.BORDERLINE
                   if action is not CorrectiveAction.NONE
                   else SufficiencyStatus.MISSING)
-    return SufficiencyResult(
+    result = SufficiencyResult(
         status=status,
         overall_score=round(score, 4),
         reason_codes=reasons,
@@ -480,3 +496,10 @@ def grade_evidence(plan: QueryPlan, retrieval: dict) -> SufficiencyResult:
         conflicts=tuple(conflicts),
         allowed_action=action,
     )
+    if emitter is not None:
+        emitter.stage(
+            "grade", "completed",
+            elapsed_ms=(perf_counter() - started_at) * 1000,
+            reason=result.status.value,
+        )
+    return result
