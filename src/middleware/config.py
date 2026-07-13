@@ -28,6 +28,14 @@ _ADAPTIVE_MAX_RETRIEVAL_ROUNDS_RANGE = (1, 2)
 _ADAPTIVE_MAX_PLANNING_CALLS_RANGE = (0, 1)
 _ADAPTIVE_MAX_CONTEXT_CHARS_RANGE = (1000, 64000)
 
+# Safe corpus explorer budgets (2.2.7.2). These caps are also enforced by the
+# API/projector so a bad configuration cannot overload a local graph client.
+_CORPUS_PAGE_LIMIT_RANGE = (1, 200)
+_CORPUS_ELEMENT_LIMIT_RANGE = (1, 2000)
+_CORPUS_VISIBLE_NODE_TARGET_RANGE = (1, 499)
+_CORPUS_OVERVIEW_TTL_RANGE = (0.1, 60.0)
+_CORPUS_OPAQUE_ID_TTL_RANGE = (1.0, 3600.0)
+
 
 class MiddlewareConfig:
     """Configuration for the FastAPI middleware layer."""
@@ -80,6 +88,13 @@ class MiddlewareConfig:
         self.graph_trace_ttl_s: int = 3600
         self.graph_excerpt_chars: int = 1000
         self.graph_question_preview_chars: int = 200
+
+        # Phase 2.2.7.2 — Store-backed, read-only corpus explorer budgets.
+        self.corpus_page_limit: int = 100
+        self.corpus_element_limit: int = 2000
+        self.corpus_visible_node_target: int = 450
+        self.corpus_overview_cache_ttl_s: float = 2.0
+        self.corpus_opaque_id_ttl_s: float = 300.0
 
         # Phase 2.1.4 — analytical tool-calling controls.
         self.enable_tools: bool = False
@@ -232,6 +247,7 @@ class MiddlewareConfig:
         self._clamp_adaptive_limits()
         self._clamp_corrective_limits()
         self._clamp_hierarchy_limits()
+        self._clamp_corpus_limits()
         self._normalize_answer_validation()
 
     def _load_from_file(self, path: Path):
@@ -300,6 +316,11 @@ class MiddlewareConfig:
         _int("GRAPH_TRACE_TTL_S", "graph_trace_ttl_s")
         _int("GRAPH_EXCERPT_CHARS", "graph_excerpt_chars")
         _int("GRAPH_QUESTION_PREVIEW_CHARS", "graph_question_preview_chars")
+        _int("CORPUS_PAGE_LIMIT", "corpus_page_limit")
+        _int("CORPUS_ELEMENT_LIMIT", "corpus_element_limit")
+        _int("CORPUS_VISIBLE_NODE_TARGET", "corpus_visible_node_target")
+        _float("CORPUS_OVERVIEW_CACHE_TTL_S", "corpus_overview_cache_ttl_s")
+        _float("CORPUS_OPAQUE_ID_TTL_S", "corpus_opaque_id_ttl_s")
         _int("EMBEDDING_CACHE_SIZE", "embedding_cache_size")
         _int("CONVERSATION_MAX_TURNS", "conversation_max_turns")
         _int("CONVERSATION_MAX_HISTORY_CHARS", "conversation_max_history_chars")
@@ -421,6 +442,41 @@ class MiddlewareConfig:
             value = "off"
         self.answer_validation = value
         self.require_evidence_ids = bool(getattr(self, "require_evidence_ids", False))
+
+    def _clamp_corpus_limits(self) -> None:
+        """Clamp corpus explorer budgets to documented safe ranges."""
+        clamped: list[str] = []
+
+        def _clamp_int(attr: str, bounds: tuple[int, int]) -> None:
+            lo, hi = bounds
+            try:
+                value = int(getattr(self, attr))
+            except (TypeError, ValueError):
+                value = hi
+            bounded = max(lo, min(hi, value))
+            if bounded != value:
+                clamped.append(f"{attr}={value}->{bounded}")
+            setattr(self, attr, bounded)
+
+        def _clamp_float(attr: str, bounds: tuple[float, float]) -> None:
+            lo, hi = bounds
+            try:
+                value = float(getattr(self, attr))
+            except (TypeError, ValueError):
+                value = hi
+            bounded = max(lo, min(hi, value))
+            if bounded != value:
+                clamped.append(f"{attr}={value}->{bounded}")
+            setattr(self, attr, bounded)
+
+        _clamp_int("corpus_page_limit", _CORPUS_PAGE_LIMIT_RANGE)
+        _clamp_int("corpus_element_limit", _CORPUS_ELEMENT_LIMIT_RANGE)
+        _clamp_int("corpus_visible_node_target", _CORPUS_VISIBLE_NODE_TARGET_RANGE)
+        _clamp_float("corpus_overview_cache_ttl_s", _CORPUS_OVERVIEW_TTL_RANGE)
+        _clamp_float("corpus_opaque_id_ttl_s", _CORPUS_OPAQUE_ID_TTL_RANGE)
+        if clamped:
+            logger.warning(
+                "Clamped corpus explorer limits to safe ranges: %s", ", ".join(clamped))
 
     def _clamp_corrective_limits(self) -> None:
         """Hard-clamp corrective retries to the documented zero-or-one range."""

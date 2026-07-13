@@ -144,6 +144,8 @@ class ChromaStore:
     MAX_READ_LIMIT = 200
     MAX_READ_OFFSET = 10_000
     MAX_ADJACENT_SECTIONS = 10
+    MAX_INVENTORY_LIMIT = 200
+    MAX_INVENTORY_OFFSET = 10_000
 
     def __init__(self,
                  persist_directory: Optional[Path] = None,
@@ -529,6 +531,220 @@ class ChromaStore:
                     "metadata": results["metadatas"][i] if results["metadatas"] else None,
                 })
         return formatted
+
+    # ── Corpus explorer metadata reads (2.2.7.2) ──────────────────────────
+
+    @classmethod
+    def _validate_inventory_page(cls, limit: int, offset: int = 0) -> None:
+        """Reject unbounded metadata pages before querying Chroma."""
+        if not isinstance(limit, int) or isinstance(limit, bool):
+            raise ValueError("limit must be an integer")
+        if not 1 <= limit <= cls.MAX_INVENTORY_LIMIT:
+            raise ValueError(
+                f"limit must be between 1 and {cls.MAX_INVENTORY_LIMIT}")
+        if not isinstance(offset, int) or isinstance(offset, bool):
+            raise ValueError("offset must be an integer")
+        if not 0 <= offset <= cls.MAX_INVENTORY_OFFSET:
+            raise ValueError(
+                f"offset must be between 0 and {cls.MAX_INVENTORY_OFFSET}")
+
+    def _all_metadata(self) -> list[dict]:
+        """Read metadata only; never asks Chroma for document bodies."""
+        results = self.collection.get(include=["metadatas"])
+        ids = list(results.get("ids") or [])
+        metadatas = list(results.get("metadatas") or [])
+        return [
+            {
+                "id": ids[index],
+                "metadata": metadatas[index] if index < len(metadatas) else {},
+            }
+            for index in range(len(ids))
+        ]
+
+    def get_source_counts(self, *, limit: int = 100, offset: int = 0) -> list[dict]:
+        """Return metadata-only counts grouped by Chroma source."""
+        self._validate_inventory_page(limit, offset)
+        counts: dict[str, int] = {}
+        for row in self._all_metadata():
+            source = row["metadata"].get("source")
+            if source:
+                counts[str(source)] = counts.get(str(source), 0) + 1
+        return [
+            {"source": source, "count": count}
+            for source, count in sorted(counts.items())
+        ][offset:offset + limit]
+
+    def get_ticker_counts(self, *, limit: int = 100, offset: int = 0) -> list[dict]:
+        """Return metadata-only ticker coverage and source memberships."""
+        self._validate_inventory_page(limit, offset)
+        grouped: dict[str, dict] = {}
+        for row in self._all_metadata():
+            metadata = row["metadata"]
+            ticker = metadata.get("ticker")
+            if not ticker:
+                continue
+            ticker = str(ticker).upper()
+            item = grouped.setdefault(
+                ticker, {"ticker": ticker, "record_count": 0, "sources": set(),
+                         "company_name": None})
+            item["record_count"] += 1
+            if metadata.get("source"):
+                item["sources"].add(str(metadata["source"]))
+            item["company_name"] = item["company_name"] or metadata.get("company_name") or metadata.get("name")
+        rows = [
+            {**item, "sources": sorted(item["sources"])}
+            for item in sorted(grouped.values(), key=lambda value: value["ticker"])
+        ]
+        return rows[offset:offset + limit]
+
+    @staticmethod
+    def _family_matches(
+        family: dict,
+        *,
+        query: Optional[str] = None,
+        date_from: Optional[str] = None,
+        date_to: Optional[str] = None,
+    ) -> bool:
+        """Apply explicit family search filters to safe metadata fields."""
+        metadata = family["metadata"]
+        date = str(metadata.get("date") or metadata.get("filing_date") or "")
+        if date_from and date < date_from:
+            return False
+        if date_to and date > date_to:
+            return False
+        if query:
+            haystack = " ".join(
+                str(metadata.get(key) or "")
+                for key in (
+                    "source", "ticker", "date", "filing_date", "parent_id",
+                    "document_id", "title", "name",
+                )
+            ).lower()
+            if str(query).lower() not in haystack:
+                return False
+        return True
+
+    def search_document_families(
+        self,
+        *,
+        query: Optional[str] = None,
+        source: Optional[str] = None,
+        ticker: Optional[str] = None,
+        date_from: Optional[str] = None,
+        date_to: Optional[str] = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> list[dict]:
+        """Search non-SEC document families using metadata filters only."""
+        self._validate_inventory_page(limit, offset)
+        where_parts = []
+        if source:
+            where_parts.append({"source": str(source)})
+        if ticker:
+            where_parts.append({"ticker": str(ticker).upper()})
+        if date_from:
+            where_parts.append({"date": {"$gte": str(date_from)}})
+        if date_to:
+            where_parts.append({"date": {"$lte": str(date_to)}})
+        if not where_parts:
+            where = None
+        elif len(where_parts) == 1:
+            where = where_parts[0]
+        else:
+            where = {"$and": where_parts}
+
+        # Fetch only metadata. A bounded row window is enough to build a page
+        # of families and prevents an explorer request from becoming a corpus dump.
+        fetch_limit = min(self.MAX_INVENTORY_LIMIT, max(limit, offset + limit + 1))
+        results = self.collection.get(
+            **({"where": where} if where is not None else {}),
+            limit=fetch_limit,
+            offset=0,
+            include=["metadatas"],
+        )
+        ids = list(results.get("ids") or [])
+        metadatas = list(results.get("metadatas") or [])
+        families: dict[str, dict] = {}
+        for index, document_id in enumerate(ids):
+            metadata = dict(metadatas[index] if index < len(metadatas) else {})
+            if metadata.get("source") == "sec_filing":
+                continue
+            parent_id = str(metadata.get("parent_id") or str(document_id).split("#", 1)[0])
+            family = families.setdefault(
+                parent_id,
+                {"id": parent_id, "metadata": metadata, "chunk_count": 0},
+            )
+            declared_count = int(metadata.get("chunk_count") or 0)
+            family["chunk_count"] = max(
+                family["chunk_count"] + (0 if declared_count else 1),
+                declared_count,
+            )
+
+        ordered = [
+            family for family in sorted(
+                families.values(), key=lambda item: (
+                    str(item["metadata"].get("date") or item["metadata"].get("filing_date") or ""),
+                    item["id"],
+                ), reverse=True,
+            )
+            if self._family_matches(
+                family, query=query, date_from=date_from, date_to=date_to,
+            )
+        ]
+        return ordered[offset:offset + limit]
+
+    def get_filing_section_families(
+        self, accession: str, *, limit: int = 100, offset: int = 0,
+    ) -> list[dict]:
+        """Return bounded SEC section-family metadata without chunk bodies."""
+        self._validate_inventory_page(limit, offset)
+        results = self.collection.get(
+            where={"$and": [
+                {"source": "sec_filing"}, {"accession": accession},
+            ]},
+            limit=self.MAX_INVENTORY_LIMIT,
+            offset=0,
+            include=["metadatas"],
+        )
+        ids = list(results.get("ids") or [])
+        metadatas = list(results.get("metadatas") or [])
+        families: dict[str, dict] = {}
+        for index, document_id in enumerate(ids):
+            metadata = dict(metadatas[index] if index < len(metadatas) else {})
+            parent_id = str(metadata.get("parent_id") or str(document_id).split("#", 1)[0])
+            family = families.setdefault(
+                parent_id,
+                {"id": parent_id, "metadata": metadata, "chunk_count": 0},
+            )
+            declared_count = int(metadata.get("chunk_count") or 0)
+            family["chunk_count"] = max(
+                family["chunk_count"] + (0 if declared_count else 1),
+                declared_count,
+            )
+        ordered = sorted(
+            families.values(),
+            key=lambda item: (
+                int(item["metadata"].get("section_index", 0) or 0),
+                item["id"],
+            ),
+        )
+        return ordered[offset:offset + limit]
+
+    def get_document_family(
+        self, parent_id: str, *, limit: int = 1, offset: int = 0,
+    ) -> list[dict]:
+        """Read one bounded document-family page, including bodies only for detail."""
+        self._validate_page(limit, offset)
+        results = self.collection.get(
+            where={"parent_id": parent_id},
+            limit=limit,
+            offset=offset,
+            include=["documents", "metadatas"],
+        )
+        return self._format_get_results(results)
+
+    list_document_families = search_document_families
+    list_filing_section_families = get_filing_section_families
 
     # ── Collection Management ─────────────────────────
 

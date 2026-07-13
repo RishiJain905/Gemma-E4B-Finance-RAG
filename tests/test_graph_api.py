@@ -87,3 +87,51 @@ def test_sse_last_event_id_replays_or_requires_reset():
     assert response.status_code == 200
     assert "event: upsert_node" in response.text
     assert "id: " in response.text
+
+
+def _corpus_client(store, *, enabled=True):
+    from src.middleware.config import MiddlewareConfig
+    from src.middleware.graph_api import create_graph_router
+
+    app = FastAPI()
+    config = MiddlewareConfig(config_path=None)
+    config.corpus_page_limit = 2
+    config.corpus_element_limit = 20
+    app.include_router(create_graph_router(
+        lambda: None, lambda: enabled, lambda: store, lambda: config,
+    ))
+    return TestClient(app, client=("127.0.0.1", 50000))
+
+
+def test_corpus_routes_are_loopback_read_only_and_contract_bounded(offline_store):
+    offline_store.sqlite.register_filing(
+        "NVDA", "10-Q", "2026-05-15", "2026-Q1", "ACC-GRAPH-1",
+        "https://sec.example/ACC-GRAPH-1",
+    )
+    offline_store.chroma.records = [{
+        "id": "sec:ACC-GRAPH-1:item_1#0", "document": "Business section",
+        "metadata": {
+            "source": "sec_filing", "ticker": "NVDA", "accession": "ACC-GRAPH-1",
+            "section_key": "item_1", "section_heading": "Business",
+            "section_index": 0, "parent_id": "sec:ACC-GRAPH-1:item_1",
+            "chunk_count": 1, "source_url": "https://sec.example/section",
+        },
+    }]
+    client = _corpus_client(offline_store)
+
+    overview = client.get("/graph/api/corpus/overview")
+    assert overview.status_code == 200
+    assert {"nodes", "edges", "next_cursor", "truncated", "corpus_revision"} <= overview.json().keys()
+    sections = client.get("/graph/api/corpus/filings/ACC-GRAPH-1/sections?limit=1")
+    assert sections.status_code == 200
+    assert sections.json()["nodes"][0]["kind"] == "section"
+    status = client.get("/graph/api/corpus/refresh-status")
+    assert status.status_code == 200
+    assert status.json()["refresh"]["sources"]
+    assert client.post("/graph/api/corpus/overview").status_code == 405
+
+
+def test_corpus_routes_return_404_when_graph_is_disabled(offline_store):
+    client = _corpus_client(offline_store, enabled=False)
+    assert client.get("/graph/api/corpus/overview").status_code == 404
+    assert client.get("/graph/api/corpus/refresh-status").status_code == 404

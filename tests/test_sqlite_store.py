@@ -261,6 +261,53 @@ def test_search_facts_empty(store: SQLiteStore):
     assert results == []
 
 
+# ── Corpus explorer inventory reads (2.2.7.2) ─────────────────────────────
+
+def test_corpus_inventory_reads_are_filtered_and_bounded(store: SQLiteStore):
+    store.upsert_fundamental(
+        "NVDA", "revenue", 26.0, unit="usd", period="2026-Q1",
+        source_type="sec", source_url="https://sec.example/revenue",
+    )
+    store.upsert_fundamental(
+        "AMD", "revenue", 5.8, unit="usd", period="2026-Q1",
+        source_type="yfinance",
+    )
+    store.register_filing(
+        "NVDA", "10-Q", "2026-05-15", "2026-Q1", "ACC-1",
+        "https://sec.example/ACC-1",
+    )
+    store.mark_filing_parsed(
+        "ACC-1", file_path=r"C:\private\ACC-1.txt", section_count=2,
+        chunk_count=3,
+    )
+    store.mark_cache_fresh("NVDA", "sec_filings")
+
+    assert store.get_source_counts(limit=10, offset=0)
+    tickers = store.get_ticker_counts(limit=10, offset=0)
+    assert {row["ticker"] for row in tickers} >= {"NVDA", "AMD"}
+
+    metrics = store.search_corpus_metrics(
+        query="revenue", ticker="NVDA", unit="usd", limit=10, offset=0,
+    )
+    assert metrics[0]["metric"] == "revenue"
+    assert metrics[0]["ticker"] == "NVDA"
+
+    filings = store.list_filings(ticker="NVDA", limit=10, offset=0)
+    assert filings[0]["accession"] == "ACC-1"
+    assert "file_path" not in filings[0]
+    assert store.get_filing("ACC-1")["index_chunk_count"] == 3
+    assert store.list_freshness(ticker="NVDA", limit=10, offset=0)
+
+
+def test_corpus_inventory_rejects_invalid_pages(store: SQLiteStore):
+    with pytest.raises(ValueError):
+        store.get_source_counts(limit=0)
+    with pytest.raises(ValueError):
+        store.list_filings(limit=SQLiteStore.MAX_INVENTORY_LIMIT + 1)
+    with pytest.raises(ValueError):
+        store.search_corpus_metrics(limit=1, offset=-1)
+
+
 # ── Store Revision (2.2.6.2) ──────────────────────
 
 def test_store_revision_starts_at_zero(store: SQLiteStore):
