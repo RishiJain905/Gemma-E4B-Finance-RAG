@@ -9,6 +9,12 @@ corpus projection/explorer, Cytoscape single-page UI, chat integration + securit
 convention (`docs/phase2.2/README-2.2.md`) keeps each feature's `RESULTS.md`
 inside its feature folder under `docs/phase2.2/`, so this file lives here.
 
+**Assets:** the binding visual design system and implementation-time browser
+smoke screenshots are preserved in [`assets/`](assets/):
+[design direction](assets/design-direction-2.2.7.3.md) ·
+[Live Trace screenshot](assets/ui-live-trace.png) ·
+[Corpus Explorer screenshot](assets/ui-corpus.png).
+
 ## Ship decision
 
 **Ship disabled by default.** `enable_graph_observer: false`. When enabled, the
