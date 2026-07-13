@@ -575,3 +575,65 @@ Scheduler-managed refreshes (SEC filings, earnings transcripts, IR pages) are
 routed through `UnifiedScheduler._run_source` so TTL tracking and error
 handling stay consistent with cron-driven runs; other sources are ingested
 directly (`_refresh_one_source_direct`).
+
+## Live Retrieval Graph Observer (Phase 2.2.7)
+
+A local, read-only observability side channel that visualizes the retrieval
+pipeline without touching it. **Disabled by default** (`enable_graph_observer`),
+served loopback-only. This is an *observability graph*, not a retrieval
+architecture — it never changes what is retrieved or how the answer is produced.
+See `docs/phase2.2/ARCHITECTURE-DECISION.md` for the explicit
+observability-graph-vs-GraphRAG distinction.
+
+### Observer side channel
+
+- **One instrumentation seam.** The pipeline already emits a single stream of
+  redacted `QueryEvent`s (`src/middleware/stream_events.py`, 2.2.6.1). The
+  observer subscribes an extra callback to that same emitter
+  (`make_event_observer`), so the pipeline is instrumented **once** and the same
+  events feed both the chat SSE progress line and the graph. `/query` and
+  `/query/stream` install the emitter (with the graph observer attached) only
+  when the flag is on; otherwise no emitter is created and behavior is
+  byte-identical.
+- **Projection.** `event_graph_deltas` (`src/middleware/graph_observer.py`)
+  projects each event into bounded, allowlisted graph deltas: nodes for the
+  query, validated plan and its subqueries, executed stages, tools, retrieved
+  evidence and its source, and the terminal answer/citations/validation; edges
+  for the `compiled_to`/`contains`/`routed_to`/`retrieved`/`from_source`/
+  `expanded_from`/`supports`/`cited_by`/`corrected_by`/`validated_as` relations.
+  Node/edge ids are prefixed by `query_id`, so two concurrent queries never share
+  elements.
+- **TraceHub.** A bounded, in-memory, non-blocking store/broadcaster. It clamps
+  trace count, total elements, and per-trace TTL; compacts repeated upserts;
+  fans out deltas to SSE subscribers **without awaiting** them (a slow/full
+  subscriber is marked for reset, never blocking a publish); and fails soft — if
+  observation ever raises it disables itself and discards future deltas rather
+  than affecting the query. Publishing is synchronous and measured p95 < 2 ms.
+  Nothing is persisted.
+- **Redaction by construction.** Questions become a bounded preview + SHA-256
+  digest; evidence bodies are bounded excerpts; a metadata allowlist plus
+  secret/local-path scrubbing runs on every node/edge; source links are kept only
+  when `http`/`https`.
+
+### Corpus projection
+
+`src/middleware/corpus_graph.py` (`CorpusGraph`) projects the authoritative Store
+inventory (sources, tickers, metrics, facts, filings, sections, document
+families, freshness, scheduler sources) into the same bounded graph shape for the
+explorer tab. It reads only the Store's read methods, never embeddings or the
+model; every page is hard-bounded and keyed to `Store.retrieval_revision()` via
+opaque cursors so a mid-browse ingestion write is detected (HTTP 409) rather than
+silently mixing revisions. The overview is cached for a short TTL keyed by
+revision.
+
+### Serving & security
+
+`src/middleware/graph_api.py` mounts the read-only `/graph/api/*` router; the
+static single-page UI (`src/middleware/static/graph/`, Cytoscape) is served from
+the app. A single HTTP middleware is the chokepoint for every `/graph*` route:
+it rejects non-loopback clients with 404 (no bypass flag) and stamps a strict
+same-origin CSP + hardening headers. The UI is same-origin and self-contained
+(no cookies/localStorage/service worker/analytics/third-party requests) and never
+writes dynamic data through `innerHTML`. See `docs/API.md` for endpoints and the
+event schema, and `docs/CONFIGURATION.md` for the flags and the explicit
+no-remote-exposure rule.

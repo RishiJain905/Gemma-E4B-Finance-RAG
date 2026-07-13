@@ -25,6 +25,7 @@ import sys
 import threading
 import time
 import uuid
+import webbrowser
 from pathlib import Path
 
 import httpx
@@ -139,6 +140,19 @@ class _ElapsedSpinner:
 def _new_session_id() -> str:
     """Generate a fresh local session id (tracing only, never persisted)."""
     return uuid.uuid4().hex
+
+
+def _open_url(url: str, *, opener=webbrowser.open) -> bool:
+    """Open a URL in the default browser via stdlib webbrowser (2.2.7.4).
+
+    Never starts the middleware or model — only hands the URL to the OS browser.
+    Returns True if the opener reported success; on any failure the caller keeps
+    running and prints the URL so it can be opened manually. ``opener`` is
+    injected in tests so nothing actually launches a browser."""
+    try:
+        return bool(opener(url))
+    except Exception:
+        return False
 
 
 class MultilineBuffer:
@@ -449,6 +463,13 @@ def _render_metadata(data: dict, *, verbose: bool) -> None:
     if tools_used:
         print(col(f"  used: {', '.join(tools_used)}", C.DIM))
 
+    # Local query-graph trace pointer (2.2.7.4). Present only when the server's
+    # graph observer is enabled; a short id keeps the terminal restrained while
+    # letting the user open it with /graph trace.
+    trace_id = data.get("graph_trace_id")
+    if trace_id:
+        print(col(f"  trace={str(trace_id)[:8]} (/graph trace to open)", C.DIM))
+
     resolved = data.get("resolved_ticker") or {}
     if resolved.get("name"):
         ticker = data.get("detected_ticker") or resolved["name"]
@@ -581,6 +602,14 @@ class ChatSession:
         self.multiline_capable: bool = True
         self.conversation_max_turns: int | None = None
         self.conversation_max_history_chars: int | None = None
+        # Local query-graph observer (2.2.7.4). Advertised by /health only when
+        # the server has ENABLE_GRAPH_OBSERVER on; older/observer-off servers
+        # leave these defaults so /graph reports the feature is unavailable.
+        self.graph_observer: bool = False
+        self.graph_url: str | None = None
+        self.graph_observer_limits: dict | None = None
+        # Short id of the most recent query's graph trace, for /graph trace.
+        self.last_trace_id: str | None = None
 
     def close(self) -> None:
         self.client.close()
@@ -609,6 +638,14 @@ class ChatSession:
             self.conversation_max_turns = caps["conversation_max_turns"]
         if isinstance(caps.get("conversation_max_history_chars"), int):
             self.conversation_max_history_chars = caps["conversation_max_history_chars"]
+        # Graph observer capabilities (2.2.7.4) — present only when enabled.
+        self.graph_observer = bool(caps.get("graph_observer"))
+        graph_url = caps.get("graph_url")
+        if isinstance(graph_url, str) and graph_url:
+            self.graph_url = graph_url
+        limits = caps.get("graph_observer_limits")
+        if isinstance(limits, dict):
+            self.graph_observer_limits = limits
         return caps
 
     def prompt_suffix(self) -> str:
@@ -718,6 +755,52 @@ class ChatSession:
             result = self._query_non_stream(payload)
         if result is not None:
             self._record_turn(question, result)
+            trace_id = (result.get("metadata") or {}).get("graph_trace_id")
+            if trace_id:
+                self.last_trace_id = trace_id
+
+    # ── Live graph (2.2.7.4) ───────────────────────────
+
+    def effective_graph_url(self) -> str:
+        """Return the graph UI URL: the server-advertised value or a local fallback.
+
+        Prefers the same-origin ``graph_url`` the server reports in /health
+        capabilities; falls back to this client's own base URL + ``/graph`` so
+        the command still resolves a correct localhost URL against an older
+        server that does not advertise it."""
+        if self.graph_url:
+            return self.graph_url
+        base = str(self.client.base_url).rstrip("/")
+        return f"{base}/graph"
+
+    def graph(self, arg: str, *, opener=webbrowser.open) -> None:
+        """Handle ``/graph``, ``/graph url``, and ``/graph trace`` (2.2.7.4).
+
+        Opens (or, for ``url``, only prints) the effective local graph URL using
+        the standard-library browser opener. Never starts the middleware or model
+        process; a failed browser launch prints the URL and continues."""
+        if not self.graph_observer:
+            print(col("  graph observer is disabled on this server. Restart the "
+                      "middleware with ENABLE_GRAPH_OBSERVER=1 to use /graph.", C.YE))
+            return
+        sub = (arg or "").strip().lower()
+        url = self.effective_graph_url()
+        if sub == "trace":
+            if self.last_trace_id:
+                url = f"{url}#trace={self.last_trace_id}"
+            else:
+                print(col("  no query trace yet — ask a question first; opening the "
+                          "live view.", C.DIM))
+        elif sub == "url":
+            print(col(f"  {url}", C.CY))
+            return
+        elif sub not in ("", "open"):
+            print(col("  usage: /graph [url|trace]", C.YE))
+            return
+        if _open_url(url, opener=opener):
+            print(col(f"  opened {url}", C.DIM))
+        else:
+            print(col(f"  couldn't open a browser automatically — open: {url}", C.YE))
 
     def refresh(self, arg: str) -> None:
         do_refresh(self.client, arg)
@@ -1073,6 +1156,8 @@ def print_capabilities(client: httpx.Client) -> None:
         parts.append(f"history={'on' if caps.get('history') else 'off'}")
     if "max_question_chars" in caps:
         parts.append(f"max_question_chars={caps.get('max_question_chars')}")
+    if caps.get("graph_observer"):
+        parts.append("graph=on")
     if parts:
         print(col("Capabilities: " + " ".join(parts), C.DIM))
 
@@ -1097,6 +1182,9 @@ HELP = f"""
   {C.CY}/tools{C.R}                   show model-callable tools
   {C.CY}/eval [N]{C.R}                run the single-turn eval (default 5 cases) against this server
   {C.CY}/eval conversations [N]{C.R}  run the conversation fixtures + carryover/leakage metrics
+  {C.CY}/graph{C.R}                   open the live retrieval graph in your browser (if enabled)
+  {C.CY}/graph url{C.R}               print the graph URL without opening it
+  {C.CY}/graph trace{C.R}             open the graph focused on the latest query trace
   {C.CY}/help{C.R}                    show this help
   {C.CY}/quit{C.R} or {C.CY}/exit{C.R}            leave (stops the middleware if this script started it)
 """
@@ -1113,6 +1201,9 @@ def main():
                         help="HTTP request timeout in seconds")
     parser.add_argument("--no-stream", action="store_true",
                         help="Disable streaming and use POST /query")
+    parser.add_argument("--open-graph", action="store_true",
+                        help="Open the live retrieval graph once at startup "
+                             "(only if the server has the graph observer enabled)")
     args = parser.parse_args()
 
     base = f"http://127.0.0.1:{args.port}"
@@ -1149,6 +1240,10 @@ def main():
     autorefresh = False
     session.load_capabilities()
     print_capabilities(session.client)
+    if args.open_graph:
+        # Open once after capabilities are known (2.2.7.4). No-op with a friendly
+        # note when the server has the observer disabled; never starts a process.
+        session.graph("")
     print(HELP)
 
     try:
@@ -1177,6 +1272,8 @@ def main():
                     session.health()
                 elif cmd == "tools":
                     session.tools()
+                elif cmd == "graph":
+                    session.graph(rest)
                 elif cmd == "refresh":
                     session.refresh(rest)
                 elif cmd == "ticker":

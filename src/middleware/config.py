@@ -28,6 +28,15 @@ _ADAPTIVE_MAX_RETRIEVAL_ROUNDS_RANGE = (1, 2)
 _ADAPTIVE_MAX_PLANNING_CALLS_RANGE = (0, 1)
 _ADAPTIVE_MAX_CONTEXT_CHARS_RANGE = (1000, 64000)
 
+# Safe query-graph observer budgets (2.2.7.4). The in-memory TraceHub also
+# clamps these internally; enforcing them here keeps a bad config from ever
+# requesting an unbounded trace/element/excerpt footprint for the local UI.
+_GRAPH_TRACE_LIMIT_RANGE = (1, 1000)
+_GRAPH_ELEMENT_LIMIT_RANGE = (1, 50000)
+_GRAPH_TRACE_TTL_RANGE = (1, 86400)
+_GRAPH_EXCERPT_CHARS_RANGE = (0, 10000)
+_GRAPH_QUESTION_PREVIEW_CHARS_RANGE = (0, 2000)
+
 # Safe corpus explorer budgets (2.2.7.2). These caps are also enforced by the
 # API/projector so a bad configuration cannot overload a local graph client.
 _CORPUS_PAGE_LIMIT_RANGE = (1, 200)
@@ -247,6 +256,7 @@ class MiddlewareConfig:
         self._clamp_adaptive_limits()
         self._clamp_corrective_limits()
         self._clamp_hierarchy_limits()
+        self._clamp_graph_limits()
         self._clamp_corpus_limits()
         self._normalize_answer_validation()
 
@@ -442,6 +452,35 @@ class MiddlewareConfig:
             value = "off"
         self.answer_validation = value
         self.require_evidence_ids = bool(getattr(self, "require_evidence_ids", False))
+
+    def _clamp_graph_limits(self) -> None:
+        """Clamp query-graph observer budgets to documented safe ranges (2.2.7.4).
+
+        A single warning is logged if any value was out of range so a bad config
+        can never request an unbounded trace/element/excerpt footprint for the
+        local read-only UI. The TraceHub clamps again defensively at construction.
+        """
+        clamped: list[str] = []
+
+        def _clamp(attr: str, bounds: tuple[int, int]) -> None:
+            lo, hi = bounds
+            try:
+                value = int(getattr(self, attr))
+            except (TypeError, ValueError):
+                value = hi
+            bounded = max(lo, min(hi, value))
+            if bounded != value:
+                clamped.append(f"{attr}={value}->{bounded}")
+            setattr(self, attr, bounded)
+
+        _clamp("graph_trace_limit", _GRAPH_TRACE_LIMIT_RANGE)
+        _clamp("graph_element_limit", _GRAPH_ELEMENT_LIMIT_RANGE)
+        _clamp("graph_trace_ttl_s", _GRAPH_TRACE_TTL_RANGE)
+        _clamp("graph_excerpt_chars", _GRAPH_EXCERPT_CHARS_RANGE)
+        _clamp("graph_question_preview_chars", _GRAPH_QUESTION_PREVIEW_CHARS_RANGE)
+        if clamped:
+            logger.warning(
+                "Clamped graph observer limits to safe ranges: %s", ", ".join(clamped))
 
     def _clamp_corpus_limits(self) -> None:
         """Clamp corpus explorer budgets to documented safe ranges."""

@@ -49,6 +49,9 @@ server doesn't report a `capabilities` block.
 | `/tools` | List model-callable tools (`GET /tools`); degrades gracefully if the endpoint is missing or tools are disabled. |
 | `/eval [N]` | Run the **single-turn** eval (default 5 cases, `--no-conversations`) against this running server and print the tail. |
 | `/eval conversations [N]` | Run the **conversation** fixtures, then score deterministically and print carryover / topic-reset / subquestion-coverage / leakage metrics. Opt-in; needs an already-running stack. |
+| `/graph` | Open the live retrieval graph (`/graph`) in your default browser. No-op with a note when the server has the graph observer disabled; never starts the middleware or model. |
+| `/graph url` | Print the effective graph URL without opening a browser. |
+| `/graph trace` | Open the graph focused on the most recent query's trace (deep-links `#trace=<id>`); opens the live view if no query has run yet. |
 | `/help` | Show the full command list. |
 | `/quit` or `/exit` | Leave (stops the middleware if this script started it). |
 
@@ -215,6 +218,33 @@ At startup, and any time you run `/health`, the client reads (or shows)
   enforces locally (default 16,000 when the server doesn't advertise it).
 - `conversation_max_turns` / `conversation_max_history_chars` — the server's
   bound on how much history it will actually use per request.
+- `graph_observer` / `graph_url` / `graph_observer_limits` — advertised **only**
+  when the server has the local retrieval-graph observer enabled (2.2.7.4). The
+  client uses `graph_url` for `/graph`, falling back to its own base URL +
+  `/graph` if an older server omits it.
 
 The startup `Capabilities:` line surfaces `history` and `max_question_chars`
-alongside `tools`/`streaming`/`answer_policy` when the server reports them.
+alongside `tools`/`streaming`/`answer_policy` (plus `graph=on` when the observer
+is enabled) when the server reports them.
+
+## Live retrieval graph (2.2.7.4)
+
+The `/graph` commands open a **local, read-only** visualization of the retrieval
+pipeline: the query, its plan/subqueries, executed stages and tools, retrieved
+evidence with source links, and the final answer, citations, and validation.
+
+- `/graph` opens the graph in your default browser (via Python's stdlib
+  `webbrowser`); `/graph url` prints the URL; `/graph trace` deep-links the most
+  recent query's trace. Launch the client with `--open-graph` to open it once at
+  startup.
+- After every answer, the metadata block prints `trace=<short id>` when the
+  observer is enabled, so you know a trace was captured and can open it.
+- The graph is **disabled by default** and served **loopback-only** with a strict
+  same-origin CSP. To use it, start the middleware with `ENABLE_GRAPH_OBSERVER=1`
+  (see `docs/CONFIGURATION.md`). Without it, `/graph` prints a short note and does
+  nothing — no browser, no processes.
+
+**Troubleshooting:** if `/graph` says the observer is disabled, restart the
+middleware with `ENABLE_GRAPH_OBSERVER=1`. If the browser doesn't open
+automatically, the command prints the URL to open manually. The page is only
+reachable from `127.0.0.1`; a remote browser gets a 404 by design.

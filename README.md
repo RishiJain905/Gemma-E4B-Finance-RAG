@@ -188,6 +188,7 @@ you> And how about AMD?  # follow-ups reuse this session's bounded history
 you> /history            # preview this conversation's turns (local, no API call)
 you> /new                # start a fresh conversation (clear history, new session id)
 you> /history off        # run single-turn (stop sending/recording history)
+you> /graph              # open the live retrieval graph (if the observer is enabled)
 you> /help               # full command list
 you> /quit               # stops the middleware if this script started it
 ```
@@ -196,6 +197,17 @@ It still requires `llama-server` on `:8087`; it warns and falls back to
 degraded answers if the model is unreachable. See
 [`scripts/CHAT.md`](scripts/CHAT.md) for every command and metadata tag the
 renderer can show.
+
+### Live retrieval graph (optional, Phase 2.2.7)
+
+An optional, **local read-only** visualization of the retrieval pipeline (query →
+plan → stages → tools → evidence → answer) plus a corpus explorer. It is
+**disabled by default** and served **loopback-only** with a strict same-origin
+CSP — start the middleware with `ENABLE_GRAPH_OBSERVER=1` to enable it, then open
+`http://127.0.0.1:8000/graph` or run `/graph` in the chat client (`--open-graph`
+opens it at startup). It is an *observability* view and never changes retrieval
+or answers. Remote exposure is intentionally unsupported. See
+[`docs/CONFIGURATION.md`](docs/CONFIGURATION.md) and [`docs/API.md`](docs/API.md).
 
 ---
 

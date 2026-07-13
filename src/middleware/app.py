@@ -22,8 +22,8 @@ from pathlib import Path
 from typing import Optional
 
 import httpx
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 
 from src.storage.store import Store
 from . import prompt_policy
@@ -911,6 +911,65 @@ def graph_static(asset: str) -> FileResponse:
     )
 
 
+# ── Local-safe graph security posture (Phase 2.2.7.4) ────────────────────────
+# The observer UI and API are a strictly local, read-only side channel. This one
+# middleware is the single chokepoint that (1) hides every /graph* surface from a
+# non-loopback client (no bypass flag — remote exposure is a separate future
+# design covering auth/TLS/proxy trust) and (2) stamps a strict same-origin CSP
+# and hardening headers on the responses. The graph router keeps its own loopback
+# dependency so it is still safe when mounted standalone in tests.
+_GRAPH_LOOPBACK_HOSTS = frozenset({"127.0.0.1", "::1", "localhost"})
+
+# default-src 'none' denies everything not explicitly granted. Scripts/fonts/
+# connect (fetch + SSE) are same-origin only; img allows data: for the inline
+# favicon and canvas tiles. style-src additionally allows 'unsafe-inline' because
+# Cytoscape injects one fixed ``position: relative`` <style> element at runtime —
+# inline STYLE cannot execute code, and script-src stays strict 'self', which is
+# the XSS-critical directive. No third-party origin is ever allowed.
+_GRAPH_CSP = (
+    "default-src 'none'; "
+    "script-src 'self'; "
+    "style-src 'self' 'unsafe-inline'; "
+    "img-src 'self' data:; "
+    "font-src 'self'; "
+    "connect-src 'self'; "
+    "base-uri 'none'; "
+    "form-action 'none'; "
+    "frame-ancestors 'none'"
+)
+
+
+def _is_graph_path(path: str) -> bool:
+    return path == "/graph" or path.startswith("/graph/")
+
+
+def _apply_graph_security_headers(response, path: str) -> None:
+    """Stamp the strict same-origin CSP + hardening headers on a graph response."""
+    response.headers["Content-Security-Policy"] = _GRAPH_CSP
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["Referrer-Policy"] = "no-referrer"
+    response.headers["Cross-Origin-Opener-Policy"] = "same-origin"
+    response.headers["Cross-Origin-Resource-Policy"] = "same-origin"
+    # Read-only observability data is never cacheable. Handlers that need a
+    # different directive (SSE keep-alive uses no-cache; the static bundle uses
+    # no-cache) set Cache-Control themselves; only add the default when absent.
+    response.headers.setdefault("Cache-Control", "no-store")
+
+
+@app.middleware("http")
+async def _graph_security_middleware(request: Request, call_next):
+    """Enforce loopback-only access and same-origin CSP for every /graph* route."""
+    path = request.url.path
+    if not _is_graph_path(path):
+        return await call_next(request)
+    host = request.client.host if request.client else ""
+    if host not in _GRAPH_LOOPBACK_HOSTS:
+        return JSONResponse(status_code=404, content={"detail": "Not found"})
+    response = await call_next(request)
+    _apply_graph_security_headers(response, path)
+    return response
+
+
 def _find_tasks_block(node) -> dict:
     if not isinstance(node, dict):
         return {}
@@ -962,7 +1021,7 @@ def _guidance_data(ticker: str) -> dict:
 # ── Health ─────────────────────────────────────────────
 
 @app.get("/health", response_model=HealthResponse)
-async def health():
+async def health(request: Request):
     """Enhanced health check with storage, model, scheduler, and freshness."""
     if not store:
         raise HTTPException(status_code=503, detail="Store not initialized")
@@ -1007,6 +1066,14 @@ async def health():
             "conversation_max_history_chars": int(
                 getattr(config, "conversation_max_history_chars", 8000)),
         }
+        # Local query-graph observer (2.2.7.4). Advertised only when enabled so
+        # older/observer-off servers stay byte-compatible and the chat client
+        # knows the effective, same-origin graph URL + bounded observer limits.
+        if _graph_observer_enabled():
+            capabilities["graph_observer"] = True
+            capabilities["graph_url"] = str(request.base_url).rstrip("/") + "/graph"
+            if graph_hub is not None:
+                capabilities["graph_observer_limits"] = graph_hub.health().get("limits")
 
     return HealthResponse(
         status="ok" if storage_health.get("sqlite") else "degraded",
@@ -1895,6 +1962,15 @@ def _build_query_response(
         resolved_metrics = list(compiled.metrics)
         resolved_timeframe = compiled.timeframe
 
+    # Optional local query-graph trace id (2.2.7.4). Non-None only when the
+    # observer is enabled and this request installed an emitter; excluded from
+    # the serialized response otherwise so behavior stays byte-compatible.
+    graph_trace_id = None
+    if _graph_observer_enabled():
+        emitter = _stream_emitter_var.get()
+        if emitter is not None:
+            graph_trace_id = emitter.query_id
+
     return QueryResponse(
         answer=answer_text,
         citations=citations,
@@ -1921,6 +1997,7 @@ def _build_query_response(
         evidence_sufficiency=context.get("evidence_sufficiency"),
         evidence_citations=evidence_citations,
         answer_validation=validation,
+        graph_trace_id=graph_trace_id,
     )
 
 

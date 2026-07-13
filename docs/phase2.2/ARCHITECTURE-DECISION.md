@@ -518,3 +518,41 @@ Primary papers and official project material used to evaluate the alternatives:
 Published results commonly use different corpora, retrievers, and much larger
 or specially trained generators. They motivate experiments; they do not
 replace local evaluation.
+
+---
+
+## Phase 2.2.7 as-built confirmation (2.2.7.4)
+
+The proposed live-retrieval-observability design shipped as specified across
+2.2.7.1–2.2.7.4. This note ratifies the two load-bearing decisions.
+
+**Cytoscape.js was used, as proposed.** One pinned Cytoscape bundle plus fonts,
+licenses, and SHA-256 hashes are served locally from
+`src/middleware/static/graph/` (no CDN, no Node build chain, no React/Vue, no
+analytics, no graph database). The visible graph stays bounded and expands on
+demand, so the general WebGL renderers (Sigma.js / Three.js) remained
+unnecessary. The interface is keyboard-navigable and readable on a side monitor,
+matching the rationale in *Renderer choice* above.
+
+**This is an observability graph, not GraphRAG — the distinction held in the
+implementation, not just the design.** Concretely:
+
+- *No effect on retrieval or the answer.* The observer subscribes an extra
+  callback to the single existing `QueryEvent` emitter (2.2.6.1) and projects
+  events into a bounded graph. When the flag is off, no emitter is installed and
+  the `/query` path is byte-identical; when on, the only response change is an
+  optional `graph_trace_id`. It never re-ranks, re-retrieves, or re-prompts.
+- *No LLM-derived graph.* Nodes/edges are the *actual* executed pipeline elements
+  (query, validated plan, request-local subqueries, executed stages/tools,
+  retrieved evidence and its real source, terminal answer/citations/validation)
+  and, in the explorer, the *authoritative* Store inventory. There are no
+  entity/relationship extraction passes, no community summaries, and no extra
+  generation calls — the two things that define GraphRAG.
+- *Direction of data flow is the opposite of GraphRAG.* GraphRAG builds a graph
+  to *drive* retrieval; here retrieval drives the graph. The graph is a faithful
+  read-out of what already happened, redacted and bounded for local viewing.
+
+If relationship-heavy questions later become a measured priority, the deferred
+path remains a deterministic metadata graph (issuer/filing/period/industry/
+metric/macro) before any GraphRAG-style indexing — the corpus projector
+(2.2.7.2) is a first, read-only step in exactly that direction.
