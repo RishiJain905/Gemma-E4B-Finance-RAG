@@ -23,7 +23,7 @@ from typing import Optional
 
 import httpx
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import StreamingResponse
+from fastapi.responses import FileResponse, StreamingResponse
 
 from src.storage.store import Store
 from . import prompt_policy
@@ -849,6 +849,66 @@ app.include_router(create_graph_router(
     lambda: store,
     lambda: config,
 ))
+
+# ── Static single-page graph UI (Phase 2.2.7.3) ──────────────────────────────
+# Served from disk only when the observer is enabled, mirroring the 404-when-off
+# convention of the graph API router. No StaticFiles mount / directory listing:
+# a fixed extension allowlist and a resolved-path containment check keep the
+# surface to the pinned bundle only.
+_GRAPH_STATIC_DIR = (Path(__file__).parent / "static" / "graph").resolve()
+_GRAPH_MEDIA_TYPES = {
+    ".html": "text/html; charset=utf-8",
+    ".css": "text/css; charset=utf-8",
+    ".js": "text/javascript; charset=utf-8",
+    ".woff2": "font/woff2",
+    ".json": "application/json",
+    ".txt": "text/plain; charset=utf-8",
+    ".png": "image/png",
+    ".svg": "image/svg+xml",
+    ".map": "application/json",
+}
+
+
+def _graph_static_file(relative: str) -> Path:
+    """Resolve a request path inside the pinned bundle or raise 404.
+
+    Rejects traversal (``..``), absolute paths, disallowed extensions, and any
+    resolved path that escapes ``_GRAPH_STATIC_DIR``.
+    """
+    if not _graph_observer_enabled():
+        raise HTTPException(status_code=404, detail="Not found")
+    candidate = (_GRAPH_STATIC_DIR / relative).resolve()
+    try:
+        candidate.relative_to(_GRAPH_STATIC_DIR)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail="Not found") from exc
+    if candidate.suffix.lower() not in _GRAPH_MEDIA_TYPES:
+        raise HTTPException(status_code=404, detail="Not found")
+    if not candidate.is_file():
+        raise HTTPException(status_code=404, detail="Not found")
+    return candidate
+
+
+@app.get("/graph", include_in_schema=False)
+def graph_index() -> FileResponse:
+    """Return the single-page graph interface (404 when the observer is off)."""
+    index = _graph_static_file("index.html")
+    return FileResponse(
+        index,
+        media_type="text/html; charset=utf-8",
+        headers={"Cache-Control": "no-store"},
+    )
+
+
+@app.get("/graph/static/{asset:path}", include_in_schema=False)
+def graph_static(asset: str) -> FileResponse:
+    """Serve one pinned bundle asset with a safe MIME type and no listing."""
+    target = _graph_static_file(asset)
+    return FileResponse(
+        target,
+        media_type=_GRAPH_MEDIA_TYPES[target.suffix.lower()],
+        headers={"Cache-Control": "no-cache"},
+    )
 
 
 def _find_tasks_block(node) -> dict:
