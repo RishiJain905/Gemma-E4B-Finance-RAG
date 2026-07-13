@@ -227,6 +227,8 @@ class Store:
     COMPANYFACTS_CONFIG_PATH = (
         Path(__file__).parent.parent.parent / "configs/sec_companyfacts.yaml"
     )
+    MAX_CORPUS_PAGE_LIMIT = 200
+    MAX_CORPUS_OFFSET = 10_000
 
     def __init__(self,
                  db_path: Optional[Path] = None,
@@ -494,6 +496,232 @@ class Store:
 
     def count_filing_sections(self, accession: Optional[str] = None) -> int:
         return self.chroma.count_filing_sections(accession)
+
+    # ── Corpus explorer read facade (2.2.7.2) ─────────────────────────────
+
+    @classmethod
+    def _validate_corpus_page(cls, limit: int, offset: int = 0) -> None:
+        """Reject unbounded corpus pages before either backend is touched."""
+        if not isinstance(limit, int) or isinstance(limit, bool):
+            raise ValueError("limit must be an integer")
+        if not 1 <= limit <= cls.MAX_CORPUS_PAGE_LIMIT:
+            raise ValueError(
+                f"limit must be between 1 and {cls.MAX_CORPUS_PAGE_LIMIT}")
+        if not isinstance(offset, int) or isinstance(offset, bool):
+            raise ValueError("offset must be an integer")
+        if not 0 <= offset <= cls.MAX_CORPUS_OFFSET:
+            raise ValueError(
+                f"offset must be between 0 and {cls.MAX_CORPUS_OFFSET}")
+
+    def get_source_counts(self, *, limit: int = 100, offset: int = 0) -> list[dict]:
+        """Merge bounded SQLite and Chroma source counts without reading bodies."""
+        self._validate_corpus_page(limit, offset)
+        counts: dict[str, int] = {}
+        for row in self.sqlite.get_source_counts(
+            limit=self.MAX_CORPUS_PAGE_LIMIT, offset=0,
+        ):
+            source = str(row.get("source") or "")
+            if source:
+                counts[source] = counts.get(source, 0) + int(row.get("count") or 0)
+        for row in self.chroma.get_source_counts(
+            limit=self.MAX_CORPUS_PAGE_LIMIT, offset=0,
+        ):
+            source = str(row.get("source") or "")
+            if source:
+                counts[source] = counts.get(source, 0) + int(row.get("count") or 0)
+        rows = [
+            {"source": source, "count": count}
+            for source, count in sorted(counts.items())
+        ]
+        return rows[offset:offset + limit]
+
+    def get_ticker_counts(self, *, limit: int = 100, offset: int = 0) -> list[dict]:
+        """Merge bounded SQLite and Chroma ticker coverage summaries."""
+        self._validate_corpus_page(limit, offset)
+        grouped: dict[str, dict] = {}
+        for backend in (self.sqlite, self.chroma):
+            for row in backend.get_ticker_counts(
+                limit=self.MAX_CORPUS_PAGE_LIMIT, offset=0,
+            ):
+                ticker = str(row.get("ticker") or "").upper()
+                if not ticker:
+                    continue
+                item = grouped.setdefault(
+                    ticker,
+                    {"ticker": ticker, "record_count": 0, "sources": set(),
+                     "source_counts": {}, "company_name": None},
+                )
+                item["record_count"] += int(row.get("record_count") or 0)
+                item["sources"].update(str(source) for source in row.get("sources", []))
+                item["company_name"] = item["company_name"] or row.get("company_name")
+                for source, count in (row.get("source_counts") or {}).items():
+                    item["source_counts"][str(source)] = (
+                        item["source_counts"].get(str(source), 0) + int(count or 0)
+                    )
+        rows = []
+        for ticker, item in sorted(grouped.items()):
+            rows.append({
+                "ticker": ticker,
+                "record_count": item["record_count"],
+                "sources": sorted(item["sources"]),
+                "source_counts": item["source_counts"],
+                "company_name": item["company_name"],
+            })
+        return rows[offset:offset + limit]
+
+    def search_corpus_metrics(
+        self,
+        query: Optional[str] = None,
+        *,
+        ticker: Optional[str] = None,
+        unit: Optional[str] = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> list[dict]:
+        """Search SQLite metric/concept inventory through the facade."""
+        self._validate_corpus_page(limit, offset)
+        return self.sqlite.search_corpus_metrics(
+            query, ticker=ticker, unit=unit, limit=limit, offset=offset,
+        )
+
+    def search_corpus_facts(
+        self,
+        query: Optional[str] = None,
+        *,
+        ticker: Optional[str] = None,
+        unit: Optional[str] = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> list[dict]:
+        """Search bounded fact metadata through the facade."""
+        self._validate_corpus_page(limit, offset)
+        return self.sqlite.search_corpus_facts(
+            query, ticker=ticker, unit=unit, limit=limit, offset=offset,
+        )
+
+    def get_corpus_fact(self, record_kind: str, record_id: int) -> Optional[dict]:
+        """Read one allowlisted fact record for corpus detail."""
+        return self.sqlite.get_corpus_fact(record_kind, record_id)
+
+    def list_filings(
+        self,
+        *,
+        query: Optional[str] = None,
+        ticker: Optional[str] = None,
+        filing_type: Optional[str] = None,
+        date_from: Optional[str] = None,
+        date_to: Optional[str] = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> list[dict]:
+        """Return bounded filing metadata through the facade."""
+        self._validate_corpus_page(limit, offset)
+        return self.sqlite.list_filings(
+            query=query, ticker=ticker, filing_type=filing_type,
+            date_from=date_from, date_to=date_to, limit=limit, offset=offset,
+        )
+
+    def get_filing(self, accession: str) -> Optional[dict]:
+        """Read one safe filing record through the facade."""
+        return self.sqlite.get_filing(accession)
+
+    def list_freshness(
+        self,
+        *,
+        ticker: Optional[str] = None,
+        source: Optional[str] = None,
+        include_scheduler: bool = False,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> list[dict]:
+        """Return bounded freshness rows without triggering refresh logic."""
+        self._validate_corpus_page(limit, offset)
+        return self.sqlite.list_freshness(
+            ticker=ticker, source=source, include_scheduler=include_scheduler,
+            limit=limit, offset=offset,
+        )
+
+    SCHEDULER_SOURCES = {
+        "yfinance": {"ttl_key": "fundamentals"},
+        "sec_filings": {"ttl_key": "sec_filings"},
+        "sec_companyfacts": {"ttl_key": "sec_companyfacts"},
+        "fred": {"ttl_key": "macro"},
+        "gdelt": {"ttl_key": "gdelt_news"},
+        "earnings_transcripts": {"ttl_key": "transcripts"},
+        "ir_pages": {"ttl_key": "ir_pages"},
+        "estimates": {"ttl_key": "estimates"},
+    }
+
+    def list_scheduler_sources(self, *, limit: int = 100, offset: int = 0) -> list[dict]:
+        """Project scheduler cadence from persisted cache rows only."""
+        self._validate_corpus_page(limit, offset)
+        persisted = {
+            str(row.get("source") or "").removeprefix("unified:"): row
+            for row in self.sqlite.list_scheduler_sources(
+                limit=self.MAX_CORPUS_PAGE_LIMIT, offset=0,
+            )
+        }
+        ttls = self._schedule_ttls()
+        rows = []
+        for source, cfg in self.SCHEDULER_SOURCES.items():
+            row = persisted.get(source, {})
+            rows.append({
+                "source": source,
+                "ttl_key": cfg["ttl_key"],
+                "ttl_hours": int(ttls.get(cfg["ttl_key"], 24)),
+                "status": row.get("status", "never_fetched"),
+                "last_run": row.get("last_run"),
+                "next_scheduled_update": row.get("next_scheduled_update"),
+                "error_message": row.get("error_message"),
+            })
+        return rows[offset:offset + limit]
+
+    def search_document_families(
+        self,
+        *,
+        query: Optional[str] = None,
+        source: Optional[str] = None,
+        ticker: Optional[str] = None,
+        date_from: Optional[str] = None,
+        date_to: Optional[str] = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> list[dict]:
+        """Search non-SEC Chroma document families through the facade."""
+        self._validate_corpus_page(limit, offset)
+        return self.chroma.search_document_families(
+            query=query, source=source, ticker=ticker, date_from=date_from,
+            date_to=date_to, limit=limit, offset=offset,
+        )
+
+    def get_filing_section_families(
+        self, accession: str, *, limit: int = 100, offset: int = 0,
+    ) -> list[dict]:
+        """Read one bounded filing's section families through the facade."""
+        self._validate_corpus_page(limit, offset)
+        return self.chroma.get_filing_section_families(
+            accession, limit=limit, offset=offset,
+        )
+
+    def get_document_family(
+        self, parent_id: str, *, limit: int = 1, offset: int = 0,
+    ) -> list[dict]:
+        """Read a bounded document-family detail page through the facade."""
+        self._validate_corpus_page(limit, offset)
+        return self.chroma.get_document_family(
+            parent_id, limit=limit, offset=offset,
+        )
+
+    def get_document(self, document_id: str) -> Optional[dict]:
+        """Read one Chroma document for a bounded explorer detail request."""
+        return self.chroma.get_document(document_id)
+
+    search_metrics = search_corpus_metrics
+    search_facts_for_corpus = search_corpus_facts
+    list_filing_inventory = list_filings
+    get_freshness_summaries = list_freshness
+    list_document_families = search_document_families
+    list_filing_section_families = get_filing_section_families
 
     def delete_filing_section_family(self, parent_id: str) -> None:
         self._bump_revision("delete_filing_section_family")

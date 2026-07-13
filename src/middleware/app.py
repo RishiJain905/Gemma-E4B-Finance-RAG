@@ -846,6 +846,8 @@ app = FastAPI(
 app.include_router(create_graph_router(
     lambda: graph_hub,
     _graph_observer_enabled,
+    lambda: store,
+    lambda: config,
 ))
 
 

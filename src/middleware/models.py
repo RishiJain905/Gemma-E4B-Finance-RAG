@@ -309,6 +309,17 @@ class GraphHealthResponse(BaseModel):
     reset_count: int = 0
 
 
+class CorpusGraphResponse(BaseModel):
+    """Common bounded wire shape for read-only corpus graph pages."""
+
+    nodes: list[dict] = Field(default_factory=list)
+    edges: list[dict] = Field(default_factory=list)
+    next_cursor: Optional[str] = None
+    truncated: bool = False
+    corpus_revision: int = 0
+    refresh: Optional[dict] = None
+
+
 class SearchRequest(BaseModel):
     """Raw search request (bypasses model, returns retrieved data only)."""
 

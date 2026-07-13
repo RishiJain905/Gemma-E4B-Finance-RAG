@@ -263,6 +263,54 @@ def test_get_ticker_documents(chroma_store):
     assert results[0]["id"] == "d1"
 
 
+def test_search_document_families_uses_metadata_only_filters(chroma_store):
+    chroma_store.collection.get.return_value = {
+        "ids": ["ir/nvda/release#0", "ir/nvda/release#1", "sec/a#0"],
+        "metadatas": [
+            {"parent_id": "ir/nvda/release", "source": "ir", "ticker": "NVDA",
+             "date": "2026-05-15", "chunk_count": 2},
+            {"parent_id": "ir/nvda/release", "source": "ir", "ticker": "NVDA",
+             "date": "2026-05-15", "chunk_count": 2},
+            {"parent_id": "sec/a", "source": "sec_filing", "ticker": "NVDA",
+             "date": "2026-05-14", "chunk_count": 1},
+        ],
+    }
+
+    families = chroma_store.search_document_families(
+        query="release", source="ir", ticker="NVDA", limit=10, offset=0,
+    )
+
+    chroma_store.collection.get.assert_called_once_with(
+        where={"$and": [{"source": "ir"}, {"ticker": "NVDA"}]},
+        limit=11, offset=0, include=["metadatas"],
+    )
+    assert len(families) == 1
+    assert families[0]["id"] == "ir/nvda/release"
+    assert families[0]["chunk_count"] == 2
+
+
+def test_filing_section_families_are_metadata_only_and_bounded(chroma_store):
+    chroma_store.collection.get.return_value = {
+        "ids": ["p#0", "p#1", "q#0"],
+        "metadatas": [
+            {"parent_id": "p", "accession": "ACC-1", "source": "sec_filing",
+             "section_index": 0, "section_heading": "Business", "chunk_count": 2},
+            {"parent_id": "p", "accession": "ACC-1", "source": "sec_filing",
+             "section_index": 0, "section_heading": "Business", "chunk_count": 2},
+            {"parent_id": "q", "accession": "ACC-1", "source": "sec_filing",
+             "section_index": 1, "section_heading": "Risk", "chunk_count": 1},
+        ],
+    }
+
+    sections = chroma_store.get_filing_section_families("ACC-1", limit=10, offset=0)
+
+    assert len(sections) == 2
+    assert sections[0]["chunk_count"] == 2
+    call = chroma_store.collection.get.call_args.kwargs
+    assert call["include"] == ["metadatas"]
+    assert "documents" not in call
+
+
 # ── Collection management tests ──────────────────────
 
 def test_reset_collection(chroma_store):
