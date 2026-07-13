@@ -1097,6 +1097,23 @@ if (typeof document !== "undefined" && document.getElementById("graph-canvas")) 
       announce("Redacted snapshot exported.");
     }
 
+    // Deep-link support for the chat client's `/graph trace` command (2.2.7.4):
+    // a `#trace=<query_id>` fragment focuses that trace instead of following the
+    // newest. Same-origin, read-only; the id is only ever passed to selectTrace.
+    function traceFromHash() {
+      const m = /(?:^|[#&])trace=([^&]+)/.exec(window.location.hash || "");
+      if (!m) return null;
+      try { return decodeURIComponent(m[1]); } catch (_e) { return m[1]; }
+    }
+    async function applyTraceHash() {
+      const queryId = traceFromHash();
+      if (!queryId) return;
+      app.pinnedTrace = true;               // stop follow-live from overriding it
+      await selectTrace(queryId);
+      const picker = $("query-picker");
+      if (picker) picker.value = queryId;
+    }
+
     async function boot() {
       buildStageRail();
       buildLegend();
@@ -1107,8 +1124,10 @@ if (typeof document !== "undefined" && document.getElementById("graph-canvas")) 
       wireControls();
       if (rendererReady) requestAnimationFrame(tickDash);
       await refreshTraceList();
+      await applyTraceHash();
       connect();
       window.addEventListener("resize", () => { if (app.mode === "live") renderLive(); });
+      window.addEventListener("hashchange", () => { applyTraceHash(); });
     }
 
     // Confirm the observer is on before wiring the live stream. If it is off

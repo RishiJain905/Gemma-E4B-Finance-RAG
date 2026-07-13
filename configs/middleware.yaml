@@ -33,11 +33,18 @@ enable_tool_final_streaming: false
 enable_stream_progress_events: false
 stream_progress_include_counts: true
 
-# Phase 2.2.7.1 — bounded in-memory query trace graph and localhost read API.
+# Phase 2.2.7 — bounded in-memory query trace graph + localhost read-only UI/API.
 # Disabled by default. No trace is persisted; questions are represented by a
 # bounded preview plus SHA-256 digest and evidence bodies by bounded excerpts.
-# Env: ENABLE_GRAPH_OBSERVER, GRAPH_TRACE_LIMIT, GRAPH_ELEMENT_LIMIT,
-# GRAPH_TRACE_TTL_S, GRAPH_EXCERPT_CHARS, GRAPH_QUESTION_PREVIEW_CHARS.
+# SECURITY (2.2.7.4): when enabled, EVERY /graph* route (UI, static bundle, API)
+# is served ONLY to loopback clients (127.0.0.1/::1) with a strict same-origin
+# CSP; a non-loopback request gets 404. There is NO bypass flag — remote exposure
+# is out of scope for Phase 2.2 and needs a separate design (auth/TLS/proxy trust/
+# retention). Do not bind the middleware to a non-loopback address or place it
+# behind a proxy while this is on. Limits below are clamped by both TraceHub and
+# MiddlewareConfig. Env: ENABLE_GRAPH_OBSERVER, GRAPH_TRACE_LIMIT,
+# GRAPH_ELEMENT_LIMIT, GRAPH_TRACE_TTL_S, GRAPH_EXCERPT_CHARS,
+# GRAPH_QUESTION_PREVIEW_CHARS.
 enable_graph_observer: false
 graph_trace_limit: 100
 graph_element_limit: 5000

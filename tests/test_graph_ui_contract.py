@@ -184,3 +184,60 @@ def test_pure_state_namespace_is_defined_in_js():
     js = JS.read_text(encoding="utf-8")
     for fn in ("applyDelta", "selectVisible", "computeBeam", "nodeMatchesFilters", "stageColumnFor"):
         assert fn in js, f"pure state function {fn} missing from graph.js"
+
+
+# ── 2.2.7.4: golden trace wire fixture + deep-link ───────────────────────────
+
+FIXTURE = Path(__file__).parent / "fixtures" / "graph" / "query_trace_v1.json"
+
+_LAYOUT_KEYS = frozenset({"position", "x", "y", "renderedPosition", "bbox", "pan", "zoom"})
+
+
+def test_golden_query_trace_fixture_matches_wire_schema():
+    """The golden fixture is a schema contract only — node kinds, edge relations,
+    allowlisted metadata, bounded excerpts. It carries NO pixel/layout positions;
+    layout is UI behavior while graph meaning is the contract."""
+    import json
+
+    from src.middleware.graph_observer import (
+        EDGE_RELATIONS,
+        NODE_KINDS,
+        NODE_STATUSES,
+        _DENIED_KEY,
+    )
+
+    fixture = json.loads(FIXTURE.read_text(encoding="utf-8"))
+    assert fixture["schema_version"] == 1
+    snapshot = fixture["snapshot"]
+    assert snapshot["schema_version"] == 1
+    assert snapshot["complete"] is True
+
+    node_ids = set()
+    for node in snapshot["nodes"]:
+        assert node["kind"] in NODE_KINDS, node["kind"]
+        assert node["status"] in NODE_STATUSES, node["status"]
+        node_ids.add(node["id"])
+        metadata = node.get("metadata") or {}
+        for key in metadata:
+            assert not _DENIED_KEY.search(key), f"denied metadata key: {key}"
+        assert not (_LAYOUT_KEYS & set(metadata)), "fixture must not embed layout"
+        assert not (_LAYOUT_KEYS & set(node)), "fixture node must not embed layout"
+        if node["kind"] == "evidence":
+            assert len(node.get("summary", "")) <= 1000
+
+    relations_seen = set()
+    for edge in snapshot["edges"]:
+        assert edge["relation"] in EDGE_RELATIONS, edge["relation"]
+        assert edge["source"] in node_ids, f"dangling source {edge['source']}"
+        assert edge["target"] in node_ids, f"dangling target {edge['target']}"
+        relations_seen.add(edge["relation"])
+    # The trace threads evidence -> answer and evidence -> citation provenance.
+    assert {"supports", "cited_by", "from_source"} <= relations_seen
+
+
+def test_graph_js_supports_trace_deep_link_from_hash():
+    js = JS.read_text(encoding="utf-8")
+    assert "traceFromHash" in js
+    assert "applyTraceHash" in js
+    assert "location.hash" in js
+    assert "hashchange" in js

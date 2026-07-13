@@ -389,6 +389,50 @@ CompanyFacts preference (2.2.5.3) is governed by `configs/sec_companyfacts.yaml`
 enabled, authoritative filed GAAP facts are merged into structured retrieval and
 conflicting values are surfaced as separate evidence, never averaged.
 
+### Live retrieval-graph observer (Phase 2.2.7)
+
+A local, **read-only** visualization of the retrieval pipeline and corpus
+inventory. **Disabled by default.** When on, the UI (`/graph`) and its API
+(`/graph/api/*`) are served **only to loopback clients** (`127.0.0.1`/`::1`) with
+a strict same-origin CSP; a non-loopback request gets 404. There is **no bypass
+flag** — remote exposure is out of scope for Phase 2.2 and would require a
+separate design covering authentication, TLS, proxy trust, and retention. Do not
+put this behind a reverse proxy or bind the middleware to a non-loopback address
+while the observer is on. The observer reuses **no** SEC/FRED/model credentials.
+
+Rollback is to flip `enable_graph_observer` back to `false`; nothing is persisted.
+The in-memory `TraceHub` and the config loader both clamp these limits to safe
+ranges so a misconfiguration cannot request an unbounded footprint.
+
+```yaml
+enable_graph_observer: false
+graph_trace_limit: 100            # clamp 1–1000
+graph_element_limit: 5000         # clamp 1–50000
+graph_trace_ttl_s: 3600           # clamp 1–86400
+graph_excerpt_chars: 1000         # clamp 0–10000
+graph_question_preview_chars: 200 # clamp 0–2000
+# Read-only corpus explorer budgets (2.2.7.2), gated by the same flag:
+corpus_page_limit: 100            # clamp 1–200
+corpus_element_limit: 2000        # clamp 1–2000
+corpus_visible_node_target: 450   # clamp 1–499
+corpus_overview_cache_ttl_s: 2.0  # clamp 0.1–60
+corpus_opaque_id_ttl_s: 300.0     # clamp 1–3600
+```
+
+| Field | Default | Env | Meaning |
+|-------|---------|-----|---------|
+| `enable_graph_observer` | `false` | `ENABLE_GRAPH_OBSERVER` | Enable the loopback-only live retrieval graph UI + API. Off → every `/graph*` route 404s and `/query` responses omit `graph_trace_id`. |
+| `graph_trace_limit` | `100` | `GRAPH_TRACE_LIMIT` | Max concurrent in-memory traces (oldest evicted). |
+| `graph_element_limit` | `5000` | `GRAPH_ELEMENT_LIMIT` | Max total nodes+edges across all traces. |
+| `graph_trace_ttl_s` | `3600` | `GRAPH_TRACE_TTL_S` | Trace time-to-live in seconds. |
+| `graph_excerpt_chars` | `1000` | `GRAPH_EXCERPT_CHARS` | Max evidence excerpt length in a node. |
+| `graph_question_preview_chars` | `200` | `GRAPH_QUESTION_PREVIEW_CHARS` | Max stored question preview (the full question is only a SHA-256 digest). |
+| `corpus_page_limit` | `100` | `CORPUS_PAGE_LIMIT` | Max rows per explorer page. |
+| `corpus_element_limit` | `2000` | `CORPUS_ELEMENT_LIMIT` | Hard cap on nodes+edges per explorer response. |
+| `corpus_visible_node_target` | `450` | `CORPUS_VISIBLE_NODE_TARGET` | Soft target for the overview projection before truncation. |
+| `corpus_overview_cache_ttl_s` | `2.0` | `CORPUS_OVERVIEW_CACHE_TTL_S` | Overview cache TTL (revision-keyed). |
+| `corpus_opaque_id_ttl_s` | `300.0` | `CORPUS_OPAQUE_ID_TTL_S` | Lifetime of an opaque corpus node id / cursor. |
+
 ---
 
 ## `configs/watchlist.yaml`

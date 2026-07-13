@@ -490,3 +490,244 @@ async def test_adaptive_path_projects_actual_plan_lane_and_selected_evidence(mon
     assert any(node["kind"] == "plan" for node in snapshot["nodes"])
     assert any(node["kind"] == "subquery" for node in snapshot["nodes"])
     assert any(node["kind"] == "evidence" for node in snapshot["nodes"])
+
+
+# ── 2.2.7.4: completeness, noninterference, overhead ────────────────────────
+
+def _assert_graph_integrity(snapshot: dict) -> None:
+    """Every node id is unique and every edge endpoint resolves to a node."""
+    ids = [node["id"] for node in snapshot["nodes"]]
+    assert len(ids) == len(set(ids)), "duplicate node ids in trace"
+    node_ids = set(ids)
+    edge_ids = [edge["id"] for edge in snapshot["edges"]]
+    assert len(edge_ids) == len(set(edge_ids)), "duplicate edge ids in trace"
+    for edge in snapshot["edges"]:
+        assert edge["source"] in node_ids, f"dangling source {edge['source']}"
+        assert edge["target"] in node_ids, f"dangling target {edge['target']}"
+
+
+def _seeded_trace(hub, query_id="q1"):
+    """One representative completed trace across the executed pipeline stages."""
+    emitter = QueryEventEmitter(
+        query_id=query_id, observers=[_observer_module()[4](hub)])
+    emitter.query_started(question="What was NVDA revenue in 2025?")
+    emitter.stage("compile", "completed", elapsed_ms=1.0)
+    emitter.graph_update(
+        nodes=[
+            {"id": f"{query_id}:plan:validated", "kind": "plan",
+             "label": "Validated Query Plan", "status": "complete",
+             "metadata": {"tickers": ["NVDA"], "metrics": ["revenue"], "lane": "standard"}},
+            {"id": f"{query_id}:subquery:sq0", "kind": "subquery", "label": "sq0",
+             "status": "complete", "group_id": f"{query_id}:plan:validated",
+             "metadata": {"subquery_id": "sq0"}},
+        ],
+        edges=[
+            {"id": f"{query_id}:plan-edge", "source": f"{query_id}:query:request",
+             "target": f"{query_id}:plan:validated", "relation": "compiled_to"},
+            {"id": f"{query_id}:sq-edge", "source": f"{query_id}:plan:validated",
+             "target": f"{query_id}:subquery:sq0", "relation": "contains"},
+        ],
+    )
+    emitter.stage("retrieve", "started")
+    emitter.tool_started("query_facts", subquery_id="sq0")
+    emitter.tool_completed("query_facts", "ok", count=1, subquery_id="sq0")
+    emitter.stage("retrieve", "completed", elapsed_ms=2.0)
+    emitter.graph_evidence(
+        evidence_id="E1", kind="fact", excerpt="NVDA revenue 60.9B",
+        metadata={"ticker": "NVDA", "metric": "revenue", "period": "2025", "rank": 1},
+        source_type="sec_10k", rank=1,
+    )
+    emitter.graph_update(
+        nodes=[
+            {"id": f"{query_id}:answer:final", "kind": "answer", "label": "Final Answer",
+             "status": "complete", "metadata": {"status": "grounded"}},
+            {"id": f"{query_id}:citation:E1", "kind": "citation", "label": "Citation E1",
+             "status": "complete",
+             "metadata": {"evidence_id": "E1", "support_status": "supported"}},
+        ],
+        edges=[
+            {"id": f"{query_id}:ans-edge", "source": f"{query_id}:query:request",
+             "target": f"{query_id}:answer:final", "relation": "returned"},
+            {"id": f"{query_id}:sup-edge", "source": f"{query_id}:evidence:E1",
+             "target": f"{query_id}:answer:final", "relation": "supports"},
+            {"id": f"{query_id}:cit-edge", "source": f"{query_id}:evidence:E1",
+             "target": f"{query_id}:citation:E1", "relation": "cited_by"},
+        ],
+    )
+    emitter.graph_update(operation="trace_complete", summary={"status": "grounded"})
+    return emitter
+
+
+def test_seeded_trace_is_complete_truthful_and_integral():
+    _GD, _GE, _GN, TraceHub, _make = _observer_module()
+    hub = TraceHub()
+    emitter = _seeded_trace(hub)
+    snapshot = hub.snapshot(emitter.query_id)
+
+    assert snapshot["complete"] is True
+    _assert_graph_integrity(snapshot)
+    kinds = [node["kind"] for node in snapshot["nodes"]]
+    # Every executed subquery/stage/tool/evidence/source/citation appears once;
+    # no node claims an unexecuted stage (e.g. no 'grade'/'validate' were run).
+    assert kinds.count("evidence") == 1
+    assert kinds.count("tool") == 1
+    assert kinds.count("citation") == 1
+    stage_labels = {
+        node["metadata"].get("phase") or node["label"]
+        for node in snapshot["nodes"] if node["kind"] == "stage"
+    }
+    assert "Grade" not in stage_labels and "Validate" not in stage_labels
+    # supports/cited_by edges resolve to the emitted evidence node.
+    evidence_ids = {n["id"] for n in snapshot["nodes"] if n["kind"] == "evidence"}
+    for rel in ("supports", "cited_by"):
+        for edge in snapshot["edges"]:
+            if edge["relation"] == rel and edge["source"] in evidence_ids:
+                assert edge["target"] in {n["id"] for n in snapshot["nodes"]}
+
+
+def test_expected_executed_elements_are_100pct_present_after_compaction():
+    _GD, _GE, _GN, TraceHub, _make = _observer_module()
+    hub = TraceHub(element_limit=5000)
+    emitter = _seeded_trace(hub)
+    snapshot = hub.snapshot(emitter.query_id)
+    expected = {
+        f"{emitter.query_id}:query:request",
+        f"{emitter.query_id}:evidence:E1",
+        f"{emitter.query_id}:answer:final",
+        f"{emitter.query_id}:citation:E1",
+    }
+    present = {node["id"] for node in snapshot["nodes"]}
+    assert expected <= present
+
+
+def test_two_concurrent_queries_never_share_nodes_or_edges():
+    _GD, _GE, _GN, TraceHub, _make = _observer_module()
+    hub = TraceHub()
+    a = hub.snapshot(_seeded_trace(hub, "qa").query_id)
+    b = hub.snapshot(_seeded_trace(hub, "qb").query_id)
+    a_nodes = {n["id"] for n in a["nodes"]}
+    b_nodes = {n["id"] for n in b["nodes"]}
+    a_edges = {e["id"] for e in a["edges"]}
+    b_edges = {e["id"] for e in b["edges"]}
+    assert a_nodes.isdisjoint(b_nodes)
+    assert a_edges.isdisjoint(b_edges)
+    assert all(node["query_id"] == "qa" for node in a["nodes"])
+    assert all(node["query_id"] == "qb" for node in b["nodes"])
+
+
+def test_terminal_states_reach_complete_for_grounded_degraded_and_error():
+    _GD, _GE, _GN, TraceHub, make_event_observer = _observer_module()
+    # Grounded terminal.
+    hub = TraceHub()
+    assert hub.snapshot(_seeded_trace(hub, "ok").query_id)["complete"] is True
+    # Degraded (model unavailable) terminal — answer node in fallback status.
+    degraded = QueryEventEmitter(query_id="deg", observers=[make_event_observer(hub)])
+    degraded.query_started(question="x")
+    degraded.graph_update(
+        nodes=[{"id": "deg:answer:final", "kind": "answer", "label": "Final Answer",
+                "status": "fallback", "metadata": {"status": "partial"}}],
+        operation="trace_complete", summary={"status": "partial"},
+    )
+    assert hub.snapshot("deg")["complete"] is True
+    # Error terminal.
+    err = QueryEventEmitter(query_id="err", observers=[make_event_observer(hub)])
+    err.query_started(question="x")
+    err.error("stream failed", terminal=True)
+    err_snap = hub.snapshot("err")
+    assert err_snap["complete"] is True
+    assert any(node["status"] == "error" for node in err_snap["nodes"])
+
+
+def test_slow_or_broken_subscriber_does_not_alter_the_published_trace():
+    _GD, _GE, _GN, TraceHub, _make = _observer_module()
+    hub = TraceHub(subscriber_queue_limit=1)
+    stalled = hub.subscribe()  # never drained -> fills and is marked reset
+    emitter = _seeded_trace(hub)
+    snapshot = hub.snapshot(emitter.query_id)
+    # The trace is fully intact even though the subscriber overflowed.
+    assert snapshot["complete"] is True
+    _assert_graph_integrity(snapshot)
+    assert stalled.reset_required is True  # subscriber degraded, publish did not
+
+
+def test_no_canary_secret_or_local_path_survives_in_any_read_output():
+    _GD, _GE, _GN, TraceHub, make_event_observer = _observer_module()
+    hub = TraceHub()
+    emitter = QueryEventEmitter(query_id="q1", observers=[make_event_observer(hub)])
+    emitter.query_started(question="revenue for api_key=CANARY_SECRET")
+    emitter.graph_evidence(
+        evidence_id="E1", kind="document",
+        excerpt=r"see C:\Users\alice\secret.txt token=CANARY_SECRET",
+        metadata={"ticker": "AAPL", "authorization": "CANARY_SECRET"},
+        source_type="sec_10k",
+    )
+    blob = json.dumps([
+        hub.snapshot("q1"), hub.list_traces(), hub.evidence("q1", "E1"), hub.health(),
+    ])
+    assert "CANARY_SECRET" not in blob
+    assert "alice" not in blob
+    assert "secret.txt" not in blob
+
+
+def test_stress_limits_hold_under_many_traces_and_elements():
+    _GD, _GE, GraphNode, TraceHub, _make = _observer_module()
+    hub = TraceHub(trace_limit=5, element_limit=20)
+    for q in range(40):
+        for n in range(10):
+            hub.publish(_GD(
+                query_id=f"q{q}", sequence=n, operation="upsert_node",
+                node=GraphNode(id=f"q{q}:stage:{n}", query_id=f"q{q}",
+                               kind="stage", label="Stage", status="active"),
+            ))
+    health = hub.health()
+    assert health["trace_count"] <= 5
+    assert health["element_count"] <= 20
+
+
+@pytest.mark.asyncio
+async def test_observer_disabled_yields_no_deltas_and_byte_compatible_response(monkeypatch):
+    from src.middleware import app as middleware_app
+    from src.middleware.config import MiddlewareConfig
+    from src.middleware.graph_observer import TraceHub
+    from src.middleware.models import QueryRequest
+
+    class FakeRetriever:
+        def retrieve(self, **_kwargs):
+            return {"facts": [], "documents": [], "retrieval_strategy": "hybrid",
+                    "timings": {}}
+
+    async def freshness(*_args, **_kwargs):
+        return {"overall": "fresh"}
+
+    def build(observer_on: bool) -> dict:
+        config = MiddlewareConfig(config_path=None)
+        config.enable_graph_observer = observer_on
+        config.enable_adaptive_rag = False
+        hub = TraceHub()
+        monkeypatch.setattr(middleware_app, "config", config)
+        monkeypatch.setattr(middleware_app, "store", object())
+        monkeypatch.setattr(middleware_app, "retriever", FakeRetriever())
+        monkeypatch.setattr(middleware_app, "graph_hub", hub)
+        monkeypatch.setattr(middleware_app, "_freshness_stage", freshness)
+        request = QueryRequest(question="What was AAPL revenue?", refresh=False)
+        emitter = middleware_app._install_query_emitter(request, chat_events=False)
+        return {"config": config, "hub": hub, "emitter": emitter, "request": request}
+
+    # Observer OFF: no emitter installed, hub stays empty.
+    off = build(False)
+    assert off["emitter"] is None
+    context_off = await middleware_app._build_query_context(off["request"])
+    response_off = middleware_app._build_query_response(
+        context=context_off, answer_text="ok", citations=[], model_available=True)
+    off_dict = middleware_app._response_to_dict(response_off)
+    assert off["hub"].health()["trace_count"] == 0
+    assert "graph_trace_id" not in off_dict  # excluded -> byte-compatible
+
+    # Observer ON: same response shape plus exactly the optional trace id.
+    on = build(True)
+    context_on = await middleware_app._build_query_context(on["request"])
+    response_on = middleware_app._build_query_response(
+        context=context_on, answer_text="ok", citations=[], model_available=True)
+    on_dict = middleware_app._response_to_dict(response_on)
+    assert on_dict["graph_trace_id"] == on["emitter"].query_id
+    assert set(on_dict) - set(off_dict) == {"graph_trace_id"}

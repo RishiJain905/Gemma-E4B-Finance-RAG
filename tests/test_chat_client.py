@@ -74,6 +74,11 @@ def _bare_session(client, *, stream_enabled=False, stream_unavailable=True, verb
     session.multiline_capable = True
     session.conversation_max_turns = None
     session.conversation_max_history_chars = None
+    # 2.2.7.4 graph observer state (normally set from /health capabilities).
+    session.graph_observer = False
+    session.graph_url = None
+    session.graph_observer_limits = None
+    session.last_trace_id = None
     return session
 
 
@@ -1037,3 +1042,126 @@ def test_health_reports_streaming_tool_final_capability(monkeypatch):
     # Tools + tool-final streaming -> streaming is genuinely available here.
     assert caps["streaming"] is True
     assert caps["streaming_tool_final"] is True
+
+
+# ── 2.2.7.4: /graph command, capabilities, and terminal trace pointer ────────
+
+class _GraphClient:
+    """Minimal client exposing /health capabilities + a base_url for /graph."""
+
+    def __init__(self, caps, base_url="http://127.0.0.1:8000"):
+        self._caps = caps
+        self.base_url = base_url
+
+    def get(self, path):
+        return FakeResponse(data={"status": "ok", "capabilities": self._caps})
+
+
+class _Opener:
+    """Injected browser opener that records URLs instead of launching one."""
+
+    def __init__(self, result=True):
+        self.result = result
+        self.opened = []
+
+    def __call__(self, url):
+        self.opened.append(url)
+        return self.result
+
+
+def _graph_caps(**over):
+    caps = {
+        "tools": False, "streaming": True, "answer_policy": "graded",
+        "graph_observer": True, "graph_url": "http://127.0.0.1:8000/graph",
+        "graph_observer_limits": {"traces": 100, "elements": 5000},
+    }
+    caps.update(over)
+    return caps
+
+
+def test_load_capabilities_reads_graph_observer_fields():
+    session = _bare_session(_GraphClient(_graph_caps()))
+    session.load_capabilities()
+    assert session.graph_observer is True
+    assert session.graph_url == "http://127.0.0.1:8000/graph"
+    assert session.graph_observer_limits["traces"] == 100
+
+
+def test_load_capabilities_omits_graph_on_older_server():
+    session = _bare_session(_GraphClient({"tools": False, "streaming": True}))
+    session.load_capabilities()
+    assert session.graph_observer is False
+    assert session.graph_url is None
+
+
+def test_graph_command_opens_effective_url(capsys):
+    session = _bare_session(_GraphClient(_graph_caps()))
+    session.load_capabilities()
+    opener = _Opener()
+    session.graph("", opener=opener)
+    assert opener.opened == ["http://127.0.0.1:8000/graph"]
+    assert "opened" in capsys.readouterr().out
+
+
+def test_graph_url_prints_without_opening(capsys):
+    session = _bare_session(_GraphClient(_graph_caps()))
+    session.load_capabilities()
+    opener = _Opener()
+    session.graph("url", opener=opener)
+    assert opener.opened == []
+    assert "http://127.0.0.1:8000/graph" in capsys.readouterr().out
+
+
+def test_graph_trace_deep_links_last_trace():
+    session = _bare_session(_GraphClient(_graph_caps()))
+    session.load_capabilities()
+    session.last_trace_id = "abcdef123456"
+    opener = _Opener()
+    session.graph("trace", opener=opener)
+    assert opener.opened == ["http://127.0.0.1:8000/graph#trace=abcdef123456"]
+
+
+def test_graph_disabled_server_prints_note_and_never_opens(capsys):
+    session = _bare_session(_GraphClient({"tools": False, "streaming": True}))
+    session.load_capabilities()
+    opener = _Opener()
+    session.graph("", opener=opener)
+    assert opener.opened == []
+    assert "disabled" in capsys.readouterr().out.lower()
+
+
+def test_graph_open_failure_prints_manual_url(capsys):
+    session = _bare_session(_GraphClient(_graph_caps()))
+    session.load_capabilities()
+    session.graph("", opener=_Opener(result=False))
+    assert "open:" in capsys.readouterr().out
+
+
+def test_effective_graph_url_falls_back_to_base_url():
+    # Older server does not advertise graph_url, but the observer is on.
+    session = _bare_session(_GraphClient(_graph_caps(graph_url=None)))
+    session.load_capabilities()
+    assert session.graph_observer is True
+    assert session.graph_url is None
+    assert session.effective_graph_url() == "http://127.0.0.1:8000/graph"
+
+
+def test_terminal_metadata_shows_trace_pointer_when_present(capsys):
+    data = _query_data()
+    data["graph_trace_id"] = "0123456789abcdef"
+    chat._render_metadata(data, verbose=False)
+    out = capsys.readouterr().out
+    assert "trace=01234567" in out
+
+
+def test_query_captures_last_trace_id_from_response():
+    data = _query_data()
+    data["graph_trace_id"] = "trace-xyz"
+
+    class FakeClient:
+        def post(self, path, json=None):
+            return FakeResponse(data=data)
+
+    session = _bare_session(FakeClient())
+    session.query("q", ticker=None, refresh=False)
+    assert session.last_trace_id == "trace-xyz"

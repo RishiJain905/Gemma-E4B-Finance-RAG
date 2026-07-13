@@ -4,6 +4,10 @@ Offline API tests for read-only localhost query graph endpoints.
 
 from __future__ import annotations
 
+import types
+from unittest.mock import AsyncMock
+
+import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
@@ -135,3 +139,119 @@ def test_corpus_routes_return_404_when_graph_is_disabled(offline_store):
     client = _corpus_client(offline_store, enabled=False)
     assert client.get("/graph/api/corpus/overview").status_code == 404
     assert client.get("/graph/api/corpus/refresh-status").status_code == 404
+
+
+# ── 2.2.7.4: app-level loopback + CSP + no-store security posture ────────────
+
+@pytest.fixture
+def graph_app(monkeypatch):
+    """The real middleware app with the observer enabled and a populated hub,
+    without running the heavy lifespan (Store/model clients)."""
+    import src.middleware.app as appmod
+
+    hub = _populated_hub()
+    monkeypatch.setattr(
+        appmod, "config", types.SimpleNamespace(enable_graph_observer=True))
+    monkeypatch.setattr(appmod, "graph_hub", hub)
+    return appmod
+
+
+def _loopback(appmod):
+    return TestClient(appmod.app, client=("127.0.0.1", 50000))
+
+
+def _remote(appmod):
+    return TestClient(appmod.app, client=("203.0.113.7", 50000))
+
+
+def test_all_graph_surfaces_reject_non_loopback_clients(graph_app):
+    client = _remote(graph_app)
+    for path in (
+        "/graph",
+        "/graph/static/graph.js",
+        "/graph/api/health",
+        "/graph/api/traces",
+        "/graph/api/traces/q1",
+        "/graph/api/events",
+    ):
+        assert client.get(path).status_code == 404, path
+
+
+def test_graph_html_carries_strict_same_origin_csp_and_hardening(graph_app):
+    resp = _loopback(graph_app).get("/graph")
+    assert resp.status_code == 200
+    csp = resp.headers["content-security-policy"]
+    assert "default-src 'none'" in csp
+    assert "script-src 'self'" in csp
+    # connect-src stays same-origin (SSE + fetch); no third-party origin appears.
+    assert "connect-src 'self'" in csp
+    assert "frame-ancestors 'none'" in csp
+    assert "http://" not in csp and "https://" not in csp
+    assert resp.headers["x-content-type-options"] == "nosniff"
+    assert resp.headers["referrer-policy"] == "no-referrer"
+    assert resp.headers["cache-control"] == "no-store"
+
+
+def test_graph_api_detail_responses_are_no_store_and_carry_csp(graph_app):
+    resp = _loopback(graph_app).get("/graph/api/traces/q1")
+    assert resp.status_code == 200
+    assert resp.headers["cache-control"] == "no-store"
+    assert "default-src 'none'" in resp.headers["content-security-policy"]
+
+
+def test_graph_sse_keepalive_directive_is_preserved_under_security_headers(graph_app):
+    resp = _loopback(graph_app).get("/graph/api/events?last_sequence=0&once=true")
+    assert resp.status_code == 200
+    # The SSE endpoint's own no-cache directive is not overwritten by the
+    # middleware default (no-store); CSP is still stamped.
+    assert resp.headers["cache-control"] == "no-cache"
+    assert "default-src 'none'" in resp.headers["content-security-policy"]
+
+
+def test_non_graph_routes_are_untouched_by_graph_security(monkeypatch):
+    import src.middleware.app as appmod
+
+    monkeypatch.setattr(
+        appmod, "config",
+        types.SimpleNamespace(
+            enable_tools=False, enable_streaming=True, answer_policy="graded",
+            conversation_max_turns=8, conversation_max_history_chars=8000,
+            enable_graph_observer=False),
+    )
+    monkeypatch.setattr(
+        appmod, "store",
+        types.SimpleNamespace(heartbeat=lambda: {"sqlite": True, "chroma": True}))
+    monkeypatch.setattr(appmod, "_check_model_health", AsyncMock(return_value=True))
+    monkeypatch.setattr(
+        appmod, "_cached_health_summary", lambda: {"scheduler": None, "freshness": {}})
+    resp = TestClient(appmod.app).get("/health")
+    assert resp.status_code == 200
+    # No graph CSP leaks onto ordinary API responses.
+    assert "content-security-policy" not in {k.lower() for k in resp.headers}
+    caps = resp.json()["capabilities"]
+    assert "graph_observer" not in caps and "graph_url" not in caps
+
+
+def test_health_advertises_graph_url_and_limits_only_when_enabled(monkeypatch):
+    import src.middleware.app as appmod
+    from src.middleware.graph_observer import TraceHub
+
+    monkeypatch.setattr(
+        appmod, "config",
+        types.SimpleNamespace(
+            enable_tools=False, enable_streaming=True, answer_policy="graded",
+            conversation_max_turns=8, conversation_max_history_chars=8000,
+            enable_graph_observer=True),
+    )
+    monkeypatch.setattr(appmod, "graph_hub", TraceHub())
+    monkeypatch.setattr(
+        appmod, "store",
+        types.SimpleNamespace(heartbeat=lambda: {"sqlite": True, "chroma": True}))
+    monkeypatch.setattr(appmod, "_check_model_health", AsyncMock(return_value=True))
+    monkeypatch.setattr(
+        appmod, "_cached_health_summary", lambda: {"scheduler": None, "freshness": {}})
+    caps = TestClient(appmod.app, client=("127.0.0.1", 50000)).get(
+        "/health").json()["capabilities"]
+    assert caps["graph_observer"] is True
+    assert caps["graph_url"].endswith("/graph")
+    assert caps["graph_observer_limits"]["traces"] == 100

@@ -235,6 +235,15 @@ class QueryResponse(BaseModel):
                     "answer_validation is off; validator errors report "
                     "validation_status=report_unavailable rather than failing the query.",
     )
+    graph_trace_id: Optional[str] = Field(
+        None,
+        exclude_if=lambda value: value is None,
+        description="Opaque id of this request's bounded local query-graph trace "
+                    "(2.2.7.4). Present only when the local graph observer is enabled; "
+                    "omitted (null) otherwise so the response stays byte-compatible for "
+                    "clients and servers without the observer. Used by the chat client's "
+                    "/graph trace command to deep-link the running trace.",
+    )
     freshness: dict = Field(
         default_factory=lambda: {
             "overall": "unknown",
