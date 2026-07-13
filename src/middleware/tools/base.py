@@ -33,6 +33,49 @@ class ToolContext:
 REGISTRY: dict[str, Tool] = {}
 
 
+def tool_result_count(result: object) -> Optional[int]:
+    """Return only the bounded row/item count from an executed tool result."""
+    if not isinstance(result, dict) or result.get("error"):
+        return None
+    rows = result.get("results")
+    if isinstance(rows, list):
+        return len(rows)
+    for key in ("fundamentals", "estimates", "price_targets", "guidance"):
+        value = result.get(key)
+        if isinstance(value, dict):
+            return len(value)
+    articles = result.get("article_count")
+    return articles if isinstance(articles, int) else None
+
+
+def _trace_tool_started(name: str, subquery_id: Optional[str]) -> float:
+    """Emit an actual dispatch start through the request's shared emitter."""
+    from ..stream_events import current_emitter
+
+    emitter = current_emitter()
+    if emitter is not None:
+        emitter.tool_started(name, subquery_id=subquery_id)
+    return perf_counter()
+
+
+def _trace_tool_completed(
+    name: str, result: object, started_at: float, subquery_id: Optional[str]
+) -> None:
+    """Emit completion from the executed result without exposing its body."""
+    from ..stream_events import current_emitter
+
+    emitter = current_emitter()
+    if emitter is not None:
+        failed = isinstance(result, dict) and bool(result.get("error"))
+        emitter.tool_completed(
+            name,
+            "error" if failed else "ok",
+            count=tool_result_count(result),
+            elapsed_ms=(perf_counter() - started_at) * 1000,
+            subquery_id=subquery_id,
+        )
+
+
 def register(tool: Tool):
     REGISTRY[tool.name] = tool
 
@@ -80,7 +123,12 @@ def validate_args(schema: dict, args: dict) -> Optional[str]:
 
 
 def dispatch_named_tool(
-    name: str, arguments: dict, store, ctx: ToolContext
+    name: str,
+    arguments: dict,
+    store,
+    ctx: ToolContext,
+    *,
+    subquery_id: Optional[str] = None,
 ) -> tuple[dict, str, dict]:
     """Validate and dispatch one already-resolved tool call.
 
@@ -94,24 +142,30 @@ def dispatch_named_tool(
     handler. Never raises for a handler failure — it is returned as
     ``{"error": ...}`` so callers can fall back to the normal retrieval lane.
     """
+    trace_start = _trace_tool_started(name, subquery_id)
+
+    def finish(result: dict, resolved_name: str, args: dict) -> tuple[dict, str, dict]:
+        _trace_tool_completed(resolved_name or name, result, trace_start, subquery_id)
+        return result, resolved_name, args
+
     tool = REGISTRY.get(name)
     if not tool:
-        return {"error": f"unknown tool: {name}"}, name, {}
+        return finish({"error": f"unknown tool: {name}"}, name, {})
 
     if not isinstance(arguments, dict):
-        return {"error": "tool arguments must be an object", "tool": name}, name, {}
+        return finish({"error": "tool arguments must be an object", "tool": name}, name, {})
 
     properties = tool.parameters.get("properties", {}) or {}
     args = {k: v for k, v in arguments.items() if k in properties}
     error = validate_args(tool.parameters, args)
     if error:
-        return {"error": error, "tool": name}, name, args
+        return finish({"error": error, "tool": name}, name, args)
 
     if tool.write and not ctx.allow_write:
-        return {"error": "write tools disabled"}, name, args
+        return finish({"error": "write tools disabled"}, name, args)
     if tool.write:
         if ctx.refresh_count + 1 > ctx.max_refreshes:
-            return {"error": "max refreshes exceeded", "tool": name}, name, args
+            return finish({"error": "max refreshes exceeded", "tool": name}, name, args)
         ctx.refresh_count += 1
 
     start = perf_counter()
@@ -119,11 +173,11 @@ def dispatch_named_tool(
         result = tool.handler(store, **args)
     except Exception as e:  # noqa: BLE001
         logger.exception("Tool handler failed: %s", name)
-        return {"error": str(e), "tool": name}, name, args
+        return finish({"error": str(e), "tool": name}, name, args)
     finally:
         duration_ms = round((perf_counter() - start) * 1000, 1)
         logger.info("Tool call %s args=%s duration_ms=%s", name, args, duration_ms)
-    return result, name, args
+    return finish(result, name, args)
 
 
 def dispatch_tool(call: dict, store, ctx: ToolContext) -> dict:

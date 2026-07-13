@@ -31,8 +31,9 @@ import itertools
 import logging
 import time
 import uuid
+from contextvars import ContextVar
 from dataclasses import dataclass, field
-from typing import Iterable, Iterator, Optional
+from typing import Callable, Iterable, Iterator, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -49,6 +50,7 @@ EVENT_TOOL_COMPLETED = "tool_completed"
 EVENT_TOKEN = "token"
 EVENT_METADATA = "metadata"
 EVENT_ERROR = "error"
+EVENT_GRAPH = "graph_observer"
 
 # Allowlisted pipeline stage names + lifecycle phases. Anything outside these
 # sets is dropped by :meth:`QueryEventEmitter.stage` so a typo/injected value can
@@ -62,6 +64,9 @@ STAGE_PHASES = frozenset({"started", "completed", "fallback"})
 TOOL_STATUS_OK = "ok"
 TOOL_STATUS_ERROR = "error"
 _TOOL_STATUSES = frozenset({TOOL_STATUS_OK, TOOL_STATUS_ERROR})
+_CURRENT_EMITTER: ContextVar[Optional["QueryEventEmitter"]] = ContextVar(
+    "query_event_emitter", default=None
+)
 
 
 @dataclass
@@ -102,11 +107,21 @@ class QueryEventEmitter:
     fail a query.
     """
 
-    def __init__(self, query_id: Optional[str] = None, *, include_counts: bool = True) -> None:
+    def __init__(
+        self,
+        query_id: Optional[str] = None,
+        *,
+        include_counts: bool = True,
+        observers: Optional[Iterable[Callable[[QueryEvent], None]]] = None,
+        buffer_events: bool = True,
+    ) -> None:
         self.query_id = query_id or new_query_id()
         self.include_counts = bool(include_counts)
         self._seq = itertools.count()
         self._pending: list[QueryEvent] = []
+        self._observers = list(observers or ())
+        self._failed_observers: set[int] = set()
+        self._buffer_events = bool(buffer_events)
 
     def _emit(self, type_: str, payload: dict) -> QueryEvent:
         event = QueryEvent(
@@ -116,7 +131,17 @@ class QueryEventEmitter:
             timestamp=time.time(),
             payload=payload,
         )
-        self._pending.append(event)
+        if self._buffer_events:
+            self._pending.append(event)
+        for observer in self._observers:
+            observer_id = id(observer)
+            if observer_id in self._failed_observers:
+                continue
+            try:
+                observer(event)
+            except Exception:  # noqa: BLE001 - observation must never fail a query
+                self._failed_observers.add(observer_id)
+                logger.exception("Query event observer failed; discarding it")
         return event
 
     def drain(self) -> list[QueryEvent]:
@@ -127,9 +152,10 @@ class QueryEventEmitter:
 
     # ── Emit helpers (each returns the created event, or None if dropped) ──
 
-    def query_started(self) -> QueryEvent:
+    def query_started(self, *, question: Optional[str] = None) -> QueryEvent:
         """Emit the opening ``query_started`` event (should be sequence 0)."""
-        return self._emit(EVENT_QUERY_STARTED, {})
+        payload = {"question": str(question)} if question is not None else {}
+        return self._emit(EVENT_QUERY_STARTED, payload)
 
     def stage(
         self,
@@ -202,6 +228,94 @@ class QueryEventEmitter:
     def error(self, message: str, *, terminal: bool) -> QueryEvent:
         """Emit an ``error`` event with a short, safe message + terminal flag."""
         return self._emit(EVENT_ERROR, {"message": _safe_message(message), "terminal": bool(terminal)})
+
+    def graph_update(
+        self,
+        *,
+        nodes: Optional[list[dict]] = None,
+        edges: Optional[list[dict]] = None,
+        operation: Optional[str] = None,
+        summary: Optional[dict] = None,
+    ) -> QueryEvent:
+        """Emit graph-only references through this shared event stream."""
+        payload: dict = {}
+        if nodes:
+            payload["nodes"] = list(nodes)
+        if edges:
+            payload["edges"] = list(edges)
+        if operation:
+            payload["operation"] = str(operation)
+        if summary:
+            payload["summary"] = dict(summary)
+        return self._emit(EVENT_GRAPH, payload)
+
+    def graph_evidence(
+        self,
+        *,
+        evidence_id: str,
+        kind: str,
+        excerpt: str,
+        metadata: Optional[dict] = None,
+        source_type: Optional[str] = None,
+        rank: Optional[int] = None,
+        retrieved_from: Optional[str] = None,
+        status: str = "complete",
+    ) -> QueryEvent:
+        """Emit one actual evidence reference and its source relationship."""
+        from .graph_observer import _edge_id, _node_id
+
+        evidence_ref = str(evidence_id)
+        evidence_node_id = _node_id(self.query_id, "evidence", evidence_ref)
+        evidence_meta = dict(metadata or {})
+        evidence_meta.update({"evidence_id": evidence_ref, "kind": str(kind)})
+        if source_type:
+            evidence_meta["source_type"] = str(source_type)
+        if rank is not None:
+            evidence_meta["rank"] = int(rank)
+        nodes = [{
+            "id": evidence_node_id,
+            "kind": "evidence",
+            "label": f"Evidence {evidence_ref}",
+            "summary": str(excerpt),
+            "status": status,
+            "metadata": evidence_meta,
+        }]
+        retrieval_node = retrieved_from or _node_id(self.query_id, "stage", "retrieve")
+        edges = [{
+            "id": _edge_id(self.query_id, retrieval_node, "retrieved", evidence_node_id),
+            "source": retrieval_node,
+            "target": evidence_node_id,
+            "relation": "retrieved",
+            "metadata": {"rank": rank} if rank is not None else {},
+        }]
+        if source_type:
+            source_ref = str(source_type)
+            source_node_id = _node_id(self.query_id, "source", source_ref)
+            nodes.append({
+                "id": source_node_id,
+                "kind": "source",
+                "label": source_ref.replace("_", " ").upper(),
+                "status": "complete",
+                "metadata": {"source_type": source_ref},
+            })
+            edges.append({
+                "id": _edge_id(self.query_id, evidence_node_id, "from_source", source_node_id),
+                "source": evidence_node_id,
+                "target": source_node_id,
+                "relation": "from_source",
+                "metadata": {},
+            })
+        return self.graph_update(nodes=nodes, edges=edges)
+
+
+def set_current_emitter(emitter: Optional[QueryEventEmitter]) -> None:
+    """Install the emitter visible to executed pipeline modules in this request."""
+    _CURRENT_EMITTER.set(emitter)
+
+
+def current_emitter() -> Optional[QueryEventEmitter]:
+    """Return the request's shared emitter, if observation is active."""
+    return _CURRENT_EMITTER.get()
 
 
 def _safe_tool_name(name: Optional[str]) -> Optional[str]:
@@ -304,12 +418,23 @@ def iter_chat_sse(
             yield serialized
 
 
-def graph_observer_delta(event: QueryEvent) -> Optional[dict]:  # pragma: no cover - 2.2.7 seam
-    """Reserved seam for the 2.2.7 localhost graph-observer projection.
+def graph_observer_delta(
+    event: QueryEvent,
+    *,
+    excerpt_chars: int = 1000,
+    question_preview_chars: int = 200,
+) -> list:
+    """Project one event through the 2.2.7 localhost graph-observer seam.
 
-    Intentionally unimplemented: 2.2.7 owns the richer (still allowlisted) delta
+    The graph observer owns the richer (still allowlisted) delta
     shape. Kept here so the single :class:`QueryEventEmitter` instrumentation is
     the one place both UIs are fed from — the pipeline is never instrumented
     twice.
     """
-    return None
+    from .graph_observer import event_graph_deltas
+
+    return event_graph_deltas(
+        event,
+        excerpt_chars=excerpt_chars,
+        question_preview_chars=question_preview_chars,
+    )

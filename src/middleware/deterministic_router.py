@@ -888,7 +888,8 @@ def execute_route(
     try:
         for inv in decision.tool_invocations[: max(0, int(max_tools))]:
             tool_result, name, args = dispatch_named_tool(
-                inv.name, dict(inv.arguments), store, ctx
+                inv.name, dict(inv.arguments), store, ctx,
+                subquery_id=inv.subquery_id,
             )
             err = tool_result.get("error") if isinstance(tool_result, dict) else None
             if err:
