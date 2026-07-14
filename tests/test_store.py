@@ -392,3 +392,16 @@ def test_universe_facade_methods_delegate_without_extra_revision_bump(fully_mock
     )
     sqlite.upsert_universe_snapshot.assert_called_once_with("ivv", "2026-01-01", [])
     sqlite.bump_store_revision.assert_not_called()
+
+
+def test_structured_record_facade_methods_delegate(fully_mocked_store):
+    store, sqlite, _chroma = fully_mocked_store
+    observation = MagicMock()
+    event = MagicMock()
+    sqlite.upsert_observation_record.return_value = {"created": True}
+    sqlite.upsert_event_record.return_value = {"created": True}
+
+    assert store.upsert_observation(observation) == {"created": True}
+    assert store.upsert_event(event) == {"created": True}
+    sqlite.upsert_observation_record.assert_called_once_with(observation)
+    sqlite.upsert_event_record.assert_called_once_with(event)
