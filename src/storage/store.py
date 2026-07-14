@@ -493,7 +493,7 @@ class Store:
             chroma_metadata["sectors"] = ",".join(record.sectors)
 
         try:
-            if result["content_changed"]:
+            if result["content_changed"] or result.get("authority_promoted"):
                 self.chroma.delete_document(item_id)
                 self.chroma.delete_filing_section_family(item_id)
             self.chroma.add_document(
@@ -918,12 +918,47 @@ class Store:
 
     def register_filing(self, ticker: str, filing_type: str,
                         filing_date: str, period: str,
-                        accession: str, source_url: str) -> bool:
+                        accession: str, source_url: str, *,
+                        cik: Optional[str] = None,
+                        primary_document: Optional[str] = None,
+                        discovery_scope: str = "deep",
+                        items: Optional[list[str]] = None,
+                        exhibits: Optional[list[dict]] = None) -> bool:
         """Register a filing as received (before parsing)."""
+        metadata = {}
+        if cik is not None:
+            metadata["cik"] = cik
+        if primary_document is not None:
+            metadata["primary_document"] = primary_document
+        if discovery_scope != "deep":
+            metadata["discovery_scope"] = discovery_scope
+        if items is not None:
+            metadata["items"] = items
+        if exhibits is not None:
+            metadata["exhibits"] = exhibits
         return self.sqlite.register_filing(
             ticker, filing_type, filing_date, period,
-            accession, source_url
+            accession, source_url,
+            **metadata,
         )
+
+    def register_sec_daily_index(
+        self, index_date: str, source_url: str, filings: list[dict],
+    ) -> dict[str, object]:
+        """Atomically register a filtered daily index and advance its cursor."""
+        return self.sqlite.register_sec_daily_index(index_date, source_url, filings)
+
+    def register_sec_filings(self, filings: list[dict]) -> int:
+        """Atomically register a normalized SEC filing batch."""
+        return self.sqlite.register_sec_filings(filings)
+
+    def get_sec_daily_index_status(self, index_date: str) -> Optional[str]:
+        """Return the processed status for one SEC daily index date."""
+        return self.sqlite.get_sec_daily_index_status(index_date)
+
+    def get_sec_daily_index_cursor(self) -> Optional[str]:
+        """Return the latest fully committed SEC daily-index date."""
+        return self.sqlite.get_sec_daily_index_cursor()
 
     def process_filing(self, filing_record: dict,
                        extracted_text: str,
@@ -1271,6 +1306,7 @@ class Store:
                 DROP TABLE IF EXISTS security_aliases;
                 DROP TABLE IF EXISTS securities;
                 DROP TABLE IF EXISTS fundamentals;
+                DROP TABLE IF EXISTS sec_daily_indexes;
                 DROP TABLE IF EXISTS filings;
                 DROP TABLE IF EXISTS cache_meta;
                 DROP TABLE IF EXISTS ingestion_log;

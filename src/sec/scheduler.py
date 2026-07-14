@@ -16,6 +16,7 @@ from datetime import datetime, timezone
 from typing import Optional
 
 from .filing_processor import FilingProcessor
+from .daily_index import SECDailyIndexDiscovery
 from src.storage.store import Store
 from src.universe.coverage import CoverageResolver
 
@@ -41,11 +42,27 @@ class FilingScheduler:
         store: Optional[Store] = None,
         processor: Optional[FilingProcessor] = None,
         coverage_resolver: Optional[CoverageResolver] = None,
+        daily_index_discovery: Optional[SECDailyIndexDiscovery] = None,
     ):
         self.store = store or Store()
         self.processor = processor or FilingProcessor(store=self.store)
         self._coverage_injected = coverage_resolver is not None
         self.coverage = coverage_resolver or CoverageResolver(self.store)
+        self.daily_index_discovery = daily_index_discovery
+        if self.daily_index_discovery is None and self.store.list_securities(
+            active=True, limit=1, offset=0,
+        ):
+            fetcher = getattr(self.processor, "fetcher", None)
+            user_agent = getattr(fetcher, "_user_agent", None)
+            sec_config = getattr(self.processor, "sec_config", None)
+            if user_agent and isinstance(sec_config, dict):
+                self.daily_index_discovery = SECDailyIndexDiscovery(
+                    store=self.store,
+                    coverage_resolver=self.coverage,
+                    sec_config=sec_config,
+                    user_agent=user_agent,
+                    request_delay=getattr(fetcher, "request_delay", 0.5),
+                )
 
         # Load the SEC filing TTL from watchlist config
         self.ttl_hours = self._load_filing_ttl()
@@ -91,6 +108,17 @@ class FilingScheduler:
                 "details": {ticker: new_count}
             }
         """
+        if self.daily_index_discovery is not None:
+            daily = self.daily_index_discovery.discover()
+            return {
+                "mode": "daily_index",
+                "checked": int(daily.get("downloaded", 0)),
+                "skipped": 0,
+                "new_filings": int(daily.get("registered", 0)),
+                "failed": int(daily.get("failed", 0)),
+                "details": daily,
+            }
+
         tickers = self._tickers_for("sec_filings")
 
         result = {
@@ -173,17 +201,20 @@ class FilingScheduler:
 
         discovery_result = self.run_discovery(force=force)
 
-        broad_tickers = set(self._tickers_for("sec_filings"))
-        deep_tickers = self._tickers_for("sec_filing_text")
-        if broad_tickers == set(deep_tickers):
+        if discovery_result.get("mode") == "daily_index":
             processing_result = self.processor.process_pending_filings(limit=50)
         else:
-            processing_result = {"processed": 0, "failed": 0, "errors": []}
-            for ticker in deep_tickers:
-                ticker_result = self.processor.process_ticker(ticker, limit=50)
-                processing_result["processed"] += int(ticker_result.get("processed", 0))
-                processing_result["failed"] += int(ticker_result.get("failed", 0))
-                processing_result["errors"].extend(ticker_result.get("errors", []) or [])
+            broad_tickers = set(self._tickers_for("sec_filings"))
+            deep_tickers = self._tickers_for("sec_filing_text")
+            if broad_tickers == set(deep_tickers):
+                processing_result = self.processor.process_pending_filings(limit=50)
+            else:
+                processing_result = {"processed": 0, "failed": 0, "errors": []}
+                for ticker in deep_tickers:
+                    ticker_result = self.processor.process_ticker(ticker, limit=50)
+                    processing_result["processed"] += int(ticker_result.get("processed", 0))
+                    processing_result["failed"] += int(ticker_result.get("failed", 0))
+                    processing_result["errors"].extend(ticker_result.get("errors", []) or [])
 
         report = {
             "discovery": discovery_result,

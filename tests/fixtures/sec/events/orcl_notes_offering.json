@@ -1,0 +1,18 @@
+{
+  "filing": {
+    "accession": "0001193125-26-188002",
+    "ticker": "ORCL",
+    "cik": "0001341439",
+    "form": "424B5",
+    "filing_date": "2026-07-10",
+    "source_url": "https://www.sec.gov/Archives/edgar/data/1341439/000119312526188002/d12345d424b5.htm",
+    "text": "Prospectus supplement for several series of senior notes. The aggregate principal amount and pricing terms will be determined at pricing."
+  },
+  "documents": [
+    {
+      "document_type": "PRIMARY",
+      "source_url": "https://www.sec.gov/Archives/edgar/data/1341439/000119312526188002/d12345d424b5.htm",
+      "text": "Prospectus supplement for several series of senior notes. The aggregate principal amount and pricing terms will be determined at pricing."
+    }
+  ]
+}

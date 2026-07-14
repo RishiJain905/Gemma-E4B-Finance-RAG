@@ -10,14 +10,20 @@ Usage:
 """
 
 import logging
+import json
+import re
 from pathlib import Path
 import time
+from datetime import datetime, timezone
 from typing import Optional
 
 from .edgar_fetcher import SECEdgarFilingFetcher
+from .event_classifier import RULE_VERSION, SECEventClassifier
 from .filing_parser import TraceAlchemyFilingParser
 from .filing_sections import split_filing_sections
 from src.storage.store import Store
+from src.ingestion.normalization import NORMALIZATION_VERSION, content_hash
+from src.ingestion.records import EventRecord, NarrativeRecord
 
 logger = logging.getLogger(__name__)
 
@@ -50,9 +56,12 @@ class FilingProcessor:
         parsed_dir: Optional[Path] = None,
     ):
         self.store = store or Store()
-        self.fetcher = fetcher or SECEdgarFilingFetcher(store=self.store)
-        self.parser = parser or TraceAlchemyFilingParser()
         self.sec_config = sec_config or self._load_sec_config()
+        self.fetcher = fetcher or SECEdgarFilingFetcher(
+            store=self.store, sec_config=self.sec_config,
+        )
+        self.parser = parser or TraceAlchemyFilingParser()
+        self.event_classifier = SECEventClassifier()
         self.index_filing_text = bool(self.sec_config.get("index_filing_text", False))
         self.max_sections_per_filing = min(
             max(int(self.sec_config.get("max_sections_per_filing", 200)), 1), 500,
@@ -65,6 +74,7 @@ class FilingProcessor:
             str(form).upper()
             for form in self.sec_config.get("index_forms", ["10-K", "10-Q", "8-K"])
         }
+        self.index_event_filings = bool(self.sec_config.get("index_event_filings", True))
         raw_db_path = getattr(self.store.sqlite, "db_path", None)
         db_path = Path(raw_db_path) if isinstance(raw_db_path, (str, Path)) else Path("data/finance.db")
         self.parsed_dir = (
@@ -90,6 +100,7 @@ class FilingProcessor:
             "max_sections_per_filing": 200,
             "max_section_chars": 2_000_000,
             "index_forms": ["10-K", "10-Q", "8-K"],
+            "index_event_filings": True,
         }
         config_path = Path(__file__).parents[2] / "configs" / "sec.yaml"
         if not config_path.exists():
@@ -271,6 +282,9 @@ class FilingProcessor:
         filing_type = filing.get("filing_type", "")
         period = filing.get("period", "")
 
+        if str(filing.get("discovery_scope") or "deep").lower() == "broad":
+            return self._process_event_filing(filing)
+
         logger.info(
             "Processing filing: %s %s %s (%s)",
             ticker, filing_type, period, accession,
@@ -398,6 +412,154 @@ class FilingProcessor:
             time.monotonic() - started,
         )
         return True
+
+    def _process_event_filing(self, filing: dict) -> bool:
+        """Persist selected broad filing evidence and deterministic events."""
+        accession = str(filing.get("accession") or "").strip()
+        ticker = str(filing.get("ticker") or "").strip().upper()
+        form = str(filing.get("filing_type") or filing.get("form") or "").strip().upper()
+        documents = self.fetcher.download_relevant_documents(filing)
+        if not documents:
+            logger.warning("No selected SEC documents downloaded for %s", accession)
+            return False
+        primary = next(
+            (document for document in documents if document.get("document_type") == "PRIMARY"),
+            documents[0],
+        )
+        items = self._json_list(filing.get("items_json") or filing.get("items"))
+        primary_text = str(primary.get("text") or "")
+        items = sorted(set(items) | set(
+            re.findall(r"(?i)\bitem\s+(\d+\.\d{2})\b", primary_text)
+        ))
+        context = {
+            **filing,
+            "form": form,
+            "text": primary_text,
+            "items": items,
+        }
+        events = self.event_classifier.classify(context, documents)
+        security = self.store.resolve_security(ticker)
+        if not security:
+            logger.error("Registered broad SEC filing %s has no canonical security", accession)
+            return False
+        security_id = str(security["security_id"])
+        memberships = self.store.list_memberships(security_id=security_id, active=True)
+        index_codes = tuple(sorted({str(row["index_code"]) for row in memberships}))
+        now = datetime.now(timezone.utc).isoformat()
+        filing_date = str(filing.get("filing_date") or "")
+        published_at = f"{filing_date}T00:00:00Z" if filing_date else None
+        source_url = str(primary.get("source_url") or filing.get("source_url") or "")
+        body = "\n\n".join(
+            f"[{document.get('document_type', 'EXHIBIT')}]\n{document.get('text', '')}"
+            for document in documents
+            if document.get("text")
+        )[:1_000_000]
+        item_id = f"sec:{accession}"
+        narrative = NarrativeRecord(
+            corpus_item_id=item_id,
+            source_name="sec",
+            source_category="regulatory_filing",
+            provider_record_id=accession,
+            original_publisher="U.S. Securities and Exchange Commission",
+            item_type="sec_filing",
+            event_type=events[0].event_type if len(events) == 1 else None,
+            title=f"{ticker} {form} filed {filing_date}".strip(),
+            body=body,
+            published_at=published_at,
+            observed_at=now,
+            accessed_at=now,
+            ingested_at=now,
+            source_url=source_url,
+            canonical_url=source_url,
+            license_label="sec_public_filing",
+            normalization_version=NORMALIZATION_VERSION,
+            content_hash=content_hash(body),
+            document_family=item_id,
+            security_ids=(security_id,),
+            tickers=(ticker,),
+            index_codes=index_codes,
+            sectors=(str(security["sector"]),) if security.get("sector") else (),
+            metadata={
+                "accession": accession,
+                "form": form,
+                "filing_item": ",".join(items),
+                "exhibit": ",".join(
+                    str(document.get("document_type") or "") for document in documents[1:]
+                ),
+            },
+            indexing_status="pending" if self.index_event_filings else "not_applicable",
+            evidence_authority="direct_sec",
+        )
+        narrative_result = self.store.upsert_narrative(narrative)
+        if narrative_result.get("indexing_status") == "error":
+            logger.warning("SEC event narrative indexing remains retryable for %s", accession)
+            return False
+        linked_item_id = str(narrative_result["corpus_item_id"])
+
+        for event in events:
+            stable_key = f"{accession}:{event.event_type}:{event.rule_version}"
+            event_metadata = {"accession": accession, "form": form}
+            if items:
+                event_metadata["filing_item"] = ",".join(items)
+            if event.source_document_types:
+                event_metadata["exhibit"] = ",".join(event.source_document_types)
+            if event.security_type:
+                event_metadata["security_type"] = event.security_type
+            if event.maturity:
+                event_metadata["maturity"] = event.maturity
+            self.store.upsert_event(EventRecord(
+                event_id=f"sec:{stable_key}",
+                event_type=event.event_type,
+                effective_at=published_at,
+                announced_at=published_at,
+                status="announced",
+                security_ids=(security_id,),
+                source_corpus_item_ids=(linked_item_id,),
+                source_name="sec",
+                source_category="regulatory_filing",
+                provider_record_id=stable_key,
+                original_publisher="U.S. Securities and Exchange Commission",
+                source_url=source_url,
+                canonical_url=source_url,
+                published_at=published_at,
+                observed_at=now,
+                accessed_at=now,
+                ingested_at=now,
+                license_label="sec_public_filing",
+                normalization_version=NORMALIZATION_VERSION,
+                amount=event.amount,
+                currency=event.currency,
+                rate=event.rate,
+                classifier_version=RULE_VERSION,
+                explanation=event.classification_reason,
+                metadata=event_metadata,
+                evidence_authority="direct_sec",
+            ))
+
+        if self.index_event_filings:
+            sections = split_filing_sections(body, filing)
+            if sections:
+                try:
+                    self.store.add_filing_sections(sections[: self.max_sections_per_filing])
+                except Exception:  # noqa: BLE001 - narrative remains durable and replayable
+                    logger.warning("SEC event section indexing failed for %s", accession, exc_info=True)
+                    return False
+        self.store.sqlite.mark_filing_parsed(accession, embedding_id=linked_item_id)
+        return True
+
+    @staticmethod
+    def _json_list(value: object) -> list[str]:
+        """Decode a stored JSON list while accepting already-normalized lists."""
+        if isinstance(value, list):
+            return [str(item) for item in value]
+        if isinstance(value, str) and value:
+            try:
+                parsed = json.loads(value)
+                if isinstance(parsed, list):
+                    return [str(item) for item in parsed]
+            except json.JSONDecodeError:
+                return [value]
+        return []
 
     # ── Status ─────────────────────────────────────────
 

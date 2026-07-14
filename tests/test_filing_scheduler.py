@@ -182,6 +182,22 @@ def test_run_full_pipeline_composition(tmp_path):
     datetime.fromisoformat(report["timestamp"])
 
 
+def test_registry_mode_runs_one_daily_index_discovery_not_per_ticker(tmp_path):
+    daily_index = MagicMock()
+    daily_index.discover.return_value = {
+        "downloaded": 1, "registered": 4, "failed": 0, "errors": [],
+    }
+    scheduler, _store, proc = _make_scheduler(tmp_path)
+    scheduler.daily_index_discovery = daily_index
+
+    result = scheduler.run_discovery()
+
+    assert result["mode"] == "daily_index"
+    assert result["new_filings"] == 4
+    daily_index.discover.assert_called_once_with()
+    proc.discover_new_filings.assert_not_called()
+
+
 # ── 6. status_report ────────────────────────────────
 
 def test_status_report_never_checked_and_age_hours(tmp_path):
@@ -246,6 +262,7 @@ def test_reset_discovery_cache_marks_stale(tmp_path):
 
 # ── 8. LIVE incremental discovery (skip-guarded) ────
 
+@pytest.mark.live
 def test_live_scheduler_incremental_discovery(tmp_path):
     """Live: force discovery, second run skips, reset re-checks."""
     if not _endpoint_reachable(f"https://{EDGAR_HOST}"):

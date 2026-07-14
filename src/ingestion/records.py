@@ -38,7 +38,9 @@ METADATA_ALLOWLIST = frozenset({
     "provider_revision",
     "release_id",
     "report_period",
+    "security_type",
     "series_id",
+    "maturity",
     "tags",
     "taxonomy",
 })

@@ -56,6 +56,15 @@ class SQLiteStore:
 
         with self._connect() as conn:
             conn.executescript(sql)
+            conn.execute(
+                """CREATE TABLE IF NOT EXISTS sec_daily_indexes (
+                    index_date TEXT PRIMARY KEY,
+                    source_url TEXT NOT NULL,
+                    status TEXT NOT NULL CHECK (status IN ('processed')),
+                    registered_count INTEGER NOT NULL DEFAULT 0,
+                    processed_at TEXT NOT NULL DEFAULT (datetime('now'))
+                )"""
+            )
             existing = {
                 row[1] for row in conn.execute("PRAGMA table_info(filings)").fetchall()
             }
@@ -67,6 +76,13 @@ class SQLiteStore:
                 "index_chunk_count": (
                     "ALTER TABLE filings ADD COLUMN index_chunk_count INTEGER DEFAULT 0"
                 ),
+                "cik": "ALTER TABLE filings ADD COLUMN cik TEXT",
+                "primary_document": "ALTER TABLE filings ADD COLUMN primary_document TEXT",
+                "discovery_scope": (
+                    "ALTER TABLE filings ADD COLUMN discovery_scope TEXT DEFAULT 'deep'"
+                ),
+                "items_json": "ALTER TABLE filings ADD COLUMN items_json TEXT DEFAULT '[]'",
+                "exhibits_json": "ALTER TABLE filings ADD COLUMN exhibits_json TEXT DEFAULT '[]'",
             }
             for column, statement in migrations.items():
                 if column not in existing:
@@ -644,17 +660,107 @@ CREATE INDEX IF NOT EXISTS idx_corpus_events_type_effective
 
     def register_filing(self, ticker: str, filing_type: str,
                         filing_date: str, period: str,
-                        accession: str, source_url: str) -> bool:
+                        accession: str, source_url: str, *,
+                        cik: Optional[str] = None,
+                        primary_document: Optional[str] = None,
+                        discovery_scope: str = "deep",
+                        items: Optional[list[str]] = None,
+                        exhibits: Optional[list[dict]] = None) -> bool:
         """Register a filing as processed. Returns True if new, False if duplicate."""
         sql = """
         INSERT OR IGNORE INTO filings
-            (ticker, filing_type, filing_date, period, accession, source_url, status)
-        VALUES (?, ?, ?, ?, ?, ?, 'unprocessed')
+            (ticker, filing_type, filing_date, period, accession, source_url, status,
+             cik, primary_document, discovery_scope, items_json, exhibits_json)
+        VALUES (?, ?, ?, ?, ?, ?, 'unprocessed', ?, ?, ?, ?, ?)
         """
         with self._connect() as conn:
-            cursor = conn.execute(sql, (ticker, filing_type, filing_date, period, accession, source_url))
+            cursor = conn.execute(sql, (
+                ticker, filing_type, filing_date, period, accession, source_url,
+                cik, primary_document, discovery_scope,
+                json.dumps(items or []), json.dumps(exhibits or []),
+            ))
             conn.commit()
             return cursor.rowcount > 0
+
+    def register_sec_daily_index(
+        self, index_date: str, source_url: str, filings: list[dict],
+    ) -> dict[str, object]:
+        """Atomically register an SEC daily-index batch and its cursor checkpoint."""
+        with self._connect() as conn:
+            existing = conn.execute(
+                "SELECT status FROM sec_daily_indexes WHERE index_date=?", (index_date,),
+            ).fetchone()
+            if existing:
+                return {"registered": 0, "replayed": True}
+            try:
+                conn.execute("BEGIN")
+                registered = self._insert_filing_rows(conn, filings)
+                conn.execute(
+                    "INSERT INTO sec_daily_indexes "
+                    "(index_date, source_url, status, registered_count) VALUES (?, ?, 'processed', ?)",
+                    (index_date, source_url, registered),
+                )
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+        return {"registered": registered, "replayed": False}
+
+    @staticmethod
+    def _insert_filing_rows(conn: sqlite3.Connection, filings: list[dict]) -> int:
+        """Insert accession-unique filing rows within the caller's transaction."""
+        registered = 0
+        for filing in filings:
+            cursor = conn.execute(
+                """INSERT OR IGNORE INTO filings (
+                    ticker, filing_type, filing_date, period, accession,
+                    source_url, status, cik, primary_document, discovery_scope,
+                    items_json, exhibits_json
+                ) VALUES (?, ?, ?, ?, ?, ?, 'unprocessed', ?, ?, ?, ?, ?)""",
+                (
+                    filing["ticker"], filing["filing_type"], filing.get("filing_date", ""),
+                    filing.get("period", ""), filing["accession"], filing["source_url"],
+                    filing.get("cik"), filing.get("primary_document"),
+                    filing.get("discovery_scope", "broad"),
+                    json.dumps(filing.get("items") or []),
+                    json.dumps(filing.get("exhibits") or []),
+                ),
+            )
+            registered += int(cursor.rowcount > 0)
+        return registered
+
+    def register_sec_filings(self, filings: list[dict]) -> int:
+        """Atomically register an accession-unique SEC filing batch."""
+        with self._connect() as conn:
+            try:
+                conn.execute("BEGIN")
+                registered = self._insert_filing_rows(conn, filings)
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+        return registered
+
+    def get_sec_daily_index_status(self, index_date: str) -> Optional[str]:
+        """Return the durable status for one SEC daily index date."""
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT status FROM sec_daily_indexes WHERE index_date=?", (index_date,),
+            ).fetchone()
+        return str(row[0]) if row else None
+
+    def get_sec_daily_index_cursor(self) -> Optional[str]:
+        """Return the latest completely registered SEC daily-index date."""
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT MAX(index_date) FROM sec_daily_indexes WHERE status='processed'"
+            ).fetchone()
+        return str(row[0]) if row and row[0] else None
+
+    def count_filings(self) -> int:
+        """Return the number of accession-unique registered SEC filings."""
+        with self._connect() as conn:
+            return int(conn.execute("SELECT COUNT(*) FROM filings").fetchone()[0])
 
     def mark_filing_parsed(
         self,
@@ -919,6 +1025,11 @@ CREATE INDEX IF NOT EXISTS idx_corpus_events_type_effective
                 )
             )
             previous_status = None if existing is None else str(existing["indexing_status"])
+            authority_promoted = bool(
+                existing is not None
+                and record.evidence_authority == "direct_sec"
+                and existing["evidence_authority"] != "direct_sec"
+            )
             common_values = (
                 record.event_type, record.title, headline, news_key, record.summary,
                 record.language, record.published_at, record.effective_at,
@@ -945,6 +1056,25 @@ CREATE INDEX IF NOT EXISTS idx_corpus_events_type_effective
                         item_id, record.source_name, record.source_category,
                         record.provider_record_id, record.original_publisher,
                         record.item_type, *common_values,
+                    ),
+                )
+            elif authority_promoted:
+                conn.execute(
+                    """UPDATE corpus_items SET
+                        source=?, source_category=?, provider_record_id=?,
+                        original_publisher=?, item_type=?, event_type=?, title=?,
+                        normalized_headline=?, syndicated_key=?, summary=?, language=?,
+                        published_at=?, effective_at=?, as_of_at=?, observed_at=?,
+                        accessed_at=?, ingested_at=?, source_url=?, canonical_url=?,
+                        tickers_json=?, index_codes_json=?, sectors_json=?, content_hash=?,
+                        metadata_json=?, document_family=?, indexing_status=?, index_error=NULL,
+                        license_label=?, normalization_version=?, evidence_authority=?,
+                        updated_at=datetime('now')
+                    WHERE corpus_item_id=?""",
+                    (
+                        record.source_name, record.source_category,
+                        record.provider_record_id, record.original_publisher,
+                        record.item_type, *common_values, item_id,
                     ),
                 )
             elif content_changed:
@@ -1003,7 +1133,8 @@ CREATE INDEX IF NOT EXISTS idx_corpus_events_type_effective
             revision = self._bump_revision_in_transaction(conn)
             conn.commit()
         needs_index = initial_status != "not_applicable" and (
-            created or content_changed or previous_status in {"pending", "error"}
+            created or content_changed or authority_promoted
+            or previous_status in {"pending", "error"}
         )
         return {
             "corpus_item_id": item_id,
@@ -1011,6 +1142,7 @@ CREATE INDEX IF NOT EXISTS idx_corpus_events_type_effective
             "deduplicated": not created,
             "deduplication_layer": layer,
             "content_changed": content_changed,
+            "authority_promoted": authority_promoted,
             "needs_index": needs_index,
             "indexing_status": initial_status if created or content_changed else previous_status,
             "revision": revision,

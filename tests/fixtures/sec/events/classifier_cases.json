@@ -1,0 +1,107 @@
+[
+  {
+    "name": "debt and convertible offering",
+    "filing": {
+      "accession": "0001-26-000001",
+      "form": "424B5",
+      "text": "Prospectus supplement. We are offering convertible senior notes due 2032 bearing interest at 3.25% per year for an aggregate principal amount of $750 million."
+    },
+    "expected": ["convertible_offering", "debt_raise", "prospectus_update"]
+  },
+  {
+    "name": "equity offering",
+    "filing": {
+      "accession": "0001-26-000002",
+      "form": "S-1",
+      "text": "Initial public offering of 12,000,000 shares of common stock."
+    },
+    "expected": ["equity_raise"]
+  },
+  {
+    "name": "shelf registration",
+    "filing": {
+      "accession": "0001-26-000003",
+      "form": "S-3ASR",
+      "text": "Automatic shelf registration statement for debt securities and common stock."
+    },
+    "expected": ["shelf_registration"]
+  },
+  {
+    "name": "acquisition",
+    "filing": {
+      "accession": "0001-26-000004",
+      "form": "8-K",
+      "items": ["2.01"],
+      "text": "Item 2.01 Completion of Acquisition or Disposition of Assets. The company completed its acquisition of Target Corp."
+    },
+    "expected": ["acquisition"]
+  },
+  {
+    "name": "earnings and guidance",
+    "filing": {
+      "accession": "0001-26-000005",
+      "form": "8-K",
+      "items": ["2.02", "7.01"],
+      "text": "Item 2.02 Results of Operations. The earnings release raises full-year revenue guidance."
+    },
+    "documents": [{"document_type": "EX-99.1", "text": "Quarterly earnings release and updated outlook."}],
+    "expected": ["earnings_release", "guidance_change"]
+  },
+  {
+    "name": "beneficial ownership",
+    "filing": {
+      "accession": "0001-26-000006",
+      "form": "SC 13D/A",
+      "text": "Amendment to Schedule 13D reporting beneficial ownership."
+    },
+    "expected": ["beneficial_ownership_change"]
+  },
+  {
+    "name": "divestiture",
+    "filing": {
+      "accession": "0001-26-000009",
+      "form": "8-K",
+      "items": ["2.01"],
+      "text": "Item 2.01. The company completed the disposition of its legacy business."
+    },
+    "expected": ["divestiture"]
+  },
+  {
+    "name": "leadership and auditor changes",
+    "filing": {
+      "accession": "0001-26-000010",
+      "form": "8-K",
+      "items": ["4.01", "5.02"],
+      "text": "Item 4.01 Change in Certifying Accountant. Item 5.02 Appointment of a new Chief Executive Officer."
+    },
+    "expected": ["auditor_change", "leadership_change"]
+  },
+  {
+    "name": "buyback and dividend",
+    "filing": {
+      "accession": "0001-26-000011",
+      "form": "8-K",
+      "items": ["8.01"],
+      "text": "The board authorized a share repurchase and declared an increased quarterly dividend."
+    },
+    "expected": ["buyback", "dividend_change"]
+  },
+  {
+    "name": "insider transaction",
+    "filing": {
+      "accession": "0001-26-000012",
+      "form": "4",
+      "text": "Statement of changes in beneficial ownership by an officer."
+    },
+    "expected": ["insider_transaction"]
+  },
+  {
+    "name": "no match",
+    "filing": {
+      "accession": "0001-26-000007",
+      "form": "10-Q",
+      "text": "Quarterly report containing routine accounting disclosures."
+    },
+    "expected": []
+  }
+]

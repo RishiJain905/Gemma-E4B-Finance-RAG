@@ -16,6 +16,7 @@ Usage:
 """
 
 import json
+from pathlib import Path
 import socket
 from unittest.mock import MagicMock, patch
 from urllib.parse import urlparse
@@ -29,12 +30,15 @@ from src.sec import (
     SECEdgarFilingFetcher,
     TraceAlchemyFilingParser,
 )
+from src.ingestion.normalization import NORMALIZATION_VERSION, content_hash
+from src.ingestion.records import NarrativeRecord
 from src.storage.store import Store
 
 
 EDGAR_HOST = "www.sec.gov"
 MODEL_ENDPOINT = "http://127.0.0.1:8087/v1/embeddings"
 DISCOVERY_SOURCE = FilingScheduler.DISCOVERY_SOURCE
+EVENT_FIXTURES = Path(__file__).parent / "fixtures" / "sec" / "events"
 
 
 # ── Shared helpers (from tests/test_filing_scheduler.py) ──
@@ -214,6 +218,9 @@ class TestSECEdgarFilingFetcher:
         assert row["ticker"] == "NVDA"
         assert row["filing_type"] == "10-K"
         assert row["status"] == "unprocessed"
+        assert row["cik"] == "0000320193"
+        assert row["primary_document"] == "nvda-10k.htm"
+        assert row["discovery_scope"] == "deep"
 
     @patch("src.sec.edgar_fetcher.EdgarClient")
     def test_register_discovered_filings_dedup(self, mock_edgar_cls, tmp_path):
@@ -295,6 +302,75 @@ class TestSECEdgarFilingFetcher:
         text = fetcher.download_filing_text(filing)
 
         assert text is None
+
+    @patch("src.sec.edgar_fetcher.requests.get")
+    @patch("src.sec.edgar_fetcher.EdgarClient")
+    def test_download_relevant_documents_never_fetches_every_exhibit(
+        self, mock_edgar_cls, mock_get, tmp_path,
+    ):
+        store = _make_store(tmp_path)
+        fetcher = SECEdgarFilingFetcher(
+            store=store,
+            request_delay=0,
+            user_agent="Researcher test@example.com",
+            sec_config={
+                "exhibits": {
+                    "always": ["EX-99.1"],
+                    "material_agreement_items": ["1.01", "2.01", "2.03"],
+                    "allowlist": {},
+                }
+            },
+        )
+        mock_edgar_cls.return_value = MagicMock()
+        index_html = (EVENT_FIXTURES / "filing-index.html").read_text()
+
+        def response(url, **_kwargs):
+            body = {
+                "-index.html": index_html,
+                "orcl-8k.htm": "ITEM 2.03 Creation of a Direct Financial Obligation. Senior notes agreement.",
+                "ex991.htm": "Press release announcing the senior notes offering.",
+                "ex101.htm": "Indenture governing the senior notes.",
+            }
+            match = next((value for suffix, value in body.items() if url.endswith(suffix)), None)
+            if match is None:
+                raise AssertionError(f"unexpected exhibit fetch: {url}")
+            result = MagicMock(text=match)
+            result.raise_for_status.return_value = None
+            return result
+
+        mock_get.side_effect = response
+        documents = fetcher.download_relevant_documents({
+            "ticker": "ORCL", "cik": "0001341439", "filing_type": "8-K",
+            "accession": "0001193125-26-188001",
+            "source_url": "https://www.sec.gov/Archives/edgar/data/1341439/0001193125-26-188001.txt",
+        })
+
+        assert [document["document_type"] for document in documents] == [
+            "PRIMARY", "EX-99.1", "EX-10.1",
+        ]
+        assert all("ex211.htm" not in call.args[0] for call in mock_get.call_args_list)
+
+    @patch("src.sec.edgar_fetcher.requests.get")
+    @patch("src.sec.edgar_fetcher.EdgarClient")
+    def test_index_failure_never_falls_back_to_complete_submission_package(
+        self, mock_edgar_cls, mock_get, tmp_path,
+    ):
+        store = _make_store(tmp_path)
+        fetcher = SECEdgarFilingFetcher(
+            store=store, request_delay=0,
+            user_agent="Researcher test@example.com", sec_config={"exhibits": {}},
+        )
+        mock_edgar_cls.return_value = MagicMock()
+        mock_get.side_effect = RuntimeError("index unavailable")
+
+        documents = fetcher.download_relevant_documents({
+            "ticker": "ORCL", "cik": "0001341439", "filing_type": "8-K",
+            "accession": "0001193125-26-188001",
+            "source_url": "https://www.sec.gov/Archives/edgar/data/1341439/0001193125-26-188001.txt",
+        })
+
+        assert documents == []
+        assert mock_get.call_count == 1
 
 
 # ============================================================
@@ -522,6 +598,165 @@ class TestFilingProcessor:
                 "SELECT status FROM filings WHERE accession = ?", ("ACC-001",),
             ).fetchone()
         assert row["status"] == "unprocessed"
+
+    @patch("src.storage.store.ChromaStore")
+    def test_event_filing_uses_normalized_contract_and_replays_without_duplicates(
+        self, chroma_class, tmp_path,
+    ):
+        chroma_class.return_value = MagicMock()
+        store = _make_store(tmp_path)
+        store.upsert_universe_snapshot("ivv", "2026-07-10T00:00:00Z", [{
+            "symbol": "ORCL", "company_name": "Oracle Corporation", "source": "ivv",
+            "index_code": "sp500", "exchange": "NYSE", "cik": "0001341439",
+            "source_url": "https://example.test/ivv",
+        }])
+        store.register_filing(
+            "ORCL", "8-K", "2026-07-10", "", "0001193125-26-188001",
+            "https://www.sec.gov/Archives/edgar/data/1341439/000119312526188001/orcl-8k.htm",
+            cik="0001341439", discovery_scope="broad", items=["2.02"],
+        )
+        fetcher = MagicMock()
+        fetcher.download_relevant_documents.return_value = [{
+            "document_type": "PRIMARY",
+            "source_url": "https://www.sec.gov/Archives/edgar/data/1341439/000119312526188001/orcl-8k.htm",
+            "text": "Item 2.02 Results of Operations. Quarterly earnings release.",
+        }]
+        parser = MagicMock()
+        processor = FilingProcessor(
+            store=store, fetcher=fetcher, parser=parser,
+            sec_config={"index_event_filings": False, "index_filing_text": False},
+        )
+
+        first = processor.process_pending_filings()
+        with store.sqlite._connect() as conn:
+            conn.execute(
+                "UPDATE filings SET status='unprocessed' WHERE accession=?",
+                ("0001193125-26-188001",),
+            )
+            conn.commit()
+        replay = processor.process_pending_filings()
+
+        assert first["processed"] == replay["processed"] == 1
+        assert store.sqlite.count_corpus_items() == 1
+        assert store.sqlite.count_events() == 1
+        item = store.sqlite.get_corpus_item("sec:0001193125-26-188001")
+        assert item["evidence_authority"] == "direct_sec"
+        assert item["document_family"] == "sec:0001193125-26-188001"
+        event = store.sqlite.get_event("sec:0001193125-26-188001:earnings_release:sec-events-v1")
+        assert event["classifier_version"] == "sec-events-v1"
+        assert event["source_corpus_item_ids"] == ["sec:0001193125-26-188001"]
+        parser.extract_facts_from_filing.assert_not_called()
+
+    @patch("src.storage.store.ChromaStore")
+    def test_direct_sec_evidence_promotes_a_deduplicated_vendor_copy(
+        self, chroma_class, tmp_path,
+    ):
+        chroma_class.return_value = MagicMock()
+        store = _make_store(tmp_path)
+        store.upsert_universe_snapshot("ivv", "2026-07-10T00:00:00Z", [{
+            "symbol": "ORCL", "company_name": "Oracle Corporation", "source": "ivv",
+            "index_code": "sp500", "exchange": "NYSE", "cik": "0001341439",
+            "source_url": "https://example.test/ivv",
+        }])
+        text = "Item 2.02 Results of Operations. Quarterly earnings release."
+        body = f"[PRIMARY]\n{text}"
+        store.upsert_narrative(NarrativeRecord(
+            corpus_item_id="vendor-copy",
+            source_name="vendor",
+            source_category="vendor_parsed_filing",
+            provider_record_id="vendor-1",
+            original_publisher="Vendor",
+            item_type="sec_filing",
+            title="Vendor copy of ORCL filing",
+            body=body,
+            published_at="2026-07-10T00:00:00Z",
+            observed_at="2026-07-10T01:00:00Z",
+            accessed_at="2026-07-10T01:00:00Z",
+            ingested_at="2026-07-10T01:00:00Z",
+            source_url="https://vendor.test/orcl-filing",
+            canonical_url="https://vendor.test/orcl-filing",
+            license_label="vendor_parsed",
+            normalization_version=NORMALIZATION_VERSION,
+            content_hash=content_hash(body),
+            document_family="vendor-copy",
+            evidence_authority="vendor_parsed",
+        ))
+        store.register_filing(
+            "ORCL", "8-K", "2026-07-10", "", "0001193125-26-188001",
+            "https://www.sec.gov/Archives/edgar/data/1341439/000119312526188001/orcl-8k.htm",
+            cik="0001341439", discovery_scope="broad", items=["2.02"],
+        )
+        fetcher = MagicMock()
+        fetcher.download_relevant_documents.return_value = [{
+            "document_type": "PRIMARY",
+            "source_url": "https://www.sec.gov/Archives/edgar/data/1341439/000119312526188001/orcl-8k.htm",
+            "text": text,
+        }]
+        processor = FilingProcessor(
+            store=store, fetcher=fetcher, parser=MagicMock(),
+            sec_config={"index_event_filings": False, "index_filing_text": False},
+        )
+
+        result = processor.process_pending_filings()
+
+        assert result["processed"] == 1
+        assert store.sqlite.count_corpus_items() == 1
+        promoted = store.sqlite.get_corpus_item("vendor-copy")
+        assert promoted["source"] == "sec"
+        assert promoted["provider_record_id"] == "0001193125-26-188001"
+        assert promoted["evidence_authority"] == "direct_sec"
+        assert promoted["source_url"].startswith("https://www.sec.gov/Archives/")
+        event = store.sqlite.get_event(
+            "sec:0001193125-26-188001:earnings_release:sec-events-v1"
+        )
+        assert event["source_corpus_item_ids"] == ["vendor-copy"]
+
+    @patch("src.storage.store.ChromaStore")
+    def test_one_accession_document_failure_does_not_stop_the_next(
+        self, chroma_class, tmp_path,
+    ):
+        chroma_class.return_value = MagicMock()
+        store = _make_store(tmp_path)
+        store.upsert_universe_snapshot("ivv", "2026-07-10T00:00:00Z", [{
+            "symbol": "ORCL", "company_name": "Oracle Corporation", "source": "ivv",
+            "index_code": "sp500", "exchange": "NYSE", "cik": "0001341439",
+            "source_url": "https://example.test/ivv",
+        }])
+        for accession, filing_date in (("FAIL-1", "2026-07-11"), ("PASS-2", "2026-07-10")):
+            store.register_filing(
+                "ORCL", "8-K", filing_date, "", accession,
+                f"https://www.sec.gov/Archives/{accession}.htm",
+                cik="0001341439", discovery_scope="broad", items=["2.02"],
+            )
+        fetcher = MagicMock()
+        fetcher.download_relevant_documents.side_effect = [[], [{
+            "document_type": "PRIMARY", "source_url": "https://www.sec.gov/pass.htm",
+            "text": "Item 2.02 Results of Operations. Earnings release.",
+        }]]
+        processor = FilingProcessor(
+            store=store, fetcher=fetcher, parser=MagicMock(),
+            sec_config={"index_event_filings": False, "index_filing_text": False},
+        )
+
+        result = processor.process_pending_filings(limit=10)
+
+        assert result["processed"] == 1
+        assert result["failed"] == 1
+        with store.sqlite._connect() as conn:
+            statuses = dict(conn.execute("SELECT accession, status FROM filings").fetchall())
+        assert statuses == {"FAIL-1": "unprocessed", "PASS-2": "parsed"}
+
+        fetcher.download_relevant_documents.side_effect = None
+        fetcher.download_relevant_documents.return_value = [{
+            "document_type": "PRIMARY", "source_url": "https://www.sec.gov/retry.htm",
+            "text": "Item 2.02 Results of Operations. Earnings release after retry.",
+        }]
+        retry = processor.process_pending_filings(limit=10)
+        assert retry["processed"] == 1
+        with store.sqlite._connect() as conn:
+            assert conn.execute(
+                "SELECT status FROM filings WHERE accession='FAIL-1'"
+            ).fetchone()[0] == "parsed"
 
 
 # ============================================================
