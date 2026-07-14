@@ -48,7 +48,7 @@ class FakeChroma:
         self.meta.pop(parent_id, None)
 
     def add_document(self, document_id, text, ticker=None, source=None,
-                     date=None, metadata=None):
+                     date=None, metadata=None, replace_family=False):
         n = max(1, (len(text) + 999) // 1000)
         self.families[document_id] = [f"{document_id}#{i}" for i in range(n)]
         self.meta[document_id] = dict(metadata or {})

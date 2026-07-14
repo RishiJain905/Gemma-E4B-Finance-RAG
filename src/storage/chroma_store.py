@@ -141,6 +141,10 @@ class ChromaStore:
     # request is ~6.3K tokens — comfortably below the 8192 ubatch ceiling.
     DEFAULT_CHUNK_CHARS = 1000
     DEFAULT_CHUNK_OVERLAP = 150
+    STRUCTURED_ONLY_ITEM_TYPES = frozenset({
+        "observation", "market_bar", "ohlcv", "rate", "economic_observation",
+    })
+    STRUCTURED_ONLY_SOURCE_CATEGORIES = frozenset({"market_data", "economic_data"})
     MAX_READ_LIMIT = 200
     MAX_READ_OFFSET = 10_000
     MAX_ADJACENT_SECTIONS = 10
@@ -195,7 +199,8 @@ class ChromaStore:
                      metadata: Optional[dict] = None,
                      ticker: Optional[str] = None,
                      source: Optional[str] = None,
-                     date: Optional[str] = None):
+                     date: Optional[str] = None,
+                     replace_family: bool = False) -> None:
         """
         Add a single document to the vector store.
 
@@ -207,7 +212,12 @@ class ChromaStore:
             source: Source type (sec, yfinance, gdelt, etc.)
             date: Document date (ISO format)
         """
-        meta = metadata or {}
+        meta = dict(metadata or {})
+        if (
+            meta.get("item_type") in self.STRUCTURED_ONLY_ITEM_TYPES
+            or meta.get("source_category") in self.STRUCTURED_ONLY_SOURCE_CATEGORIES
+        ):
+            raise ValueError("structured-only numeric observations cannot be stored in Chroma")
         if ticker:
             meta["ticker"] = ticker.upper()
         if source:
@@ -232,10 +242,13 @@ class ChromaStore:
             return  # nothing to store (empty/whitespace text)
 
         is_section_family = source == "sec_filing"
+        family_id = str(meta.get("document_family_id") or document_id)
+        if replace_family:
+            meta["document_family_id"] = family_id
 
         # Short documents are stored as a single entry under their original id,
         # preserving the existing id scheme and avoiding the embedder's batch limit.
-        if len(chunks) == 1 and not is_section_family:
+        if len(chunks) == 1 and not is_section_family and not replace_family:
             self.collection.add(
                 documents=[chunks[0]],
                 metadatas=[meta],
@@ -246,24 +259,36 @@ class ChromaStore:
         # Long documents are split so each embedded chunk fits the batch limit
         # and retrieval stays granular. Each chunk is its own entry: "{id}#{i}".
         total = len(chunks)
-        ids = [f"{document_id}#{i}" for i in range(total)]
+        ids = [f"{family_id}#{i}" for i in range(total)]
         metadatas = []
         for i in range(total):
             chunk_meta = dict(meta)
-            chunk_meta["parent_id"] = document_id
+            chunk_meta["parent_id"] = family_id
             chunk_meta["chunk_index"] = i
+            chunk_meta["chunk_ordinal"] = i
             chunk_meta["chunk_count"] = total
+            chunk_meta["child_chunk_id"] = ids[i]
             if is_section_family:
                 chunk_meta["document_id"] = ids[i]
             if self.chunk_strategy == "structural":
                 chunk_meta["section"] = sections[i]
             metadatas.append(chunk_meta)
 
-        self.collection.add(
-            documents=chunks,
-            metadatas=metadatas,
-            ids=ids
-        )
+        if not replace_family:
+            self.collection.add(documents=chunks, metadatas=metadatas, ids=ids)
+            return
+
+        family_filter = {"$or": [
+            {"document_family_id": family_id},
+            {"corpus_item_id": family_id},
+            {"parent_id": family_id},
+        ]}
+        existing = self.collection.get(where=family_filter, include=["metadatas"])
+        existing_ids = set(existing.get("ids") or [])
+        self.collection.upsert(documents=chunks, metadatas=metadatas, ids=ids)
+        stale_ids = sorted(existing_ids.difference(ids))
+        if stale_ids:
+            self.collection.delete(ids=stale_ids)
 
     @classmethod
     def _validate_page(cls, limit: int, offset: int = 0) -> None:
@@ -471,6 +496,14 @@ class ChromaStore:
     def delete_document(self, document_id: str):
         """Remove a document from the collection."""
         self.collection.delete(ids=[document_id])
+
+    def delete_document_family(self, document_family_id: str) -> None:
+        """Remove only the chunks belonging to one stable narrative family."""
+        self.collection.delete(where={"$or": [
+            {"document_family_id": document_family_id},
+            {"corpus_item_id": document_family_id},
+            {"parent_id": document_family_id},
+        ]})
 
     def count(self) -> int:
         """How many documents are in the collection?"""

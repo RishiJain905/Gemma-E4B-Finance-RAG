@@ -125,6 +125,12 @@ class Reranker:
 
         self.backend = self.backend.lower()  # normalize
         self.timeout = timeout
+        self.enable_authority_ranking = bool(
+            getattr(config, "enable_authority_ranking", True)
+        )
+        self.authority_max_boost = max(0.0, min(0.025, float(
+            getattr(config, "authority_max_boost", 0.025)
+        )))
         self._model = None  # lazy — loaded on first use
 
     # ── Model loading ─────────────────────────────────
@@ -207,9 +213,23 @@ class Reranker:
             paired = list(zip(docs, scores))
             paired.sort(key=lambda pair: pair[1], reverse=True)
             result = []
-            for d, s in paired[:top_n]:
+            for d, s in paired:
                 d["rerank_score"] = float(s)
                 result.append(d)
+            if self.enable_authority_ranking:
+                try:
+                    from .evidence_taxonomy import rank_evidence
+
+                    result = rank_evidence(
+                        result,
+                        query=query,
+                        authority_max_boost=self.authority_max_boost,
+                    )
+                except Exception as exc:  # noqa: BLE001 - preserve relevance order
+                    logger.warning(
+                        "Authority ranking failed, using relevance order: %s", exc
+                    )
+            result = result[:top_n]
             elapsed_ms = int((time.perf_counter() - start) * 1000)
             logger.info("rerank scored %d docs in %dms", len(docs), elapsed_ms)
             return result

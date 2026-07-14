@@ -1,0 +1,175 @@
+{
+  "taxonomy_version": "finance-evidence-taxonomy-v1",
+  "documents": [
+    {
+      "id": "sec-orcl-notes-2026",
+      "document": "Oracle filed a prospectus for a senior notes financing with the SEC.",
+      "fusion_score": 0.032,
+      "metadata": {
+        "ticker": "ORCL",
+        "security_id": "sec-orcl",
+        "source": "sec",
+        "source_category": "regulatory_filing",
+        "item_type": "sec_filing",
+        "event_type": "debt_raise",
+        "event_id": "orcl-notes-2026",
+        "form": "424B5",
+        "item": "2.03",
+        "exhibit": "EX-10.1",
+        "published_at": "2026-07-10T13:00:00Z",
+        "effective_at": "2026-07-10T00:00:00Z",
+        "as_of_at": "2026-07-10T00:00:00Z",
+        "ingested_at": "2026-07-14T18:00:00Z",
+        "index_memberships": "sp500",
+        "sectors": "Information Technology",
+        "industries": "Software—Infrastructure",
+        "indexing_status": "indexed",
+        "freshness_status": "fresh",
+        "authority_tier": "direct_sec",
+        "discovery_scope": "broad"
+      }
+    },
+    {
+      "id": "issuer-orcl-notes-2026",
+      "document": "Oracle described the notes, intended use of proceeds, and maturity schedule.",
+      "fusion_score": 0.031,
+      "metadata": {
+        "ticker": "ORCL",
+        "security_id": "sec-orcl",
+        "source": "oracle_ir",
+        "source_category": "issuer_release",
+        "item_type": "press_release",
+        "event_type": "debt_raise",
+        "event_id": "orcl-notes-2026",
+        "published_at": "2026-07-10T13:30:00Z",
+        "ingested_at": "2026-07-10T13:31:00Z",
+        "index_memberships": "sp500",
+        "sectors": "Information Technology",
+        "industries": "Software—Infrastructure",
+        "indexing_status": "indexed",
+        "freshness_status": "fresh",
+        "authority_tier": "issuer",
+        "coverage_tier": "deep"
+      }
+    },
+    {
+      "id": "finnhub-orcl-notes-2026",
+      "document": "A licensed market-news summary adds investor reaction to Oracle's notes financing.",
+      "fusion_score": 0.032,
+      "metadata": {
+        "ticker": "ORCL",
+        "security_id": "sec-orcl",
+        "source": "finnhub",
+        "source_category": "news_vendor",
+        "item_type": "news",
+        "event_type": "debt_raise",
+        "event_id": "orcl-notes-2026",
+        "published_at": "2026-07-10T14:00:00Z",
+        "ingested_at": "2026-07-10T14:02:00Z",
+        "index_memberships": "sp500",
+        "sectors": "Information Technology",
+        "industries": "Software—Infrastructure",
+        "indexing_status": "indexed",
+        "freshness_status": "fresh",
+        "authority_tier": "provider",
+        "coverage_tier": "broad",
+        "canonical_url": "https://example.test/orcl-notes-analysis"
+      }
+    },
+    {
+      "id": "syndicated-orcl-notes-a",
+      "document": "Oracle launches senior notes offering.",
+      "fusion_score": 0.030,
+      "metadata": {
+        "ticker": "ORCL",
+        "source": "massive",
+        "source_category": "news_vendor",
+        "item_type": "news",
+        "event_type": "debt_raise",
+        "event_id": "orcl-notes-2026",
+        "syndicated_key": "oracle-launches-notes-2026-07-10",
+        "published_at": "2026-07-10T14:05:00Z",
+        "authority_tier": "provider",
+        "indexing_status": "indexed"
+      }
+    },
+    {
+      "id": "syndicated-orcl-notes-b",
+      "document": "Oracle launches senior notes offering.",
+      "fusion_score": 0.029,
+      "metadata": {
+        "ticker": "ORCL",
+        "source": "gdelt",
+        "source_category": "global_news",
+        "item_type": "news",
+        "event_type": "debt_raise",
+        "event_id": "orcl-notes-2026",
+        "syndicated_key": "oracle-launches-notes-2026-07-10",
+        "published_at": "2026-07-10T14:06:00Z",
+        "authority_tier": "discovery",
+        "indexing_status": "indexed"
+      }
+    },
+    {
+      "id": "bls-cpi-2026-06",
+      "document": "The Bureau of Labor Statistics published the June consumer price index release.",
+      "fusion_score": 0.031,
+      "metadata": {
+        "source": "bls",
+        "source_category": "official_macro",
+        "item_type": "official_release",
+        "event_type": "economic_release",
+        "published_at": "2026-07-12T12:30:00Z",
+        "effective_at": "2026-07-12T12:30:00Z",
+        "observation_period": "2026-06",
+        "as_of_at": "2026-07-12T12:30:00Z",
+        "ingested_at": "2026-07-14T19:00:00Z",
+        "indexing_status": "indexed",
+        "freshness_status": "fresh",
+        "authority_tier": "official",
+        "coverage_tier": "global"
+      }
+    },
+    {
+      "id": "nhtsa-recall-2026",
+      "document": "NHTSA announced a vehicle safety recall affecting an automotive issuer.",
+      "fusion_score": 0.028,
+      "metadata": {
+        "ticker": "F",
+        "source": "nhtsa",
+        "source_category": "official_regulatory",
+        "item_type": "official_release",
+        "event_type": "recall",
+        "published_at": "2026-07-11T15:00:00Z",
+        "effective_at": "2026-07-11T00:00:00Z",
+        "sectors": "Consumer Discretionary",
+        "industries": "Automobile Manufacturers",
+        "indexing_status": "indexed",
+        "freshness_status": "fresh",
+        "authority_tier": "official",
+        "coverage_tier": "sector"
+      }
+    },
+    {
+      "id": "meta-historical-2021",
+      "document": "The company reported results while its public ticker was FB.",
+      "fusion_score": 0.027,
+      "metadata": {
+        "ticker": "META",
+        "tickers": "META,FB",
+        "security_id": "sec-meta",
+        "source": "sec",
+        "source_category": "regulatory_filing",
+        "item_type": "sec_filing",
+        "event_type": "earnings_release",
+        "form": "10-Q",
+        "published_at": "2021-10-25T20:00:00Z",
+        "as_of_at": "2021-09-30T00:00:00Z",
+        "ingested_at": "2026-07-14T20:00:00Z",
+        "indexing_status": "indexed",
+        "authority_tier": "direct_sec",
+        "coverage_tier": "deep"
+      }
+    }
+  ]
+}

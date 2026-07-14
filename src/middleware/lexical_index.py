@@ -91,13 +91,15 @@ class LexicalIndex:
     # ── search ─────────────────────────────────────────
 
     def search(self, query: str, k: int = 10,
-               where: Optional[dict] = None) -> list[dict]:
+               where: Optional[dict] = None,
+               filters: Optional[dict] = None) -> list[dict]:
         """Return up to ``k`` docs ranked by BM25 score (highest first).
 
         Args:
             query: the natural-language query.
             k: max results.
             where: optional metadata filter, e.g. {"ticker": "NVDA"}.
+            filters: optional composable stable evidence facets.
 
         Returns dicts shaped like ChromaStore.search: {id, document, metadata,
         score}, only docs that share at least one query token (ranked by BM25
@@ -122,12 +124,22 @@ class LexicalIndex:
             meta = self._metas[idx] if idx < len(self._metas) else {}
             if where and not all(meta.get(mk) == mv for mk, mv in where.items()):
                 continue
-            out.append({
+            row = {
                 "id": self._ids[idx],
                 "document": self._texts[idx] if idx < len(self._texts) else "",
                 "metadata": meta,
                 "score": float(score),
-            })
+            }
+            if filters:
+                try:
+                    from .evidence_taxonomy import evidence_matches_filters, normalize_evidence
+
+                    if not evidence_matches_filters(row, filters):
+                        continue
+                    row = normalize_evidence(row)
+                except Exception as exc:  # noqa: BLE001 - lexical filtering is fail-soft
+                    logger.warning("Evidence filter failed in lexical search: %s", exc)
+            out.append(row)
             if len(out) >= k:
                 break
         return out

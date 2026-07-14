@@ -116,6 +116,8 @@ class QueryPlan:
     # to_legacy_intent() reproduces IntentParser.parse() exactly.
     primary_period: Optional[str] = None
     primary_period_type: Optional[str] = None
+    evidence_topic: Optional[str] = None
+    evidence_filters: dict = field(default_factory=dict)
     reason_codes: list[str] = field(default_factory=list)
 
     # ── Ordered accessors ──────────────────────────────

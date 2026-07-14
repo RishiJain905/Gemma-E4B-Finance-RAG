@@ -392,6 +392,7 @@ def _emit_graph_evidence(
             "section": item.section,
             "parent_id": item.parent_id,
         }
+        metadata.update(item.taxonomy_metadata())
         retrieved_from = None
         if item.subquery_ids:
             from .graph_observer import _node_id
@@ -507,6 +508,13 @@ def _emit_graph_terminal(
                 "metric": data.get("metric"),
                 "period": data.get("period"),
                 "support_status": data.get("support_status"),
+                "item_type": data.get("item_type"),
+                "event_type": data.get("event_type"),
+                "authority_tier": data.get("authority_tier"),
+                "source": data.get("source"),
+                "date_semantics": data.get("date_semantics"),
+                "canonical_security": data.get("canonical_security"),
+                "coverage_tier": data.get("coverage_tier"),
             },
         })
         if data.get("evidence_id"):

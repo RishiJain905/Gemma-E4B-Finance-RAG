@@ -218,3 +218,13 @@ reranker_backend: "cross-encoder"   # "cross-encoder" | "llm"
 reranker_model: "cross-encoder/ms-marco-MiniLM-L-6-v2"
 rerank_candidates: 30               # broad retrieve, then re-rank
 rerank_top_n: 5                     # final docs after re-rank (= top_k_documents)
+
+# Phase 2.3.3.3 — source-independent evidence taxonomy and post-relevance policy.
+# These stages are additive/fail-soft. Authority is capped below exact entity,
+# type, and latest-recency terms; duplicate packing keeps useful secondary
+# coverage while preventing syndicated copies from spending the evidence budget.
+enable_evidence_taxonomy: true
+enable_authority_ranking: true
+enable_duplicate_coverage_packing: true
+authority_max_boost: 0.025
+max_secondary_per_event: 2
