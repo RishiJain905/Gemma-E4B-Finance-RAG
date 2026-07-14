@@ -11,6 +11,14 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
+from src.ingestion.normalization import (
+    content_hash,
+    normalize_canonical_url,
+    normalize_headline,
+    syndicated_news_key,
+)
+from src.ingestion.records import EventRecord, NarrativeRecord, ObservationRecord
+
 logger = logging.getLogger(__name__)
 
 
@@ -265,6 +273,188 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_memberships_one_active
     ON security_memberships(security_id, index_code)
     WHERE active = 1;
 CREATE INDEX IF NOT EXISTS idx_universe_errors_run ON universe_errors(run_id);
+
+-- -- Corpus metadata ledger (2.3.3.1) ----------------------------------------
+CREATE TABLE IF NOT EXISTS corpus_items (
+    corpus_item_id TEXT PRIMARY KEY,
+    source TEXT NOT NULL,
+    source_category TEXT NOT NULL,
+    provider_record_id TEXT,
+    original_publisher TEXT,
+    item_type TEXT NOT NULL,
+    event_type TEXT,
+    title TEXT NOT NULL,
+    normalized_headline TEXT NOT NULL,
+    syndicated_key TEXT,
+    summary TEXT CHECK (summary IS NULL OR length(summary) <= 4000),
+    language TEXT NOT NULL,
+    published_at TEXT,
+    effective_at TEXT,
+    as_of_at TEXT,
+    observed_at TEXT,
+    accessed_at TEXT NOT NULL,
+    ingested_at TEXT NOT NULL,
+    source_url TEXT NOT NULL,
+    canonical_url TEXT,
+    tickers_json TEXT NOT NULL DEFAULT '[]',
+    index_codes_json TEXT NOT NULL DEFAULT '[]',
+    sectors_json TEXT NOT NULL DEFAULT '[]',
+    content_hash TEXT NOT NULL,
+    metadata_json TEXT NOT NULL DEFAULT '{}',
+    document_family TEXT NOT NULL,
+    indexing_status TEXT NOT NULL CHECK (
+        indexing_status IN ('pending', 'indexed', 'error', 'not_applicable')
+    ),
+    index_error TEXT,
+    license_label TEXT NOT NULL,
+    normalization_version TEXT NOT NULL,
+    evidence_authority TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS corpus_item_sources (
+    corpus_item_id TEXT NOT NULL REFERENCES corpus_items(corpus_item_id) ON DELETE CASCADE,
+    source_key TEXT NOT NULL,
+    source_name TEXT NOT NULL,
+    source_category TEXT NOT NULL,
+    provider_record_id TEXT,
+    original_publisher TEXT,
+    source_url TEXT NOT NULL,
+    canonical_url TEXT,
+    published_at TEXT,
+    observed_at TEXT,
+    accessed_at TEXT NOT NULL,
+    ingested_at TEXT NOT NULL,
+    license_label TEXT NOT NULL,
+    evidence_authority TEXT NOT NULL,
+    metadata_json TEXT NOT NULL DEFAULT '{}',
+    PRIMARY KEY (corpus_item_id, source_key)
+);
+
+CREATE TABLE IF NOT EXISTS corpus_item_securities (
+    corpus_item_id TEXT NOT NULL REFERENCES corpus_items(corpus_item_id) ON DELETE CASCADE,
+    security_id TEXT NOT NULL REFERENCES securities(security_id),
+    ticker TEXT,
+    PRIMARY KEY (corpus_item_id, security_id)
+);
+
+CREATE TABLE IF NOT EXISTS corpus_observations (
+    observation_id TEXT PRIMARY KEY,
+    metric_id TEXT NOT NULL,
+    series_id TEXT,
+    value_text TEXT NOT NULL,
+    value_numeric REAL,
+    unit TEXT NOT NULL,
+    frequency TEXT NOT NULL,
+    period_start TEXT,
+    period_end TEXT NOT NULL,
+    vintage_at TEXT,
+    as_of_at TEXT,
+    scope TEXT NOT NULL CHECK (scope IN ('security', 'sector', 'global')),
+    tickers_json TEXT NOT NULL DEFAULT '[]',
+    sector TEXT,
+    source_name TEXT NOT NULL,
+    source_category TEXT NOT NULL,
+    provider_record_id TEXT,
+    original_publisher TEXT,
+    source_url TEXT NOT NULL,
+    canonical_url TEXT,
+    published_at TEXT,
+    observed_at TEXT,
+    accessed_at TEXT NOT NULL,
+    ingested_at TEXT NOT NULL,
+    license_label TEXT NOT NULL,
+    normalization_version TEXT NOT NULL,
+    evidence_authority TEXT NOT NULL,
+    metadata_json TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS observation_securities (
+    observation_id TEXT NOT NULL REFERENCES corpus_observations(observation_id) ON DELETE CASCADE,
+    security_id TEXT NOT NULL REFERENCES securities(security_id),
+    PRIMARY KEY (observation_id, security_id)
+);
+
+CREATE TABLE IF NOT EXISTS corpus_events (
+    event_id TEXT PRIMARY KEY,
+    event_type TEXT NOT NULL,
+    effective_at TEXT,
+    announced_at TEXT,
+    status TEXT NOT NULL,
+    amount REAL,
+    currency TEXT,
+    rate REAL,
+    ratio REAL,
+    action_date TEXT,
+    classifier_version TEXT,
+    explanation TEXT CHECK (explanation IS NULL OR length(explanation) <= 4000),
+    source_name TEXT NOT NULL,
+    source_category TEXT NOT NULL,
+    provider_record_id TEXT,
+    original_publisher TEXT,
+    source_url TEXT NOT NULL,
+    canonical_url TEXT,
+    published_at TEXT,
+    observed_at TEXT,
+    accessed_at TEXT NOT NULL,
+    ingested_at TEXT NOT NULL,
+    license_label TEXT NOT NULL,
+    normalization_version TEXT NOT NULL,
+    evidence_authority TEXT NOT NULL,
+    metadata_json TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS event_securities (
+    event_id TEXT NOT NULL REFERENCES corpus_events(event_id) ON DELETE CASCADE,
+    security_id TEXT NOT NULL REFERENCES securities(security_id),
+    PRIMARY KEY (event_id, security_id)
+);
+
+CREATE TABLE IF NOT EXISTS event_corpus_items (
+    event_id TEXT NOT NULL REFERENCES corpus_events(event_id) ON DELETE CASCADE,
+    corpus_item_id TEXT NOT NULL REFERENCES corpus_items(corpus_item_id),
+    PRIMARY KEY (event_id, corpus_item_id)
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_corpus_items_provider_identity
+    ON corpus_items(source, provider_record_id)
+    WHERE provider_record_id IS NOT NULL AND provider_record_id <> '';
+CREATE UNIQUE INDEX IF NOT EXISTS idx_corpus_items_url_identity
+    ON corpus_items(source, canonical_url, published_at)
+    WHERE provider_record_id IS NULL AND canonical_url IS NOT NULL
+        AND published_at IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_corpus_items_hash_identity
+    ON corpus_items(source, content_hash)
+    WHERE provider_record_id IS NULL AND canonical_url IS NULL;
+CREATE INDEX IF NOT EXISTS idx_corpus_items_canonical_url
+    ON corpus_items(canonical_url, published_at);
+CREATE INDEX IF NOT EXISTS idx_corpus_items_content_hash
+    ON corpus_items(content_hash);
+CREATE INDEX IF NOT EXISTS idx_corpus_items_headline_window
+    ON corpus_items(syndicated_key)
+    WHERE syndicated_key IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_corpus_items_indexing_status
+    ON corpus_items(indexing_status, updated_at);
+CREATE INDEX IF NOT EXISTS idx_corpus_item_sources_source
+    ON corpus_item_sources(source_name, provider_record_id);
+CREATE INDEX IF NOT EXISTS idx_corpus_item_securities_security
+    ON corpus_item_securities(security_id, corpus_item_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_corpus_observations_provider
+    ON corpus_observations(source_name, provider_record_id)
+    WHERE provider_record_id IS NOT NULL AND provider_record_id <> '';
+CREATE INDEX IF NOT EXISTS idx_corpus_observations_metric_period
+    ON corpus_observations(metric_id, period_end, vintage_at);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_corpus_events_provider
+    ON corpus_events(source_name, provider_record_id)
+    WHERE provider_record_id IS NOT NULL AND provider_record_id <> '';
+CREATE INDEX IF NOT EXISTS idx_corpus_events_type_effective
+    ON corpus_events(event_type, effective_at);
+
 
 """
 
@@ -631,6 +821,466 @@ CREATE INDEX IF NOT EXISTS idx_universe_errors_run ON universe_errors(run_id);
         revision = int(row[0]) if row else 0
         logger.debug("Store revision bumped to %d (%s)", revision, reason or "")
         return revision
+
+    # -- Normalized corpus records (2.3.3.1) ---------------------------------
+
+    @staticmethod
+    def _json_value(value: object) -> str:
+        return json.dumps(value, sort_keys=True, separators=(",", ":"))
+
+    @staticmethod
+    def _bump_revision_in_transaction(conn: sqlite3.Connection) -> int:
+        conn.execute(
+            "INSERT INTO store_revision (id, revision, updated_at) "
+            "VALUES (1, 1, datetime('now')) ON CONFLICT(id) DO UPDATE SET "
+            "revision=revision+1, updated_at=datetime('now')"
+        )
+        return int(conn.execute(
+            "SELECT revision FROM store_revision WHERE id=1"
+        ).fetchone()[0])
+
+    @staticmethod
+    def _source_key(record: NarrativeRecord, canonical_url: Optional[str]) -> str:
+        identity = (
+            f"provider:{record.provider_record_id}"
+            if record.provider_record_id
+            else f"url:{canonical_url or record.source_url}"
+        )
+        return content_hash(f"{record.source_name}\n{identity}")
+
+    @staticmethod
+    def _decode_corpus_row(row: sqlite3.Row) -> dict:
+        result = dict(row)
+        for name in ("tickers_json", "index_codes_json", "sectors_json", "metadata_json"):
+            result[name.removesuffix("_json")] = json.loads(result.pop(name))
+        return result
+
+    def _find_corpus_duplicate(
+        self,
+        conn: sqlite3.Connection,
+        record: NarrativeRecord,
+        canonical_url: Optional[str],
+        news_key: Optional[str],
+    ) -> tuple[Optional[sqlite3.Row], Optional[str]]:
+        lookups = []
+        if record.provider_record_id:
+            lookups.append((
+                "provider_identity", "source=? AND provider_record_id=?",
+                (record.source_name, record.provider_record_id),
+            ))
+        if canonical_url and record.published_at:
+            lookups.append((
+                "canonical_url", "canonical_url=? AND published_at=?",
+                (canonical_url, record.published_at),
+            ))
+        lookups.append(("content_hash", "content_hash=?", (record.content_hash,)))
+        if news_key:
+            lookups.append((
+                "syndicated_headline",
+                "syndicated_key=? AND source<>?",
+                (news_key, record.source_name),
+            ))
+        for layer, predicate, params in lookups:
+            row = conn.execute(
+                f"SELECT * FROM corpus_items WHERE {predicate} "
+                "ORDER BY created_at, corpus_item_id LIMIT 1", params,
+            ).fetchone()
+            if row:
+                return row, layer
+        return None, None
+
+    def upsert_narrative_record(self, record: NarrativeRecord) -> dict:
+        """Atomically upsert narrative metadata, provenance, and security links."""
+        canonical_url = normalize_canonical_url(record.canonical_url)
+        headline = normalize_headline(record.title)
+        news_key = (
+            syndicated_news_key(record.title, record.published_at)
+            if record.item_type == "news" and record.published_at else None
+        )
+        metadata_json = self._json_value(dict(record.metadata))
+        initial_status = (
+            "not_applicable" if record.indexing_status == "not_applicable" else "pending"
+        )
+        with self._connect() as conn:
+            existing, layer = self._find_corpus_duplicate(
+                conn, record, canonical_url, news_key,
+            )
+            created = existing is None
+            item_id = record.corpus_item_id if created else str(existing["corpus_item_id"])
+            content_changed = bool(
+                existing is not None
+                and existing["content_hash"] != record.content_hash
+                and (
+                    layer == "provider_identity"
+                    or (
+                        layer == "canonical_url"
+                        and existing["source"] == record.source_name
+                    )
+                )
+            )
+            previous_status = None if existing is None else str(existing["indexing_status"])
+            common_values = (
+                record.event_type, record.title, headline, news_key, record.summary,
+                record.language, record.published_at, record.effective_at,
+                record.as_of_at, record.observed_at, record.accessed_at,
+                record.ingested_at, record.source_url, canonical_url,
+                self._json_value(record.tickers), self._json_value(record.index_codes),
+                self._json_value(record.sectors), record.content_hash, metadata_json,
+                record.document_family, initial_status, record.license_label,
+                record.normalization_version, record.evidence_authority,
+            )
+            if created:
+                conn.execute(
+                    """INSERT INTO corpus_items (
+                        corpus_item_id, source, source_category, provider_record_id,
+                        original_publisher, item_type, event_type, title,
+                        normalized_headline, syndicated_key, summary, language,
+                        published_at, effective_at, as_of_at, observed_at, accessed_at,
+                        ingested_at, source_url, canonical_url, tickers_json,
+                        index_codes_json, sectors_json, content_hash, metadata_json,
+                        document_family, indexing_status, license_label,
+                        normalization_version, evidence_authority
+                    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    (
+                        item_id, record.source_name, record.source_category,
+                        record.provider_record_id, record.original_publisher,
+                        record.item_type, *common_values,
+                    ),
+                )
+            elif content_changed:
+                conn.execute(
+                    """UPDATE corpus_items SET
+                        event_type=?, title=?, normalized_headline=?, syndicated_key=?,
+                        summary=?, language=?, published_at=?, effective_at=?, as_of_at=?,
+                        observed_at=?, accessed_at=?, ingested_at=?, source_url=?,
+                        canonical_url=?, tickers_json=?, index_codes_json=?, sectors_json=?,
+                        content_hash=?, metadata_json=?, document_family=?,
+                        indexing_status=?, index_error=NULL, license_label=?,
+                        normalization_version=?, evidence_authority=?, updated_at=datetime('now')
+                    WHERE corpus_item_id=?""",
+                    (*common_values, item_id),
+                )
+            else:
+                conn.execute(
+                    "UPDATE corpus_items SET accessed_at=MAX(accessed_at, ?), "
+                    "ingested_at=MAX(ingested_at, ?), updated_at=datetime('now') "
+                    "WHERE corpus_item_id=?",
+                    (record.accessed_at, record.ingested_at, item_id),
+                )
+            conn.execute(
+                """INSERT INTO corpus_item_sources (
+                    corpus_item_id, source_key, source_name, source_category,
+                    provider_record_id, original_publisher, source_url, canonical_url,
+                    published_at, observed_at, accessed_at, ingested_at, license_label,
+                    evidence_authority, metadata_json
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                ON CONFLICT(corpus_item_id, source_key) DO UPDATE SET
+                    source_category=excluded.source_category,
+                    original_publisher=excluded.original_publisher,
+                    source_url=excluded.source_url, canonical_url=excluded.canonical_url,
+                    published_at=excluded.published_at, observed_at=excluded.observed_at,
+                    accessed_at=MAX(corpus_item_sources.accessed_at, excluded.accessed_at),
+                    ingested_at=MAX(corpus_item_sources.ingested_at, excluded.ingested_at),
+                    license_label=excluded.license_label,
+                    evidence_authority=excluded.evidence_authority,
+                    metadata_json=excluded.metadata_json""",
+                (
+                    item_id, self._source_key(record, canonical_url), record.source_name,
+                    record.source_category, record.provider_record_id,
+                    record.original_publisher, record.source_url, canonical_url,
+                    record.published_at, record.observed_at, record.accessed_at,
+                    record.ingested_at, record.license_label,
+                    record.evidence_authority, metadata_json,
+                ),
+            )
+            for index, security_id in enumerate(record.security_ids):
+                ticker = record.tickers[index] if index < len(record.tickers) else None
+                conn.execute(
+                    "INSERT OR IGNORE INTO corpus_item_securities "
+                    "(corpus_item_id, security_id, ticker) VALUES (?, ?, ?)",
+                    (item_id, security_id, ticker),
+                )
+            revision = self._bump_revision_in_transaction(conn)
+            conn.commit()
+        needs_index = initial_status != "not_applicable" and (
+            created or content_changed or previous_status in {"pending", "error"}
+        )
+        return {
+            "corpus_item_id": item_id,
+            "created": created,
+            "deduplicated": not created,
+            "deduplication_layer": layer,
+            "content_changed": content_changed,
+            "needs_index": needs_index,
+            "indexing_status": initial_status if created or content_changed else previous_status,
+            "revision": revision,
+        }
+
+    def set_corpus_index_status(
+        self, corpus_item_id: str, status: str, error: Optional[str] = None,
+    ) -> None:
+        if status not in {"pending", "indexed", "error", "not_applicable"}:
+            raise ValueError("invalid corpus indexing status")
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE corpus_items SET indexing_status=?, index_error=?, "
+                "updated_at=datetime('now') WHERE corpus_item_id=?",
+                (status, error[:2_000] if error else None, corpus_item_id),
+            )
+            conn.commit()
+
+    def get_corpus_item(self, corpus_item_id: str) -> Optional[dict]:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM corpus_items WHERE corpus_item_id=?", (corpus_item_id,),
+            ).fetchone()
+        return self._decode_corpus_row(row) if row else None
+
+    def count_corpus_items(self) -> int:
+        with self._connect() as conn:
+            return int(conn.execute("SELECT COUNT(*) FROM corpus_items").fetchone()[0])
+
+    def list_corpus_item_sources(self, corpus_item_id: str) -> list[dict]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM corpus_item_sources WHERE corpus_item_id=? "
+                "ORDER BY source_name, source_key", (corpus_item_id,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def list_corpus_item_securities(self, corpus_item_id: str) -> list[dict]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM corpus_item_securities WHERE corpus_item_id=? "
+                "ORDER BY security_id", (corpus_item_id,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def list_retryable_corpus_items(self, limit: int = 100) -> list[dict]:
+        if limit < 1 or limit > self.MAX_INVENTORY_LIMIT:
+            raise ValueError(f"limit must be between 1 and {self.MAX_INVENTORY_LIMIT}")
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM corpus_items WHERE indexing_status IN ('pending', 'error') "
+                "ORDER BY updated_at, corpus_item_id LIMIT ?", (limit,),
+            ).fetchall()
+        return [self._decode_corpus_row(row) for row in rows]
+
+    def upsert_observation_record(self, record: ObservationRecord) -> dict:
+        """Atomically upsert one structured observation and its security links."""
+        values = {
+            "metric_id": record.metric_id,
+            "series_id": record.series_id,
+            "value_text": record.value_text,
+            "value_numeric": record.value_numeric,
+            "unit": record.unit,
+            "frequency": record.frequency,
+            "period_start": record.period_start,
+            "period_end": record.period_end,
+            "vintage_at": record.vintage_at,
+            "as_of_at": record.as_of_at,
+            "scope": record.scope,
+            "tickers_json": self._json_value(record.tickers),
+            "sector": record.sector,
+            "source_name": record.source_name,
+            "source_category": record.source_category,
+            "provider_record_id": record.provider_record_id,
+            "original_publisher": record.original_publisher,
+            "source_url": record.source_url,
+            "canonical_url": normalize_canonical_url(record.canonical_url),
+            "published_at": record.published_at,
+            "observed_at": record.observed_at,
+            "accessed_at": record.accessed_at,
+            "ingested_at": record.ingested_at,
+            "license_label": record.license_label,
+            "normalization_version": record.normalization_version,
+            "evidence_authority": record.evidence_authority,
+            "metadata_json": self._json_value(dict(record.metadata)),
+        }
+        with self._connect() as conn:
+            existing = None
+            if record.provider_record_id:
+                existing = conn.execute(
+                    "SELECT * FROM corpus_observations WHERE source_name=? "
+                    "AND provider_record_id=?",
+                    (record.source_name, record.provider_record_id),
+                ).fetchone()
+            if existing is None:
+                existing = conn.execute(
+                    "SELECT * FROM corpus_observations WHERE observation_id=?",
+                    (record.observation_id,),
+                ).fetchone()
+            observation_id = (
+                record.observation_id if existing is None else existing["observation_id"]
+            )
+            linked = {
+                row[0] for row in conn.execute(
+                    "SELECT security_id FROM observation_securities WHERE observation_id=?",
+                    (observation_id,),
+                ).fetchall()
+            }
+            changed = existing is None or any(
+                existing[key] != value for key, value in values.items()
+            )
+            changed = changed or linked != set(record.security_ids)
+            if not changed:
+                return {
+                    "observation_id": observation_id,
+                    "created": False,
+                    "changed": False,
+                    "revision": self.get_store_revision(),
+                }
+            columns = ", ".join(values)
+            placeholders = ", ".join("?" for _ in values)
+            updates = ", ".join(f"{name}=excluded.{name}" for name in values)
+            conn.execute(
+                f"INSERT INTO corpus_observations (observation_id, {columns}) "
+                f"VALUES (?, {placeholders}) ON CONFLICT(observation_id) DO UPDATE SET "
+                f"{updates}, updated_at=datetime('now')",
+                (observation_id, *values.values()),
+            )
+            conn.execute(
+                "DELETE FROM observation_securities WHERE observation_id=?",
+                (observation_id,),
+            )
+            conn.executemany(
+                "INSERT INTO observation_securities (observation_id, security_id) "
+                "VALUES (?, ?)",
+                ((observation_id, security_id) for security_id in record.security_ids),
+            )
+            revision = self._bump_revision_in_transaction(conn)
+            conn.commit()
+        return {
+            "observation_id": observation_id,
+            "created": existing is None,
+            "changed": True,
+            "revision": revision,
+        }
+
+    def count_observations(self) -> int:
+        with self._connect() as conn:
+            return int(conn.execute(
+                "SELECT COUNT(*) FROM corpus_observations"
+            ).fetchone()[0])
+
+    def upsert_event_record(self, record: EventRecord) -> dict:
+        """Atomically upsert one event and all item/security relationships."""
+        values = {
+            "event_type": record.event_type,
+            "effective_at": record.effective_at,
+            "announced_at": record.announced_at,
+            "status": record.status,
+            "amount": record.amount,
+            "currency": record.currency,
+            "rate": record.rate,
+            "ratio": record.ratio,
+            "action_date": record.action_date,
+            "classifier_version": record.classifier_version,
+            "explanation": record.explanation,
+            "source_name": record.source_name,
+            "source_category": record.source_category,
+            "provider_record_id": record.provider_record_id,
+            "original_publisher": record.original_publisher,
+            "source_url": record.source_url,
+            "canonical_url": normalize_canonical_url(record.canonical_url),
+            "published_at": record.published_at,
+            "observed_at": record.observed_at,
+            "accessed_at": record.accessed_at,
+            "ingested_at": record.ingested_at,
+            "license_label": record.license_label,
+            "normalization_version": record.normalization_version,
+            "evidence_authority": record.evidence_authority,
+            "metadata_json": self._json_value(dict(record.metadata)),
+        }
+        with self._connect() as conn:
+            existing = None
+            if record.provider_record_id:
+                existing = conn.execute(
+                    "SELECT * FROM corpus_events WHERE source_name=? AND provider_record_id=?",
+                    (record.source_name, record.provider_record_id),
+                ).fetchone()
+            if existing is None:
+                existing = conn.execute(
+                    "SELECT * FROM corpus_events WHERE event_id=?", (record.event_id,),
+                ).fetchone()
+            event_id = record.event_id if existing is None else existing["event_id"]
+            old_securities = {
+                row[0] for row in conn.execute(
+                    "SELECT security_id FROM event_securities WHERE event_id=?",
+                    (event_id,),
+                ).fetchall()
+            }
+            old_items = {
+                row[0] for row in conn.execute(
+                    "SELECT corpus_item_id FROM event_corpus_items WHERE event_id=?",
+                    (event_id,),
+                ).fetchall()
+            }
+            changed = existing is None or any(
+                existing[key] != value for key, value in values.items()
+            )
+            changed = changed or old_securities != set(record.security_ids)
+            changed = changed or old_items != set(record.source_corpus_item_ids)
+            if not changed:
+                return {
+                    "event_id": event_id,
+                    "created": False,
+                    "changed": False,
+                    "revision": self.get_store_revision(),
+                }
+            columns = ", ".join(values)
+            placeholders = ", ".join("?" for _ in values)
+            updates = ", ".join(f"{name}=excluded.{name}" for name in values)
+            conn.execute(
+                f"INSERT INTO corpus_events (event_id, {columns}) VALUES (?, {placeholders}) "
+                f"ON CONFLICT(event_id) DO UPDATE SET {updates}, updated_at=datetime('now')",
+                (event_id, *values.values()),
+            )
+            conn.execute("DELETE FROM event_securities WHERE event_id=?", (event_id,))
+            conn.executemany(
+                "INSERT INTO event_securities (event_id, security_id) VALUES (?, ?)",
+                ((event_id, security_id) for security_id in record.security_ids),
+            )
+            conn.execute("DELETE FROM event_corpus_items WHERE event_id=?", (event_id,))
+            conn.executemany(
+                "INSERT INTO event_corpus_items (event_id, corpus_item_id) VALUES (?, ?)",
+                ((event_id, item_id) for item_id in record.source_corpus_item_ids),
+            )
+            revision = self._bump_revision_in_transaction(conn)
+            conn.commit()
+        return {
+            "event_id": event_id,
+            "created": existing is None,
+            "changed": True,
+            "revision": revision,
+        }
+
+    def get_event(self, event_id: str) -> Optional[dict]:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM corpus_events WHERE event_id=?", (event_id,),
+            ).fetchone()
+            if not row:
+                return None
+            result = dict(row)
+            result["metadata"] = json.loads(result.pop("metadata_json"))
+            result["security_ids"] = [
+                linked[0] for linked in conn.execute(
+                    "SELECT security_id FROM event_securities WHERE event_id=? "
+                    "ORDER BY security_id", (event_id,),
+                ).fetchall()
+            ]
+            result["source_corpus_item_ids"] = [
+                linked[0] for linked in conn.execute(
+                    "SELECT corpus_item_id FROM event_corpus_items WHERE event_id=? "
+                    "ORDER BY corpus_item_id", (event_id,),
+                ).fetchall()
+            ]
+        return result
+
+    def count_events(self) -> int:
+        with self._connect() as conn:
+            return int(conn.execute("SELECT COUNT(*) FROM corpus_events").fetchone()[0])
 
     # ── Query Support (for middleware) ─────────────────
 

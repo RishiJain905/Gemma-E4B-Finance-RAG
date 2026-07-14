@@ -23,6 +23,8 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Optional
 
+from src.ingestion.records import EventRecord, NarrativeRecord, ObservationRecord
+
 from .chroma_store import ChromaStore
 from .sqlite_store import SQLiteStore
 
@@ -455,6 +457,72 @@ class Store:
     def list_universe_errors(self, run_id: str) -> list[dict]:
         """Return reconciliation errors recorded for one refresh run."""
         return self.sqlite.list_universe_errors(run_id)
+
+    def upsert_narrative(self, record: NarrativeRecord) -> dict:
+        """Persist narrative metadata, then index content with retryable status."""
+        result = self.sqlite.upsert_narrative_record(record)
+        if not result["needs_index"]:
+            return result
+
+        item_id = result["corpus_item_id"]
+        chroma_metadata = {
+            "corpus_item_id": item_id,
+            "source_category": record.source_category,
+            "item_type": record.item_type,
+            "document_family": record.document_family,
+            "content_hash": record.content_hash,
+            "license_label": record.license_label,
+            "normalization_version": record.normalization_version,
+            "evidence_authority": record.evidence_authority,
+        }
+        optional_metadata = {
+            "provider_record_id": record.provider_record_id,
+            "original_publisher": record.original_publisher,
+            "canonical_url": record.canonical_url,
+            "event_type": record.event_type,
+        }
+        chroma_metadata.update({
+            key: value for key, value in optional_metadata.items() if value is not None
+        })
+        chroma_metadata.update(dict(record.metadata))
+        if record.tickers:
+            chroma_metadata["tickers"] = ",".join(record.tickers)
+        if record.index_codes:
+            chroma_metadata["index_codes"] = ",".join(record.index_codes)
+        if record.sectors:
+            chroma_metadata["sectors"] = ",".join(record.sectors)
+
+        try:
+            if result["content_changed"]:
+                self.chroma.delete_document(item_id)
+                self.chroma.delete_filing_section_family(item_id)
+            self.chroma.add_document(
+                document_id=item_id,
+                text=record.body,
+                ticker=record.tickers[0] if record.tickers else None,
+                source=record.source_name,
+                date=record.published_at,
+                metadata=chroma_metadata,
+            )
+        except Exception as exc:  # noqa: BLE001 - metadata must survive Chroma failure
+            logger.warning("Narrative indexing failed for %s", item_id, exc_info=True)
+            self.sqlite.set_corpus_index_status(item_id, "error", str(exc))
+            result["indexing_status"] = "error"
+            result["index_error"] = str(exc)[:2_000]
+            return result
+
+        self.sqlite.set_corpus_index_status(item_id, "indexed")
+        result["indexing_status"] = "indexed"
+        result["index_error"] = None
+        return result
+
+    def upsert_observation(self, record: ObservationRecord) -> dict:
+        """Persist a structured observation without embedding it."""
+        return self.sqlite.upsert_observation_record(record)
+
+    def upsert_event(self, record: EventRecord) -> dict:
+        """Persist a structured event and its item/security links."""
+        return self.sqlite.upsert_event_record(record)
 
     def save_document(self,
                       document_id: str,
@@ -1190,6 +1258,14 @@ class Store:
         # For SQLite, just drop and recreate tables
         with self.sqlite._connect() as conn:
             conn.executescript("""
+                DROP TABLE IF EXISTS event_corpus_items;
+                DROP TABLE IF EXISTS event_securities;
+                DROP TABLE IF EXISTS corpus_events;
+                DROP TABLE IF EXISTS observation_securities;
+                DROP TABLE IF EXISTS corpus_observations;
+                DROP TABLE IF EXISTS corpus_item_securities;
+                DROP TABLE IF EXISTS corpus_item_sources;
+                DROP TABLE IF EXISTS corpus_items;
                 DROP TABLE IF EXISTS universe_errors;
                 DROP TABLE IF EXISTS security_memberships;
                 DROP TABLE IF EXISTS security_aliases;

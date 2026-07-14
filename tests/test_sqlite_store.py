@@ -342,6 +342,11 @@ def test_inline_schema(store: SQLiteStore):
     assert "CREATE TABLE IF NOT EXISTS securities" in schema
     assert "CREATE TABLE IF NOT EXISTS security_aliases" in schema
     assert "CREATE TABLE IF NOT EXISTS security_memberships" in schema
+    assert "CREATE TABLE IF NOT EXISTS corpus_items" in schema
+    assert "CREATE TABLE IF NOT EXISTS corpus_item_sources" in schema
+    assert "CREATE TABLE IF NOT EXISTS corpus_item_securities" in schema
+    assert "CREATE TABLE IF NOT EXISTS corpus_observations" in schema
+    assert "CREATE TABLE IF NOT EXISTS corpus_events" in schema
 
 
 def test_init_creates_store_revision_table(tmp_path: Path):
@@ -375,6 +380,34 @@ def test_init_creates_universe_tables_and_indexes(store: SQLiteStore):
         "idx_securities_active_ticker", "idx_securities_cik",
         "idx_security_aliases_lookup", "idx_memberships_active_index",
         "idx_securities_sector", "idx_securities_last_seen",
+    } <= indexes
+
+
+def test_init_creates_corpus_ledger_tables_and_indexes(store: SQLiteStore):
+    with store._connect() as conn:
+        tables = {
+            row[0] for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()
+        }
+        indexes = {
+            row[0] for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='index'"
+            ).fetchall()
+        }
+
+    assert {
+        "corpus_items", "corpus_item_sources", "corpus_item_securities",
+        "corpus_observations", "observation_securities", "corpus_events",
+        "event_securities", "event_corpus_items",
+    } <= tables
+    assert {
+        "idx_corpus_items_provider_identity", "idx_corpus_items_url_identity",
+        "idx_corpus_items_hash_identity", "idx_corpus_items_canonical_url",
+        "idx_corpus_items_content_hash", "idx_corpus_items_headline_window",
+        "idx_corpus_items_indexing_status", "idx_corpus_item_sources_source",
+        "idx_corpus_item_securities_security", "idx_corpus_observations_metric_period",
+        "idx_corpus_events_type_effective",
     } <= indexes
 
 

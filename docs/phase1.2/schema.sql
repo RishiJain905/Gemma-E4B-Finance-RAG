@@ -215,3 +215,184 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_memberships_one_active
     ON security_memberships(security_id, index_code)
     WHERE active = 1;
 CREATE INDEX IF NOT EXISTS idx_universe_errors_run ON universe_errors(run_id);
+
+-- -- Corpus metadata ledger (2.3.3.1) ----------------------------------------
+CREATE TABLE IF NOT EXISTS corpus_items (
+    corpus_item_id TEXT PRIMARY KEY,
+    source TEXT NOT NULL,
+    source_category TEXT NOT NULL,
+    provider_record_id TEXT,
+    original_publisher TEXT,
+    item_type TEXT NOT NULL,
+    event_type TEXT,
+    title TEXT NOT NULL,
+    normalized_headline TEXT NOT NULL,
+    syndicated_key TEXT,
+    summary TEXT CHECK (summary IS NULL OR length(summary) <= 4000),
+    language TEXT NOT NULL,
+    published_at TEXT,
+    effective_at TEXT,
+    as_of_at TEXT,
+    observed_at TEXT,
+    accessed_at TEXT NOT NULL,
+    ingested_at TEXT NOT NULL,
+    source_url TEXT NOT NULL,
+    canonical_url TEXT,
+    tickers_json TEXT NOT NULL DEFAULT '[]',
+    index_codes_json TEXT NOT NULL DEFAULT '[]',
+    sectors_json TEXT NOT NULL DEFAULT '[]',
+    content_hash TEXT NOT NULL,
+    metadata_json TEXT NOT NULL DEFAULT '{}',
+    document_family TEXT NOT NULL,
+    indexing_status TEXT NOT NULL CHECK (
+        indexing_status IN ('pending', 'indexed', 'error', 'not_applicable')
+    ),
+    index_error TEXT,
+    license_label TEXT NOT NULL,
+    normalization_version TEXT NOT NULL,
+    evidence_authority TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS corpus_item_sources (
+    corpus_item_id TEXT NOT NULL REFERENCES corpus_items(corpus_item_id) ON DELETE CASCADE,
+    source_key TEXT NOT NULL,
+    source_name TEXT NOT NULL,
+    source_category TEXT NOT NULL,
+    provider_record_id TEXT,
+    original_publisher TEXT,
+    source_url TEXT NOT NULL,
+    canonical_url TEXT,
+    published_at TEXT,
+    observed_at TEXT,
+    accessed_at TEXT NOT NULL,
+    ingested_at TEXT NOT NULL,
+    license_label TEXT NOT NULL,
+    evidence_authority TEXT NOT NULL,
+    metadata_json TEXT NOT NULL DEFAULT '{}',
+    PRIMARY KEY (corpus_item_id, source_key)
+);
+
+CREATE TABLE IF NOT EXISTS corpus_item_securities (
+    corpus_item_id TEXT NOT NULL REFERENCES corpus_items(corpus_item_id) ON DELETE CASCADE,
+    security_id TEXT NOT NULL REFERENCES securities(security_id),
+    ticker TEXT,
+    PRIMARY KEY (corpus_item_id, security_id)
+);
+
+CREATE TABLE IF NOT EXISTS corpus_observations (
+    observation_id TEXT PRIMARY KEY,
+    metric_id TEXT NOT NULL,
+    series_id TEXT,
+    value_text TEXT NOT NULL,
+    value_numeric REAL,
+    unit TEXT NOT NULL,
+    frequency TEXT NOT NULL,
+    period_start TEXT,
+    period_end TEXT NOT NULL,
+    vintage_at TEXT,
+    as_of_at TEXT,
+    scope TEXT NOT NULL CHECK (scope IN ('security', 'sector', 'global')),
+    tickers_json TEXT NOT NULL DEFAULT '[]',
+    sector TEXT,
+    source_name TEXT NOT NULL,
+    source_category TEXT NOT NULL,
+    provider_record_id TEXT,
+    original_publisher TEXT,
+    source_url TEXT NOT NULL,
+    canonical_url TEXT,
+    published_at TEXT,
+    observed_at TEXT,
+    accessed_at TEXT NOT NULL,
+    ingested_at TEXT NOT NULL,
+    license_label TEXT NOT NULL,
+    normalization_version TEXT NOT NULL,
+    evidence_authority TEXT NOT NULL,
+    metadata_json TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS observation_securities (
+    observation_id TEXT NOT NULL REFERENCES corpus_observations(observation_id) ON DELETE CASCADE,
+    security_id TEXT NOT NULL REFERENCES securities(security_id),
+    PRIMARY KEY (observation_id, security_id)
+);
+
+CREATE TABLE IF NOT EXISTS corpus_events (
+    event_id TEXT PRIMARY KEY,
+    event_type TEXT NOT NULL,
+    effective_at TEXT,
+    announced_at TEXT,
+    status TEXT NOT NULL,
+    amount REAL,
+    currency TEXT,
+    rate REAL,
+    ratio REAL,
+    action_date TEXT,
+    classifier_version TEXT,
+    explanation TEXT CHECK (explanation IS NULL OR length(explanation) <= 4000),
+    source_name TEXT NOT NULL,
+    source_category TEXT NOT NULL,
+    provider_record_id TEXT,
+    original_publisher TEXT,
+    source_url TEXT NOT NULL,
+    canonical_url TEXT,
+    published_at TEXT,
+    observed_at TEXT,
+    accessed_at TEXT NOT NULL,
+    ingested_at TEXT NOT NULL,
+    license_label TEXT NOT NULL,
+    normalization_version TEXT NOT NULL,
+    evidence_authority TEXT NOT NULL,
+    metadata_json TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS event_securities (
+    event_id TEXT NOT NULL REFERENCES corpus_events(event_id) ON DELETE CASCADE,
+    security_id TEXT NOT NULL REFERENCES securities(security_id),
+    PRIMARY KEY (event_id, security_id)
+);
+
+CREATE TABLE IF NOT EXISTS event_corpus_items (
+    event_id TEXT NOT NULL REFERENCES corpus_events(event_id) ON DELETE CASCADE,
+    corpus_item_id TEXT NOT NULL REFERENCES corpus_items(corpus_item_id),
+    PRIMARY KEY (event_id, corpus_item_id)
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_corpus_items_provider_identity
+    ON corpus_items(source, provider_record_id)
+    WHERE provider_record_id IS NOT NULL AND provider_record_id <> '';
+CREATE UNIQUE INDEX IF NOT EXISTS idx_corpus_items_url_identity
+    ON corpus_items(source, canonical_url, published_at)
+    WHERE provider_record_id IS NULL AND canonical_url IS NOT NULL
+        AND published_at IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_corpus_items_hash_identity
+    ON corpus_items(source, content_hash)
+    WHERE provider_record_id IS NULL AND canonical_url IS NULL;
+CREATE INDEX IF NOT EXISTS idx_corpus_items_canonical_url
+    ON corpus_items(canonical_url, published_at);
+CREATE INDEX IF NOT EXISTS idx_corpus_items_content_hash
+    ON corpus_items(content_hash);
+CREATE INDEX IF NOT EXISTS idx_corpus_items_headline_window
+    ON corpus_items(syndicated_key)
+    WHERE syndicated_key IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_corpus_items_indexing_status
+    ON corpus_items(indexing_status, updated_at);
+CREATE INDEX IF NOT EXISTS idx_corpus_item_sources_source
+    ON corpus_item_sources(source_name, provider_record_id);
+CREATE INDEX IF NOT EXISTS idx_corpus_item_securities_security
+    ON corpus_item_securities(security_id, corpus_item_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_corpus_observations_provider
+    ON corpus_observations(source_name, provider_record_id)
+    WHERE provider_record_id IS NOT NULL AND provider_record_id <> '';
+CREATE INDEX IF NOT EXISTS idx_corpus_observations_metric_period
+    ON corpus_observations(metric_id, period_end, vintage_at);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_corpus_events_provider
+    ON corpus_events(source_name, provider_record_id)
+    WHERE provider_record_id IS NOT NULL AND provider_record_id <> '';
+CREATE INDEX IF NOT EXISTS idx_corpus_events_type_effective
+    ON corpus_events(event_type, effective_at);
