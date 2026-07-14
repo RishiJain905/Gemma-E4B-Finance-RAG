@@ -1,41 +1,27 @@
 # configs/watchlist.yaml
-# Core tracked tickers — these get full ingestion (fundamentals + news + documents)
-core:
-  - NVDA
-  - AMD
-  - AAPL
-  - MSFT
-  - META
-  - CRWD
+# Security coverage is configured in coverage.yaml. Legacy core/extended
+# watchlists remain readable for one compatibility release.
 
-# Extended watchlist — fundamentals only, less frequent updates
-extended:
-  - GOOGL
-  - AMZN
-  - TSLA
-  - AVGO
-  - ORCL
-  - INTC
-  - QCOM
-  - PANW
-  - PLTR
-  - SNOW
+# Deprecated compatibility mirror. CoverageResolver does not use these when
+# coverage.yaml is present.
+core: [NVDA, AMD, AAPL, MSFT, META, CRWD]
+extended: [GOOGL, AMZN, TSLA, AVGO, ORCL, INTC, QCOM, PANW, PLTR, SNOW]
 
-# Macro indicators — fetched but not tied to a ticker
+# Macro indicators fetched as market proxies, not as company securities.
 macro_tickers:
   - SPY    # S&P 500 ETF (market proxy)
   - QQQ    # Nasdaq ETF (tech proxy)
   - TLT    # Long-term treasuries (rates proxy)
   - GLD    # Gold (inflation/hedge proxy)
 
-# Ingestion schedule (in hours)
+# Ingestion schedule (hours)
 schedule:
-  fundamentals: 24    # Re-fetch fundamentals daily
-  news: 6             # Re-fetch news every 6 hours
-  macro: 24           # Macro indicators daily
-  sec_filings: 12     # Check for new SEC filings every 12 hours
-  sec_companyfacts: 24 # Refresh authoritative SEC XBRL facts daily
-  gdelt_news: 6       # GDELT global news every 6 hours
-  transcripts: 168    # Earnings transcripts weekly (7 days)
-  ir_pages: 24        # Company IR pages (press releases / presentations) daily
-  estimates: 24       # Analyst estimates & price targets daily
+  fundamentals: 24
+  news: 6
+  macro: 24
+  sec_filings: 12
+  sec_companyfacts: 24
+  gdelt_news: 6
+  transcripts: 168
+  ir_pages: 24
+  estimates: 24

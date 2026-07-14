@@ -398,6 +398,64 @@ class Store:
 
     # ── Document Storage (ChromaDB) ──────────────────
 
+    # -- Security Universe (2.3.1.1) -----------------------------------------
+
+    def list_securities(
+        self,
+        index: Optional[str] = None,
+        active: Optional[bool] = True,
+        sector: Optional[str] = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> list[dict]:
+        """List bounded canonical securities through the SQLite facade."""
+        return self.sqlite.list_securities(
+            index=index,
+            active=active,
+            sector=sector,
+            limit=limit,
+            offset=offset,
+        )
+
+    def get_security(self, ticker_or_id: str) -> Optional[dict]:
+        """Return one canonical security by ticker or opaque id."""
+        return self.sqlite.get_security(ticker_or_id)
+
+    def resolve_security(
+        self,
+        symbol: str,
+        provider: Optional[str] = None,
+        as_of: Optional[str] = None,
+    ) -> Optional[dict]:
+        """Resolve canonical, vendor, or historical security symbols."""
+        return self.sqlite.resolve_security(symbol, provider=provider, as_of=as_of)
+
+    def list_memberships(
+        self,
+        security_id: Optional[str] = None,
+        index_code: Optional[str] = None,
+        active: Optional[bool] = None,
+    ) -> list[dict]:
+        """List current or historical index memberships."""
+        return self.sqlite.list_memberships(
+            security_id=security_id,
+            index_code=index_code,
+            active=active,
+        )
+
+    def upsert_universe_snapshot(
+        self,
+        source: str,
+        observed_at: str,
+        rows: list[object],
+    ) -> dict:
+        """Atomically reconcile a validated provider universe snapshot."""
+        return self.sqlite.upsert_universe_snapshot(source, observed_at, rows)
+
+    def list_universe_errors(self, run_id: str) -> list[dict]:
+        """Return reconciliation errors recorded for one refresh run."""
+        return self.sqlite.list_universe_errors(run_id)
+
     def save_document(self,
                       document_id: str,
                       text: str,
@@ -1132,6 +1190,10 @@ class Store:
         # For SQLite, just drop and recreate tables
         with self.sqlite._connect() as conn:
             conn.executescript("""
+                DROP TABLE IF EXISTS universe_errors;
+                DROP TABLE IF EXISTS security_memberships;
+                DROP TABLE IF EXISTS security_aliases;
+                DROP TABLE IF EXISTS securities;
                 DROP TABLE IF EXISTS fundamentals;
                 DROP TABLE IF EXISTS filings;
                 DROP TABLE IF EXISTS cache_meta;

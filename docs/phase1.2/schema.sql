@@ -137,3 +137,81 @@ CREATE INDEX IF NOT EXISTS idx_filings_ticker ON filings(ticker);
 CREATE INDEX IF NOT EXISTS idx_filings_status ON filings(status);
 CREATE INDEX IF NOT EXISTS idx_cache_meta_status ON cache_meta(status);
 CREATE INDEX IF NOT EXISTS idx_ingestion_log_run ON ingestion_log(run_id);
+-- -- Security Universe (2.3.1.1) ---------------------------------------------
+CREATE TABLE IF NOT EXISTS securities (
+    security_id TEXT PRIMARY KEY,
+    ticker TEXT NOT NULL,
+    normalized_ticker TEXT NOT NULL,
+    company_name TEXT NOT NULL,
+    exchange TEXT NOT NULL DEFAULT '',
+    cik TEXT,
+    security_type TEXT NOT NULL DEFAULT 'common_stock',
+    share_class TEXT,
+    sector TEXT,
+    industry TEXT,
+    active INTEGER NOT NULL DEFAULT 1 CHECK (active IN (0, 1)),
+    first_seen_at TEXT NOT NULL,
+    last_seen_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(normalized_ticker, exchange)
+);
+
+CREATE TABLE IF NOT EXISTS security_aliases (
+    alias_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    security_id TEXT NOT NULL REFERENCES securities(security_id),
+    alias TEXT NOT NULL,
+    normalized_alias TEXT NOT NULL,
+    alias_type TEXT NOT NULL CHECK (
+        alias_type IN ('ticker', 'vendor_symbol', 'former_ticker')
+    ),
+    provider TEXT,
+    valid_from TEXT,
+    valid_to TEXT,
+    source TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS security_memberships (
+    membership_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    security_id TEXT NOT NULL REFERENCES securities(security_id),
+    index_code TEXT NOT NULL CHECK (index_code IN ('sp500', 'nasdaq100')),
+    effective_from TEXT NOT NULL,
+    effective_to TEXT,
+    active INTEGER NOT NULL DEFAULT 1 CHECK (active IN (0, 1)),
+    source TEXT NOT NULL,
+    source_url TEXT,
+    observed_at TEXT NOT NULL,
+    UNIQUE(security_id, index_code, effective_from)
+);
+
+CREATE TABLE IF NOT EXISTS universe_errors (
+    error_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id TEXT NOT NULL,
+    source TEXT NOT NULL,
+    symbol TEXT,
+    error_code TEXT NOT NULL,
+    message TEXT NOT NULL,
+    payload TEXT,
+    observed_at TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_securities_active_ticker
+    ON securities(active, normalized_ticker);
+CREATE INDEX IF NOT EXISTS idx_securities_cik ON securities(cik);
+CREATE INDEX IF NOT EXISTS idx_securities_sector ON securities(sector);
+CREATE INDEX IF NOT EXISTS idx_securities_last_seen ON securities(last_seen_at);
+CREATE INDEX IF NOT EXISTS idx_security_aliases_lookup
+    ON security_aliases(normalized_alias, provider, valid_from, valid_to);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_security_aliases_active_global
+    ON security_aliases(normalized_alias)
+    WHERE valid_to IS NULL AND provider IS NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_security_aliases_active_provider
+    ON security_aliases(normalized_alias, provider)
+    WHERE valid_to IS NULL AND provider IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_memberships_active_index
+    ON security_memberships(index_code, active, security_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_memberships_one_active
+    ON security_memberships(security_id, index_code)
+    WHERE active = 1;
+CREATE INDEX IF NOT EXISTS idx_universe_errors_run ON universe_errors(run_id);

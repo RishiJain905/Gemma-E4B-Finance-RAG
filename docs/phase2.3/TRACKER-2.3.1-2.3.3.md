@@ -1,0 +1,39 @@
+# Phase 2.3 — 2.3.1 through 2.3.3 build loop
+
+Branch: `phase-2.3.1-2.3.3` (from `Rishi-Ghost`)
+
+Covers the first three feature groups of the Phase 2.3 roadmap
+([README-2.3.md](README-2.3.md)): the security universe and coverage-tier
+foundation, multi-source finance ingestion, and corpus organization/provenance.
+Per the documented build order, 2.3.1 must land first — nothing else may fan
+out to the broad universe before stable identities and coverage scopes exist —
+and 2.3.3.1's normalized record/provenance contract must land before 2.3.2's
+adapters so every source writes through the same shape from the start.
+
+## 2.3.1 — Universe and coverage foundation
+
+- [x] 2.3.1.1 security-universe-and-membership-history — **DONE 2026-07-14**: canonical `securities`/`security_aliases`/`security_memberships` (+`universe_errors`) schema, bounded Nasdaq/IVV/SEC providers, transactional `UniverseRegistry.refresh()`, Store API; 64 new offline tests, full suite 1,387 passed, VERIFY: PASS. — spec: `docs/phase2.3/2.3.1-universe-and-coverage-foundation/2.3.1.1-security-universe-and-membership-history.md` — replace the hand-maintained ticker-only universe with canonical securities and historical S&P 500/Nasdaq-100 membership (`securities` + `security_aliases`); every downstream source resolves work through this registry instead of copying a ticker list.
+- [x] 2.3.1.2 coverage-tiers-and-source-policy — **DONE 2026-07-14**: `CoverageResolver` + `configs/coverage.yaml` (universe/broad/deep/sector/global scopes), scheduler + six ingestors converted off the shared core list with one-release legacy compat; 57 focused tests, full suite 1,400 passed, VERIFY: PASS. — spec: `docs/phase2.3/2.3.1-universe-and-coverage-foundation/2.3.1.2-coverage-tiers-and-source-policy.md` — define explicit universe/broad/deep/sector/global coverage scopes and the default source policy per scope so broad coverage doesn't trigger every expensive per-ticker ingestion path.
+
+## 2.3.2 — Multi-source finance ingestion
+
+- [ ] 2.3.2.1 sec-event-and-capital-markets-ingestion — spec: `docs/phase2.3/2.3.2-multi-source-finance-ingestion/2.3.2.1-sec-event-and-capital-markets-ingestion.md` — turn SEC EDGAR into the authoritative broad-universe event feed via index-driven discovery (daily index files, cursor-advanced registration), covering the forms/exhibits needed to detect financings, acquisitions, earnings, guidance, governance, and ownership changes beyond the current 10-K/10-Q/8-K-only path.
+- [ ] 2.3.2.2 company-news-market-data-and-corporate-actions — spec: `docs/phase2.3/2.3.2-multi-source-finance-ingestion/2.3.2.2-company-news-market-data-and-corporate-actions.md` — add broad-universe company news (Finnhub) and daily market/corporate-action data (Massive grouped summary, splits/dividends) through small provider adapters with explicit entitlements, quotas, and `disabled_entitlement` handling distinct from transient failure.
+- [ ] 2.3.2.3 official-macro-regulatory-and-sector-feeds — spec: `docs/phase2.3/2.3.2-multi-source-finance-ingestion/2.3.2.3-official-macro-regulatory-and-sector-feeds.md` — add first-party macro/rates feeds (Federal Reserve, Treasury, BLS, BEA, EIA, NY Fed, CFTC) and sector/regulatory feeds (openFDA, NHTSA, USAspending) with mandatory source/release/vintage provenance, complementing rather than duplicating FRED.
+
+## 2.3.3 — Corpus organization and provenance
+
+- [ ] 2.3.3.1 normalized-record-contract-and-deduplication — spec: `docs/phase2.3/2.3.3-corpus-organization-and-provenance/2.3.3.1-normalized-record-contract-and-deduplication.md` — define the smallest common boundary between provider adapters and storage (`NarrativeRecord`, `ObservationRecord`, and a third focused record family) so every source preserves provenance, deduplicates predictably, and appears under a stable corpus taxonomy. Lands before 2.3.2's adapters per the phase build order.
+- [ ] 2.3.3.2 dual-store-placement-chunking-and-retention — spec: `docs/phase2.3/2.3.3-corpus-organization-and-provenance/2.3.3.2-dual-store-placement-chunking-and-retention.md` — place each new data type in the correct store per the placement matrix (structured rows in SQLite, narrative text/summaries in Chroma, numeric series never embedded), establish stable document families for chunked narrative evidence, and add explicit retention rules.
+- [ ] 2.3.3.3 retrieval-taxonomy-filtering-and-ranking — spec: `docs/phase2.3/2.3.3-corpus-organization-and-provenance/2.3.3.3-retrieval-taxonomy-filtering-and-ranking.md` — make the expanded corpus retrievable by a stable finance taxonomy (source category, item type, event type) rather than provider names, extend filters/intent routing, and prefer primary and timely evidence in ranking.
+
+## Rules
+
+- Gate: `scripts\verify.ps1` → `VERIFY: PASS`.
+- 2.3.1 blocks every other feature group — nothing fans out to the broad universe before the universe registry and coverage-tier policy exist, per `README-2.3.md`'s build order.
+- 2.3.3.1 blocks 2.3.2 — the normalized record/provenance contract must exist before SEC event, news/market-data, and macro/sector adapters are implemented against it.
+- Two failed gate attempts on the same failure for one task → mark **BLOCKED** below with a one-line diagnosis, move to the next task. Don't loop on it.
+- One commit per task, checked off here with a one-line result note as you go.
+- Each implemented feature writes its own `RESULTS.md` inside the feature folder (setup, before/after metrics, caveats, regression-gate outcome, ship/rollback decision) — not created speculatively ahead of implementation.
+- All new network tests are mocked and offline-safe; live tests are opt-in, per the phase-wide hard bounds in `README-2.3.md`.
+- No push, no merge to `Rishi-Ghost` — leave the branch for review.

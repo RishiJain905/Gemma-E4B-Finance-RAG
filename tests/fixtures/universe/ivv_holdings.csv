@@ -1,0 +1,9 @@
+iShares Core S&P 500 ETF
+Fund Holdings as of,07/10/2026
+"Ticker","Name","Sector","Asset Class","Exchange","Weight (%)"
+AAPL,APPLE INC,Information Technology,Equity,NASDAQ,7.10
+BRK.B,BERKSHIRE HATHAWAY INC CLASS B,Financials,Equity,NYSE,1.80
+GOOGL,ALPHABET INC CLASS A,Communication,Equity,NASDAQ,2.10
+MSFT,MICROSOFT CORP,Information Technology,Equity,NASDAQ,6.50
+USD,USD CASH,Cash and/or Derivatives,Cash,,0.10
+ESM6,S&P 500 EMINI FUT JUN 26,Other,Futures,CME,0.02

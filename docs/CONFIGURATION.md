@@ -435,15 +435,82 @@ corpus_opaque_id_ttl_s: 300.0     # clamp 1–3600
 
 ---
 
-## `configs/watchlist.yaml`
+## `configs/coverage.yaml`
 
-Tracked tickers and the per-source ingestion schedule. The `schedule` block is
-the source of truth for TTLs used by both `UnifiedScheduler` and the `Store`
-freshness logic (each falls back to built-in defaults if a key is missing).
+Source-aware security coverage policy. `CoverageResolver` reads this file and
+the canonical security registry only; it never calls a provider or changes
+security/index membership. A security may hold multiple scopes:
+`universe`, `broad`, `deep`, `sector`, and `global`.
 
 ```yaml
-core:        [NVDA, AMD, AAPL, MSFT, META, CRWD]
-extended:    [GOOGL, AMZN, TSLA, AVGO, ORCL, INTC, QCOM, PANW, PLTR, SNOW]
+revision: "2.3.1.2-r1"
+fallback_when_registry_empty: deep
+
+deep:
+  tickers: [NVDA, AMD, AAPL, MSFT, META, CRWD]
+  allow_outside_indexes: []
+broad:
+  additions: [GOOGL, AMZN, TSLA, AVGO, ORCL, INTC, QCOM, PANW, PLTR, SNOW]
+sector:
+  rules:
+    health_care: [Health Care, Healthcare]
+
+sources:
+  sec_filings:
+    enabled: true
+    scopes: [broad]
+    capabilities: [sec_event_discovery]
+  sec_filing_text:
+    enabled: true
+    scopes: [deep]
+    capabilities: [full_filing_text]
+  fred:
+    enabled: true
+    scopes: [global]
+    capabilities: [official_macro]
+```
+
+| Field | Meaning |
+|-------|---------|
+| `revision` | Non-secret policy revision included in scheduler/status and graph-ready explanations. |
+| `fallback_when_registry_empty` | Fresh-install behavior. `deep` means broad sources temporarily receive only `deep.tickers` until the first universe snapshot; broad additions are not fanned out during fallback. `empty` is also accepted. |
+| `deep.tickers` | Explicit focused-research list. Deep is additive policy over canonical identities, not a second identity registry. |
+| `deep.allow_outside_indexes` | Explicit ticker list (or `true`) permitting intentional off-index deep coverage. Without this opt-in, a deep ticker outside the active index union is a validation error once the registry is populated. |
+| `broad.additions` | Optional explicit additions to the unique active S&P 500/Nasdaq-100 union. This replaces the old hidden `extended` semantics. |
+| `sector.rules` | Named lists of canonical sector labels used by sector-scoped sources. |
+| `sources.<name>.enabled` | Enables or disables the source independently. |
+| `sources.<name>.scopes` | One or more allowed scopes (`universe`, `broad`, `deep`, `sector`, `global`). Overlap is deduplicated per source run. |
+| `sources.<name>.sector_rules` | Named sector rules applied by a sector-scoped source. |
+| `sources.<name>.capabilities` | Safe capability labels exposed by policy explanations. |
+
+Default policy keeps SEC event discovery and Yahoo market/news work broad;
+full filing text, CompanyFacts, IR pages, transcripts, estimates, and optional
+GDELT work deep; FRED global; and future openFDA/NHTSA/USAspending adapters
+disabled and bounded to their configured sector rules. Universe-provider
+capabilities use the `universe` scope.
+
+`CoverageResolver.explain()` exposes only the source, scope, inclusion reason,
+enabled capabilities, ticker count/identity, and policy revision. It never
+returns config paths, provider keys, or raw YAML.
+
+For one compatibility release, a legacy YAML containing `core` and `extended`
+can be supplied as the resolver config. It logs a deprecation warning, maps
+`core` to `deep.tickers`, and maps `extended` to `broad.additions`.
+
+---
+
+## `configs/watchlist.yaml`
+
+Market-proxy tickers and the per-source ingestion schedule. Security selection
+now comes from `configs/coverage.yaml`. The deprecated `core`/`extended` mirror
+remains for one release so older readers keep working, but converted ingestors
+do not use it as policy. The `schedule` block remains the source of truth for
+TTLs used by both `UnifiedScheduler` and `Store` freshness logic.
+
+```yaml
+# Deprecated compatibility mirror only:
+core: [NVDA, AMD, AAPL, MSFT, META, CRWD]
+extended: [GOOGL, AMZN, TSLA, AVGO, ORCL, INTC, QCOM, PANW, PLTR, SNOW]
 macro_tickers: [SPY, QQQ, TLT, GLD]
 
 schedule:
@@ -458,8 +525,8 @@ schedule:
 
 | Field | Meaning |
 |-------|---------|
-| `core` | Tickers that get full ingestion (fundamentals + news + documents). |
-| `extended` | Tickers that get fundamentals only, less frequently. |
+| `core` | Deprecated compatibility mirror of `coverage.yaml -> deep.tickers`. |
+| `extended` | Deprecated compatibility mirror of `coverage.yaml -> broad.additions`. |
 | `macro_tickers` | Market-proxy ETFs fetched but not tied to a single company. |
 | `schedule.<key>` | TTL in **hours** per logical source. Keys map to sources via `Store.FRESHNESS_SOURCES` and `UnifiedScheduler.SOURCES`. |
 

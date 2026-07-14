@@ -17,6 +17,7 @@ import yfinance as yf
 import yaml
 
 from src.storage.store import Store
+from src.universe.coverage import CoverageResolver
 from src.utils.env import load_env
 
 logger = logging.getLogger(__name__)
@@ -50,9 +51,12 @@ class EstimatesIngestor:
         self,
         store: Optional[Store] = None,
         config_path: Optional[Path] = None,
+        coverage_resolver: Optional[CoverageResolver] = None,
     ) -> None:
         load_env()
         self.store = store or Store()
+        self._coverage_injected = coverage_resolver is not None
+        self.coverage = coverage_resolver or CoverageResolver(self.store)
         self.config = self._load_config(config_path)
         self.provider = str(self.config.get("provider", "yfinance")).lower()
         self.request_delay = float(self.config.get("request_delay", 3.0))
@@ -141,15 +145,21 @@ class EstimatesIngestor:
 
     def fetch_all_core(self) -> dict[str, dict]:
         """Fetch estimates for all core tickers with the configured delay."""
-        from src.ingestion.yfinance_ingestor import YFinanceIngestor
-
-        ingestor = YFinanceIngestor(store=self.store)
         results: dict[str, dict] = {}
-        for ticker in ingestor.core_tickers:
+        for ticker in self._batch_tickers("estimates"):
             results[ticker] = self.fetch_for_ticker(ticker)
             if self.request_delay > 0:
                 time.sleep(self.request_delay)
         return results
+
+    def _batch_tickers(self, source_name: str) -> list[str]:
+        """Use the legacy core list only while a fresh registry is empty."""
+        rows = self.store.list_securities(active=None, limit=1, offset=0)
+        if not self._coverage_injected and (not isinstance(rows, list) or not rows):
+            from src.ingestion.yfinance_ingestor import YFinanceIngestor
+
+            return list(YFinanceIngestor(store=self.store).core_tickers)
+        return self.coverage.tickers_for(source_name)
 
     def _fetch_yfinance(self, ticker: str, errors: list[str]) -> list[dict]:
         facts: list[dict] = []

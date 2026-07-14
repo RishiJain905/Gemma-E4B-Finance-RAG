@@ -341,6 +341,14 @@ def test_bump_failure_never_crashes_mutation(store, monkeypatch):
 
 def test_reset(store, mock_chroma, tmp_path: Path):
     store.save_fundamental("TEST", "metric_a", 1.0, period="2026-Q1")
+    store.upsert_universe_snapshot(
+        "ivv",
+        "2026-07-01T00:00:00Z",
+        [{
+            "symbol": "TEST", "company_name": "Test Incorporated",
+            "source": "ivv", "index_code": "sp500",
+        }],
+    )
     store.register_filing(
         "TEST", "10-K", "2026-01-01", "2026-FY",
         "acc-reset-1", "http://example.com",
@@ -351,4 +359,36 @@ def test_reset(store, mock_chroma, tmp_path: Path):
     mock_chroma.reset_collection.assert_called_once()
     with store.sqlite._connect() as conn:
         count = conn.execute("SELECT COUNT(*) FROM fundamentals").fetchone()[0]
+        security_count = conn.execute("SELECT COUNT(*) FROM securities").fetchone()[0]
     assert count == 0
+    assert security_count == 0
+
+
+def test_universe_facade_methods_delegate_without_extra_revision_bump(fully_mocked_store):
+    store, sqlite, _chroma = fully_mocked_store
+    sqlite.list_securities.return_value = [{"ticker": "AAPL"}]
+    sqlite.get_security.return_value = {"ticker": "AAPL"}
+    sqlite.resolve_security.return_value = {"ticker": "AAPL"}
+    sqlite.list_memberships.return_value = [{"index_code": "sp500"}]
+    sqlite.upsert_universe_snapshot.return_value = {"changed": False}
+    sqlite.list_universe_errors.return_value = []
+
+    assert store.list_securities(index="sp500", limit=5, offset=1) == [{"ticker": "AAPL"}]
+    assert store.get_security("AAPL") == {"ticker": "AAPL"}
+    assert store.resolve_security("AAPL", provider="sec", as_of="2026-01-01") == {
+        "ticker": "AAPL"
+    }
+    assert store.list_memberships(index_code="sp500", active=True) == [
+        {"index_code": "sp500"}
+    ]
+    assert store.upsert_universe_snapshot("ivv", "2026-01-01", []) == {"changed": False}
+    assert store.list_universe_errors("run-1") == []
+
+    sqlite.list_securities.assert_called_once_with(
+        index="sp500", active=True, sector=None, limit=5, offset=1,
+    )
+    sqlite.resolve_security.assert_called_once_with(
+        "AAPL", provider="sec", as_of="2026-01-01",
+    )
+    sqlite.upsert_universe_snapshot.assert_called_once_with("ivv", "2026-01-01", [])
+    sqlite.bump_store_revision.assert_not_called()

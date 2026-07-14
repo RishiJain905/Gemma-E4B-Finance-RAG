@@ -339,6 +339,9 @@ def test_inline_schema(store: SQLiteStore):
     assert "CREATE TABLE IF NOT EXISTS cache_meta" in schema
     assert "CREATE TABLE IF NOT EXISTS ingestion_log" in schema
     assert "CREATE TABLE IF NOT EXISTS store_revision" in schema
+    assert "CREATE TABLE IF NOT EXISTS securities" in schema
+    assert "CREATE TABLE IF NOT EXISTS security_aliases" in schema
+    assert "CREATE TABLE IF NOT EXISTS security_memberships" in schema
 
 
 def test_init_creates_store_revision_table(tmp_path: Path):
@@ -349,3 +352,84 @@ def test_init_creates_store_revision_table(tmp_path: Path):
                 "SELECT name FROM sqlite_master WHERE type='table'").fetchall()
         }
     assert "store_revision" in tables
+
+
+# -- Security universe (2.3.1.1) ---------------------------------------------
+
+def test_init_creates_universe_tables_and_indexes(store: SQLiteStore):
+    with store._connect() as conn:
+        tables = {
+            row[0] for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()
+        }
+        indexes = {
+            row[0] for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='index'"
+            ).fetchall()
+        }
+    assert {
+        "securities", "security_aliases", "security_memberships", "universe_errors",
+    } <= tables
+    assert {
+        "idx_securities_active_ticker", "idx_securities_cik",
+        "idx_security_aliases_lookup", "idx_memberships_active_index",
+        "idx_securities_sector", "idx_securities_last_seen",
+    } <= indexes
+
+
+def test_universe_reads_filter_and_resolve_aliases(store: SQLiteStore):
+    result = store.upsert_universe_snapshot(
+        "ivv",
+        "2026-07-01T00:00:00Z",
+        [
+            {
+                "symbol": "BRK.B", "company_name": "Berkshire Hathaway Class B",
+                "source": "ivv", "index_code": "sp500", "exchange": "NYSE",
+                "cik": "0001067983", "sector": "Financials",
+                "source_url": "https://example.test/ivv",
+            },
+            {
+                "symbol": "MSFT", "company_name": "Microsoft Corporation",
+                "source": "ivv", "index_code": "sp500", "exchange": "NASDAQ",
+                "cik": None, "sector": "Technology",
+                "source_url": "https://example.test/ivv",
+            },
+        ],
+    )
+
+    assert result["changed"] is True
+    assert [row["ticker"] for row in store.list_securities(
+        index="sp500", active=True, sector="Financials", limit=10, offset=0,
+    )] == ["BRK-B"]
+    security = store.get_security("BRK.B")
+    assert security["ticker"] == "BRK-B"
+    assert store.get_security(security["security_id"])["security_id"] == security["security_id"]
+    assert store.resolve_security("BRK.B", provider="ivv")["security_id"] == security["security_id"]
+    assert store.list_memberships(security_id=security["security_id"], active=True)
+
+
+def test_list_tickers_uses_canonical_active_symbols_without_aliases(store: SQLiteStore):
+    store.upsert_fundamental("LEGACY", "revenue", 1.0, period="2026-Q1")
+    store.upsert_universe_snapshot(
+        "ivv",
+        "2026-07-01T00:00:00Z",
+        [{
+            "symbol": "BRK.B", "company_name": "Berkshire Hathaway Class B",
+            "source": "ivv", "index_code": "sp500", "exchange": "NYSE",
+            "source_url": "https://example.test/ivv",
+        }],
+    )
+    with store._connect() as conn:
+        security_id = conn.execute(
+            "SELECT security_id FROM securities WHERE ticker='BRK-B'"
+        ).fetchone()[0]
+        conn.execute(
+            "INSERT INTO security_aliases "
+            "(security_id, alias, normalized_alias, alias_type, source, valid_from) "
+            "VALUES (?, 'BF.B', 'BF-B', 'former_ticker', 'ivv', '2020-01-01')",
+            (security_id,),
+        )
+        conn.commit()
+
+    assert store.list_tickers() == ["BRK-B"]

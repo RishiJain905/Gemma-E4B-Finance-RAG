@@ -26,6 +26,7 @@ from pathlib import Path
 from typing import Optional
 
 from src.storage.store import Store
+from src.universe.coverage import CoverageResolver
 
 logger = logging.getLogger(__name__)
 
@@ -104,10 +105,12 @@ class UnifiedScheduler:
         store: Optional[Store] = None,
         inter_source_delay: float = 2.0,
         watchlist_path: Optional[Path] = None,
+        coverage_resolver: Optional[CoverageResolver] = None,
     ):
         self.store = store or Store()
         self.inter_source_delay = inter_source_delay
         self.watchlist_path = watchlist_path or self.DEFAULT_WATCHLIST_PATH
+        self.coverage = coverage_resolver or CoverageResolver(self.store)
         self.ttls = self._load_ttls()
         self._dlq = None  # lazy
 
@@ -179,12 +182,18 @@ class UnifiedScheduler:
         """
         if name == "yfinance":
             from src.ingestion.yfinance_ingestor import YFinanceIngestor
-            YFinanceIngestor(store=self.store).ingest_all()
+            YFinanceIngestor(
+                store=self.store,
+                coverage_resolver=self.coverage,
+            ).ingest_all()
             return {"action": "ingest_all"}
 
         if name == "sec_filings":
             from src.sec import FilingScheduler
-            sched = FilingScheduler(store=self.store)
+            sched = FilingScheduler(
+                store=self.store,
+                coverage_resolver=self.coverage,
+            )
             if deep:
                 return sched.run_full_pipeline(force=force)
             return sched.run_discovery(force=force)
@@ -200,38 +209,43 @@ class UnifiedScheduler:
 
         if name == "gdelt":
             from src.macros.gdelt_ingestor import GDELTIngestor
-            results = GDELTIngestor(store=self.store).fetch_and_store_all()
+            results = GDELTIngestor(
+                store=self.store,
+                coverage_resolver=self.coverage,
+            ).fetch_and_store_all()
             return {"articles_stored": sum(results.values()), "tickers": len(results)}
 
         if name == "earnings_transcripts":
             from src.macros.earnings_transcripts import EarningsTranscriptIngestor
-            results = EarningsTranscriptIngestor(store=self.store).fetch_all_core()
+            results = EarningsTranscriptIngestor(
+                store=self.store,
+                coverage_resolver=self.coverage,
+            ).fetch_all_core()
             return {"tickers_processed": len(results)}
 
         if name == "ir_pages":
             from src.macros.ir_ingestor import IRIngestor
-            results = IRIngestor(store=self.store).fetch_all_core()
+            results = IRIngestor(
+                store=self.store,
+                coverage_resolver=self.coverage,
+            ).fetch_all_core()
             stored = sum(r.get("items_stored", 0) for r in results.values())
             return {"tickers_processed": len(results), "items_stored": stored}
 
         if name == "estimates":
             from src.macros.estimates_ingestor import EstimatesIngestor
-            results = EstimatesIngestor(store=self.store).fetch_all_core()
+            results = EstimatesIngestor(
+                store=self.store,
+                coverage_resolver=self.coverage,
+            ).fetch_all_core()
             stored = sum(r.get("facts_stored", 0) for r in results.values())
             return {"tickers_processed": len(results), "facts_stored": stored}
 
         raise ValueError(f"Unknown source: {name}")
 
     def _load_core_tickers(self) -> list[str]:
-        """Load normalized core tickers without constructing another ingestor."""
-        try:
-            import yaml
-
-            with open(self.watchlist_path, encoding="utf-8") as watchlist_file:
-                config = yaml.safe_load(watchlist_file) or {}
-            return [str(ticker).upper() for ticker in config.get("core", [])]
-        except Exception as exc:  # noqa: BLE001
-            raise ValueError(f"Could not load core tickers: {exc}") from exc
+        """Compatibility alias for CompanyFacts deep-coverage tickers."""
+        return self.coverage.tickers_for("sec_companyfacts")
 
     def _run_sec_companyfacts(self) -> dict:
         """Ingest core tickers independently and update per-ticker freshness."""
@@ -300,6 +314,9 @@ class UnifiedScheduler:
         results: dict[str, dict] = {}
 
         for i, (name, cfg) in enumerate(ordered):
+            if not self.coverage.is_enabled(name):
+                results[name] = {"status": "skipped", "reason": "policy_disabled"}
+                continue
             if not force and not self._is_stale(name):
                 results[name] = {"status": "skipped", "reason": "cache_fresh"}
                 continue
@@ -377,6 +394,7 @@ class UnifiedScheduler:
                     "age_hours": None,
                     "ttl_hours": ttl,
                     "error": None,
+                    "coverage": self.coverage.explain(name),
                 }
                 continue
             age = Store._age_hours(status.get("last_updated"))
@@ -393,6 +411,7 @@ class UnifiedScheduler:
                 "age_hours": round(age, 2) if age is not None else None,
                 "ttl_hours": ttl,
                 "error": status.get("error_message"),
+                "coverage": self.coverage.explain(name),
             }
 
         # Persisted counters only: status must never invoke an embedding call.
