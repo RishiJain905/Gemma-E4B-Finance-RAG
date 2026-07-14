@@ -177,8 +177,19 @@ def _emit_tool_completed(name: str, status: str, *, count=None, elapsed_ms=None,
             name, status, count=count, elapsed_ms=elapsed_ms, subquery_id=subquery_id)
 
 
-def _emit_graph_legacy_intent(intent: dict) -> None:
-    """Emit the compact legacy query -> intent -> retrieval route."""
+def _emit_graph_legacy_intent(intent: dict, *, fallback_reason: Optional[str] = None) -> None:
+    """Emit the compact legacy query -> route(intent) -> retrieval step.
+
+    The legacy intent-parse *is* the routing stage, so its node uses the shared
+    ``stage:route`` id (label stays "Intent" for the reader). This keeps it in
+    the ROUTE column and, critically, lets the observer's tool ``routed_to``
+    edges — which source from ``stage:route`` whenever a tool has no subquery,
+    as legacy tools never do — resolve to a real node instead of dangling.
+
+    ``fallback_reason`` is set only when the adaptive layer demoted to legacy;
+    it marks the routing node as ``fallback`` so that signal survives the merge
+    with the ``stage:route`` node the fallback branch already emitted.
+    """
     emitter = _stream_emitter_var.get()
     if emitter is None or not _graph_observer_enabled():
         return
@@ -186,31 +197,34 @@ def _emit_graph_legacy_intent(intent: dict) -> None:
 
     query_id = emitter.query_id
     query_node = _node_id(query_id, "query", "request")
-    intent_node = _node_id(query_id, "stage", "intent")
+    route_node = _node_id(query_id, "stage", "route")
     retrieve_node = _node_id(query_id, "stage", "retrieve")
+    metadata = {
+        "ticker": intent.get("ticker"),
+        "metrics": list(intent.get("metrics") or ()),
+        "period": intent.get("timeframe"),
+        "kind": intent.get("question_type"),
+    }
+    if fallback_reason:
+        metadata["reason"] = fallback_reason
     emitter.graph_update(
         nodes=[{
-            "id": intent_node,
+            "id": route_node,
             "kind": "stage",
             "label": "Intent",
-            "status": "complete",
-            "metadata": {
-                "ticker": intent.get("ticker"),
-                "metrics": list(intent.get("metrics") or ()),
-                "period": intent.get("timeframe"),
-                "kind": intent.get("question_type"),
-            },
+            "status": "fallback" if fallback_reason else "complete",
+            "metadata": metadata,
         }],
         edges=[
             {
-                "id": _edge_id(query_id, query_node, "compiled_to", intent_node),
+                "id": _edge_id(query_id, query_node, "compiled_to", route_node),
                 "source": query_node,
-                "target": intent_node,
+                "target": route_node,
                 "relation": "compiled_to",
             },
             {
-                "id": _edge_id(query_id, intent_node, "routed_to", retrieve_node),
-                "source": intent_node,
+                "id": _edge_id(query_id, route_node, "routed_to", retrieve_node),
+                "source": route_node,
                 "target": retrieve_node,
                 "relation": "routed_to",
             },
@@ -1355,7 +1369,9 @@ async def _build_legacy_query_context(
     timings = shared["timings"]
     retrieval_query = shared["retrieval_query"]
     retrieval_intent = shared["retrieval_intent"]
-    _emit_graph_legacy_intent(retrieval_intent)
+    _emit_graph_legacy_intent(
+        retrieval_intent, fallback_reason=(orchestration or {}).get("fallback_reason")
+    )
 
     freshness_meta = await _freshness_stage(retrieval_intent, request.refresh, timings)
 

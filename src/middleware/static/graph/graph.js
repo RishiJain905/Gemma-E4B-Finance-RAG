@@ -160,10 +160,16 @@
       case "stage": {
         const name = String(node.label || "").toLowerCase().trim();
         const map = {
-          compile: 0, route: 1, retrieve: 2, grade: 2, correct: 2,
+          compile: 0, route: 1, intent: 1, retrieve: 2, grade: 2, correct: 2,
           pack: 3, generate: 4, validate: 5, "query error": 5,
         };
-        return name in map ? map[name] : 3;
+        if (name in map) return map[name];
+        // Tolerate composed labels ("route · intent"): first known token wins,
+        // so the legacy intent/route node always lands in the ROUTE column.
+        for (const part of name.split(/[^a-z]+/)) {
+          if (part && part in map) return map[part];
+        }
+        return 3;
       }
       default:
         return 3;
@@ -244,8 +250,10 @@ if (typeof document !== "undefined" && document.getElementById("graph-canvas")) 
       pinnedNode: null,
       scrubberMax: 0,
       cap: 5000,
-      corpus: { revision: null, cursor: null, lastQuery: null, nodes: new Map(), edges: new Map() },
+      corpus: { revision: null, cursor: null, lastQuery: null, nodes: new Map(), edges: new Map(), freshAgg: new Map() },
       dragging: false,
+      scrubbing: false,           // slider drag in progress -> instant, no fit
+      scrubRaf: 0,                // coalesces scrub-driven re-renders
       pending: [],                // batched deltas
       rafHandle: 0,
       knownTraceIds: new Set(),
@@ -325,6 +333,12 @@ if (typeof document !== "undefined" && document.getElementById("graph-canvas")) 
           selector: "node[kind = 'ticker'], node[kind='metric'], node[kind='fact'], node[kind='filing'], node[kind='section'], node[kind='document_family'], node[kind='freshness'], node[kind='scheduler_source']",
           style: { "background-color": COL.surface2, "border-color": COL.flow },
         },
+        // Corpus: a ticker whose folded freshness leaves carry a worst status
+        // rings in that status colour (must follow the kind rule to win).
+        { selector: 'node[freshWorst="complete"]', style: { "border-color": COL.supported, "border-width": 2.4 } },
+        { selector: 'node[freshWorst="pending"]', style: { "border-color": COL.pending, "border-width": 2.4 } },
+        { selector: 'node[freshWorst="dropped"]', style: { "border-color": COL.steel, "border-width": 2.4 } },
+        { selector: 'node[freshWorst="error"]', style: { "border-color": COL.conflict, "border-width": 2.4, "border-style": "dashed" } },
       ];
     }
 
@@ -354,6 +368,17 @@ if (typeof document !== "undefined" && document.getElementById("graph-canvas")) 
 
     function activeTrace() {
       return app.activeId ? app.traces.get(app.activeId) : null;
+    }
+
+    // Coalesce scrubber `input` bursts into one render per animation frame and
+    // mark the interaction so renders stay instant and viewport-stable.
+    function scheduleScrubRender() {
+      app.scrubbing = true;
+      if (app.scrubRaf) return;
+      app.scrubRaf = requestAnimationFrame(() => {
+        app.scrubRaf = 0;
+        renderLive();
+      });
     }
 
     function renderLive() {
@@ -390,7 +415,11 @@ if (typeof document !== "undefined" && document.getElementById("graph-canvas")) 
             const col = GS.stageColumnFor(n);
             const w = cy.width() || 900;
             ele.position({ x: (w / 6) * col + w / 12, y: 60 + (Number(n.created_sequence) % 12) * 42 });
-            if (!reduceMotion) { ele.style("opacity", 0); ele.animate({ style: { opacity: 1 } }, { duration: 200 }); }
+            // Fade-in belongs to live streaming only; scrubbing positions
+            // instantly so dragging the slider never triggers entrance motion.
+            // Only the starting opacity is set here — layoutLive owns the ramp
+            // to 1, so its stop(true) can never strand a node invisible.
+            if (!reduceMotion && !app.scrubbing) ele.style("opacity", 0);
           }
         }
         for (const e of edges) {
@@ -408,20 +437,42 @@ if (typeof document !== "undefined" && document.getElementById("graph-canvas")) 
       for (const n of nodes) buckets[GS.stageColumnFor(n)].push(n);
       for (const b of buckets) b.sort((a, c) => Number(a.created_sequence) - Number(c.created_sequence));
       const positions = {};
+      const usableH = Math.max(120, h - 80);
+      const minGap = 46;
       buckets.forEach((bucket, col) => {
-        const gap = Math.min(70, (h - 80) / Math.max(1, bucket.length));
+        const laneLeft = colW * col;
+        const count = bucket.length;
+        // Stagger a tall bucket into 2+ sub-columns within its lane so a long
+        // evidence chain never forces fit() to zoom the whole trace out. A small
+        // bucket keeps the reference look: one centered column.
+        const maxRows = Math.max(1, Math.floor(usableH / minGap));
+        const subCols = Math.max(1, Math.ceil(count / maxRows));
+        const rows = Math.max(1, Math.ceil(count / subCols));
+        const gap = Math.min(70, usableH / rows);
         bucket.forEach((n, i) => {
-          positions[n.id] = { x: colW * col + colW / 2, y: 60 + gap * i + gap / 2 };
+          const sub = Math.floor(i / rows);
+          const row = i % rows;
+          const x = subCols === 1
+            ? laneLeft + colW / 2
+            : laneLeft + (colW * (sub + 1)) / (subCols + 1);
+          positions[n.id] = { x, y: 60 + gap * row + gap / 2 };
         });
       });
+      const instant = reduceMotion || app.scrubbing;
       cy.nodes().forEach((ele) => {
         const p = positions[ele.id()];
         if (!p) return;
-        if (reduceMotion) ele.position(p);
-        else ele.animate({ position: p }, { duration: 200, easing: "ease-out" });
+        ele.stop(true);  // stop AND clear queued motion so rapid renders never stack animations
+        if (instant) { ele.style("opacity", 1); ele.position(p); }
+        else ele.animate({ position: p, style: { opacity: 1 } }, { duration: 200, easing: "ease-out" });
       });
       markHotLanes(buckets);
-      if (app.follow) requestAnimationFrame(() => cy.fit(cy.elements(), 48));
+      // Never re-fit while scrubbing — the viewport must stay put under the slider.
+      if (app.follow && !app.scrubbing) {
+        requestAnimationFrame(() => { cy.fit(cy.elements(), 48); syncStageRail(); });
+      } else {
+        syncStageRail();
+      }
     }
 
     function markHotLanes(buckets) {
@@ -430,6 +481,26 @@ if (typeof document !== "undefined" && document.getElementById("graph-canvas")) 
         const hot = buckets[col] && buckets[col].some((n) => n.status === "active");
         lane.classList.toggle("hot", !!hot);
       });
+    }
+
+    // Keep the DOM stage-rail lanes glued to the Cytoscape viewport: project the
+    // fixed model-space lane geometry (colW = container/6, matching layoutLive)
+    // through the current pan/zoom so lanes and node columns stay aligned after
+    // auto-fit and any manual zoom/pan. Cheap: a direct transform per lane, no
+    // layout thrash. Labels are positioned (not scaled), so text never stretches.
+    function syncStageRail() {
+      if (!cy || app.mode !== "live") return;
+      const rail = $("stage-rail");
+      const lanes = rail.children;
+      if (!lanes.length) return;
+      const z = cy.zoom();
+      const pan = cy.pan();
+      const laneW = (cy.width() || 900) / 6;
+      for (let col = 0; col < lanes.length; col++) {
+        const lane = lanes[col];
+        lane.style.transform = `translateX(${col * laneW * z + pan.x}px)`;
+        lane.style.width = `${laneW * z}px`;
+      }
     }
 
     let dashOffset = 0;
@@ -472,30 +543,99 @@ if (typeof document !== "undefined" && document.getElementById("graph-canvas")) 
     function clearBeam() { if (cy) cy.elements().removeClass("beam dimmed"); }
 
     /* ══ Corpus Explorer ══════════════════════════════════════════════════ */
-    function corpusEle(container) {
-      const nodes = Array.from(app.corpus.nodes.values()).map((n) => ({
-        group: "nodes",
-        data: { id: n.id, label: n.label || n.kind, kind: n.kind, status: "complete", emd: "", raw: n },
-      }));
-      const ids = new Set(nodes.map((n) => n.data.id));
-      const edges = Array.from(app.corpus.edges.values())
-        .filter((e) => ids.has(e.source) && ids.has(e.target))
-        .map((e) => ({ group: "edges", data: { id: e.id, source: e.source, target: e.target, relation: e.relation, raw: e } }));
-      return { nodes, edges, hidden: container };
+    // Freshness leaf status -> node status colour; worst wins per ticker.
+    const FRESH_RANK = { complete: 0, pending: 1, dropped: 2, error: 3 };
+    function freshStatus(raw) {
+      const v = String(raw || "").toLowerCase();
+      if (v.includes("error") || v.includes("fail")) return "error";
+      if (v.includes("never") || v.includes("miss")) return "dropped";
+      if (v.includes("stale") || v.includes("expired") || v.includes("due") || v.includes("pending")) return "pending";
+      if (v.includes("fresh") || v.includes("ok") || v.includes("current")) return "complete";
+      return "pending";  // unknown reads as "needs attention", never a false green
     }
+
+    // Fold the ~150 freshness leaves out of the CANVAS view: aggregate each into
+    // its ticker (worst-status ring + per-status counts) so the overview reads
+    // as sources + tickers instead of a hairball. The full node set still flows
+    // to the list/table/inspector — folding is purely a canvas concern.
+    function foldCorpusForCanvas(rawNodes, rawEdges) {
+      const byId = new Map(rawNodes.map((n) => [n.id, n]));
+      const freshToTicker = new Map();
+      for (const e of rawEdges) {
+        if (e.relation === "freshness_for") freshToTicker.set(e.source, e.target);
+      }
+      const agg = new Map();       // tickerId -> { counts, worst }
+      const folded = new Set();    // freshness node ids removed from canvas
+      for (const n of rawNodes) {
+        if (n.kind !== "freshness") continue;
+        const tickerId = freshToTicker.get(n.id);
+        if (!tickerId || !byId.has(tickerId)) continue;  // orphan freshness stays visible
+        folded.add(n.id);
+        const status = freshStatus((n.metadata && n.metadata.status) || "");
+        const entry = agg.get(tickerId) || { counts: {}, worst: "complete" };
+        entry.counts[status] = (entry.counts[status] || 0) + 1;
+        if (FRESH_RANK[status] > FRESH_RANK[entry.worst]) entry.worst = status;
+        agg.set(tickerId, entry);
+      }
+      app.corpus.freshAgg = agg;
+
+      const nodes = [];
+      for (const n of rawNodes) {
+        if (folded.has(n.id)) continue;
+        const data = { id: n.id, label: n.label || n.kind, kind: n.kind, status: "complete", emd: "", raw: n };
+        const summary = agg.get(n.id);
+        if (n.kind === "ticker" && summary) {
+          data.freshWorst = summary.worst;
+          data.status = summary.worst;
+        }
+        nodes.push({ group: "nodes", data });
+      }
+      const ids = new Set(nodes.map((n) => n.data.id));
+      const edges = Array.from(rawEdges)
+        .filter((e) => !folded.has(e.source) && !folded.has(e.target) && ids.has(e.source) && ids.has(e.target))
+        .map((e) => ({ group: "edges", data: { id: e.id, source: e.source, target: e.target, relation: e.relation, raw: e } }));
+      return { nodes, edges, foldedCount: folded.size };
+    }
+
+    // Label level-of-detail: hubs (sources, tickers) always labelled; leaf labels
+    // fade in only past a zoom threshold, keeping the overview free of label soup.
+    let corpusLeafLabelsShown = true;
+    function updateCorpusLabelLOD(force) {
+      if (!cy || app.mode !== "corpus") return;
+      const show = cy.zoom() >= 0.6;
+      if (!force && show === corpusLeafLabelsShown) return;
+      corpusLeafLabelsShown = show;
+      cy.batch(() => {
+        cy.nodes().forEach((ele) => {
+          const kind = ele.data("kind");
+          if (kind === "source" || kind === "ticker") return;
+          ele.style("text-opacity", show ? 1 : 0);
+        });
+      });
+    }
+
     function renderCorpus() {
       if (!cy) return;
-      const { nodes, edges } = corpusEle();
+      const rawNodes = Array.from(app.corpus.nodes.values());
+      const rawEdges = Array.from(app.corpus.edges.values());
+      const { nodes, edges } = foldCorpusForCanvas(rawNodes, rawEdges);
       $("canvas-empty").hidden = nodes.length > 0;
       if (!nodes.length) $("canvas-empty").textContent = "Search the corpus or pick a source group to expand.";
       cy.elements().remove();
       cy.add(nodes);
       cy.add(edges);
       if (nodes.length) {
-        const layout = cy.layout({ name: "cose", animate: !reduceMotion, animationDuration: 300, fit: true, padding: 40, nodeRepulsion: 6000 });
+        const layout = cy.layout({
+          name: "cose", animate: !reduceMotion, animationDuration: 400, fit: true,
+          padding: 60, nodeRepulsion: 14000, idealEdgeLength: 140, edgeElasticity: 100,
+          gravity: 0.22, componentSpacing: 140, nodeOverlap: 20, randomize: false,
+        });
         layout.run();
+        corpusLeafLabelsShown = true;   // force LOD to re-evaluate against post-fit zoom
+        updateCorpusLabelLOD(true);
       }
-      syncSecondaryViews(nodes.map((n) => n.data.raw), edges.map((e) => e.data.raw));
+      // List/table/inspector see the complete corpus — freshness stays inspectable.
+      syncSecondaryViews(rawNodes, rawEdges);
       $("hidden-count").textContent = app.corpus.cursor ? "more pages available" : "";
       $("btn-corpus-more").hidden = !app.corpus.cursor;
     }
@@ -726,6 +866,21 @@ if (typeof document !== "undefined" && document.getElementById("graph-canvas")) 
         dl.appendChild(dt); dl.appendChild(dd);
       }
 
+      // Corpus tickers surface their folded freshness rollup (counts by status)
+      // so the data folded off the canvas stays visible where you inspect it.
+      if (app.mode === "corpus" && node.kind === "ticker" && app.corpus.freshAgg) {
+        const summary = app.corpus.freshAgg.get(node.id);
+        if (summary) {
+          const total = Object.keys(summary.counts).reduce((sum, s) => sum + summary.counts[s], 0);
+          const parts = Object.keys(summary.counts).sort().map((s) => `${summary.counts[s]} ${s}`);
+          const dt = document.createElement("dt");
+          dt.textContent = "freshness";
+          const dd = document.createElement("dd");
+          dd.textContent = `${total} tracked · ${parts.join(", ")}`;
+          dl.appendChild(dt); dl.appendChild(dd);
+        }
+      }
+
       const excerpt = node.excerpt || (node.kind === "evidence" ? node.summary : "");
       $("insp-excerpt-wrap").hidden = !excerpt;
       $("insp-excerpt").textContent = excerpt || "";
@@ -901,13 +1056,13 @@ if (typeof document !== "undefined" && document.getElementById("graph-canvas")) 
         else renderCorpus();
       } else {
         renderLive();
+        syncStageRail();
       }
     }
 
     /* ══ 7. Bootstrap + events ════════════════════════════════════════════ */
     function buildStageRail() {
       const rail = $("stage-rail");
-      rail.style.gridTemplateColumns = "repeat(6, 1fr)";
       rail.replaceChildren();
       for (const name of GS.STAGE_COLUMNS) {
         const lane = document.createElement("div");
@@ -918,6 +1073,7 @@ if (typeof document !== "undefined" && document.getElementById("graph-canvas")) 
         lane.appendChild(label);
         rail.appendChild(lane);
       }
+      syncStageRail();
     }
     function buildLegend() {
       const legend = $("legend");
@@ -950,6 +1106,10 @@ if (typeof document !== "undefined" && document.getElementById("graph-canvas")) 
         cy.on("dbltap", "node", (evt) => { if (app.mode === "corpus") corpusExpand(evt.target.id()); });
         cy.on("grab", () => { app.dragging = true; });
         cy.on("free", () => { app.dragging = false; });
+        // Reproject the stage rail whenever the viewport moves so lanes track
+        // node columns through auto-fit, manual zoom, pan, and container resize.
+        cy.on("pan zoom resize", syncStageRail);
+        cy.on("zoom", () => updateCorpusLabelLOD());
         return true;
       } catch (err) {
         showError("Graph renderer failed to start", err);
@@ -1032,6 +1192,12 @@ if (typeof document !== "undefined" && document.getElementById("graph-canvas")) 
         app.atLiveSticky = app.scrubberValue >= app.scrubberMax;
         $("scrubber-value").textContent = app.atLiveSticky ? "live" : `seq ${app.scrubberValue}`;
         $("scrubber").setAttribute("aria-valuetext", app.atLiveSticky ? "live" : `sequence ${app.scrubberValue}`);
+        scheduleScrubRender();
+      });
+      // Drag end (or keyboard commit): leave scrub mode so live updates animate
+      // and follow-fit resumes. atLiveSticky already tracks whether we're at head.
+      $("scrubber").addEventListener("change", () => {
+        app.scrubbing = false;
         renderLive();
       });
 
@@ -1122,11 +1288,11 @@ if (typeof document !== "undefined" && document.getElementById("graph-canvas")) 
       if (!okConfig) return;
       const rendererReady = initCytoscape();
       wireControls();
-      if (rendererReady) requestAnimationFrame(tickDash);
+      if (rendererReady) { requestAnimationFrame(tickDash); syncStageRail(); }
       await refreshTraceList();
       await applyTraceHash();
       connect();
-      window.addEventListener("resize", () => { if (app.mode === "live") renderLive(); });
+      window.addEventListener("resize", () => { if (app.mode === "live") { renderLive(); syncStageRail(); } });
       window.addEventListener("hashchange", () => { applyTraceHash(); });
     }
 

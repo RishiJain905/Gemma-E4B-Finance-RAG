@@ -241,3 +241,35 @@ def test_graph_js_supports_trace_deep_link_from_hash():
     assert "applyTraceHash" in js
     assert "location.hash" in js
     assert "hashchange" in js
+
+
+# ── 2.2.7.x graph-UI defect fixes (guard against regression) ─────────────────
+
+def test_graph_js_maps_legacy_intent_to_route_column():
+    """Defect 1: the legacy intent/route stage node lands in the ROUTE column."""
+    js = JS.read_text(encoding="utf-8")
+    assert "intent: 1" in js
+
+
+def test_graph_js_syncs_stage_rail_to_viewport():
+    """Defect 3: the stage rail is projected through the Cytoscape viewport."""
+    js = JS.read_text(encoding="utf-8")
+    assert "syncStageRail" in js
+    assert "pan zoom resize" in js
+    assert "cy.zoom()" in js and "cy.pan()" in js
+
+
+def test_graph_js_scrubber_is_raf_throttled_and_instant():
+    """Defect 4: scrubbing coalesces per frame, positions instantly, no re-fit."""
+    js = JS.read_text(encoding="utf-8")
+    assert "scheduleScrubRender" in js
+    assert "app.scrubbing" in js
+    assert "ele.stop(true)" in js
+
+
+def test_graph_js_folds_corpus_freshness_leaves():
+    """Defect 5: freshness leaves fold into their ticker; leaf labels use LOD."""
+    js = JS.read_text(encoding="utf-8")
+    assert "foldCorpusForCanvas" in js
+    assert "updateCorpusLabelLOD" in js
+    assert "freshWorst" in js

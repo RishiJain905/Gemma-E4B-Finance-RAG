@@ -265,14 +265,18 @@ button, select, input {
   display: none;
   pointer-events: none;
   z-index: 0;
+  overflow: hidden;
 }
-[data-mode="live"] .stage-rail { display: grid; }
+[data-mode="live"] .stage-rail { display: block; }
+/* Lanes are projected onto the Cytoscape viewport by JS (syncStageRail): each
+   lane's translateX + width are set in screen px so lanes track node columns
+   through auto-fit, zoom, and pan. */
 .stage-rail .lane {
+  position: absolute; top: 0; bottom: 0; left: 0;
   border-right: 1px solid var(--hairline);
-  position: relative;
   opacity: 0.55;
+  will-change: transform, width;
 }
-.stage-rail .lane:last-child { border-right: 0; }
 .stage-rail .lane-label {
   position: absolute; top: 8px; left: 50%; transform: translateX(-50%);
   font-size: 11px; text-transform: uppercase; letter-spacing: 0.14em;

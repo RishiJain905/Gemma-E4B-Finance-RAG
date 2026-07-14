@@ -419,6 +419,65 @@ async def test_legacy_path_uses_executed_retrieval_once_and_builds_small_trace(m
 
 
 @pytest.mark.asyncio
+async def test_legacy_tool_edges_resolve_to_the_shared_route_node(monkeypatch):
+    """Legacy tools carry no subquery, so the observer sources their ``routed_to``
+    edges from ``stage:route``. The legacy intent node must therefore BE
+    ``stage:route`` or every such edge dangles and the ROUTE column shows no
+    fan-out (Defect 2). Drive the real tool-emit path (which the small-trace test
+    above never exercises) and assert the routing node exists and the edges land."""
+    from src.middleware import app as middleware_app
+    from src.middleware.config import MiddlewareConfig
+    from src.middleware.graph_observer import TraceHub, _node_id
+    from src.middleware.models import QueryRequest
+
+    class ToolEmittingRetriever:
+        def retrieve(self, **_kwargs):
+            # A legacy dispatch: tool events with no subquery_id.
+            middleware_app._emit_tool_started("query_facts")
+            middleware_app._emit_tool_completed("query_facts", "ok", count=1)
+            return {
+                "facts": [{
+                    "id": "fact-1", "ticker": "AAPL", "metric": "revenue",
+                    "value": 10, "period": "2025", "source_type": "sec_10k",
+                }],
+                "documents": [], "retrieval_strategy": "hybrid", "timings": {},
+            }
+
+    async def freshness(*_args, **_kwargs):
+        return {"overall": "fresh"}
+
+    config = MiddlewareConfig()
+    config.enable_graph_observer = True
+    config.enable_adaptive_rag = False
+    monkeypatch.setattr(middleware_app, "config", config)
+    monkeypatch.setattr(middleware_app, "store", object())
+    monkeypatch.setattr(middleware_app, "retriever", ToolEmittingRetriever())
+    monkeypatch.setattr(middleware_app, "graph_hub", TraceHub())
+    monkeypatch.setattr(middleware_app, "_freshness_stage", freshness)
+
+    request = QueryRequest(question="What was AAPL revenue?", refresh=False)
+    emitter = middleware_app._install_query_emitter(request, chat_events=False)
+    context = await middleware_app._build_query_context(request)
+    middleware_app._emit_graph_terminal(
+        context, model_available=False, evidence_citations=[], validation=None
+    )
+
+    snapshot = middleware_app.graph_hub.snapshot(emitter.query_id)
+    _assert_graph_integrity(snapshot)  # no dangling edges anywhere in the trace
+    node_ids = {node["id"] for node in snapshot["nodes"]}
+    route_id = _node_id(emitter.query_id, "stage", "route")
+    tool_ids = {n["id"] for n in snapshot["nodes"] if n["kind"] == "tool"}
+    assert route_id in node_ids, "legacy routing node must use the shared stage:route id"
+    assert tool_ids, "the dispatched tool must appear as a node"
+    routed = [
+        edge for edge in snapshot["edges"]
+        if edge["relation"] == "routed_to" and edge["target"] in tool_ids
+    ]
+    assert routed, "the ROUTE column must fan out to the tool"
+    assert all(edge["source"] == route_id for edge in routed)
+
+
+@pytest.mark.asyncio
 async def test_adaptive_path_projects_actual_plan_lane_and_selected_evidence(monkeypatch):
     from src.middleware import adaptive_orchestrator, app as middleware_app
     from src.middleware.adaptive_orchestrator import ContextSelection, Lane, OrchestrationResult
