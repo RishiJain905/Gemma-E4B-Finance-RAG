@@ -32,6 +32,7 @@ import httpx
 import yaml
 
 from src.storage.store import Store
+from src.universe.coverage import CoverageResolver
 
 logger = logging.getLogger(__name__)
 
@@ -84,8 +85,11 @@ class GDELTIngestor:
         self,
         store: Optional[Store] = None,
         config_path: Optional[Path] = None,
+        coverage_resolver: Optional[CoverageResolver] = None,
     ):
         self.store = store or Store()
+        self._coverage_injected = coverage_resolver is not None
+        self.coverage = coverage_resolver or CoverageResolver(self.store)
         self.config = self._load_config(config_path)
         self._gkg_file_cache: dict[str, dict[str, float]] = {}
 
@@ -231,18 +235,24 @@ class GDELTIngestor:
         Returns:
             {ticker: articles_stored}
         """
-        from src.ingestion.yfinance_ingestor import YFinanceIngestor
-
-        ingestor = YFinanceIngestor(store=self.store)
         results = {}
 
-        for ticker in ingestor.core_tickers:
+        for ticker in self._batch_tickers("gdelt"):
             count = self.fetch_and_store_for_ticker(
                 ticker, max_records=100,
             )
             results[ticker] = count
 
         return results
+
+    def _batch_tickers(self, source_name: str) -> list[str]:
+        """Use the legacy core list only while a fresh registry is empty."""
+        rows = self.store.list_securities(active=None, limit=1, offset=0)
+        if not self._coverage_injected and (not isinstance(rows, list) or not rows):
+            from src.ingestion.yfinance_ingestor import YFinanceIngestor
+
+            return list(YFinanceIngestor(store=self.store).core_tickers)
+        return self.coverage.tickers_for(source_name)
 
     # ── Tone Analysis ─────────────────────────────────
 

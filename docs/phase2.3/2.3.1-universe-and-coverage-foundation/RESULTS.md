@@ -1,5 +1,53 @@
 # 2.3.1 — Universe and Coverage Foundation — Results
 
+## 2.3.1.2 Coverage Tiers and Source Policy
+
+**Implemented:** 2026-07-14, branch `phase-2.3.1`, gpt-5.6-sol (effort high) via Codex, orchestrated by Claude (Fable 5).
+
+### Setup
+
+- `CoverageResolver` (`src/universe/coverage.py`): read-only policy engine over
+  the 2.3.1.1 registry + `configs/coverage.yaml` — `tickers_for`, `scopes_for`,
+  `is_enabled`, `explain`. Never contacts providers, never mutates membership.
+- Scopes: `universe` / `broad` (active index union) / `deep` (explicit research
+  list, additive) / `sector` / `global`, with the spec's default source policy so
+  deep-only sources (full filing text, CompanyFacts, IR, transcripts, estimates,
+  GDELT) can never fan out to the broad universe.
+- Converted `src/scheduler/__init__.py`, `yfinance_ingestor`, `sec/scheduler`,
+  `earnings_transcripts`, `estimates_ingestor`, `gdelt_ingestor`, `ir_ingestor`
+  to resolve tickers through the policy. Legacy `core`/`extended` watchlist keys
+  remain as a deprecated one-release compatibility mirror (warning + same deep
+  list, tested).
+- Unknown deep tickers are validation errors unless `allow_outside_indexes` is
+  set. Policy decisions are deterministic and explainable (scope, inclusion
+  reason, enabled capabilities, policy revision); no secrets/paths exposed.
+
+### Before / after
+
+| Metric | Before | After |
+|---|---|---|
+| Source scoping | one shared `core` ticker list for every source | per-source capability policy over registry scopes |
+| Deep fan-out risk | `fetch_all_core()` reuse could hit every ticker | deep sources bounded to explicit list (tested invariant) |
+| Offline test count | 1,387 | 1,400 passed / 1 skipped (57 focused policy tests) |
+
+### Regression gate
+
+Full offline suite 1,400 passed / 1 skipped / 7 deselected; ruff clean;
+`scripts/verify.ps1` → **VERIFY: PASS** (implementer run + independent
+orchestrator re-run before commit).
+
+### Caveats
+
+- Fresh-install fallback: with an empty securities registry, broad sources
+  receive exactly `deep.tickers` (no broad additions) until the first universe
+  snapshot lands — prevents accidental fan-out; documented in CONFIGURATION.md.
+- Legacy watchlist keys are scheduled for removal after one release.
+
+### Decision
+
+**Ship.** No retrieval/prompt surface touched (ingestion scoping only), so
+answer quality is unaffected; rollback = revert the task commit.
+
 ## 2.3.1.1 Security Universe and Membership History
 
 **Implemented:** 2026-07-14, branch `phase-2.3.1`, gpt-5.6-sol (effort high) via Codex, orchestrated by Claude (Fable 5).

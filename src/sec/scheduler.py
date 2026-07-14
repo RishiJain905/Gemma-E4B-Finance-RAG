@@ -17,6 +17,7 @@ from typing import Optional
 
 from .filing_processor import FilingProcessor
 from src.storage.store import Store
+from src.universe.coverage import CoverageResolver
 
 logger = logging.getLogger(__name__)
 
@@ -39,12 +40,25 @@ class FilingScheduler:
         self,
         store: Optional[Store] = None,
         processor: Optional[FilingProcessor] = None,
+        coverage_resolver: Optional[CoverageResolver] = None,
     ):
         self.store = store or Store()
         self.processor = processor or FilingProcessor(store=self.store)
+        self._coverage_injected = coverage_resolver is not None
+        self.coverage = coverage_resolver or CoverageResolver(self.store)
 
         # Load the SEC filing TTL from watchlist config
         self.ttl_hours = self._load_filing_ttl()
+
+    def _tickers_for(self, source_name: str) -> list[str]:
+        """Resolve policy tickers, retaining the fresh-install legacy seam."""
+        if not self._coverage_injected and not self.store.list_securities(
+            active=None, limit=1, offset=0
+        ):
+            from src.ingestion.yfinance_ingestor import YFinanceIngestor
+
+            return list(YFinanceIngestor(store=self.store).core_tickers)
+        return self.coverage.tickers_for(source_name)
 
     def _load_filing_ttl(self) -> int:
         """Load the SEC filing discovery TTL from watchlist config."""
@@ -77,10 +91,7 @@ class FilingScheduler:
                 "details": {ticker: new_count}
             }
         """
-        from src.ingestion.yfinance_ingestor import YFinanceIngestor
-
-        ingestor = YFinanceIngestor(store=self.store)
-        tickers = ingestor.core_tickers
+        tickers = self._tickers_for("sec_filings")
 
         result = {
             "checked": 0,
@@ -162,7 +173,17 @@ class FilingScheduler:
 
         discovery_result = self.run_discovery(force=force)
 
-        processing_result = self.processor.process_pending_filings(limit=50)
+        broad_tickers = set(self._tickers_for("sec_filings"))
+        deep_tickers = self._tickers_for("sec_filing_text")
+        if broad_tickers == set(deep_tickers):
+            processing_result = self.processor.process_pending_filings(limit=50)
+        else:
+            processing_result = {"processed": 0, "failed": 0, "errors": []}
+            for ticker in deep_tickers:
+                ticker_result = self.processor.process_ticker(ticker, limit=50)
+                processing_result["processed"] += int(ticker_result.get("processed", 0))
+                processing_result["failed"] += int(ticker_result.get("failed", 0))
+                processing_result["errors"].extend(ticker_result.get("errors", []) or [])
 
         report = {
             "discovery": discovery_result,
@@ -194,12 +215,9 @@ class FilingScheduler:
                 "pipeline": {total_unprocessed, total_parsed, ...},
             }
         """
-        from src.ingestion.yfinance_ingestor import YFinanceIngestor
-
-        ingestor = YFinanceIngestor(store=self.store)
         discovery_status = []
 
-        for ticker in ingestor.core_tickers:
+        for ticker in self._tickers_for("sec_filings"):
             cache = self.store.get_cache_status(ticker, self.DISCOVERY_SOURCE)
             if cache:
                 age = None
@@ -245,9 +263,6 @@ class FilingScheduler:
 
         Next discovery run will re-check all tickers regardless of TTL.
         """
-        from src.ingestion.yfinance_ingestor import YFinanceIngestor
-
-        ingestor = YFinanceIngestor(store=self.store)
-        for ticker in ingestor.core_tickers:
+        for ticker in self._tickers_for("sec_filings"):
             self.store.upsert_cache_stale(ticker, self.DISCOVERY_SOURCE)
-        logger.info("Filing discovery cache reset for all core tickers")
+        logger.info("Filing discovery cache reset for all policy tickers")

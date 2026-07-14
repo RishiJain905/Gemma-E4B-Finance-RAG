@@ -1,0 +1,93 @@
+# configs/coverage.yaml
+# Source-aware security coverage policy. This file contains no provider credentials.
+revision: "2.3.1.2-r1"
+fallback_when_registry_empty: deep
+
+deep:
+  tickers: [NVDA, AMD, AAPL, MSFT, META, CRWD]
+  allow_outside_indexes: []
+
+broad:
+  additions: [GOOGL, AMZN, TSLA, AVGO, ORCL, INTC, QCOM, PANW, PLTR, SNOW]
+
+sector:
+  rules:
+    health_care: [Health Care, Healthcare]
+    automotive: [Consumer Discretionary, Automotive]
+    government_contractors: [Industrials, Aerospace & Defense]
+
+sources:
+  universe_ivv:
+    enabled: true
+    scopes: [universe]
+    capabilities: [index_membership]
+  universe_nasdaq100:
+    enabled: true
+    scopes: [universe]
+    capabilities: [index_membership]
+  universe_sec:
+    enabled: true
+    scopes: [universe]
+    capabilities: [security_identity]
+
+  yfinance:
+    enabled: true
+    scopes: [broad]
+    capabilities: [market_summary, company_news]
+  yfinance_fundamentals:
+    enabled: true
+    scopes: [broad]
+    capabilities: [market_summary]
+  yfinance_news:
+    enabled: true
+    scopes: [broad]
+    capabilities: [company_news]
+  sec_filings:
+    enabled: true
+    scopes: [broad]
+    capabilities: [sec_event_discovery]
+  sec_filing_text:
+    enabled: true
+    scopes: [deep]
+    capabilities: [full_filing_text]
+  sec_companyfacts:
+    enabled: true
+    scopes: [deep]
+    capabilities: [sec_companyfacts]
+  earnings_transcripts:
+    enabled: true
+    scopes: [deep]
+    capabilities: [earnings_transcripts]
+  ir_pages:
+    enabled: true
+    scopes: [deep]
+    capabilities: [investor_relations]
+  estimates:
+    enabled: true
+    scopes: [deep]
+    capabilities: [analyst_estimates]
+  gdelt:
+    enabled: true
+    optional: true
+    scopes: [deep]
+    capabilities: [gdelt_news]
+  fred:
+    enabled: true
+    scopes: [global]
+    capabilities: [official_macro]
+
+  openfda:
+    enabled: false
+    scopes: [sector]
+    sector_rules: [health_care]
+    capabilities: [regulatory_events]
+  nhtsa:
+    enabled: false
+    scopes: [sector]
+    sector_rules: [automotive]
+    capabilities: [vehicle_safety_events]
+  usaspending:
+    enabled: false
+    scopes: [sector]
+    sector_rules: [government_contractors]
+    capabilities: [government_awards]
