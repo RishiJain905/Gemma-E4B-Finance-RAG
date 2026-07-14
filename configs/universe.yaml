@@ -1,0 +1,22 @@
+# Security universe provider configuration (Phase 2.3.1.1).
+providers:
+  nasdaq100:
+    enabled: true
+    source: nasdaq
+    index_code: nasdaq100
+    url: https://www.nasdaq.com/solutions/global-indexes/nasdaq-100/companies
+    min_constituents: 90
+    timeout_seconds: 30
+  sp500:
+    enabled: true
+    source: ivv
+    index_code: sp500
+    url: https://www.ishares.com/us/products/239726/ishares-core-sp-500-etf/1467271812596.ajax?fileType=csv&fileName=IVV_holdings&dataType=fund
+    min_constituents: 450
+    timeout_seconds: 30
+  sec_identity:
+    enabled: true
+    source: sec
+    url: https://www.sec.gov/files/company_tickers_exchange.json
+    min_records: 1000
+    timeout_seconds: 30

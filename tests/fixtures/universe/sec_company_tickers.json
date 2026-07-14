@@ -1,0 +1,8 @@
+{
+  "0": {"cik_str": 320193, "ticker": "AAPL", "title": "Apple Inc.", "exchange": "Nasdaq"},
+  "1": {"cik_str": 1652044, "ticker": "GOOG", "title": "Alphabet Inc. Class C", "exchange": "Nasdaq"},
+  "2": {"cik_str": 1652044, "ticker": "GOOGL", "title": "Alphabet Inc. Class A", "exchange": "Nasdaq"},
+  "3": {"cik_str": 1067983, "ticker": "BRK-A", "title": "Berkshire Hathaway Inc. Class A", "exchange": "NYSE"},
+  "4": {"cik_str": 1067983, "ticker": "BRK-B", "title": "Berkshire Hathaway Inc. Class B", "exchange": "NYSE"},
+  "5": {"cik_str": 789019, "ticker": "MSFT", "title": "Microsoft Corporation", "exchange": "Nasdaq"}
+}

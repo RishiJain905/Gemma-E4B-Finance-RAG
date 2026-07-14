@@ -3,6 +3,7 @@ src/storage/sqlite_store.py
 SQLite storage layer for structured financial data.
 """
 
+import json
 import logging
 import sqlite3
 import uuid
@@ -186,6 +187,85 @@ CREATE INDEX IF NOT EXISTS idx_filings_ticker ON filings(ticker);
 CREATE INDEX IF NOT EXISTS idx_filings_status ON filings(status);
 CREATE INDEX IF NOT EXISTS idx_cache_meta_status ON cache_meta(status);
 CREATE INDEX IF NOT EXISTS idx_ingestion_log_run ON ingestion_log(run_id);
+-- -- Security Universe (2.3.1.1) ---------------------------------------------
+CREATE TABLE IF NOT EXISTS securities (
+    security_id TEXT PRIMARY KEY,
+    ticker TEXT NOT NULL,
+    normalized_ticker TEXT NOT NULL,
+    company_name TEXT NOT NULL,
+    exchange TEXT NOT NULL DEFAULT '',
+    cik TEXT,
+    security_type TEXT NOT NULL DEFAULT 'common_stock',
+    share_class TEXT,
+    sector TEXT,
+    industry TEXT,
+    active INTEGER NOT NULL DEFAULT 1 CHECK (active IN (0, 1)),
+    first_seen_at TEXT NOT NULL,
+    last_seen_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(normalized_ticker, exchange)
+);
+
+CREATE TABLE IF NOT EXISTS security_aliases (
+    alias_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    security_id TEXT NOT NULL REFERENCES securities(security_id),
+    alias TEXT NOT NULL,
+    normalized_alias TEXT NOT NULL,
+    alias_type TEXT NOT NULL CHECK (
+        alias_type IN ('ticker', 'vendor_symbol', 'former_ticker')
+    ),
+    provider TEXT,
+    valid_from TEXT,
+    valid_to TEXT,
+    source TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS security_memberships (
+    membership_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    security_id TEXT NOT NULL REFERENCES securities(security_id),
+    index_code TEXT NOT NULL CHECK (index_code IN ('sp500', 'nasdaq100')),
+    effective_from TEXT NOT NULL,
+    effective_to TEXT,
+    active INTEGER NOT NULL DEFAULT 1 CHECK (active IN (0, 1)),
+    source TEXT NOT NULL,
+    source_url TEXT,
+    observed_at TEXT NOT NULL,
+    UNIQUE(security_id, index_code, effective_from)
+);
+
+CREATE TABLE IF NOT EXISTS universe_errors (
+    error_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id TEXT NOT NULL,
+    source TEXT NOT NULL,
+    symbol TEXT,
+    error_code TEXT NOT NULL,
+    message TEXT NOT NULL,
+    payload TEXT,
+    observed_at TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_securities_active_ticker
+    ON securities(active, normalized_ticker);
+CREATE INDEX IF NOT EXISTS idx_securities_cik ON securities(cik);
+CREATE INDEX IF NOT EXISTS idx_securities_sector ON securities(sector);
+CREATE INDEX IF NOT EXISTS idx_securities_last_seen ON securities(last_seen_at);
+CREATE INDEX IF NOT EXISTS idx_security_aliases_lookup
+    ON security_aliases(normalized_alias, provider, valid_from, valid_to);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_security_aliases_active_global
+    ON security_aliases(normalized_alias)
+    WHERE valid_to IS NULL AND provider IS NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_security_aliases_active_provider
+    ON security_aliases(normalized_alias, provider)
+    WHERE valid_to IS NULL AND provider IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_memberships_active_index
+    ON security_memberships(index_code, active, security_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_memberships_one_active
+    ON security_memberships(security_id, index_code)
+    WHERE active = 1;
+CREATE INDEX IF NOT EXISTS idx_universe_errors_run ON universe_errors(run_id);
+
 """
 
     # ── Fundamentals CRUD ─────────────────────────────
@@ -554,6 +634,758 @@ CREATE INDEX IF NOT EXISTS idx_ingestion_log_run ON ingestion_log(run_id);
 
     # ── Query Support (for middleware) ─────────────────
 
+    # -- Security Universe (2.3.1.1) -----------------------------------------
+
+    @staticmethod
+    def _normalize_universe_symbol(symbol: object) -> str:
+        """Normalize dot/slash share-class spellings to the canonical dash form."""
+        import re
+
+        value = str(symbol or "").strip().upper()
+        value = re.sub(r"[./]", "-", value)
+        return re.sub(r"\s+", "", value)
+
+    @staticmethod
+    def _normalize_exchange(exchange: object) -> str:
+        """Normalize common exchange labels used by the three providers."""
+        value = str(exchange or "").strip().upper()
+        if value.startswith("NASDAQ"):
+            return "NASDAQ"
+        if value.startswith("NEW YORK STOCK EXCHANGE") or value == "NYSE":
+            return "NYSE"
+        return value
+
+    @staticmethod
+    def _normalize_company_identity(company_name: object) -> str:
+        """Return a conservative comparison form for CIK-only identity matches."""
+        import re
+
+        value = re.sub(r"[^A-Z0-9]+", " ", str(company_name or "").upper())
+        return re.sub(r"\s+", " ", value).strip()
+
+    @staticmethod
+    def _share_class_parts(symbol: object) -> tuple[str, Optional[str]]:
+        """Split explicit dash-suffixed share classes such as BRK-A and BRK-B."""
+        import re
+
+        value = str(symbol or "")
+        match = re.fullmatch(r"(.+)-([A-Z])", value)
+        return (match.group(1), match.group(2)) if match else (value, None)
+
+    @classmethod
+    def _symbols_look_like_share_classes(cls, first: object, second: object) -> bool:
+        """Recognize common listed share-class symbol pairs conservatively."""
+        first_value = str(first or "")
+        second_value = str(second or "")
+        if first_value == second_value:
+            return False
+        first_base, first_class = cls._share_class_parts(first_value)
+        second_base, second_class = cls._share_class_parts(second_value)
+        if first_base == second_base and (first_class or second_class):
+            return True
+        shorter, longer = sorted((first_value, second_value), key=len)
+        return len(shorter) >= 2 and len(longer) == len(shorter) + 1 and longer.startswith(
+            shorter
+        )
+
+    @staticmethod
+    def _normalize_cik(cik: object) -> Optional[str]:
+        """Return a zero-padded SEC CIK, or None when the provider omitted it."""
+        value = str(cik or "").strip()
+        if not value:
+            return None
+        if not value.isdigit():
+            raise ValueError(f"invalid CIK: {value}")
+        return value.zfill(10)
+
+    @staticmethod
+    def _normalize_observed_at(observed_at: object) -> tuple[str, str]:
+        """Validate an ISO observation timestamp and return it plus its date."""
+        value = str(observed_at or "").strip()
+        if not value:
+            raise ValueError("observed_at is required")
+        try:
+            datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError as exc:
+            raise ValueError("observed_at must be an ISO date or timestamp") from exc
+        return value, value[:10]
+
+    @staticmethod
+    def _universe_row_dict(row: object) -> dict:
+        """Accept provider dataclasses or plain dictionaries at the Store seam."""
+        if isinstance(row, dict):
+            return dict(row)
+        as_dict = getattr(row, "as_dict", None)
+        if callable(as_dict):
+            return dict(as_dict())
+        raise TypeError("universe rows must be dictionaries or UniverseRecord values")
+
+    @staticmethod
+    def _record_universe_error(
+        conn: sqlite3.Connection,
+        *,
+        run_id: str,
+        source: str,
+        row: dict,
+        error_code: str,
+        message: str,
+        observed_at: str,
+    ) -> None:
+        """Persist one bounded reconciliation error inside the snapshot transaction."""
+        conn.execute(
+            """
+            INSERT INTO universe_errors (
+                run_id, source, symbol, error_code, message, payload, observed_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                run_id,
+                source,
+                str(row.get("symbol") or "")[:32],
+                error_code,
+                message[:500],
+                json.dumps(row, sort_keys=True, default=str)[:4000],
+                observed_at,
+            ),
+        )
+
+    @staticmethod
+    def _security_candidates(rows: list[sqlite3.Row]) -> list[dict]:
+        """Deduplicate joined identity candidates by security id."""
+        candidates: dict[str, dict] = {}
+        for row in rows:
+            item = dict(row)
+            candidates[item["security_id"]] = item
+        return list(candidates.values())
+
+    def _find_universe_security(
+        self,
+        conn: sqlite3.Connection,
+        row: dict,
+        *,
+        observed_date: str,
+        multi_symbol_ciks: set[str],
+    ) -> tuple[Optional[dict], Optional[str]]:
+        """Return one safe identity match, or an explicit ambiguity code."""
+        normalized = row["normalized_symbol"]
+        exchange = row["normalized_exchange"]
+        cik = row["cik"]
+        direct = self._security_candidates(
+            conn.execute(
+                "SELECT * FROM securities WHERE normalized_ticker = ?",
+                (normalized,),
+            ).fetchall()
+        )
+        if len(direct) > 1 and exchange:
+            direct = [item for item in direct if item["exchange"] == exchange]
+        if len(direct) == 1:
+            candidate = direct[0]
+            conflicting_exchange = bool(
+                exchange
+                and candidate["exchange"]
+                and candidate["exchange"] != exchange
+                and (not cik or candidate.get("cik") != cik)
+            )
+            if not conflicting_exchange:
+                return candidate, None
+            direct = []
+        if len(direct) > 1:
+            return None, "ambiguous_symbol"
+
+        aliases = self._security_candidates(
+            conn.execute(
+                """
+                SELECT s.*
+                FROM security_aliases a
+                JOIN securities s ON s.security_id = a.security_id
+                WHERE a.normalized_alias = ?
+                  AND (a.provider = ? OR a.provider IS NULL)
+                  AND (a.valid_from IS NULL OR a.valid_from <= ?)
+                  AND (a.valid_to IS NULL OR a.valid_to >= ?)
+                ORDER BY CASE WHEN a.provider = ? THEN 0 ELSE 1 END
+                """,
+                (
+                    normalized,
+                    row["source"],
+                    observed_date,
+                    observed_date,
+                    row["source"],
+                ),
+            ).fetchall()
+        )
+        if exchange:
+            aliases = [
+                candidate
+                for candidate in aliases
+                if not candidate["exchange"]
+                or candidate["exchange"] == exchange
+                or (cik and candidate.get("cik") == cik)
+            ]
+        if len(aliases) == 1:
+            return aliases[0], None
+        if len(aliases) > 1:
+            return None, "ambiguous_alias"
+
+        if not cik or cik in multi_symbol_ciks:
+            return None, None
+        cik_rows = self._security_candidates(
+            conn.execute(
+                "SELECT * FROM securities WHERE cik = ? AND active = 1", (cik,)
+            ).fetchall()
+        )
+        if len(cik_rows) > 1 and exchange:
+            exchange_rows = [item for item in cik_rows if item["exchange"] == exchange]
+            if exchange_rows:
+                cik_rows = exchange_rows
+        if len(cik_rows) == 1:
+            candidate = cik_rows[0]
+            different_share_classes = self._symbols_look_like_share_classes(
+                candidate["normalized_ticker"], row["normalized_symbol"]
+            )
+            same_name = self._normalize_company_identity(
+                candidate["company_name"]
+            ) == self._normalize_company_identity(row["company_name"])
+            same_share_class = bool(
+                row.get("share_class")
+                and row.get("share_class") == candidate.get("share_class")
+            )
+            if not different_share_classes and (same_name or same_share_class):
+                return candidate, None
+            return None, None
+        if len(cik_rows) > 1:
+            return None, "ambiguous_cik"
+        return None, None
+
+    @staticmethod
+    def _ensure_universe_alias(
+        conn: sqlite3.Connection,
+        *,
+        security_id: str,
+        alias: str,
+        normalized_alias: str,
+        alias_type: str,
+        provider: Optional[str],
+        source: str,
+        valid_from: Optional[str],
+        valid_to: Optional[str] = None,
+    ) -> bool:
+        """Insert one alias when the same scoped mapping is not already present."""
+        if valid_to is None:
+            existing = conn.execute(
+                """
+                SELECT 1 FROM security_aliases
+                WHERE security_id = ? AND normalized_alias = ?
+                  AND alias_type = ? AND provider IS ? AND valid_to IS NULL
+                """,
+                (security_id, normalized_alias, alias_type, provider),
+            ).fetchone()
+            if not existing:
+                conflicting = conn.execute(
+                    """
+                    SELECT 1 FROM security_aliases
+                    WHERE security_id <> ? AND normalized_alias = ?
+                      AND provider IS ? AND valid_to IS NULL
+                    """,
+                    (security_id, normalized_alias, provider),
+                ).fetchone()
+                if conflicting:
+                    return False
+        else:
+            existing = conn.execute(
+                """
+                SELECT 1 FROM security_aliases
+                WHERE security_id = ? AND normalized_alias = ?
+                  AND alias_type = ? AND provider IS ?
+                  AND valid_from IS ? AND valid_to IS ?
+                """,
+                (
+                    security_id,
+                    normalized_alias,
+                    alias_type,
+                    provider,
+                    valid_from,
+                    valid_to,
+                ),
+            ).fetchone()
+        if existing:
+            return False
+        conn.execute(
+            """
+            INSERT INTO security_aliases (
+                security_id, alias, normalized_alias, alias_type,
+                provider, valid_from, valid_to, source
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                security_id,
+                alias,
+                normalized_alias,
+                alias_type,
+                provider,
+                valid_from,
+                valid_to,
+                source,
+            ),
+        )
+        return True
+
+    def upsert_universe_snapshot(
+        self,
+        source: str,
+        observed_at: str,
+        rows: list[object],
+    ) -> dict:
+        """Reconcile one validated provider snapshot in a single transaction."""
+        observed_at, observed_date = self._normalize_observed_at(observed_at)
+        source = str(source or "").strip().lower()
+        if not source:
+            raise ValueError("source is required")
+        normalized_rows = []
+        for value in rows:
+            row = self._universe_row_dict(value)
+            symbol = str(row.get("symbol") or row.get("ticker") or "").strip().upper()
+            company_name = str(row.get("company_name") or row.get("name") or "").strip()
+            normalized_symbol = self._normalize_universe_symbol(symbol)
+            if not normalized_symbol or not company_name:
+                raise ValueError("every universe row requires symbol and company_name")
+            index_code = row.get("index_code")
+            if index_code is not None and index_code not in {"sp500", "nasdaq100"}:
+                raise ValueError(f"unsupported index_code: {index_code}")
+            normalized_rows.append(
+                {
+                    **row,
+                    "symbol": symbol,
+                    "company_name": company_name,
+                    "source": source,
+                    "index_code": index_code,
+                    "normalized_symbol": normalized_symbol,
+                    "normalized_exchange": self._normalize_exchange(row.get("exchange")),
+                    "cik": self._normalize_cik(row.get("cik")),
+                    "security_type": str(row.get("security_type") or "common_stock"),
+                }
+            )
+        symbols = [row["normalized_symbol"] for row in normalized_rows]
+        if len(symbols) != len(set(symbols)):
+            raise ValueError("snapshot contains duplicate normalized symbols")
+
+        cik_symbols: dict[str, set[str]] = {}
+        for row in normalized_rows:
+            if row["cik"]:
+                cik_symbols.setdefault(row["cik"], set()).add(row["normalized_symbol"])
+        multi_symbol_ciks = {
+            cik for cik, cik_tickers in cik_symbols.items() if len(cik_tickers) > 1
+        }
+        run_id = str(uuid.uuid4())
+        counts = {
+            "securities_created": 0,
+            "securities_updated": 0,
+            "memberships_opened": 0,
+            "memberships_closed": 0,
+            "aliases_created": 0,
+            "errors": 0,
+        }
+        changed = False
+        resolved_by_index: dict[str, set[str]] = {}
+        index_errors: set[str] = set()
+
+        with self._connect() as conn:
+            for row in normalized_rows:
+                security, error_code = self._find_universe_security(
+                    conn,
+                    row,
+                    observed_date=observed_date,
+                    multi_symbol_ciks=multi_symbol_ciks,
+                )
+                if error_code:
+                    self._record_universe_error(
+                        conn,
+                        run_id=run_id,
+                        source=source,
+                        row=row,
+                        error_code=error_code,
+                        message=f"No safe identity match for {row['symbol']}: {error_code}",
+                        observed_at=observed_at,
+                    )
+                    counts["errors"] += 1
+                    if row["index_code"]:
+                        index_errors.add(row["index_code"])
+                    continue
+
+                if security is None:
+                    security_id = str(uuid.uuid4())
+                    conn.execute(
+                        """
+                        INSERT INTO securities (
+                            security_id, ticker, normalized_ticker, company_name,
+                            exchange, cik, security_type, share_class, sector,
+                            industry, active, first_seen_at, last_seen_at, updated_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)
+                        """,
+                        (
+                            security_id,
+                            row["normalized_symbol"],
+                            row["normalized_symbol"],
+                            row["company_name"],
+                            row["normalized_exchange"],
+                            row["cik"],
+                            row["security_type"],
+                            row.get("share_class"),
+                            row.get("sector"),
+                            row.get("industry"),
+                            observed_at,
+                            observed_at,
+                            observed_at,
+                        ),
+                    )
+                    security = dict(
+                        conn.execute(
+                            "SELECT * FROM securities WHERE security_id = ?", (security_id,)
+                        ).fetchone()
+                    )
+                    counts["securities_created"] += 1
+                    changed = True
+                else:
+                    security_id = security["security_id"]
+                    if row["cik"] and security.get("cik") not in {None, row["cik"]}:
+                        self._record_universe_error(
+                            conn,
+                            run_id=run_id,
+                            source=source,
+                            row=row,
+                            error_code="identity_conflict",
+                            message=(
+                                f"CIK {row['cik']} conflicts with stored CIK {security['cik']}"
+                            ),
+                            observed_at=observed_at,
+                        )
+                        counts["errors"] += 1
+                        if row["index_code"]:
+                            index_errors.add(row["index_code"])
+                        continue
+
+                    updates = {
+                        "company_name": row["company_name"],
+                        "exchange": row["normalized_exchange"] or security["exchange"],
+                        "cik": row["cik"] or security["cik"],
+                        "security_type": row["security_type"],
+                        "share_class": row.get("share_class") or security["share_class"],
+                        "sector": row.get("sector") or security["sector"],
+                        "industry": row.get("industry") or security["industry"],
+                    }
+                    renamed = security["normalized_ticker"] != row["normalized_symbol"]
+                    if renamed:
+                        old_ticker = security["ticker"]
+                        old_normalized = security["normalized_ticker"]
+                        conn.execute(
+                            """
+                            UPDATE security_aliases SET valid_to = ?
+                            WHERE security_id = ? AND normalized_alias = ?
+                              AND valid_to IS NULL
+                            """,
+                            (observed_date, security_id, old_normalized),
+                        )
+                        if self._ensure_universe_alias(
+                            conn,
+                            security_id=security_id,
+                            alias=old_ticker,
+                            normalized_alias=old_normalized,
+                            alias_type="former_ticker",
+                            provider=None,
+                            source=source,
+                            valid_from=str(security["first_seen_at"])[:10],
+                            valid_to=observed_date,
+                        ):
+                            counts["aliases_created"] += 1
+                        updates["ticker"] = row["normalized_symbol"]
+                        updates["normalized_ticker"] = row["normalized_symbol"]
+                    metadata_changed = renamed or any(
+                        security.get(key) != value for key, value in updates.items()
+                    )
+                    if metadata_changed:
+                        updates["last_seen_at"] = observed_at
+                        updates["updated_at"] = observed_at
+                        assignments = ", ".join(f"{key} = ?" for key in updates)
+                        conn.execute(
+                            f"UPDATE securities SET {assignments} WHERE security_id = ?",
+                            (*updates.values(), security_id),
+                        )
+                        counts["securities_updated"] += 1
+                        changed = True
+
+                if self._ensure_universe_alias(
+                    conn,
+                    security_id=security_id,
+                    alias=row["symbol"],
+                    normalized_alias=row["normalized_symbol"],
+                    alias_type="vendor_symbol",
+                    provider=source,
+                    source=source,
+                    valid_from=observed_date,
+                ):
+                    counts["aliases_created"] += 1
+                    changed = True
+
+                index_code = row["index_code"]
+                if not index_code:
+                    continue
+                resolved_by_index.setdefault(index_code, set()).add(security_id)
+                active_membership = conn.execute(
+                    """
+                    SELECT membership_id FROM security_memberships
+                    WHERE security_id = ? AND index_code = ? AND active = 1
+                    """,
+                    (security_id, index_code),
+                ).fetchone()
+                if not active_membership:
+                    conn.execute(
+                        """
+                        INSERT INTO security_memberships (
+                            security_id, index_code, effective_from, active,
+                            source, source_url, observed_at
+                        ) VALUES (?, ?, ?, 1, ?, ?, ?)
+                        """,
+                        (
+                            security_id,
+                            index_code,
+                            observed_date,
+                            source,
+                            row.get("source_url"),
+                            observed_at,
+                        ),
+                    )
+                    counts["memberships_opened"] += 1
+                    changed = True
+
+            for index_code, resolved_ids in resolved_by_index.items():
+                if index_code in index_errors:
+                    continue
+                active_rows = conn.execute(
+                    """
+                    SELECT membership_id, security_id FROM security_memberships
+                    WHERE index_code = ? AND active = 1
+                    """,
+                    (index_code,),
+                ).fetchall()
+                for membership in active_rows:
+                    if membership["security_id"] in resolved_ids:
+                        continue
+                    conn.execute(
+                        """
+                        UPDATE security_memberships
+                        SET active = 0, effective_to = ?
+                        WHERE membership_id = ?
+                        """,
+                        (observed_date, membership["membership_id"]),
+                    )
+                    counts["memberships_closed"] += 1
+                    changed = True
+
+            if changed:
+                conn.execute(
+                    """
+                    INSERT INTO store_revision (id, revision, updated_at)
+                    VALUES (1, 1, datetime('now'))
+                    ON CONFLICT(id) DO UPDATE SET
+                        revision = revision + 1, updated_at = datetime('now')
+                    """
+                )
+            revision_row = conn.execute(
+                "SELECT revision FROM store_revision WHERE id = 1"
+            ).fetchone()
+            revision = int(revision_row[0]) if revision_row else 0
+
+        return {
+            "run_id": run_id,
+            "source": source,
+            "changed": changed,
+            **counts,
+            "revision": revision,
+        }
+
+    def list_securities(
+        self,
+        index: Optional[str] = None,
+        active: Optional[bool] = True,
+        sector: Optional[str] = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> list[dict]:
+        """List bounded canonical securities with optional membership filters."""
+        self._validate_inventory_page(limit, offset)
+        conditions = []
+        params: list = []
+        join = ""
+        if index is not None:
+            if index not in {"sp500", "nasdaq100"}:
+                raise ValueError(f"unsupported index: {index}")
+            join = "JOIN security_memberships m ON m.security_id = s.security_id"
+            conditions.append("m.index_code = ?")
+            params.append(index)
+            if active is not None:
+                conditions.append("m.active = ?")
+                params.append(int(active))
+        elif active is not None:
+            conditions.append("s.active = ?")
+            params.append(int(active))
+        if sector is not None:
+            conditions.append("s.sector = ?")
+            params.append(sector)
+        where = " AND ".join(conditions) or "1=1"
+        sql = f"""
+            SELECT DISTINCT s.* FROM securities s {join}
+            WHERE {where}
+            ORDER BY s.ticker
+            LIMIT ? OFFSET ?
+        """
+        params.extend([limit, offset])
+        with self._connect() as conn:
+            return [dict(row) for row in conn.execute(sql, params).fetchall()]
+
+    def get_security(self, ticker_or_id: str) -> Optional[dict]:
+        """Return one canonical security by opaque id or normalized ticker."""
+        value = str(ticker_or_id or "").strip()
+        if not value:
+            return None
+        normalized = self._normalize_universe_symbol(value)
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT * FROM securities
+                WHERE security_id = ? OR normalized_ticker = ?
+                ORDER BY active DESC, updated_at DESC
+                LIMIT 1
+                """,
+                (value, normalized),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def resolve_security(
+        self,
+        symbol: str,
+        provider: Optional[str] = None,
+        as_of: Optional[str] = None,
+    ) -> Optional[dict]:
+        """Resolve a canonical or aliased symbol, optionally at a historical date."""
+        normalized = self._normalize_universe_symbol(symbol)
+        if not normalized:
+            return None
+        as_of_date = self._validate_as_of(as_of) if as_of is not None else None
+        with self._connect() as conn:
+            if as_of_date is None:
+                direct = conn.execute(
+                    """
+                    SELECT * FROM securities WHERE normalized_ticker = ?
+                    ORDER BY active DESC, updated_at DESC
+                    """,
+                    (normalized,),
+                ).fetchall()
+            else:
+                direct_conditions = [
+                    "s.normalized_ticker = ?",
+                    "a.normalized_alias = ?",
+                    "(a.valid_from IS NULL OR a.valid_from <= ?)",
+                    "(a.valid_to IS NULL OR a.valid_to >= ?)",
+                ]
+                direct_params: list = [
+                    normalized,
+                    normalized,
+                    as_of_date,
+                    as_of_date,
+                ]
+                if provider is not None:
+                    direct_conditions.append("(a.provider = ? OR a.provider IS NULL)")
+                    direct_params.append(provider.lower())
+                direct = conn.execute(
+                    f"""
+                    SELECT s.* FROM securities s
+                    JOIN security_aliases a ON a.security_id = s.security_id
+                    WHERE {' AND '.join(direct_conditions)}
+                    ORDER BY s.active DESC, s.updated_at DESC
+                    """,
+                    direct_params,
+                ).fetchall()
+            direct_candidates = self._security_candidates(direct)
+            if len(direct_candidates) == 1:
+                return direct_candidates[0]
+
+            conditions = ["a.normalized_alias = ?"]
+            params: list = [normalized]
+            if provider is not None:
+                conditions.append("(a.provider = ? OR a.provider IS NULL)")
+                params.append(provider.lower())
+            if as_of_date is not None:
+                conditions.extend(
+                    [
+                        "(a.valid_from IS NULL OR a.valid_from <= ?)",
+                        "(a.valid_to IS NULL OR a.valid_to >= ?)",
+                    ]
+                )
+                params.extend([as_of_date, as_of_date])
+            else:
+                conditions.append("a.valid_to IS NULL")
+            order = ""
+            if provider is not None:
+                order = "ORDER BY CASE WHEN a.provider = ? THEN 0 ELSE 1 END"
+                params.append(provider.lower())
+            alias_rows = conn.execute(
+                f"""
+                SELECT s.* FROM security_aliases a
+                JOIN securities s ON s.security_id = a.security_id
+                WHERE {' AND '.join(conditions)}
+                {order}
+                """,
+                params,
+            ).fetchall()
+        candidates = self._security_candidates(alias_rows)
+        return candidates[0] if len(candidates) == 1 else None
+
+    def list_memberships(
+        self,
+        security_id: Optional[str] = None,
+        index_code: Optional[str] = None,
+        active: Optional[bool] = None,
+    ) -> list[dict]:
+        """List current or historical index membership rows."""
+        conditions = []
+        params: list = []
+        if security_id is not None:
+            conditions.append("m.security_id = ?")
+            params.append(security_id)
+        if index_code is not None:
+            if index_code not in {"sp500", "nasdaq100"}:
+                raise ValueError(f"unsupported index_code: {index_code}")
+            conditions.append("m.index_code = ?")
+            params.append(index_code)
+        if active is not None:
+            conditions.append("m.active = ?")
+            params.append(int(active))
+        where = " AND ".join(conditions) or "1=1"
+        with self._connect() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT m.*, s.ticker, s.company_name
+                FROM security_memberships m
+                JOIN securities s ON s.security_id = m.security_id
+                WHERE {where}
+                ORDER BY m.index_code, m.effective_from, s.ticker
+                """,
+                params,
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def list_universe_errors(self, run_id: str) -> list[dict]:
+        """Return reconciliation errors for one universe refresh run."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT error_id, run_id, source, symbol, error_code,
+                       message, payload, observed_at, created_at
+                FROM universe_errors WHERE run_id = ? ORDER BY error_id
+                """,
+                (run_id,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
     def list_metrics(self, ticker: Optional[str] = None) -> list[str]:
         """Return the distinct metric names present in `fundamentals`, optionally scoped to a ticker."""
         if ticker:
@@ -567,10 +1399,15 @@ CREATE INDEX IF NOT EXISTS idx_ingestion_log_run ON ingestion_log(run_id);
             return [row["metric"] for row in rows]
 
     def list_tickers(self) -> list[str]:
-        """Return the distinct tickers present in `fundamentals`."""
-        sql = "SELECT DISTINCT ticker FROM fundamentals ORDER BY ticker"
+        """Return active canonical tickers, falling back to legacy facts."""
         with self._connect() as conn:
-            rows = conn.execute(sql).fetchall()
+            rows = conn.execute(
+                "SELECT ticker FROM securities WHERE active = 1 ORDER BY ticker"
+            ).fetchall()
+            if not rows:
+                rows = conn.execute(
+                    "SELECT DISTINCT ticker FROM fundamentals ORDER BY ticker"
+                ).fetchall()
             return [row["ticker"] for row in rows]
 
     _ORDER_SQL = {"asc": "ASC", "desc": "DESC"}
