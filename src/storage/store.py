@@ -23,12 +23,29 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Optional
 
+from src.ingestion.normalization import NORMALIZATION_VERSION, content_hash
 from src.ingestion.records import EventRecord, NarrativeRecord, ObservationRecord
 
 from .chroma_store import ChromaStore
+from .retention import RetentionPolicy, load_retention_policy
 from .sqlite_store import SQLiteStore
 
 logger = logging.getLogger(__name__)
+
+STRUCTURED_ONLY_NARRATIVE_TYPES = frozenset({
+    "observation",
+    "market_bar",
+    "ohlcv",
+    "rate",
+    "economic_observation",
+    "security",
+    "membership",
+    "alias",
+    "refresh_status",
+    "cursor",
+    "run_health",
+})
+STRUCTURED_ONLY_SOURCE_CATEGORIES = frozenset({"market_data", "economic_data"})
 
 
 def _companyfacts_cutoff(as_of: Optional[str]) -> str:
@@ -504,49 +521,94 @@ class Store:
 
     def upsert_narrative(self, record: NarrativeRecord) -> dict:
         """Persist narrative metadata, then index content with retryable status."""
+        if (
+            record.item_type in STRUCTURED_ONLY_NARRATIVE_TYPES
+            or record.source_category in STRUCTURED_ONLY_SOURCE_CATEGORIES
+        ):
+            raise ValueError(
+                f"{record.item_type!r} is structured-only and cannot use narrative placement"
+            )
         result = self.sqlite.upsert_narrative_record(record)
         if not result["needs_index"]:
             return result
 
         item_id = result["corpus_item_id"]
+        security_ids = set(record.security_ids)
+        tickers = set(record.tickers)
+        index_memberships = set(record.index_codes)
+        sectors = set(record.sectors)
+        industries: set[str] = set()
+        for security_id in record.security_ids:
+            security = self.sqlite.get_security(security_id)
+            if security:
+                tickers.add(str(security["ticker"]))
+                if security.get("sector"):
+                    sectors.add(str(security["sector"]))
+                if security.get("industry"):
+                    industries.add(str(security["industry"]))
+            for membership in self.sqlite.list_memberships(
+                security_id=security_id, active=True,
+            ):
+                index_memberships.add(str(membership["index_code"]))
+
         chroma_metadata = {
             "corpus_item_id": item_id,
+            "document_family_id": item_id,
             "source_category": record.source_category,
+            "source_name": record.source_name,
             "item_type": record.item_type,
             "document_family": record.document_family,
             "content_hash": record.content_hash,
             "license_label": record.license_label,
             "normalization_version": record.normalization_version,
             "evidence_authority": record.evidence_authority,
+            "authority_tier": record.evidence_authority,
         }
         optional_metadata = {
             "provider_record_id": record.provider_record_id,
             "original_publisher": record.original_publisher,
             "canonical_url": record.canonical_url,
             "event_type": record.event_type,
+            "published_at": record.published_at,
+            "effective_at": record.effective_at,
+            "as_of_at": record.as_of_at,
         }
         chroma_metadata.update({
             key: value for key, value in optional_metadata.items() if value is not None
         })
-        chroma_metadata.update(dict(record.metadata))
-        if record.tickers:
-            chroma_metadata["tickers"] = ",".join(record.tickers)
-        if record.index_codes:
-            chroma_metadata["index_codes"] = ",".join(record.index_codes)
-        if record.sectors:
-            chroma_metadata["sectors"] = ",".join(record.sectors)
+        record_metadata = {
+            key: value for key, value in dict(record.metadata).items()
+            if value is not None and isinstance(value, (str, int, float, bool))
+        }
+        chroma_metadata.update(record_metadata)
+        if "filing_item" in record_metadata and "item" not in record_metadata:
+            chroma_metadata["item"] = record_metadata["filing_item"]
+        if security_ids:
+            chroma_metadata["security_ids"] = ",".join(sorted(security_ids))
+        if tickers:
+            chroma_metadata["tickers"] = ",".join(sorted(tickers))
+        if index_memberships:
+            chroma_metadata["index_memberships"] = ",".join(sorted(index_memberships))
+        if sectors:
+            chroma_metadata["sectors"] = ",".join(sorted(sectors))
+        if industries:
+            chroma_metadata["industries"] = ",".join(sorted(industries))
+
+        narrative_text = record.body
+        if record.item_type == "news":
+            narrative_text = "\n\n".join(
+                value for value in (record.title, record.summary) if value
+            )
 
         try:
-            if result["content_changed"] or result.get("authority_promoted"):
-                self.chroma.delete_document(item_id)
-                self.chroma.delete_filing_section_family(item_id)
             self.chroma.add_document(
                 document_id=item_id,
-                text=record.body,
+                text=narrative_text,
                 ticker=record.tickers[0] if record.tickers else None,
                 source=record.source_name,
                 date=record.published_at,
                 metadata=chroma_metadata,
+                replace_family=True,
             )
         except Exception as exc:  # noqa: BLE001 - metadata must survive Chroma failure
             logger.warning("Narrative indexing failed for %s", item_id, exc_info=True)
@@ -567,6 +629,83 @@ class Store:
     def upsert_event(self, record: EventRecord) -> dict:
         """Persist a structured event and its item/security links."""
         return self.sqlite.upsert_event_record(record)
+
+    def run_retention(
+        self,
+        *,
+        as_of: Optional[str] = None,
+        apply: bool = False,
+        policy: Optional[RetentionPolicy] = None,
+        limit: Optional[int] = None,
+    ) -> dict:
+        """Preview or explicitly apply configured narrative retention."""
+        active_policy = policy or load_retention_policy()
+        cutoff = active_policy.company_news_cutoff(as_of)
+        run_limit = active_policy.max_items_per_run if limit is None else limit
+        candidates = self.sqlite.list_news_retention_candidates(cutoff, limit=run_limit)
+        family_ids = [str(row["document_family_id"]) for row in candidates]
+        result = {
+            "apply": apply,
+            "cutoff": cutoff,
+            "eligible": len(candidates),
+            "expired": 0,
+            "failed": 0,
+            "document_family_ids": family_ids,
+        }
+        if not apply or not candidates:
+            return result
+
+        expired_item_ids: list[str] = []
+        for candidate in candidates:
+            family_id = str(candidate["document_family_id"])
+            try:
+                self.chroma.delete_document_family(family_id)
+            except Exception:  # noqa: BLE001 - one family must not stop maintenance
+                logger.warning(
+                    "Retention could not delete narrative family %s", family_id,
+                    exc_info=True,
+                )
+                result["failed"] += 1
+                continue
+            expired_item_ids.append(str(candidate["corpus_item_id"]))
+
+        retired_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        result["expired"] = self.sqlite.expire_news_narratives(
+            expired_item_ids,
+            retired_at=retired_at,
+            reason=f"company_news_older_than_{active_policy.company_news_months}_months",
+        )
+        if result["expired"] != len(expired_item_ids):
+            result["failed"] += len(expired_item_ids) - result["expired"]
+        return result
+
+    def get_corpus_accounting(
+        self,
+        group_by: str,
+        *,
+        source_category: Optional[str] = None,
+        source: Optional[str] = None,
+        item_type: Optional[str] = None,
+        security: Optional[str] = None,
+        year: Optional[str] = None,
+        month: Optional[str] = None,
+        indexing_state: Optional[str] = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> list[dict]:
+        """Expose bounded SQLite corpus aggregates without scanning Chroma."""
+        return self.sqlite.get_corpus_accounting(
+            group_by,
+            source_category=source_category,
+            source=source,
+            item_type=item_type,
+            security=security,
+            year=year,
+            month=month,
+            indexing_state=indexing_state,
+            limit=limit,
+            offset=offset,
+        )
 
     # -- Incremental source cursors -----------------------------------------
 
@@ -684,25 +823,55 @@ class Store:
                 counts["skipped"] += 1
                 continue
             existing_count = self.chroma.count_filing_section_chunks(section.document_id)
-            self.chroma.delete_filing_section_family(section.document_id)
+            security = self.sqlite.resolve_security(section.ticker)
+            security_id = str(security["security_id"]) if security else None
+            memberships = self.sqlite.list_memberships(
+                security_id=security_id, active=True,
+            ) if security_id else []
+            section_metadata = {
+                "accession": section.accession,
+                "as_of_at": section.report_period,
+                "authority_tier": "direct_sec",
+                "content_hash": content_hash(section.text),
+                "corpus_item_id": section.document_id,
+                "document_family_id": section.document_id,
+                "evidence_authority": "direct_sec",
+                "filing_date": section.filing_date,
+                "form": section.form,
+                "item": section.section_key,
+                "item_type": "sec_filing",
+                "normalization_version": NORMALIZATION_VERSION,
+                "parent_id": section.document_id,
+                "provider_record_id": section.accession,
+                "published_at": section.filing_date,
+                "report_period": section.report_period,
+                "section_heading": section.section_heading,
+                "section_index": section.section_index,
+                "section_key": section.section_key,
+                "source_category": "regulatory_filing",
+                "source_name": "sec",
+                "source_url": section.source_url,
+                "parsed_path": section.parsed_path,
+                "tickers": section.ticker,
+            }
+            if security_id:
+                section_metadata["security_ids"] = security_id
+            if memberships:
+                section_metadata["index_memberships"] = ",".join(sorted({
+                    str(row["index_code"]) for row in memberships
+                }))
+            if security and security.get("sector"):
+                section_metadata["sectors"] = str(security["sector"])
+            if security and security.get("industry"):
+                section_metadata["industries"] = str(security["industry"])
             self.chroma.add_document(
                 document_id=section.document_id,
                 text=section.text,
                 ticker=section.ticker,
                 source="sec_filing",
                 date=section.filing_date,
-                metadata={
-                    "accession": section.accession,
-                    "form": section.form,
-                    "filing_date": section.filing_date,
-                    "report_period": section.report_period,
-                    "section_key": section.section_key,
-                    "section_heading": section.section_heading,
-                    "section_index": section.section_index,
-                    "parent_id": section.document_id,
-                    "source_url": section.source_url,
-                    "parsed_path": section.parsed_path,
-                },
+                metadata=section_metadata,
+                replace_family=True,
             )
             stored_count = self.chroma.count_filing_section_chunks(section.document_id)
             if not stored_count:

@@ -1,5 +1,49 @@
 # 2.3.3 — Corpus Organization and Provenance — Results
 
+## 2.3.3.2 Dual-Store Placement, Chunking, and Retention
+
+**Implemented:** 2026-07-14, branch `phase-2.3.3`, gpt-5.6-sol (effort high) via Codex, orchestrated by Claude (Fable 5).
+
+### Setup
+
+- Placement-matrix enforcement with an explicit guard: numeric market/economic
+  observations can never create a Chroma document; structured rows stay
+  SQLite-only; narrative evidence (SEC sections, news headline+summary, release
+  text) goes to Chroma with full facet metadata.
+- Stable document families: one `document_family_id` per narrative
+  `corpus_item_id`; chunks carry source/security/date/type/authority facets,
+  parent/child ids + ordinal, content hash, normalization version. Exact replay
+  → identical chunk ids; replacement is upsert-before-orphan-cleanup, atomic
+  from the retrieval perspective (SEC section replacement converted to the same
+  contract).
+- `src/storage/retention.py` + `Store.run_retention(...)` (preview by default,
+  max batch 1,000): news narratives 24 months (configurable) with SQLite
+  tombstones after Chroma family removal; SEC/issuer/government/events/actions/
+  memberships/observations permanent; failed metadata retained until repaired;
+  raw payloads never retained. Deletions bump the revision once per run and are
+  never query-triggered.
+- `Store.get_corpus_accounting(group_by, ...)`: counts + approximate bytes by
+  source category/source/item type/security/year/month/indexing state, computed
+  entirely from SQLite metadata (no Chroma scans).
+
+### Regression gate
+
+Focused 69 passed; full offline suite 1,491 passed / 1 skipped / 8 deselected;
+ruff clean; `scripts/verify.ps1` → **VERIFY: PASS** (implementer + independent
+orchestrator re-run).
+
+### Caveats
+
+- Two legacy tests updated: one encoded delete-before-add replacement (now
+  forbidden by the atomicity contract) and one used an outdated fake Chroma
+  signature.
+
+### Decision
+
+**Ship.** Storage-side; retrieval sees identical or strictly-richer chunk
+metadata, and Phase 2.2 SEC section hierarchy is preserved (existing pipeline
+tests unchanged). Rollback = revert the task commit.
+
 ## 2.3.3.1 Normalized Record Contract and Deduplication
 
 **Implemented:** 2026-07-14, branch `phase-2.3.3.1`, gpt-5.6-sol (effort high) via Codex, orchestrated by Claude (Fable 5).

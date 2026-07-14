@@ -233,10 +233,11 @@ def test_changed_narrative_content_reindexes_only_affected_family(store):
     facade.upsert_narrative(second)
 
     assert result["content_changed"] is True
-    chroma.delete_document.assert_called_once_with("item-1")
-    chroma.delete_filing_section_family.assert_called_once_with("item-1")
+    chroma.delete_document.assert_not_called()
+    chroma.delete_filing_section_family.assert_not_called()
     assert chroma.add_document.call_count == 1
     assert chroma.add_document.call_args.kwargs["document_id"] == "item-1"
+    assert chroma.add_document.call_args.kwargs["replace_family"] is True
 
 
 def test_same_source_url_fallback_updates_changed_canonical_content(store):
@@ -258,8 +259,9 @@ def test_same_source_url_fallback_updates_changed_canonical_content(store):
     assert result["corpus_item_id"] == "item-1"
     assert result["deduplication_layer"] == "canonical_url"
     assert result["content_changed"] is True
-    chroma.delete_document.assert_called_once_with("item-1")
+    chroma.delete_document.assert_not_called()
     assert chroma.add_document.call_count == 1
+    assert chroma.add_document.call_args.kwargs["replace_family"] is True
 
 
 def test_headline_window_does_not_merge_two_items_from_same_source(store):

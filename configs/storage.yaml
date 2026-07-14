@@ -31,6 +31,21 @@ chunking:
   overlap_sentences: 1        # structural: sentences carried into the next chunk
   fixed_overlap_chars: 150    # fixed: char overlap (legacy DEFAULT_CHUNK_OVERLAP)
 
+# Explicit maintenance policy. Query paths never invoke retention.
+retention:
+  company_news_months: 24
+  retain_raw_network_payloads: false
+  max_items_per_run: 1000
+  permanent_item_types:
+    - sec_filing
+    - sec_exhibit
+    - issuer_release
+    - official_release
+    - event
+    - corporate_action
+    - membership
+    - observation
+
 sec:
   # SEC EDGAR requires a descriptive User-Agent identifying the requester.
   # Resolution order in SECEdgarFilingFetcher: constructor param >

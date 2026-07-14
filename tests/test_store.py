@@ -16,6 +16,8 @@ if "chromadb" not in sys.modules:
     sys.modules["chromadb"] = _mock_chroma
     sys.modules["chromadb.api"] = MagicMock()
 
+from src.ingestion.normalization import NORMALIZATION_VERSION, content_hash
+from src.ingestion.records import NarrativeRecord
 from src.storage.store import Store
 from src.sec.filing_sections import FilingSection
 
@@ -125,18 +127,28 @@ def test_add_filing_sections_routes_through_structural_chunker(store, mock_chrom
 
     result = store.add_filing_sections([section])
 
-    mock_chroma.delete_filing_section_family.assert_called_once_with(section.document_id)
+    mock_chroma.delete_filing_section_family.assert_not_called()
     mock_chroma.add_document.assert_called_once()
     call = mock_chroma.add_document.call_args.kwargs
     assert call["document_id"] == section.document_id
     assert call["text"].startswith("Item 2. MD&A")
     assert call["source"] == "sec_filing"
+    assert call["replace_family"] is True
     assert call["metadata"] == {
-        "accession": "ACC-1", "form": "10-Q", "filing_date": "2026-05-15",
-        "report_period": "2026-03-31", "section_key": "item_2",
-        "section_heading": "Item 2. MD&A", "section_index": 0,
-        "parent_id": "sec:ACC-1:item_2", "source_url": "https://sec.example",
-        "parsed_path": "parsed/ACC-1.txt",
+        "accession": "ACC-1", "as_of_at": "2026-03-31",
+        "authority_tier": "direct_sec",
+        "content_hash": content_hash(section.text),
+        "corpus_item_id": "sec:ACC-1:item_2",
+        "document_family_id": "sec:ACC-1:item_2",
+        "evidence_authority": "direct_sec", "filing_date": "2026-05-15",
+        "form": "10-Q", "item": "item_2", "item_type": "sec_filing",
+        "normalization_version": NORMALIZATION_VERSION,
+        "parent_id": "sec:ACC-1:item_2", "parsed_path": "parsed/ACC-1.txt",
+        "provider_record_id": "ACC-1", "published_at": "2026-05-15",
+        "report_period": "2026-03-31", "section_heading": "Item 2. MD&A",
+        "section_index": 0, "section_key": "item_2",
+        "source_category": "regulatory_filing", "source_name": "sec",
+        "source_url": "https://sec.example", "tickers": "NVDA",
     }
     assert result == {
         "sections_written": 1, "chunks_written": 1,
@@ -156,8 +168,9 @@ def test_reprocessing_filing_section_replaces_family_without_duplicate(store, mo
 
     result = store.add_filing_sections([section])
 
-    mock_chroma.delete_filing_section_family.assert_called_once_with(section.document_id)
+    mock_chroma.delete_filing_section_family.assert_not_called()
     assert mock_chroma.add_document.call_args.kwargs["document_id"] == section.document_id
+    assert mock_chroma.add_document.call_args.kwargs["replace_family"] is True
     assert result["replacements"] == 1
     assert result["sections_written"] == 1
 
@@ -405,3 +418,121 @@ def test_structured_record_facade_methods_delegate(fully_mocked_store):
     assert store.upsert_event(event) == {"created": True}
     sqlite.upsert_observation_record.assert_called_once_with(observation)
     sqlite.upsert_event_record.assert_called_once_with(event)
+
+
+def test_numeric_narrative_is_rejected_before_either_store_is_mutated(store, mock_chroma):
+    body = "ACME close was 42.00 USD."
+    record = NarrativeRecord(
+        corpus_item_id="bad-observation",
+        source_name="massive",
+        source_category="market_data",
+        provider_record_id="bar-1",
+        original_publisher=None,
+        item_type="observation",
+        title="ACME daily close",
+        body=body,
+        published_at="2026-07-14T00:00:00Z",
+        observed_at="2026-07-14T00:00:00Z",
+        accessed_at="2026-07-14T00:00:00Z",
+        ingested_at="2026-07-14T00:00:00Z",
+        source_url="https://example.test/bar/1",
+        canonical_url=None,
+        license_label="provider_entitlement",
+        normalization_version=NORMALIZATION_VERSION,
+        content_hash=content_hash(body),
+        document_family="market_observation",
+    )
+
+    with pytest.raises(ValueError, match="structured-only"):
+        store.upsert_narrative(record)
+
+    assert store.sqlite.count_corpus_items() == 0
+    mock_chroma.add_document.assert_not_called()
+
+
+def test_news_indexing_uses_provider_summary_and_complete_family_facets(store, mock_chroma):
+    store.upsert_universe_snapshot(
+        "ivv", "2026-07-14T00:00:00Z", [{
+            "symbol": "ACME", "company_name": "Acme Corporation",
+            "source": "ivv", "index_code": "sp500", "exchange": "NYSE",
+            "sector": "Industrials", "industry": "Machinery",
+        }],
+    )
+    security = store.resolve_security("ACME")
+    body = "Headline\n\nProvider summary\n\nPublisher name that must not be indexed"
+    record = NarrativeRecord(
+        corpus_item_id="news-1",
+        source_name="finnhub",
+        source_category="news_vendor",
+        provider_record_id="provider-1",
+        original_publisher="Publisher",
+        item_type="news",
+        title="Headline",
+        body=body,
+        summary="Provider summary",
+        published_at="2026-07-14T12:00:00Z",
+        effective_at="2026-07-15T00:00:00Z",
+        as_of_at="2026-07-14T00:00:00Z",
+        observed_at="2026-07-14T12:01:00Z",
+        accessed_at="2026-07-14T12:02:00Z",
+        ingested_at="2026-07-14T12:03:00Z",
+        source_url="https://example.test/news/1",
+        canonical_url="https://publisher.test/news/1",
+        license_label="provider_entitlement",
+        normalization_version=NORMALIZATION_VERSION,
+        content_hash=content_hash(body),
+        document_family="company_news",
+        security_ids=(security["security_id"],),
+        tickers=("ACME",),
+        evidence_authority="provider",
+    )
+
+    store.upsert_narrative(record)
+
+    call = mock_chroma.add_document.call_args.kwargs
+    assert call["text"] == "Headline\n\nProvider summary"
+    assert call["replace_family"] is True
+    assert call["document_id"] == "news-1"
+    assert call["metadata"] == {
+        "authority_tier": "provider",
+        "canonical_url": "https://publisher.test/news/1",
+        "content_hash": record.content_hash,
+        "corpus_item_id": "news-1",
+        "document_family": "company_news",
+        "document_family_id": "news-1",
+        "effective_at": "2026-07-15T00:00:00Z",
+        "evidence_authority": "provider",
+        "index_memberships": "sp500",
+        "industries": "Machinery",
+        "item_type": "news",
+        "license_label": "provider_entitlement",
+        "normalization_version": NORMALIZATION_VERSION,
+        "original_publisher": "Publisher",
+        "provider_record_id": "provider-1",
+        "published_at": "2026-07-14T12:00:00Z",
+        "as_of_at": "2026-07-14T00:00:00Z",
+        "security_ids": security["security_id"],
+        "sectors": "Industrials",
+        "source_category": "news_vendor",
+        "source_name": "finnhub",
+        "tickers": "ACME",
+    }
+
+
+def test_corpus_accounting_delegates_to_sqlite_only(fully_mocked_store):
+    store, sqlite, chroma = fully_mocked_store
+    sqlite.get_corpus_accounting.return_value = [{
+        "key": "news_vendor", "count": 2, "approximate_bytes": 512,
+    }]
+
+    result = store.get_corpus_accounting(
+        "source_category", indexing_state="indexed", limit=10, offset=2,
+    )
+
+    assert result == [{"key": "news_vendor", "count": 2, "approximate_bytes": 512}]
+    sqlite.get_corpus_accounting.assert_called_once_with(
+        "source_category", source_category=None, source=None, item_type=None,
+        security=None, year=None, month=None, indexing_state="indexed",
+        limit=10, offset=2,
+    )
+    chroma.iter_documents.assert_not_called()

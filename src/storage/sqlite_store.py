@@ -27,6 +27,7 @@ class SQLiteStore:
 
     MAX_INVENTORY_LIMIT = 200
     MAX_INVENTORY_OFFSET = 10_000
+    MAX_MAINTENANCE_LIMIT = 10_000
 
     SCHEMA_SQL = Path(__file__).parent.parent.parent / "docs/phase1.2/schema.sql"
     DEFAULT_DB_PATH = Path(__file__).parent.parent.parent / "data/finance.db"
@@ -107,6 +108,38 @@ class SQLiteStore:
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_source_cursors_status "
                 "ON source_cursors(source, status, updated_at)"
+            )
+            corpus_columns = {
+                row[1] for row in conn.execute("PRAGMA table_info(corpus_items)").fetchall()
+            }
+            corpus_migrations = {
+                "document_family_id": "ALTER TABLE corpus_items ADD COLUMN document_family_id TEXT",
+                "narrative_bytes": (
+                    "ALTER TABLE corpus_items ADD COLUMN narrative_bytes INTEGER NOT NULL DEFAULT 0"
+                ),
+                "metadata_bytes": (
+                    "ALTER TABLE corpus_items ADD COLUMN metadata_bytes INTEGER NOT NULL DEFAULT 0"
+                ),
+                "is_tombstone": (
+                    "ALTER TABLE corpus_items ADD COLUMN is_tombstone INTEGER NOT NULL DEFAULT 0"
+                ),
+                "retired_at": "ALTER TABLE corpus_items ADD COLUMN retired_at TEXT",
+                "retention_reason": "ALTER TABLE corpus_items ADD COLUMN retention_reason TEXT",
+            }
+            for column, statement in corpus_migrations.items():
+                if column not in corpus_columns:
+                    conn.execute(statement)
+            conn.execute(
+                "UPDATE corpus_items SET document_family_id=corpus_item_id "
+                "WHERE document_family_id IS NULL OR document_family_id=''"
+            )
+            conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_corpus_items_document_family "
+                "ON corpus_items(document_family_id)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_corpus_items_retention "
+                "ON corpus_items(item_type, is_tombstone, indexing_status, published_at)"
             )
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_corpus_observations_market_key "
@@ -1015,7 +1048,33 @@ CREATE INDEX IF NOT EXISTS idx_corpus_events_type_effective
         result = dict(row)
         for name in ("tickers_json", "index_codes_json", "sectors_json", "metadata_json"):
             result[name.removesuffix("_json")] = json.loads(result.pop(name))
+        result["is_tombstone"] = bool(result.get("is_tombstone", 0))
         return result
+
+    @classmethod
+    def _corpus_metadata_bytes(cls, record: NarrativeRecord) -> int:
+        """Estimate retained SQLite metadata bytes without storing the narrative body."""
+        values = (
+            record.corpus_item_id,
+            record.source_name,
+            record.source_category,
+            record.provider_record_id,
+            record.original_publisher,
+            record.item_type,
+            record.event_type,
+            record.title,
+            record.summary,
+            record.published_at,
+            record.effective_at,
+            record.as_of_at,
+            record.source_url,
+            record.canonical_url,
+            cls._json_value(record.tickers),
+            cls._json_value(record.index_codes),
+            cls._json_value(record.sectors),
+            cls._json_value(dict(record.metadata)),
+        )
+        return sum(len(str(value).encode("utf-8")) for value in values if value is not None)
 
     def _find_corpus_duplicate(
         self,
@@ -1153,6 +1212,18 @@ CREATE INDEX IF NOT EXISTS idx_corpus_events_type_effective
                     "WHERE corpus_item_id=?",
                     (record.accessed_at, record.ingested_at, item_id),
                 )
+            if created or content_changed or authority_promoted:
+                conn.execute(
+                    "UPDATE corpus_items SET document_family_id=?, narrative_bytes=?, "
+                    "metadata_bytes=?, is_tombstone=0, retired_at=NULL, retention_reason=NULL "
+                    "WHERE corpus_item_id=?",
+                    (
+                        item_id,
+                        len(record.body.encode("utf-8")),
+                        self._corpus_metadata_bytes(record),
+                        item_id,
+                    ),
+                )
             conn.execute(
                 """INSERT INTO corpus_item_sources (
                     corpus_item_id, source_key, source_name, source_category,
@@ -1201,6 +1272,7 @@ CREATE INDEX IF NOT EXISTS idx_corpus_events_type_effective
             "authority_promoted": authority_promoted,
             "needs_index": needs_index,
             "indexing_status": initial_status if created or content_changed else previous_status,
+            "document_family_id": item_id,
             "revision": revision,
         }
 
@@ -1253,6 +1325,172 @@ CREATE INDEX IF NOT EXISTS idx_corpus_events_type_effective
                 "ORDER BY updated_at, corpus_item_id LIMIT ?", (limit,),
             ).fetchall()
         return [self._decode_corpus_row(row) for row in rows]
+
+    def list_news_retention_candidates(self, cutoff: str, *, limit: int) -> list[dict]:
+        """Return a bounded set of indexed company-news families older than cutoff."""
+        if limit < 1 or limit > self.MAX_MAINTENANCE_LIMIT:
+            raise ValueError(
+                f"limit must be between 1 and {self.MAX_MAINTENANCE_LIMIT}"
+            )
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT corpus_item_id, document_family_id, published_at "
+                "FROM corpus_items WHERE item_type='news' AND is_tombstone=0 "
+                "AND indexing_status='indexed' AND published_at IS NOT NULL "
+                "AND published_at < ? ORDER BY published_at, corpus_item_id LIMIT ?",
+                (cutoff, limit),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def expire_news_narratives(
+        self,
+        corpus_item_ids: list[str],
+        *,
+        retired_at: str,
+        reason: str,
+    ) -> int:
+        """Turn selected news rows into tombstones and bump revision once."""
+        item_ids = list(dict.fromkeys(corpus_item_ids))
+        if not item_ids:
+            return 0
+        if len(item_ids) > self.MAX_MAINTENANCE_LIMIT:
+            raise ValueError("too many corpus items for one retention run")
+        placeholders = ",".join("?" for _ in item_ids)
+        with self._connect() as conn:
+            cursor = conn.execute(
+                f"UPDATE corpus_items SET is_tombstone=1, narrative_bytes=0, "
+                f"indexing_status='not_applicable', index_error=NULL, retired_at=?, "
+                f"retention_reason=?, updated_at=datetime('now') WHERE corpus_item_id IN "
+                f"({placeholders}) AND item_type='news' AND is_tombstone=0 "
+                f"AND indexing_status='indexed'",
+                (retired_at, reason, *item_ids),
+            )
+            changed = int(cursor.rowcount)
+            if changed:
+                self._bump_revision_in_transaction(conn)
+            conn.commit()
+        return changed
+
+    def get_corpus_accounting(
+        self,
+        group_by: str,
+        *,
+        source_category: Optional[str] = None,
+        source: Optional[str] = None,
+        item_type: Optional[str] = None,
+        security: Optional[str] = None,
+        year: Optional[str] = None,
+        month: Optional[str] = None,
+        indexing_state: Optional[str] = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> list[dict]:
+        """Return bounded corpus counts and byte estimates from SQLite metadata."""
+        self._validate_inventory_page(limit, offset)
+        include_security = group_by == "security" or security is not None
+        narrative_join = (
+            "LEFT JOIN corpus_item_securities link "
+            "ON link.corpus_item_id=ci.corpus_item_id"
+            if include_security else ""
+        )
+        observation_join = (
+            "LEFT JOIN observation_securities link "
+            "ON link.observation_id=observation.observation_id "
+            "LEFT JOIN securities security ON security.security_id=link.security_id"
+            if include_security else ""
+        )
+        event_join = (
+            "LEFT JOIN event_securities link ON link.event_id=event.event_id "
+            "LEFT JOIN securities security ON security.security_id=link.security_id"
+            if include_security else ""
+        )
+        narrative_security = "link.security_id" if include_security else "NULL"
+        narrative_ticker = "link.ticker" if include_security else "NULL"
+        structured_security = "link.security_id" if include_security else "NULL"
+        structured_ticker = "security.ticker" if include_security else "NULL"
+        cte = f"""
+            WITH accounting AS (
+                SELECT ci.source_category, ci.source, ci.item_type,
+                       {narrative_security} AS security_id,
+                       {narrative_ticker} AS ticker,
+                       COALESCE(ci.published_at, ci.effective_at, ci.as_of_at,
+                                ci.ingested_at) AS occurred_at,
+                       ci.indexing_status AS indexing_state,
+                       ci.metadata_bytes + ci.narrative_bytes AS approximate_bytes
+                FROM corpus_items ci {narrative_join}
+                UNION ALL
+                SELECT observation.source_category, observation.source_name,
+                       'observation', {structured_security}, {structured_ticker},
+                       COALESCE(observation.published_at, observation.as_of_at,
+                                observation.period_end, observation.ingested_at),
+                       'not_applicable',
+                       length(CAST(COALESCE(observation.metric_id, '') AS BLOB)) +
+                       length(CAST(COALESCE(observation.value_text, '') AS BLOB)) +
+                       length(CAST(COALESCE(observation.unit, '') AS BLOB)) +
+                       length(CAST(COALESCE(observation.metadata_json, '') AS BLOB))
+                FROM corpus_observations observation {observation_join}
+                UNION ALL
+                SELECT event.source_category, event.source_name, 'event',
+                       {structured_security}, {structured_ticker},
+                       COALESCE(event.published_at, event.effective_at,
+                                event.announced_at, event.ingested_at),
+                       'not_applicable',
+                       length(CAST(COALESCE(event.event_type, '') AS BLOB)) +
+                       length(CAST(COALESCE(event.explanation, '') AS BLOB)) +
+                       length(CAST(COALESCE(event.metadata_json, '') AS BLOB))
+                FROM corpus_events event {event_join}
+            )
+        """
+        date_value = "a.occurred_at"
+        dimensions = {
+            "source_category": "a.source_category",
+            "source": "a.source",
+            "item_type": "a.item_type",
+            "security": "COALESCE(a.security_id, 'unlinked')",
+            "year": f"substr({date_value}, 1, 4)",
+            "month": f"substr({date_value}, 1, 7)",
+            "indexing_state": "a.indexing_state",
+        }
+        expression = dimensions.get(group_by)
+        if expression is None:
+            raise ValueError(f"group_by must be one of {sorted(dimensions)}")
+
+        predicates: list[str] = []
+        params: list[object] = []
+        filters = (
+            ("a.source_category", source_category),
+            ("a.source", source),
+            ("a.item_type", item_type),
+            (f"substr({date_value}, 1, 4)", year),
+            (f"substr({date_value}, 1, 7)", month),
+            ("a.indexing_state", indexing_state),
+        )
+        for column, value in filters:
+            if value is not None:
+                predicates.append(f"{column}=?")
+                params.append(value)
+        if security is not None:
+            predicates.append("(a.security_id=? OR a.ticker=?)")
+            params.extend((security, security.upper()))
+        where = f"WHERE {' AND '.join(predicates)}" if predicates else ""
+        sql = (
+            cte +
+            f"SELECT {expression} AS key, COUNT(*) AS count, "
+            f"COALESCE(SUM(a.approximate_bytes), 0) AS approximate_bytes "
+            f"FROM accounting a {where} GROUP BY {expression} "
+            f"ORDER BY count DESC, key LIMIT ? OFFSET ?"
+        )
+        params.extend((limit, offset))
+        with self._connect() as conn:
+            rows = conn.execute(sql, params).fetchall()
+        return [
+            {
+                "key": row["key"] or "unknown",
+                "count": int(row["count"]),
+                "approximate_bytes": int(row["approximate_bytes"]),
+            }
+            for row in rows
+        ]
 
     def upsert_observation_record(self, record: ObservationRecord) -> dict:
         """Atomically upsert one structured observation and its security links."""
