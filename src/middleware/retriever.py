@@ -70,6 +70,125 @@ def rrf_fuse(vector_hits: list[dict], lexical_hits: list[dict],
     return sorted(scores.items(), key=lambda x: -x[1])
 
 
+# ── Weighted subquery fusion (Phase 2.2.4.2) ───────────────
+
+def _fusion_identities(doc: dict) -> list[tuple]:
+    """All independent de-dup identities a doc carries (mirror of the adaptive
+    orchestrator's ``_doc_identities``): a stable id and a
+    (parent_id, chunk_index) pair are INDEPENDENT — the same physical chunk can
+    surface once keyed by id and once keyed by parent+chunk, and either match
+    means duplicate. Bodyless-and-idless docs fall back to their body text."""
+    meta = doc.get("metadata") or {}
+    identities: list[tuple] = []
+    doc_id = doc.get("id") or meta.get("id")
+    if doc_id is not None:
+        identities.append(("id", doc_id))
+    parent = meta.get("parent_id") or doc.get("parent_id")
+    chunk = meta.get("chunk_index", meta.get("chunk"))
+    if parent is not None and chunk is not None:
+        identities.append(("chunk", parent, chunk))
+    if not identities:
+        body = doc.get("document") or doc.get("text") or doc.get("content") or ""
+        identities.append(("body", str(body).strip()))
+    return identities
+
+
+def _fusion_low_authority(doc: dict) -> int:
+    """0 for authoritative/fresh docs, 1 for stale/scoreless — a stable
+    secondary sort key so authoritative evidence wins when scores are comparable."""
+    meta = doc.get("metadata") or {}
+    if meta.get("stale") or doc.get("stale"):
+        return 1
+    if doc.get("rerank_score") is None and doc.get("fusion_score") is None:
+        return 1
+    return 0
+
+
+def fuse_weighted_subqueries(
+    channels: list[dict], *, top_k: int, k: int = 60,
+) -> list[dict]:
+    """Weighted RRF over per-subquery ranked document lists (2.2.4.2 Step 4).
+
+    Each channel is ``{"subquery_id": str, "weight": float, "documents": [...]}``
+    where ``documents`` are already ranked (index = rank). A doc's fused score is
+    the weight-scaled reciprocal-rank sum across every subquery that surfaced it,
+    so the original ``sq0`` channel (weight 1.0) stays the strongest signal above
+    deterministic-derived (0.8) and planner-derived (0.6) channels. Documents are
+    deduplicated by stable id AND parent/chunk identity; at least one slot is
+    reserved for every covered subquery before the remaining slots are filled by
+    fused score (authoritative/fresh evidence preferred on ties); the result is
+    truncated to ``top_k``. Each returned doc keeps its ``subquery_ids``,
+    per-subquery ``channel_ranks``, ``subquery_weights``, and ``fused_score``.
+
+    Structured facts are never fused here — they attach to their obligation
+    directly (see the orchestrator's fact merge).
+    """
+    groups: list[dict] = []
+    index: dict[tuple, int] = {}
+    covered_order: list[str] = []
+
+    for channel in channels:
+        sqid = channel.get("subquery_id")
+        weight = float(channel.get("weight", 1.0))
+        docs = channel.get("documents") or []
+        if sqid not in covered_order:
+            covered_order.append(sqid)
+        for rank, doc in enumerate(docs):
+            if not isinstance(doc, dict):
+                continue
+            identities = _fusion_identities(doc)
+            gidx = next((index[i] for i in identities if i in index), None)
+            if gidx is None:
+                gidx = len(groups)
+                groups.append({
+                    "doc": dict(doc), "score": 0.0, "subquery_ids": [],
+                    "weights": {}, "channel_ranks": {},
+                })
+            group = groups[gidx]
+            for identity in identities:
+                index[identity] = gidx
+            group["score"] += weight * (1.0 / (k + rank + 1))
+            if sqid not in group["subquery_ids"]:
+                group["subquery_ids"].append(sqid)
+            group["weights"][sqid] = weight
+            prior = group["channel_ranks"].get(sqid)
+            group["channel_ranks"][sqid] = rank if prior is None else min(prior, rank)
+
+    ordered = sorted(
+        groups,
+        key=lambda g: (-g["score"], _fusion_low_authority(g["doc"]), str(g["doc"].get("id"))),
+    )
+
+    # Reserve one slot per covered subquery (in subquery order), highest-scoring
+    # eligible group first, before filling the rest by fused score.
+    reserved_gids: set[int] = set()
+    for sqid in covered_order:
+        for group in ordered:
+            if id(group) in reserved_gids:
+                continue
+            if sqid in group["subquery_ids"]:
+                reserved_gids.add(id(group))
+                break
+
+    final: list[dict] = [g for g in ordered if id(g) in reserved_gids]
+    for group in ordered:
+        if len(final) >= max(0, top_k):
+            break
+        if id(group) not in reserved_gids:
+            final.append(group)
+    final = final[: max(0, top_k)]
+
+    out: list[dict] = []
+    for group in final:
+        doc = dict(group["doc"])
+        doc["fused_score"] = round(group["score"], 8)
+        doc["subquery_ids"] = list(group["subquery_ids"])
+        doc["subquery_weights"] = dict(group["weights"])
+        doc["channel_ranks"] = dict(group["channel_ranks"])
+        out.append(doc)
+    return out
+
+
 class Retriever:
     """
     Hybrid retriever — queries SQLite + ChromaDB based on intent.
@@ -105,6 +224,12 @@ class Retriever:
         # ("vector" | "hybrid" | "hybrid+rerank") — surfaced in the /query response.
         self._doc_retrieval_strategy = "vector"
         self._timings = {"embedding": 0.0, "chroma": 0.0, "sqlite": 0.0}
+        # Phase 2.2.3.3 — per-channel ranked ids from a document fusion are the
+        # adaptive orchestrator's channel-disagreement signal. They are NOT kept
+        # on the instance (that cross-contaminated concurrent requests on the
+        # shared Retriever — 2.2.3.4 review D); a request-local ``channels`` dict
+        # is threaded through the doc-retrieval path and surfaced only in
+        # retrieve_candidates()' returned dict.
 
     @property
     def lexical(self) -> LexicalIndex:
@@ -166,8 +291,105 @@ class Retriever:
                 "retrieval_strategy": str,  # doc path: vector|hybrid|hybrid+rerank
             }
         """
+        return self._run_retrieval(query, intent, top_k_documents, top_k_facts, pool=False)
+
+    def retrieve_candidates(self, query: str, intent: dict,
+                            top_k_documents: int = 5,
+                            top_k_facts: int = 10) -> dict:
+        """Retrieve facts + the *un-reranked, untruncated* document candidate
+        pool plus per-channel ranked ids (Phase 2.2.3.3).
+
+        Same strategy/fact logic as :meth:`retrieve`, but the document pool is
+        returned before final re-ranking/truncation so the adaptive orchestrator
+        can decide whether one re-rank is justified. ``retrieve()`` itself is
+        unchanged for every feature-disabled caller.
+        """
+        result = self._run_retrieval(query, intent, top_k_documents, top_k_facts, pool=True)
+        # vector_ids / lexical_ids are produced request-locally by _run_retrieval
+        # (pool=True) — never read back off shared instance state.
+        result.setdefault("vector_ids", [])
+        result.setdefault("lexical_ids", [])
+        result["candidate_count"] = len(result.get("documents", []))
+        return result
+
+    def expand_parent_sections(self, documents: list[dict]) -> list[dict]:
+        """Read adjacent sibling chunks for known parents from local Chroma only.
+
+        This bounded corrective seam never invokes ingestion, HTTP, arbitrary
+        URLs, or write tools. Missing parents/siblings fail soft per item.
+        """
+        expanded: list[dict] = []
+        seen: set[str] = set()
+        for document in documents:
+            metadata = document.get("metadata") or {}
+            parent = metadata.get("parent_id") or document.get("parent_id")
+            chunk = metadata.get("chunk_index", metadata.get("chunk"))
+            if parent is None or not isinstance(chunk, int):
+                continue
+            for index in (chunk - 1, chunk + 1):
+                if index < 0:
+                    continue
+                sibling_id = f"{parent}#{index}"
+                if sibling_id in seen:
+                    continue
+                seen.add(sibling_id)
+                try:
+                    sibling = self.store.chroma.get_document(sibling_id)
+                except Exception:  # noqa: BLE001 - correction is fail-soft per item
+                    logger.debug("Adjacent chunk unavailable: %s", sibling_id, exc_info=True)
+                    continue
+                if sibling:
+                    expanded.append(dict(sibling))
+        return expanded
+
+    def hierarchical_expand(self, documents: list[dict], plan=None, *,
+                            missing_local_context: bool = False) -> list[dict]:
+        """Bounded filing → section → child expansion of precise hits (2.2.5.3).
+
+        Delegates to :func:`hierarchical_retrieval.expand_filing_hits` using this
+        retriever's store and the configured hierarchy caps. Returns the root hits
+        plus their in-budget same-section / adjacent-section neighbors, each
+        annotated with ``expansion_reason`` / ``root_hit_id`` and the root hit's
+        score. An entire filing parent is never returned. Fails soft to the
+        original documents on any error so it can never break a query.
+        """
+        try:
+            from .hierarchical_retrieval import expand_filing_hits
+
+            obligations: tuple = ()
+            if plan is not None:
+                try:
+                    from .evidence_grader import build_obligations
+                    obligations = build_obligations(plan)
+                except Exception:  # noqa: BLE001 - heading match is best-effort
+                    obligations = ()
+            max_items = int(getattr(self.config, "hierarchy_max_expanded_items", 0) or 0)
+            return expand_filing_hits(
+                list(documents or []),
+                self.store,
+                obligations,
+                int(getattr(self.config, "adaptive_max_context_chars", 18000)),
+                max_siblings=int(getattr(self.config, "hierarchy_max_siblings", 2)),
+                max_adjacent_sections=int(
+                    getattr(self.config, "hierarchy_max_adjacent_sections", 1)),
+                max_expanded_items=max_items or None,
+                missing_local_context=missing_local_context,
+            )
+        except Exception as e:  # noqa: BLE001 - expansion must never fail a query
+            logger.warning("Hierarchical expansion failed, keeping hits: %s", e)
+            return list(documents or [])
+
+    def _run_retrieval(self, query: str, intent: dict,
+                       top_k_documents: int, top_k_facts: int,
+                       *, pool: bool) -> dict:
+        """Shared retrieval core for :meth:`retrieve` (``pool=False``, byte-for-
+        byte legacy behavior) and :meth:`retrieve_candidates` (``pool=True``,
+        full document candidate pool without re-rank/truncation)."""
         self._doc_retrieval_strategy = "vector"  # reset; upgraded by hybrid path
         self._timings = {"embedding": 0.0, "chroma": 0.0, "sqlite": 0.0}
+        # Request-local channel ids (review D): the doc path writes the most
+        # recent fusion's per-channel ranked ids here, never onto self.
+        channels: dict = {"vector_ids": [], "lexical_ids": []}
         ticker = intent.get("ticker")
         metrics = intent.get("metrics", [])
         question_type = intent.get("question_type", "general")
@@ -192,24 +414,28 @@ class Retriever:
             )
 
         elif strategy == "documents_only":
-            documents = self._retrieve_documents(query, ticker, top_k_documents)
+            documents = self._retrieve_documents(
+                query, ticker, top_k_documents, pool=pool, channels=channels)
 
         elif strategy == "macro":
             facts = self._time_sqlite(self._retrieve_macro_facts, top_k_facts)
-            documents = self._retrieve_documents(query, ticker=None, n_results=top_k_documents)
+            documents = self._retrieve_documents(
+                query, ticker=None, n_results=top_k_documents, pool=pool, channels=channels)
 
         elif strategy == "macro_hybrid":
             facts = self._time_sqlite(
                 self._retrieve_facts, ticker, metrics, timeframe, top_k_facts,
             )
             facts.extend(self._time_sqlite(self._retrieve_macro_facts, top_k_facts))
-            documents = self._retrieve_documents(query, ticker, top_k_documents)
+            documents = self._retrieve_documents(
+                query, ticker, top_k_documents, pool=pool, channels=channels)
 
         elif strategy == "hybrid":
             facts = self._time_sqlite(
                 self._retrieve_facts, ticker, metrics, timeframe, top_k_facts,
             )
-            documents = self._retrieve_documents(query, ticker, top_k_documents)
+            documents = self._retrieve_documents(
+                query, ticker, top_k_documents, pool=pool, channels=channels)
 
         elif strategy == "comparison":
             # Multi-ticker: extract all tickers from query
@@ -219,12 +445,14 @@ class Retriever:
                     self._retrieve_facts, t, metrics, timeframe, top_k_facts // len(tickers),
                 )
                 facts.extend(t_facts)
-                t_docs = self._retrieve_documents(query, t, top_k_documents // len(tickers))
+                t_docs = self._retrieve_documents(
+                    query, t, top_k_documents // len(tickers), pool=pool, channels=channels)
                 documents.extend(t_docs)
 
         elif strategy == "broad":
             # No ticker detected — search everything
-            documents = self._retrieve_documents(query, ticker=None, n_results=top_k_documents)
+            documents = self._retrieve_documents(
+                query, ticker=None, n_results=top_k_documents, pool=pool, channels=channels)
             facts = self._time_sqlite(self._retrieve_all_facts, top_k_facts)
 
         if question_type == "projection" and ticker:
@@ -235,7 +463,7 @@ class Retriever:
             strategy, ticker, len(facts), len(documents),
         )
 
-        return {
+        result = {
             "facts": facts,
             "documents": documents,
             "ticker": ticker,
@@ -243,6 +471,12 @@ class Retriever:
             "retrieval_strategy": self._doc_retrieval_strategy,
             "timings": {k: round(v, 1) for k, v in self._timings.items()},
         }
+        # Channel ids are only meaningful to the candidate (pool) consumer and
+        # are omitted from the legacy retrieve() dict so its shape is unchanged.
+        if pool:
+            result["vector_ids"] = list(channels["vector_ids"])
+            result["lexical_ids"] = list(channels["lexical_ids"])
+        return result
 
     def _time_sqlite(self, func, *args, **kwargs):
         """Run a SQLite-backed retrieval function and accumulate elapsed time."""
@@ -342,7 +576,32 @@ class Retriever:
                 if not any(f.get("metric") == r.get("metric") for f in facts):
                     facts.append(dict(r))
 
+        # Prefer authoritative SEC CompanyFacts for supported GAAP metrics
+        # (2.2.5.3). No-op when CompanyFacts ingestion is disabled; conflicts
+        # stay as separate evidence rows rather than being averaged/dropped.
+        facts = self._merge_companyfacts(ticker, metrics, facts)
+
         return facts[:limit]
+
+    def _merge_companyfacts(self, ticker: str, metrics: list[str],
+                            facts: list[dict]) -> list[dict]:
+        """Reconcile legacy facts with authoritative CompanyFacts (fail-soft).
+
+        Only runs for explicitly requested metrics; returns ``facts`` unchanged
+        when CompanyFacts is disabled/empty or on any lookup error, so the legacy
+        fact path is preserved byte-for-byte until the source is enabled.
+        """
+        if not metrics:
+            return facts
+        try:
+            authoritative = self.store.companyfacts_evidence(ticker, list(metrics))
+        except Exception as e:  # noqa: BLE001 - authoritative merge is best-effort
+            logger.warning("CompanyFacts lookup failed for %s: %s", ticker, e)
+            return facts
+        if not authoritative:
+            return facts
+        from .evidence import reconcile_structured_facts
+        return reconcile_structured_facts(facts, authoritative)
 
     def _merge_projection_facts(self, ticker: str, facts: list[dict]) -> list[dict]:
         """Add full estimate rows for projection queries, failing per metric."""
@@ -419,29 +678,47 @@ class Retriever:
         return self._retrieve_documents(query, ticker, n_results)
 
     def _retrieve_documents(self, query: str, ticker: Optional[str],
-                            n_results: int) -> list[dict]:
+                            n_results: int, *, pool: bool = False,
+                            channels: Optional[dict] = None) -> list[dict]:
         """Retrieve relevant documents — hybrid (vector+BM25+RRF, optional
         re-rank) when enabled, else the original vector-only path.
 
         ``n_results`` is the final count returned. The hybrid path retrieves
         ``rerank_candidates`` broadly, fuses, then re-ranks / truncates to
-        ``n_results``.
+        ``n_results``. When ``pool`` is True (2.2.3.3), the full fused candidate
+        pool is returned *without* re-ranking or truncation so the adaptive
+        orchestrator owns the re-rank/context decision. When ``channels`` is
+        given (request-local, review D), the per-channel ranked ids of the
+        fusion are written into it — never onto shared instance state.
         """
         if not self.config.enable_lexical:
+            candidate_n = max(self.config.rerank_candidates, n_results) if pool else n_results
             start = time.perf_counter()
-            results = self.store.search(query=query, n_results=n_results,
+            results = self.store.search(query=query, n_results=candidate_n,
                                         ticker=ticker)
             elapsed_ms = (time.perf_counter() - start) * 1000
             chroma = getattr(self.store, "chroma", None)
             search_timings = getattr(chroma, "last_search_timings", {}) or {}
             self._timings["embedding"] += float(search_timings.get("embedding", 0.0) or 0.0)
             self._timings["chroma"] += float(search_timings.get("chroma", elapsed_ms) or 0.0)
-            return results.get("documents", [])
-        return self._retrieve_documents_hybrid(query, ticker, n_results)
+            docs = results.get("documents", [])
+            if channels is not None:
+                channels["vector_ids"] = [d.get("id") for d in docs if d.get("id") is not None]
+                channels["lexical_ids"] = []
+            self._doc_retrieval_strategy = "vector"
+            return docs
+        return self._retrieve_documents_hybrid(
+            query, ticker, n_results, pool=pool, channels=channels)
 
-    def _retrieve_documents_hybrid(self, query: str, ticker: Optional[str],
-                                   n_results: int) -> list[dict]:
-        """Vector + BM25 → RRF → (optional) cross-encoder re-rank → top n."""
+    def _fuse_channels(self, query: str, ticker: Optional[str],
+                       n_results: int, *, channels: Optional[dict] = None) -> list[dict]:
+        """Vector + BM25 → RRF → hydrated fused docs (no re-rank, no truncation).
+
+        Records the strategy (``hybrid`` when lexical produced hits, else
+        ``vector``) and the per-channel ranked ids for the fusion pass. Shared by
+        the hybrid ``retrieve()`` tail and the ``retrieve_candidates()`` seam so
+        both see identical fusion behavior.
+        """
         candidates = max(self.config.rerank_candidates, n_results)
         vfilter = {"ticker": ticker} if ticker else None
         broad_n = max(candidates // 2, n_results)
@@ -490,13 +767,27 @@ class Retriever:
             d["fusion_score"] = float(rrf_score)
             fused_docs.append(d)
 
-        # Record the strategy actually used (vector if lexical produced nothing).
-        if lexical_hits:
-            self._doc_retrieval_strategy = "hybrid"
-        else:
-            self._doc_retrieval_strategy = "vector"
+        # Record the strategy actually used (vector if lexical produced nothing)
+        # and the per-channel ranked ids for the conditional-rerank signal.
+        self._doc_retrieval_strategy = "hybrid" if lexical_hits else "vector"
+        if channels is not None:
+            channels["vector_ids"] = [h["id"] for h in vector_hits]
+            channels["lexical_ids"] = [h["id"] for h in lexical_hits]
+        return fused_docs
 
-        # 5. Re-rank or truncate to the final count.
+    def _retrieve_documents_hybrid(self, query: str, ticker: Optional[str],
+                                   n_results: int, *, pool: bool = False,
+                                   channels: Optional[dict] = None) -> list[dict]:
+        """Vector + BM25 → RRF → (optional) cross-encoder re-rank → top n.
+
+        With ``pool=True`` the full fused candidate pool is returned unranked and
+        untruncated (the adaptive orchestrator owns re-ranking/truncation).
+        """
+        fused_docs = self._fuse_channels(query, ticker, n_results, channels=channels)
+        if pool:
+            return fused_docs
+
+        # Re-rank or truncate to the final count.
         if self.config.enable_reranker and fused_docs:
             try:
                 fused_docs = self.reranker.rerank(

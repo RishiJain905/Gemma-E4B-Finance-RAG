@@ -15,6 +15,54 @@ return_timings: true
 enable_streaming: true
 embedding_cache_size: 256
 
+# Phase 2.2.6.1 — tool-aware streaming & progress events.
+# Both feature flags default off so the streaming/tool behavior is byte-identical
+# to the pre-2.2.6 path until promotion:
+#   enable_tool_final_streaming   — allow /query/stream to serve a tools-enabled
+#       request by running the bounded tool/planning rounds non-streaming, then
+#       streaming ONLY the final answer. Off -> /query/stream 404s while tools
+#       are enabled (current behavior).
+#   enable_stream_progress_events — emit versioned, redacted pipeline stage/tool
+#       progress events (query_started, stage, tool_started, tool_completed,
+#       error) on the SSE stream. Off -> only the legacy token/metadata events.
+#   stream_progress_include_counts — include row/item counts on retrieve and
+#       tool_completed progress events (default on).
+# Env: ENABLE_TOOL_FINAL_STREAMING, ENABLE_STREAM_PROGRESS_EVENTS,
+# STREAM_PROGRESS_INCLUDE_COUNTS.
+enable_tool_final_streaming: false
+enable_stream_progress_events: false
+stream_progress_include_counts: true
+
+# Phase 2.2.7 — bounded in-memory query trace graph + localhost read-only UI/API.
+# Disabled by default. No trace is persisted; questions are represented by a
+# bounded preview plus SHA-256 digest and evidence bodies by bounded excerpts.
+# SECURITY (2.2.7.4): when enabled, EVERY /graph* route (UI, static bundle, API)
+# is served ONLY to loopback clients (127.0.0.1/::1) with a strict same-origin
+# CSP; a non-loopback request gets 404. There is NO bypass flag — remote exposure
+# is out of scope for Phase 2.2 and needs a separate design (auth/TLS/proxy trust/
+# retention). Do not bind the middleware to a non-loopback address or place it
+# behind a proxy while this is on. Limits below are clamped by both TraceHub and
+# MiddlewareConfig. Env: ENABLE_GRAPH_OBSERVER, GRAPH_TRACE_LIMIT,
+# GRAPH_ELEMENT_LIMIT, GRAPH_TRACE_TTL_S, GRAPH_EXCERPT_CHARS,
+# GRAPH_QUESTION_PREVIEW_CHARS.
+enable_graph_observer: false
+graph_trace_limit: 100
+graph_element_limit: 5000
+graph_trace_ttl_s: 3600
+graph_excerpt_chars: 1000
+graph_question_preview_chars: 200
+
+# Phase 2.2.7.2 — read-only Store-backed corpus explorer. The graph observer
+# flag gates the routes. Pages and expansion responses are hard-bounded; the
+# overview cache is keyed by Store.retrieval_revision(). Env overrides:
+# CORPUS_PAGE_LIMIT, CORPUS_ELEMENT_LIMIT, CORPUS_VISIBLE_NODE_TARGET,
+# CORPUS_OVERVIEW_CACHE_TTL_S, CORPUS_OPAQUE_ID_TTL_S.
+corpus_page_limit: 100
+corpus_element_limit: 2000
+corpus_visible_node_target: 450
+corpus_overview_cache_ttl_s: 2.0
+corpus_opaque_id_ttl_s: 300.0
+
 # Phase 2.1.4 — structured analytical tooling.
 # Disabled by default until concrete tools are registered and validated.
 enable_tools: true
@@ -22,10 +70,141 @@ max_tool_iterations: 3
 allow_write_tools: true
 max_refreshes_per_query: 2
 
+# Phase 2.2.3.2 — deterministic finance tool routing.
+# When enable_deterministic_tool_routing is on, safe analytical/comparison/
+# projection/bounded-calculation requests are routed to the existing read-only
+# tools before any model call (deterministic_router.route). Off by default so
+# 2.2.3.4 can A/B the route against the current model tool loop first.
+# enable_deterministic_answers additionally lets a fully-covered route skip
+# model generation and answer from a short template. Env overrides:
+# ENABLE_DETERMINISTIC_TOOL_ROUTING, MAX_DETERMINISTIC_TOOLS_PER_QUERY,
+# ENABLE_DETERMINISTIC_ANSWERS.
+enable_deterministic_tool_routing: false
+max_deterministic_tools_per_query: 3
+enable_deterministic_answers: false
+
+# Phase 2.2.3.3 — bounded adaptive-RAG orchestration.
+# When enable_adaptive_rag is on, 2.2.3.4 routes a request through the
+# fast/standard/complex lanes of adaptive_orchestrator.orchestrate under one
+# shared execution budget (<=3 subqueries incl. sq0, <=2 retrieval rounds, <=1
+# planning call, <=1 re-rank call, deterministic-tool cap) and one context
+# budget. Every adaptive stage falls soft to the existing single-query
+# Retriever.retrieve() — a query never fails because the adaptive layer failed.
+# The optional pre-answer planning model call is a further opt-in and only runs
+# when deterministic parsing cannot assign retrieval modes. Out-of-range limits
+# are clamped to the documented safe ranges with a warning (see
+# src/middleware/config.py). Env overrides: ENABLE_ADAPTIVE_RAG,
+# ADAPTIVE_ENABLE_PLANNING_CALL, ADAPTIVE_MAX_SUBQUERIES,
+# ADAPTIVE_MAX_RETRIEVAL_ROUNDS, ADAPTIVE_MAX_PLANNING_CALLS,
+# ADAPTIVE_MAX_CONTEXT_CHARS, ADAPTIVE_CONDITIONAL_RERANK.
+enable_adaptive_rag: false
+adaptive_enable_planning_call: false
+adaptive_max_subqueries: 3           # clamp 1–3 (includes sq0)
+adaptive_max_retrieval_rounds: 2     # clamp 1–2
+adaptive_max_planning_calls: 1       # clamp 0–1
+adaptive_max_context_chars: 18000    # hard context ceiling (clamp 1000–64000)
+adaptive_conditional_rerank: true
+
+# Phase 2.2.4.1 — deterministic evidence sufficiency and one bounded internal
+# corrective retrieval. Both flags remain off until eval promotion. The retry
+# limit is hard-clamped to 0–1; total retrieval rounds remain capped at two.
+# Env: ENABLE_EVIDENCE_SUFFICIENCY, ENABLE_CORRECTIVE_RETRY,
+# MAX_CORRECTIVE_RETRIES.
+enable_evidence_sufficiency: false
+enable_corrective_retry: false
+max_corrective_retries: 1
+
+# Phase 2.2.4.3 — citation provenance & deterministic numerical validation.
+#   off     — legacy behavior, byte-identical (no [E#] ids, no validator).
+#   report  — render [E#] evidence ids, run the deterministic validator, and
+#             attach citation/numeric validation metadata (no answer change).
+#   enforce — additionally downgrade grounded->partial (or refuse a wholly-
+#             unsupported answer) with a short support warning.
+# The validator uses only the standard library + Decimal — it never makes a
+# model call and always fails soft to validation_status=report_unavailable.
+# require_evidence_ids tightens enforcement so a specific-figure answer with no
+# resolving [E#] counts as a violation. Env: ANSWER_VALIDATION, REQUIRE_EVIDENCE_IDS.
+answer_validation: report        # off | report | enforce
+require_evidence_ids: false
+
+# Phase 2.2.5.3 — bounded hierarchical (filing → section → child) retrieval.
+# When enable_hierarchical_retrieval is on, a precise SEC child hit is expanded
+# with at most hierarchy_max_siblings same-section neighbors (to complete a
+# sentence/table) and at most hierarchy_max_adjacent_sections adjacent sections
+# (only on an obligation-heading match or a grader missing-context signal),
+# always under the shared context character budget and never injecting an entire
+# filing parent. Off by default until the long-document eval gates pass; the
+# corrective EXPAND_PARENT_SECTION seam keeps its 2.2.4.1 sibling-only behavior.
+# hierarchy_max_expanded_items caps total added neighbors (0 = budget-bounded
+# only). Env: ENABLE_HIERARCHICAL_RETRIEVAL, HIERARCHY_MAX_SIBLINGS,
+# HIERARCHY_MAX_ADJACENT_SECTIONS, HIERARCHY_MAX_EXPANDED_ITEMS.
+enable_hierarchical_retrieval: false
+hierarchy_max_siblings: 2            # clamp 0–4
+hierarchy_max_adjacent_sections: 1  # clamp 0–3
+hierarchy_max_expanded_items: 12    # clamp 0–50 (0 = bounded only by the budget)
+
+# Phase 2.2.6.2 — versioned retrieval cache & prompt efficiency.
+# enable_retrieval_cache reuses a planned request's normalized PRE-PROMPT evidence
+# (facts/documents + retrieval metadata — NEVER a final generated answer) when the
+# identical request recurs at the same store data revision. The cache key includes
+# the compiled query, the validated plan, the config/model fingerprint, and the
+# monotonic store revision, so any ingestion write (a fact insert/update or a
+# document add/replace/delete, INCLUDING a same-count section replacement)
+# invalidates it exactly. Off by default -> behavior is byte-identical; a cache
+# miss or internal cache error is always just a miss, never a query failure.
+# retrieval_cache_ttl_s is a SECONDARY staleness bound beneath the revision key;
+# retrieval_cache_max_value_chars refuses to store a single oversized evidence
+# snapshot so memory stays bounded. Explicit-refresh requests never look up the
+# cache.
+#
+# DELIBERATELY NOT IMPLEMENTED: a semantic final-answer cache. Volatile finance
+# answers (prices, news, sentiment, freshness, estimates, guidance, "latest" asks)
+# must never be reused via embedding similarity — nearby embeddings for different
+# tickers/periods would serve wrong or stale figures. Only exact retrieval evidence,
+# invalidated on every revision change, is cached here. An exact answer cache for
+# immutable, explicitly date-bounded requests is out of scope and would need its
+# own evidence-watermark + citation contract.
+#
+# llama_cache_prompt (off by default) sends llama-server's official prompt-reuse
+# field (cache_prompt: true) on the final answer request when the backend supports
+# it, and captures reused-token timings; on backend rejection it disables itself
+# for the process and retries the plain payload once (fail-soft). Off -> the
+# request JSON is byte-identical. Live TTFT / prompt-reuse measurement is a
+# separately authorized activity.
+# Env: ENABLE_RETRIEVAL_CACHE, RETRIEVAL_CACHE_MAX_ENTRIES, RETRIEVAL_CACHE_TTL_S,
+# RETRIEVAL_CACHE_MAX_VALUE_CHARS, LLAMA_CACHE_PROMPT.
+enable_retrieval_cache: false
+retrieval_cache_max_entries: 256
+retrieval_cache_ttl_s: 300         # seconds; secondary bound under the revision key
+retrieval_cache_max_value_chars: 200000  # refuse to cache a single larger snapshot
+llama_cache_prompt: false
+
 # Phase 2.1.6 — fetch-on-miss ingestion.
 enable_fetch_on_miss: true
 fetch_on_miss_timeout_s: 10.0
 fetch_on_miss_per_query: 1
+
+# Phase 2.2.2.1 — bounded client-owned conversation history.
+# The middleware stays stateless; the client (scripts/chat.py) owns the turns
+# and sends them per request. These cap how much of that history/question one
+# request may use. Values above the documented safe maxima are clamped with a
+# warning (see src/middleware/config.py). Env overrides: CONVERSATION_MAX_TURNS,
+# CONVERSATION_MAX_HISTORY_CHARS, CONVERSATION_MAX_QUESTION_CHARS.
+conversation_max_turns: 8            # max recent turns kept (ceiling 50)
+conversation_max_history_chars: 8000 # max total history chars kept (ceiling 32000)
+conversation_max_question_chars: 16000  # hard cap on the current question (422 over-limit)
+
+# Phase 2.2.2.2 — follow-up rewriting & entity carryover.
+# When enable_conversation_rewrite is on and history is present, the current
+# turn + bounded history are compiled into a SEPARATE retrieval query while the
+# raw question is left byte-for-byte unchanged. Off by default (behavior
+# unchanged) until the conversational gates pass. enable_llm_rewrite_fallback
+# adds one bounded, schema/catalog-validated model call only when deterministic
+# compilation leaves a slot ambiguous. Env: ENABLE_CONVERSATION_REWRITE,
+# ENABLE_LLM_REWRITE_FALLBACK, CONVERSATION_REWRITE_TIMEOUT_S.
+enable_conversation_rewrite: false
+enable_llm_rewrite_fallback: false
+conversation_rewrite_timeout_s: 15.0
 
 # Phase 2.1.2 — hybrid retrieval & re-ranking.
 # Lexical (BM25) channel + RRF fusion (2.1.2.1). Low-risk; on by default.

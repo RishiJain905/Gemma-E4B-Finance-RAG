@@ -156,9 +156,10 @@ curl -X POST http://127.0.0.1:8000/query \
 
 For a single, centralized entry point, use the interactive client. It
 **auto-starts the middleware** if it isn't already running, gives you a chat
-loop over `/query` (streamed by default), and surfaces every Phase 2.1
-feature — grounding mode, tool calls, retrieval strategy, fetch-on-miss, and
-resolved-ticker confirmation — in one consistent answer renderer:
+loop over `/query` (streamed by default), and surfaces every Phase 2.1/2.2
+feature — grounding mode, tool calls, retrieval strategy, fetch-on-miss,
+resolved-ticker confirmation, bounded conversation history, multiline questions,
+and streamed progress events — in one consistent answer renderer:
 
 ```bash
 python scripts/chat.py
@@ -183,6 +184,11 @@ you> /tools              # list model-callable tools
 you> /grounding strict   # force the strict answer policy for this session
 you> /eval 10            # run the eval harness (10 cases) against this server
 you> /ticker NVDA        # pin a ticker for following questions
+you> And how about AMD?  # follow-ups reuse this session's bounded history
+you> /history            # preview this conversation's turns (local, no API call)
+you> /new                # start a fresh conversation (clear history, new session id)
+you> /history off        # run single-turn (stop sending/recording history)
+you> /graph              # open the live retrieval graph (if the observer is enabled)
 you> /help               # full command list
 you> /quit               # stops the middleware if this script started it
 ```
@@ -191,6 +197,17 @@ It still requires `llama-server` on `:8087`; it warns and falls back to
 degraded answers if the model is unreachable. See
 [`scripts/CHAT.md`](scripts/CHAT.md) for every command and metadata tag the
 renderer can show.
+
+### Live retrieval graph (optional, Phase 2.2.7)
+
+An optional, **local read-only** visualization of the retrieval pipeline (query →
+plan → stages → tools → evidence → answer) plus a corpus explorer. It is
+**disabled by default** and served **loopback-only** with a strict same-origin
+CSP — start the middleware with `ENABLE_GRAPH_OBSERVER=1` to enable it, then open
+`http://127.0.0.1:8000/graph` or run `/graph` in the chat client (`--open-graph`
+opens it at startup). It is an *observability* view and never changes retrieval
+or answers. Remote exposure is intentionally unsupported. See
+[`docs/CONFIGURATION.md`](docs/CONFIGURATION.md) and [`docs/API.md`](docs/API.md).
 
 ---
 
@@ -300,8 +317,9 @@ The middleware exposes the following endpoints (full schemas and examples in
 | Method | Path                   | Purpose                                          |
 |--------|------------------------|--------------------------------------------------|
 | GET    | `/`                    | Service info + links                             |
-| GET    | `/health`              | Storage, model, scheduler, freshness status      |
+| GET    | `/health`              | Storage, model, scheduler, freshness, capabilities |
 | POST   | `/query`               | Full RAG pipeline — grounded, cited answer       |
+| POST   | `/query/stream`        | SSE variant of `/query` (streamed final answer, 2.2.6.1) |
 | POST   | `/search`              | Raw hybrid search (bypasses the model)           |
 | GET    | `/freshness/{ticker}`  | Per-source freshness report for a ticker         |
 | POST   | `/refresh/{ticker}`    | On-demand re-ingestion of stale sources          |

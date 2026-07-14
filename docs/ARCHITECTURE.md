@@ -203,6 +203,110 @@ overrides:
 The `/query` response reports the actual answer path as `grounding`:
 `grounded`, `partial`, `general`, or `refused`.
 
+> **Phase 2.2.4 augmentations (additive, flag-gated).** When
+> `enable_evidence_sufficiency` is on, the count-based grounding hint above is
+> replaced by a deterministic, route-aware sufficiency assessment
+> (`sufficient|borderline|missing`) that can trigger one bounded corrective
+> retrieval (`enable_corrective_retry`); the response carries an
+> `evidence_sufficiency` block. When `answer_validation` is `report`/`enforce`,
+> every model-visible fact/document is assigned a request-local `[E#]` id, a
+> deterministic (stdlib + `Decimal`, no model call) validator checks citation
+> support and specific financial numbers, and `evidence_citations` +
+> `answer_validation` blocks are attached (see *Corrective Retrieval &
+> Provenance* below). With every flag off, the answer path is byte-identical to
+> the graded policy described here.
+
+---
+
+## Conversational & Adaptive Query Path (Phase 2.2.2–2.2.4)
+
+These layers wrap the existing retrieval/answer pipeline. Each is feature-flagged
+and falls soft to the legacy single-turn, single-plan path; all are **off by
+default** (except `answer_validation: report`, which is metadata-only).
+
+### Conversational query understanding (2.2.2)
+
+The middleware stays stateless: the client (`scripts/chat.py`) owns a bounded
+conversation history and sends it per request (`QueryRequest.history`, a flat
+list of `ChatTurn`). The server uses at most `conversation_max_turns` /
+`conversation_max_history_chars` of it and never persists anything; `session_id`
+is tracing metadata only, never a server-side lookup key. The current question
+has its own independent 16,000-char cap and is **never silently truncated** — an
+over-limit question is an HTTP 422. When `enable_conversation_rewrite` is on and
+history is present, the current turn + bounded history are compiled into a
+**separate** standalone retrieval query (`retrieval_query`) while the raw
+question is left byte-for-byte unchanged; deterministic entity/metric/timeframe
+carryover populates `carried_context` / `resolved_*`, and
+`enable_llm_rewrite_fallback` adds at most one bounded model call only when a
+slot stays ambiguous. Responses carry a `conversation` block
+(`history_turns_received/used`, `history_truncated`, `topic_reset`).
+
+### Adaptive orchestration (2.2.3)
+
+When `enable_adaptive_rag` is on, `src/middleware/adaptive_orchestrator.py`
+routes a request through **fast / standard / complex** lanes under one shared
+execution budget (≤ 3 subqueries incl. sq0, ≤ 2 retrieval rounds, ≤ 1 planning
+call, ≤ 1 re-rank call, deterministic-tool cap) and one context-character
+budget. Fast and standard lanes make no pre-answer model call; only the complex
+lane may make one optional compact planning call
+(`adaptive_enable_planning_call`). Deterministically recognized safe finance
+operations are routed to the existing read-only tools **before** any model call
+(`enable_deterministic_tool_routing`), and a write tool can never be selected by
+that router. Every adaptive stage falls soft to `Retriever.retrieve()`; the
+response carries an `orchestration` block of the **actual executed** counters
+(not configured maxima).
+
+### Corrective retrieval & provenance (2.2.4)
+
+- **Evidence sufficiency & bounded retry (2.2.4.1).** A deterministic grader
+  classifies coverage of the plan's obligations as `sufficient|borderline|
+  missing`, answering immediately when covered, allowing **one** internal
+  corrective retrieval when borderline, and returning an honest partial/refusal
+  when missing. Total retrieval rounds stay ≤ 2.
+- **Selective decomposition & weighted fusion (2.2.4.2).** In the complex lane,
+  a genuinely compound or low-coverage plan is decomposed into at most two
+  derived, drift-validated subqueries, retrieved through their appropriate
+  modality and fused by weighted RRF (original query the strongest signal:
+  `sq0=1.0`, derived `0.8`, planner `0.6`) with slot reservation.
+- **Citation provenance & numeric validation (2.2.4.3).** Every model-visible
+  fact/document/tool result/calculation gets a stable request-local `[E#]` id;
+  the answer is expected to cite those ids. A stdlib+`Decimal` validator (never
+  a model call) resolves `[E#]` and legacy `[Source: …]` citations and checks
+  specific financial numbers (currency/percent/signed/ratio/K-M-B-T-scaled)
+  against cited evidence. `answer_validation: report` attaches metadata without
+  changing the answer; `enforce` additionally downgrades grounded→partial or
+  refuses a wholly-unsupported answer. The validator always fails soft to
+  `validation_status=report_unavailable`.
+
+---
+
+## Runtime: Streaming & Caching (Phase 2.2.6)
+
+Additive, flag-gated, and local-safe; all off by default.
+
+- **Tool-aware final streaming & progress events (2.2.6.1).** The bounded
+  tool/planning rounds run non-streaming, then only the final answer synthesis
+  is streamed, so enabling tools no longer disables streaming for the whole
+  request. `enable_tool_final_streaming` makes `POST /query/stream` serve a
+  tools-enabled request (off → it 404s while tools are enabled).
+  `enable_stream_progress_events` emits versioned, **redacted** SSE progress
+  events (`query_started`, `stage`, `tool_started`, `tool_completed`, `error`) —
+  stage names, safe tool names, statuses, and optional row counts only, never
+  prompts, tool arguments, or document text. `/health` advertises the honest
+  effective capability (`streaming`, `streaming_tool_final`).
+- **Versioned retrieval cache & prompt efficiency (2.2.6.2).** A monotonic
+  `store_revision` is bumped before every model-visible mutation. When
+  `enable_retrieval_cache` is on, a thread-safe LRU+TTL cache reuses a planned
+  request's **pre-prompt** evidence keyed on the compiled query + validated plan
+  + config/model fingerprint + revision, so any ingestion write (including a
+  same-count section replacement) invalidates it exactly; a miss or internal
+  error is always just a miss. Prompt sections are emitted in a stable order with
+  a prefix digest for reuse, and `llama_cache_prompt` optionally sends
+  llama-server's `cache_prompt: true` with a capability fallback. **No semantic
+  final-answer cache exists** — volatile finance answers are never reused by
+  similarity; only versioned retrieval evidence and immutable date-bounded
+  results are cacheable.
+
 ---
 
 ## Data Sources
@@ -299,15 +403,91 @@ DDL in `SQLiteStore._inline_schema()`.
 - Embeddings are produced by `TraceAlchemyEmbeddingFunction`, which POSTs text
   to the llama-server `/v1/embeddings` endpoint (`model: tracealchemy`,
   mean-pooled) in batches of 10.
-- Documents longer than `DEFAULT_CHUNK_CHARS` (1000 chars, 150-char overlap)
-  are split into overlapping windows on whitespace boundaries; each chunk is
-  stored as `"{id}#{i}"` with `parent_id`, `chunk_index`, and `chunk_count`
-  metadata. Shorter documents are stored as a single entry under their original
-  id.
+- Chunking is **structure-aware by default** (Phase 2.1.3,
+  `chunking.strategy: structural` in `configs/storage.yaml`): text is split on
+  SEC section markers / markdown headings and whole sentences are packed up to
+  `max_chars` (1000) with sentence-based overlap — no mid-sentence cuts. The
+  legacy `fixed` strategy (a ~1000-char sliding window with 150-char overlap on
+  whitespace boundaries) remains available for rollback. Each chunk is stored as
+  `"{id}#{i}"` with `parent_id`, `chunk_index`, `chunk_count`, and (under the
+  structural strategy) `section` metadata. Shorter documents are stored as a
+  single entry under their original id, except SEC section families
+  (`source == "sec_filing"`), which always keep the `#i` child scheme so the
+  filing → section → child hierarchy (2.2.5.2) stays addressable.
 - The embedding vector dimension is determined at runtime by the model served
   on `:8087` (ChromaDB infers it from the embedding function's first response).
   The `embedding_dimension` field in `configs/storage.yaml` is descriptive
   only and is not enforced by the code.
+
+---
+
+## Hierarchical Retrieval & Authoritative Facts (Phase 2.2.5)
+
+Two additive, independently gated capabilities improve long-document evidence
+and structured-fact authority without changing the default query path.
+
+### Filing → section → child hierarchy
+
+SEC filings are indexed as a natural hierarchy (2.2.5.2): a filing (`accession`)
+holds sections (`parent_id = sec:{accession}:{section_key}`, `section_index`),
+each split into child chunks (`chunk_index`). `src/middleware/hierarchical_retrieval.py`
+(`expand_filing_hits`) reconstructs *just enough* local context around a precise
+child hit:
+
+- the exact hit and its section heading are always kept;
+- at most `hierarchy_max_siblings` same-section neighbors are added when the hit
+  begins or ends mid-sentence/table (one preceding, one following);
+- at most `hierarchy_max_adjacent_sections` adjacent sections are added, only
+  when a requested obligation matches the adjacent heading or the evidence grader
+  reports missing local context;
+- shared parent/sibling chunks are deduplicated across hits, expansion stops
+  before the shared context character budget is exceeded, and **an entire filing
+  parent is never returned**.
+
+Every expanded item preserves the root hit's original retrieval score plus
+`expansion_reason` and `root_hit_id`. The expander is wired into the adaptive
+orchestrator's `EXPAND_PARENT_SECTION` corrective seam (upgraded from the
+2.2.4.1 sibling-only reader) and exposed as `Retriever.hierarchical_expand`. All
+store reads fail soft per item — a query never errors because an expansion read
+failed. Feature flag: `enable_hierarchical_retrieval` (off by default).
+
+### Authoritative CompanyFacts preference
+
+When `configs/sec_companyfacts.yaml` is enabled, `Store.companyfacts_evidence`
+projects filed GAAP observations into structured fact-evidence rows and
+`evidence.reconcile_structured_facts` merges them into structured retrieval:
+an exact SEC concept/unit/period/as-of match wins for filed GAAP facts,
+estimates never overwrite realized facts, and legacy Yahoo fundamentals fill
+unsupported or more-current market fields. Conflicting values remain **separate
+evidence items** with source/period/unit; the grader discloses the conflict and
+never averages. The merge happens only at retrieval/evidence normalization — the
+legacy `fundamentals` table is never rewritten, so rollback stays possible.
+
+### Backfill, promotion gates, and rollback
+
+`scripts/index_sec_filing_text.py` migrates existing parsed artifacts into the
+section index (dry-run-first, pilotable, resumable via a source-hash manifest,
+idempotent, and `--backup`-reversible; no parser-model call). The offline
+long-document eval (`eval/run_eval.py::evaluate_long_document_configs` over
+`tests/fixtures/sec/hierarchical_corpus.json`) compares flat, flat-larger-top-k,
+and hierarchical retrieval.
+
+**Promotion gate** (`metrics.long_document_gate`) — enable hierarchical expansion
+by default only when, on the long-document corpus:
+
+- Recall@10 improves at least 8 points over the flat baseline;
+- context precision regresses no more than 0.02;
+- answer correctness regresses no more than 0.02;
+- packed prompt characters are no higher than the larger-top-k config (the
+  hierarchical path must reach that recall without the top-k prompt cost);
+- retrieval p95 adds no more than 20% and the backfill restore is tested;
+- no ingestion-time model call is added.
+
+**Rollback** — set `enable_hierarchical_retrieval: false` to return to the
+sibling-only corrective behavior; if the index itself must be reversed, restore
+the Chroma backup snapshot taken by the backfill's `--backup`. CompanyFacts is an
+independent additive source — disable it via `configs/sec_companyfacts.yaml`
+(`enabled: false`) with no effect on the hierarchy path or vice versa.
 
 ---
 
@@ -360,10 +540,21 @@ The embeddings endpoint requires `--embeddings --pooling mean` on the server.
    retrieved facts and documents into a grounded prompt.
 5. **Model call** — if `/health` on the model server returns 200, the prompt
    is sent to `/v1/chat/completions` with a finance-assistant system prompt.
-   Inline `[Source: type/ticker]` citations are parsed out of the response.
+   Inline `[Source: type/ticker]` citations are parsed out of the response; when
+   `answer_validation` is on, request-local `[E#]` evidence-id citations are
+   resolved and validated as well.
 6. **Response** — `QueryResponse` returns the answer, citations, detected
    ticker/intent, counts of facts/documents used, latency, `model_available`,
-   and the freshness metadata block.
+   and the freshness metadata block, plus any flag-gated additive blocks
+   (`conversation`, `orchestration`, `evidence_sufficiency`,
+   `evidence_citations`, `answer_validation`, `retrieval_query`).
+
+The steps above describe the legacy single-turn path, which remains the default.
+When the Phase 2.2 flags are enabled, a conversational query compiler (2.2.2)
+runs before step 1, adaptive lane selection (2.2.3) wraps steps 3–5, and the
+evidence sufficiency grader / corrective retry / citation-numeric validator
+(2.2.4) wrap steps 4–6 — see *Conversational & Adaptive Query Path* above.
+`POST /query/stream` runs the same pipeline and streams the final answer (2.2.6.1).
 
 ---
 
@@ -384,3 +575,65 @@ Scheduler-managed refreshes (SEC filings, earnings transcripts, IR pages) are
 routed through `UnifiedScheduler._run_source` so TTL tracking and error
 handling stay consistent with cron-driven runs; other sources are ingested
 directly (`_refresh_one_source_direct`).
+
+## Live Retrieval Graph Observer (Phase 2.2.7)
+
+A local, read-only observability side channel that visualizes the retrieval
+pipeline without touching it. **Disabled by default** (`enable_graph_observer`),
+served loopback-only. This is an *observability graph*, not a retrieval
+architecture — it never changes what is retrieved or how the answer is produced.
+See `docs/phase2.2/ARCHITECTURE-DECISION.md` for the explicit
+observability-graph-vs-GraphRAG distinction.
+
+### Observer side channel
+
+- **One instrumentation seam.** The pipeline already emits a single stream of
+  redacted `QueryEvent`s (`src/middleware/stream_events.py`, 2.2.6.1). The
+  observer subscribes an extra callback to that same emitter
+  (`make_event_observer`), so the pipeline is instrumented **once** and the same
+  events feed both the chat SSE progress line and the graph. `/query` and
+  `/query/stream` install the emitter (with the graph observer attached) only
+  when the flag is on; otherwise no emitter is created and behavior is
+  byte-identical.
+- **Projection.** `event_graph_deltas` (`src/middleware/graph_observer.py`)
+  projects each event into bounded, allowlisted graph deltas: nodes for the
+  query, validated plan and its subqueries, executed stages, tools, retrieved
+  evidence and its source, and the terminal answer/citations/validation; edges
+  for the `compiled_to`/`contains`/`routed_to`/`retrieved`/`from_source`/
+  `expanded_from`/`supports`/`cited_by`/`corrected_by`/`validated_as` relations.
+  Node/edge ids are prefixed by `query_id`, so two concurrent queries never share
+  elements.
+- **TraceHub.** A bounded, in-memory, non-blocking store/broadcaster. It clamps
+  trace count, total elements, and per-trace TTL; compacts repeated upserts;
+  fans out deltas to SSE subscribers **without awaiting** them (a slow/full
+  subscriber is marked for reset, never blocking a publish); and fails soft — if
+  observation ever raises it disables itself and discards future deltas rather
+  than affecting the query. Publishing is synchronous and measured p95 < 2 ms.
+  Nothing is persisted.
+- **Redaction by construction.** Questions become a bounded preview + SHA-256
+  digest; evidence bodies are bounded excerpts; a metadata allowlist plus
+  secret/local-path scrubbing runs on every node/edge; source links are kept only
+  when `http`/`https`.
+
+### Corpus projection
+
+`src/middleware/corpus_graph.py` (`CorpusGraph`) projects the authoritative Store
+inventory (sources, tickers, metrics, facts, filings, sections, document
+families, freshness, scheduler sources) into the same bounded graph shape for the
+explorer tab. It reads only the Store's read methods, never embeddings or the
+model; every page is hard-bounded and keyed to `Store.retrieval_revision()` via
+opaque cursors so a mid-browse ingestion write is detected (HTTP 409) rather than
+silently mixing revisions. The overview is cached for a short TTL keyed by
+revision.
+
+### Serving & security
+
+`src/middleware/graph_api.py` mounts the read-only `/graph/api/*` router; the
+static single-page UI (`src/middleware/static/graph/`, Cytoscape) is served from
+the app. A single HTTP middleware is the chokepoint for every `/graph*` route:
+it rejects non-loopback clients with 404 (no bypass flag) and stamps a strict
+same-origin CSP + hardening headers. The UI is same-origin and self-contained
+(no cookies/localStorage/service worker/analytics/third-party requests) and never
+writes dynamic data through `innerHTML`. See `docs/API.md` for endpoints and the
+event schema, and `docs/CONFIGURATION.md` for the flags and the explicit
+no-remote-exposure rule.

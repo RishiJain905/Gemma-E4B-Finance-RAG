@@ -1,0 +1,5 @@
+9c2a3bf2592e0b14a1f7bec07c03a54f16dedf32af9cd0af155c716aa6c87bc3 *vendor/cytoscape.min.js
+14ef41458aeba3d812284c4e32ee956910b88845062c61e91cc8578c2b78bccb *fonts/RecursiveSans.woff2
+86132abb57fc615f2ab900cde4cd9d5796e9791daf1f85d79fc933aa50b3b15c *fonts/CommitMono.woff2
+1b00600b728444492b0c4906cb85e0055b889ea32ea4fb29bf25cd90cd0365b4 *fonts/CommitMono-700.woff2
+# Cytoscape.js 3.34.0 (MIT), Recursive variable + Commit Mono 400/700 (SIL OFL 1.1) — pinned 2026-07-13, no CDN at runtime

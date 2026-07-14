@@ -61,7 +61,9 @@ def test_scenario_1_full_daily_run(store):
     result = scheduler.run_daily()
 
     # Daily sources ran; hourly/weekly-only sources were not part of the run.
-    assert set(result) == {"yfinance", "fred", "sec_filings", "ir_pages", "estimates"}
+    assert set(result) == {
+        "yfinance", "fred", "sec_filings", "sec_companyfacts", "ir_pages", "estimates",
+    }
     assert all(r["status"] == "success" for r in result.values())
     assert "gdelt" not in result
     assert "earnings_transcripts" not in result

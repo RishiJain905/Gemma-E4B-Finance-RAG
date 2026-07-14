@@ -1,0 +1,333 @@
+{
+  "_comment": "Golden query-trace wire fixture (2.2.7.4). Schema-compatibility only: node kinds, edge relations, allowlisted metadata, bounded excerpts. No pixel/layout positions \u2014 graph MEANING is the contract, layout is UI.",
+  "schema_version": 1,
+  "snapshot": {
+    "complete": true,
+    "created_at": 1000.0,
+    "edge_count": 11,
+    "edges": [
+      {
+        "id": "qgold:e1",
+        "metadata": {},
+        "query_id": "qgold",
+        "relation": "compiled_to",
+        "sequence": 0,
+        "source": "qgold:query:request",
+        "target": "qgold:plan:validated"
+      },
+      {
+        "id": "qgold:e2",
+        "metadata": {},
+        "query_id": "qgold",
+        "relation": "contains",
+        "sequence": 0,
+        "source": "qgold:plan:validated",
+        "target": "qgold:subquery:sq0"
+      },
+      {
+        "id": "qgold:edge:7e1bbdbca7eaed92",
+        "metadata": {},
+        "query_id": "qgold",
+        "relation": "routed_to",
+        "sequence": 0,
+        "source": "qgold:subquery:sq0",
+        "target": "qgold:tool:sq0:query_facts"
+      },
+      {
+        "id": "qgold:edge:d2ddcb99c583cc99",
+        "metadata": {
+          "status": "ok"
+        },
+        "query_id": "qgold",
+        "relation": "returned",
+        "sequence": 0,
+        "source": "qgold:tool:sq0:query_facts",
+        "target": "qgold:stage:retrieve"
+      },
+      {
+        "id": "qgold:edge:d8001e6bbfe42006",
+        "metadata": {
+          "rank": 1
+        },
+        "query_id": "qgold",
+        "relation": "retrieved",
+        "sequence": 0,
+        "source": "qgold:stage:retrieve",
+        "target": "qgold:evidence:E1"
+      },
+      {
+        "id": "qgold:edge:82ed69c00b5647b0",
+        "metadata": {},
+        "query_id": "qgold",
+        "relation": "from_source",
+        "sequence": 0,
+        "source": "qgold:evidence:E1",
+        "target": "qgold:source:sec_10k"
+      },
+      {
+        "id": "qgold:e3",
+        "metadata": {},
+        "query_id": "qgold",
+        "relation": "returned",
+        "sequence": 0,
+        "source": "qgold:query:request",
+        "target": "qgold:answer:final"
+      },
+      {
+        "id": "qgold:e4",
+        "metadata": {},
+        "query_id": "qgold",
+        "relation": "supports",
+        "sequence": 0,
+        "source": "qgold:evidence:E1",
+        "target": "qgold:answer:final"
+      },
+      {
+        "id": "qgold:e5",
+        "metadata": {},
+        "query_id": "qgold",
+        "relation": "cited_by",
+        "sequence": 0,
+        "source": "qgold:evidence:E1",
+        "target": "qgold:citation:E1"
+      },
+      {
+        "id": "qgold:e6",
+        "metadata": {},
+        "query_id": "qgold",
+        "relation": "supports",
+        "sequence": 0,
+        "source": "qgold:citation:E1",
+        "target": "qgold:answer:final"
+      },
+      {
+        "id": "qgold:e7",
+        "metadata": {},
+        "query_id": "qgold",
+        "relation": "validated_as",
+        "sequence": 0,
+        "source": "qgold:answer:final",
+        "target": "qgold:stage:validate"
+      }
+    ],
+    "last_sequence": 27,
+    "node_count": 13,
+    "nodes": [
+      {
+        "created_sequence": 0,
+        "id": "qgold:query:request",
+        "kind": "query",
+        "label": "Query",
+        "metadata": {
+          "question_digest": "57e0ea97c06574ba874a912f319e233ca7e05ef78fb4326aa72b910dd2a5a262",
+          "question_preview_chars": 200
+        },
+        "query_id": "qgold",
+        "status": "active",
+        "summary": "What was NVDA revenue in 2025?",
+        "updated_sequence": 0
+      },
+      {
+        "created_sequence": 1,
+        "id": "qgold:stage:compile",
+        "kind": "stage",
+        "label": "Compile",
+        "metadata": {
+          "elapsed_ms": 1.0
+        },
+        "query_id": "qgold",
+        "status": "complete",
+        "summary": "",
+        "updated_sequence": 1
+      },
+      {
+        "created_sequence": 2,
+        "id": "qgold:plan:validated",
+        "kind": "plan",
+        "label": "Validated Query Plan",
+        "metadata": {
+          "intents": [
+            "fact_lookup"
+          ],
+          "lane": "standard",
+          "metrics": [
+            "revenue"
+          ],
+          "periods": [
+            "2025"
+          ],
+          "tickers": [
+            "NVDA"
+          ]
+        },
+        "query_id": "qgold",
+        "status": "complete",
+        "summary": "",
+        "updated_sequence": 2
+      },
+      {
+        "created_sequence": 3,
+        "group_id": "qgold:plan:validated",
+        "id": "qgold:subquery:sq0",
+        "kind": "subquery",
+        "label": "sq0",
+        "metadata": {
+          "derived": false,
+          "metrics": [
+            "revenue"
+          ],
+          "periods": [
+            "2025"
+          ],
+          "subquery_id": "sq0",
+          "tickers": [
+            "NVDA"
+          ]
+        },
+        "query_id": "qgold",
+        "status": "complete",
+        "summary": "",
+        "updated_sequence": 3
+      },
+      {
+        "created_sequence": 6,
+        "id": "qgold:stage:route",
+        "kind": "stage",
+        "label": "Route",
+        "metadata": {
+          "elapsed_ms": 0.5
+        },
+        "query_id": "qgold",
+        "status": "complete",
+        "summary": "",
+        "updated_sequence": 6
+      },
+      {
+        "created_sequence": 8,
+        "id": "qgold:tool:sq0:query_facts",
+        "kind": "tool",
+        "label": "query_facts",
+        "metadata": {
+          "count": 1,
+          "elapsed_ms": 2.0,
+          "status": "ok",
+          "subquery_id": "sq0"
+        },
+        "query_id": "qgold",
+        "status": "complete",
+        "summary": "",
+        "updated_sequence": 10
+      },
+      {
+        "created_sequence": 7,
+        "id": "qgold:stage:retrieve",
+        "kind": "stage",
+        "label": "Retrieve",
+        "metadata": {
+          "elapsed_ms": 3.0
+        },
+        "query_id": "qgold",
+        "status": "complete",
+        "summary": "",
+        "updated_sequence": 13
+      },
+      {
+        "created_sequence": 14,
+        "id": "qgold:evidence:E1",
+        "kind": "evidence",
+        "label": "Evidence E1",
+        "metadata": {
+          "evidence_id": "E1",
+          "kind": "fact",
+          "metric": "revenue",
+          "period": "2025",
+          "rank": 1,
+          "source_type": "sec_10k",
+          "ticker": "NVDA"
+        },
+        "query_id": "qgold",
+        "status": "complete",
+        "summary": "NVDA revenue was 60.9B for FY2025",
+        "updated_sequence": 14
+      },
+      {
+        "created_sequence": 15,
+        "id": "qgold:source:sec_10k",
+        "kind": "source",
+        "label": "SEC 10K",
+        "metadata": {
+          "source_type": "sec_10k"
+        },
+        "query_id": "qgold",
+        "status": "complete",
+        "summary": "",
+        "updated_sequence": 15
+      },
+      {
+        "created_sequence": 18,
+        "id": "qgold:stage:grade",
+        "kind": "stage",
+        "label": "Grade",
+        "metadata": {
+          "elapsed_ms": 0.4
+        },
+        "query_id": "qgold",
+        "status": "complete",
+        "summary": "",
+        "updated_sequence": 18
+      },
+      {
+        "created_sequence": 19,
+        "id": "qgold:answer:final",
+        "kind": "answer",
+        "label": "Final Answer",
+        "metadata": {
+          "documents": 0,
+          "facts": 1,
+          "status": "grounded"
+        },
+        "query_id": "qgold",
+        "status": "complete",
+        "summary": "",
+        "updated_sequence": 19
+      },
+      {
+        "created_sequence": 20,
+        "id": "qgold:citation:E1",
+        "kind": "citation",
+        "label": "Citation E1",
+        "metadata": {
+          "evidence_id": "E1",
+          "metric": "revenue",
+          "period": "2025",
+          "source_type": "sec_10k",
+          "support_status": "supported",
+          "ticker": "NVDA"
+        },
+        "query_id": "qgold",
+        "status": "complete",
+        "summary": "",
+        "updated_sequence": 20
+      },
+      {
+        "created_sequence": 21,
+        "id": "qgold:stage:validate",
+        "kind": "stage",
+        "label": "Validate",
+        "metadata": {
+          "citation_support_rate": 1.0,
+          "validation_status": "supported"
+        },
+        "query_id": "qgold",
+        "status": "complete",
+        "summary": "",
+        "updated_sequence": 21
+      }
+    ],
+    "query_id": "qgold",
+    "question_digest": "57e0ea97c06574ba874a912f319e233ca7e05ef78fb4326aa72b910dd2a5a262",
+    "question_preview": "What was NVDA revenue in 2025?",
+    "schema_version": 1,
+    "updated_at": 1000.0
+  }
+}

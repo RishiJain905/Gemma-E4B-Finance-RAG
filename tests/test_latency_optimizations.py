@@ -7,6 +7,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from fastapi.testclient import TestClient
 
 from src.middleware import app as middleware_app
 from src.middleware.models import QueryRequest, SourceCitation
@@ -22,11 +23,14 @@ def _config(**overrides):
         "top_k_documents": 5,
         "top_k_facts": 10,
         "enable_tools": False,
+        "enable_streaming": True,
         "enable_fetch_on_miss": False,
         "answer_policy": "graded",
         "allow_general_fallback": True,
         "return_timings": True,
         "embedding_cache_size": 256,
+        "conversation_max_turns": 8,
+        "conversation_max_history_chars": 8000,
     }
     values.update(overrides)
     return SimpleNamespace(**values)
@@ -46,6 +50,8 @@ def reset_latency_caches(monkeypatch):
     monkeypatch.setattr(middleware_app, "_model_health", {"ok": False, "ts": 0.0}, raising=False)
     monkeypatch.setattr(middleware_app, "_health_cache", {"ts": 0.0, "value": None}, raising=False)
     monkeypatch.setattr(middleware_app, "_scheduler", None, raising=False)
+    monkeypatch.setattr(middleware_app, "_prompt_cache_supported", True, raising=False)
+    monkeypatch.setattr(middleware_app, "_retrieval_cache", None, raising=False)
 
 
 def _patch_query_dependencies(monkeypatch, *, config=None):
@@ -174,3 +180,155 @@ async def test_no_behavior_change(monkeypatch):
     assert cached.facts_used == uncached.facts_used
     assert cached.documents_used == uncached.documents_used
     assert uncached.timings is None
+
+
+def test_health_advertises_conversation_and_multiline_capabilities(monkeypatch):
+    """/health advertises the effective history/multiline limits (2.2.2.3) so
+    the client can size its composer instead of guessing."""
+    monkeypatch.setattr(middleware_app, "config", _config(
+        enable_tools=False, enable_streaming=True, answer_policy="graded"))
+    monkeypatch.setattr(
+        middleware_app, "store",
+        SimpleNamespace(heartbeat=lambda: {"sqlite": True, "chroma": True}))
+    monkeypatch.setattr(middleware_app, "_check_model_health", AsyncMock(return_value=True))
+    monkeypatch.setattr(
+        middleware_app, "_cached_health_summary", lambda: {"scheduler": None, "freshness": {}})
+
+    caps = TestClient(middleware_app.app).get("/health").json()["capabilities"]
+
+    assert caps["history"] is True
+    assert caps["multiline"] is True
+    assert caps["max_question_chars"] == 16000
+    assert caps["conversation_max_turns"] == 8
+    assert caps["conversation_max_history_chars"] == 8000
+
+
+# ── Phase 2.2.3.4 — adaptive path latency instrumentation ───────────────
+
+@pytest.mark.asyncio
+async def test_adaptive_path_records_plan_and_orchestration_timings(monkeypatch):
+    """The adaptive path adds `query_plan` + `orchestration` timing stages and
+    keeps the retrieval timings shape, so latency reporting never regresses."""
+    from src.middleware.config import MiddlewareConfig
+    from src.middleware import adaptive_orchestrator as ao
+    from src.middleware.adaptive_orchestrator import (
+        ContextSelection, Lane, OrchestrationResult)
+
+    cfg = MiddlewareConfig()
+    cfg.enable_adaptive_rag = True
+    cfg.enable_fetch_on_miss = False
+    cfg.enable_conversation_rewrite = False
+
+    monkeypatch.setattr(
+        middleware_app, "store",
+        SimpleNamespace(sqlite=SimpleNamespace(list_metrics=lambda: ["total_revenue"])))
+    monkeypatch.setattr(middleware_app, "config", cfg)
+    monkeypatch.setattr(middleware_app, "retriever", SimpleNamespace())
+    monkeypatch.setattr(
+        middleware_app, "_evaluate_and_refresh",
+        MagicMock(return_value={"overall": "fresh", "fetched_on_miss": []}))
+    monkeypatch.setattr(middleware_app, "_task_params", lambda _t: {})
+    monkeypatch.setattr(middleware_app, "_check_model_health", AsyncMock(return_value=True))
+    monkeypatch.setattr(
+        middleware_app, "_call_model",
+        AsyncMock(return_value=("adaptive answer", [])))
+
+    def fake_orch(plan, store, config, **kwargs):
+        ctx = ContextSelection(
+            facts=[{"metric": "total_revenue", "value": 26.0, "ticker": "NVDA"}],
+            documents=[], context_chars=120, estimated_tokens=30)
+        return OrchestrationResult(
+            lane=Lane.STANDARD, plan=plan, reason_codes=["lane_standard"],
+            merged_facts=list(ctx.facts), merged_documents=[],
+            subqueries_executed=["sq0"], retrieval_rounds_used=1,
+            retrieval_strategy="hybrid", context=ctx,
+            context_size=ctx.context_chars, estimated_tokens=ctx.estimated_tokens)
+
+    monkeypatch.setattr(ao, "orchestrate", fake_orch)
+
+    response = await middleware_app.query(QueryRequest(question="What is NVDA revenue?"))
+
+    assert response.timings is not None
+    assert "query_plan" in response.timings
+    assert "orchestration" in response.timings
+    assert response.orchestration["lane"] == "standard"
+
+
+# ── Phase 2.2.6.2 — prompt efficiency + llama prompt-reuse capability ─────
+
+
+@pytest.mark.asyncio
+async def test_prompt_efficiency_metrics_recorded(monkeypatch):
+    """The pack stage records prompt chars/tokens, evidence chars, and a stable
+    fixed-prefix digest (2.2.6.2 Step 3), additively under timings['prompt']."""
+    _patch_query_dependencies(monkeypatch)
+    monkeypatch.setattr(middleware_app, "_check_model_health", AsyncMock(return_value=True))
+    monkeypatch.setattr(
+        middleware_app, "_call_model", AsyncMock(return_value=("answer", [])))
+
+    response = await middleware_app.query(QueryRequest(question="What is NVDA revenue?"))
+
+    metrics = response.timings["prompt"]
+    assert metrics["prompt_chars"] > 0
+    assert metrics["estimated_tokens"] == metrics["prompt_chars"] // 4
+    assert metrics["evidence_chars"] >= 0
+    assert len(metrics["fixed_prefix_digest"]) == 16
+
+
+@pytest.mark.asyncio
+async def test_cache_prompt_off_is_byte_identical_payload(monkeypatch):
+    """With llama_cache_prompt off, no cache_prompt field is ever sent."""
+    monkeypatch.setattr(middleware_app, "config", _config(llama_cache_prompt=False))
+    captured = {}
+
+    async def fake_post(url, json):
+        captured["json"] = json
+        return _response("ok")
+
+    monkeypatch.setattr(
+        middleware_app, "model_client", SimpleNamespace(post=AsyncMock(side_effect=fake_post)))
+
+    await middleware_app._post_and_parse({"model": "m", "messages": []})
+    assert "cache_prompt" not in captured["json"]
+
+
+@pytest.mark.asyncio
+async def test_cache_prompt_on_sends_reuse_field(monkeypatch):
+    monkeypatch.setattr(middleware_app, "config", _config(llama_cache_prompt=True))
+    captured = {}
+
+    async def fake_post(url, json):
+        captured["json"] = json
+        return _response("ok")
+
+    monkeypatch.setattr(
+        middleware_app, "model_client", SimpleNamespace(post=AsyncMock(side_effect=fake_post)))
+
+    content, _ = await middleware_app._post_and_parse({"model": "m", "messages": []})
+    assert content == "ok"
+    assert captured["json"]["cache_prompt"] is True
+
+
+@pytest.mark.asyncio
+async def test_cache_prompt_backend_rejection_disables_and_retries_plain(monkeypatch):
+    """A backend that rejects cache_prompt disables it for the process and the
+    plain payload is retried exactly once (fail-soft capability fallback)."""
+    monkeypatch.setattr(middleware_app, "config", _config(llama_cache_prompt=True))
+    calls: list = []
+
+    async def fake_post(url, json):
+        calls.append(dict(json))
+        if "cache_prompt" in json:
+            raise RuntimeError("unknown field: cache_prompt")
+        return _response("recovered")
+
+    monkeypatch.setattr(
+        middleware_app, "model_client", SimpleNamespace(post=AsyncMock(side_effect=fake_post)))
+
+    content, _ = await middleware_app._post_and_parse({"model": "m", "messages": []})
+
+    assert content == "recovered"
+    assert len(calls) == 2
+    assert "cache_prompt" in calls[0]
+    assert "cache_prompt" not in calls[1]
+    assert middleware_app._prompt_cache_supported is False

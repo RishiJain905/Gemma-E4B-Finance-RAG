@@ -25,6 +25,26 @@ import httpx
 logger = logging.getLogger(__name__)
 
 
+# Shared deterministic markers used by both fact extraction and filing-text
+# indexing. Keep these parser-owned so indexing never rediscovers structure via
+# a model call.
+SECTION_HEADINGS = (
+    "CONSOLIDATED INCOME STATEMENT",
+    "CONSOLIDATED STATEMENTS OF INCOME",
+    "CONSOLIDATED BALANCE SHEET",
+    "CONSOLIDATED STATEMENTS OF CASH FLOWS",
+    "CONSOLIDATED STATEMENTS OF STOCKHOLDERS",
+    "NOTES TO CONSOLIDATED FINANCIAL STATEMENTS",
+    "MANAGEMENT'S DISCUSSION AND ANALYSIS",
+    "RISK FACTORS",
+    "BUSINESS",
+)
+SEC_ITEM_HEADING_RE = re.compile(
+    r"^\s*ITEM\s+(?P<item>\d{1,2}(?:\.\d{2})?[A-Z]?)\.?\s*(?P<title>.*)$",
+    re.IGNORECASE,
+)
+
+
 class TraceAlchemyFilingParser:
     """Parses SEC filing text into structured financial facts using TraceAlchemy.
 
@@ -472,22 +492,10 @@ Return the JSON array now."""
         current_section = "preamble"
         current_text = []
 
-        section_headers = [
-            "CONSOLIDATED INCOME STATEMENT",
-            "CONSOLIDATED STATEMENTS OF INCOME",
-            "CONSOLIDATED BALANCE SHEET",
-            "CONSOLIDATED STATEMENTS OF CASH FLOWS",
-            "CONSOLIDATED STATEMENTS OF STOCKHOLDERS",
-            "NOTES TO CONSOLIDATED FINANCIAL STATEMENTS",
-            "MANAGEMENT'S DISCUSSION AND ANALYSIS",
-            "RISK FACTORS",
-            "BUSINESS",
-        ]
-
         for line in filing_text.split("\n"):
             upper_line = line.strip().upper()
             matched = False
-            for header in section_headers:
+            for header in SECTION_HEADINGS:
                 if header in upper_line:
                     if current_text:
                         sections[current_section] = "\n".join(current_text)

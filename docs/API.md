@@ -44,6 +44,7 @@ unavailable).
 | `model_available` | bool | Whether the llama-server `/health` returns 200. |
 | `scheduler` | object \| null | `UnifiedScheduler.status_report()` per-source freshness. |
 | `freshness` | object | Per-ticker overall freshness for the core watchlist. |
+| `capabilities` | object \| null | Active deployment capabilities and effective limits. Always includes `{tools, streaming, answer_policy}`. `streaming` is the **effective** capability (2.2.6.1): whether `/query/stream` can be served at all — `false` when tools are enabled but tool-final streaming is off. `streaming_tool_final` is `true` only when a tools-enabled request streams its final synthesis after bounded non-streaming tool rounds. On conversation-memory builds (2.2.2) it also advertises `{history, multiline, max_question_chars, conversation_max_turns, conversation_max_history_chars}` so clients read the real limits instead of guessing. |
 | `version` | string | API version (`"1.0.0"`). |
 
 **Example (200):**
@@ -114,13 +115,17 @@ additionally gated by `allow_write_tools` and per-query refresh limits.
 
 | Field | Type | Default | Constraints |
 |-------|------|---------|-------------|
-| `question` | string | — (required) | 1–2000 chars |
+| `question` | string | — (required) | 1–16000 chars. Never silently truncated — an over-limit question is a **422** (`MAX_QUESTION_CHARS`, 2.2.2.1). |
+| `history` | array | `[]` | Bounded client-owned conversation history (2.2.2.1): a flat list of `ChatTurn` `{role, content, turn_id?, context?}`. Additive — omit/empty preserves single-turn behavior. The server uses at most `conversation_max_turns` / `conversation_max_history_chars` of it and persists nothing. |
+| `session_id` | string \| null | `null` | Opaque client id for tracing only (1–128 chars of `[A-Za-z0-9._:-]`); never a server-side lookup key. |
 | `ticker` | string \| null | `null` | Optional ticker override |
 | `temperature` | float \| null | `null` | 0.0–2.0; falls back to config default (0.3) |
 | `max_tokens` | int \| null | `null` | 64–8192; falls back to config default (2048) |
-| `stream` | bool | `false` | Reserved |
+| `stream` | bool | `false` | Hint only on `POST /query` (that endpoint always returns a full body). Streaming is served by `POST /query/stream` (below). |
 | `refresh` | bool | `true` | Auto-refresh stale sources before answering |
 | `include_sources` | bool | `true` | Include source citations |
+| `answer_policy` | string \| null | `null` | Per-request override of the server default: `strict` or `graded`. |
+| `include_evidence_trace` | bool | `false` | Attach the exact evidence trace (system/user prompts, usable facts/documents, tool results) used to produce the answer. Intended for evaluation (2.2.1.2); never populated for a degraded answer. |
 
 **Response (`QueryResponse`):**
 
@@ -132,13 +137,38 @@ additionally gated by `allow_write_tools` and per-query refresh limits.
 | `detected_intent` | string \| null | Question type (`fact_lookup`, `comparison`, `trend`, `explanation`, `sentiment`, `news`, `risk`, `general`). |
 | `facts_used` | int | Number of SQLite facts retrieved. |
 | `documents_used` | int | Number of ChromaDB documents retrieved. |
+| `grounding` | string | Actual answer path: `grounded`, `partial`, `general`, or `refused`. |
 | `latency_ms` | float | End-to-end latency. |
+| `timings` | object \| null | Per-stage latency breakdown (ms), incl. retrieval sub-timings; present when `return_timings` is on. |
 | `model_available` | bool | `false` when the answer was produced in degraded mode. |
-| `freshness` | object | `{overall, refreshed_during_query, stale_sources_used, warning}`. |
+| `retrieval_strategy` | string \| null | Document retrieval path: `vector`, `hybrid`, or `hybrid+rerank`. |
+| `tools_used` | array \| null | Names of middleware tools invoked while answering, if any. |
+| `resolved_ticker` | object \| null | `{name, source}` when the resolver mapped a non-exact company name/typo (omitted for exact symbol / explicit override). |
+| `freshness` | object | `{overall, refreshed_during_query, stale_sources_used, fetched_on_miss, warning}`. |
 | `timestamp` | string | UTC ISO timestamp. |
+
+**Additive, flag-gated blocks** — present only when the relevant feature ran;
+older clients that ignore unknown fields are unaffected:
+
+| Field | Type | Present when |
+|-------|------|--------------|
+| `conversation` | object \| null | The request carried history (2.2.2.1): `{history_turns_received, history_turns_used, history_truncated, topic_reset}`. |
+| `retrieval_query` | string \| null | Follow-up rewriting ran (2.2.2.2): the compiled standalone retrieval query — retrieval input only, never the user's wording. |
+| `carried_context` | object \| null | Rewriting ran (2.2.2.2): `{entities, metrics, timeframe, topic_reset, ambiguous_slots, resolution_sources}`. |
+| `resolved_tickers` / `resolved_metrics` / `resolved_timeframe` | array / array / string \| null | Effective retrieval entities after carryover (2.2.2.2). |
+| `orchestration` | object \| null | `enable_adaptive_rag` on (2.2.3.4): `{lane, reason_codes, subqueries_executed, retrieval_rounds, planning_calls, reranker_calls, deterministic_tools, context_chars, evidence_dropped, fallback_reason}` — **actual executed** counters, not maxima. |
+| `evidence_sufficiency` | object \| null | `enable_evidence_sufficiency` on (2.2.4.1): `{status, reason_codes, covered_subqueries, missing_subqueries, corrective_action, retry_performed}`. |
+| `evidence_citations` | array \| null | `answer_validation` is `report`/`enforce` (2.2.4.3): `EvidenceCitation` objects resolved against the model-visible ledger. |
+| `answer_validation` | object \| null | `answer_validation` is `report`/`enforce` (2.2.4.3): `{validation_status, citation_support_rate, numeric_claims_supported, numeric_claims_unsupported, numeric_claims_ambiguous, mismatch_counts, enforcement, …}`. Validator errors report `validation_status=report_unavailable` rather than failing the query. |
+| `evidence_trace` | object \| null | `include_evidence_trace: true` and a model call succeeded (2.2.1.2). |
 
 `SourceCitation` fields: `source_type`, `ticker`, optional `metric`, `value`,
 `period`, `source_url`, `relevance_score`.
+
+`EvidenceCitation` fields (2.2.4.3): `evidence_id` (request-local `[E#]`, or
+`null` for a legacy source label), `source_type`, `ticker`, `metric`, `period`,
+`source_url`, and `support_status` (`supported` / `missing` / `malformed` — a
+`missing`/`malformed` id is never converted into a real source citation).
 
 **Example request:**
 
@@ -189,6 +219,44 @@ curl -X POST http://127.0.0.1:8000/query \
 ```
 
 Returns **503** if the store is not initialized.
+
+---
+
+## POST `/query/stream`
+
+Server-Sent Events (SSE) variant of `/query`: streams the **final answer** as
+`token` deltas, then a terminal `metadata` event carrying the same
+`QueryResponse` fields (minus `answer`). Same request body as `/query`
+(`QueryRequest`).
+
+Availability is capability-gated (read `capabilities` from `/health`):
+
+- `enable_streaming` off → **404** (`Streaming disabled`).
+- `enable_tools` on **and** `enable_tool_final_streaming` off → **404**
+  (`Streaming disabled while tools are enabled`). This is the documented signal
+  the client caches to fall back to `POST /query`.
+- `enable_tools` + `enable_tool_final_streaming` on (2.2.6.1) → the bounded
+  tool/planning rounds run **non-streaming** first, then only the final answer
+  synthesis streams.
+- When `enable_stream_progress_events` is on, versioned, **redacted** progress
+  events (`query_started`, `stage`, `tool_started`, `tool_completed`, `error`)
+  precede the tokens — stage/tool names, statuses, and optional counts only,
+  never prompts, tool arguments, or document text.
+
+**Event stream (media type `text/event-stream`):**
+
+| Event | Payload | Meaning |
+|-------|---------|---------|
+| `query_started` | `{version, seq, …}` | Emitted first when progress events are on. |
+| `stage` | `{name, status, …}` | Pipeline stage transition (compile/route/retrieve/grade/generate…). |
+| `tool_started` / `tool_completed` | `{name, status, count?}` | Safe tool lifecycle (progress events on). |
+| `token` | `{token}` | A chunk of the streamed final answer. |
+| `metadata` | `QueryResponse` sans `answer` | Terminal event with citations, grounding, counts, freshness, and any flag-gated blocks. |
+| `error` | `{message}` | A redacted error notice; the stream still terminates cleanly. |
+
+If the model is unavailable, the legacy path (both flags off) returns **404**;
+with progress events or tool-final streaming on it degrades gracefully to a
+streamed degraded answer instead of poisoning the client's streaming capability.
 
 ---
 
@@ -447,3 +515,86 @@ Returns **503** if the store is not initialized.
 > The exact keys inside `guidance` are whatever
 > `EarningsTranscriptIngestor.get_latest_guidance()` extracted for that ticker;
 > the example above is illustrative.
+
+## Local retrieval-graph observer (Phase 2.2.7)
+
+A bounded, **read-only, localhost-only** side channel that projects each query's
+retrieval pipeline into a graph for the single-page UI at `GET /graph`. It is an
+**observability** view — it never changes retrieval or the answer (see
+`docs/phase2.2/ARCHITECTURE-DECISION.md` for why this is *not* GraphRAG).
+
+**Enablement & access.** Every `/graph*` route (the UI, its static bundle, and
+the `/graph/api/*` endpoints) is served only when `enable_graph_observer` is on
+and only to loopback clients (`127.0.0.1`/`::1`). A non-loopback client, or any
+request while the observer is disabled, gets **404** — there is no bypass flag.
+Remote exposure is out of scope for Phase 2.2 and would need a separate design
+covering authentication, TLS, proxy trust, and retention.
+
+**Security headers.** Graph responses carry a strict same-origin CSP
+(`default-src 'none'`; `script-src 'self'`; `style-src 'self' 'unsafe-inline'`;
+`img-src 'self' data:`; `font-src 'self'`; `connect-src 'self'`;
+`frame-ancestors 'none'`), plus `X-Content-Type-Options: nosniff`,
+`Referrer-Policy: no-referrer`, and `Cross-Origin-{Opener,Resource}-Policy:
+same-origin`. Trace/corpus detail responses are `Cache-Control: no-store`; the
+SSE stream keeps `no-cache`. No cookies, localStorage, service worker, analytics,
+or third-party requests are used.
+
+**Redaction by construction.** Nodes/edges carry only allowlisted metadata.
+Questions are stored as a bounded preview plus a SHA-256 digest; evidence bodies
+are bounded excerpts; secrets (`api_key`/`token`/`secret`/`authorization`/
+`cookie`) and local filesystem paths are stripped; source links are kept only
+when `http`/`https`. Node ids never expose local paths.
+
+### Query response field
+
+When the observer is enabled, `POST /query` and the `/query/stream` terminal
+`metadata` event include `graph_trace_id` — the opaque id of this request's
+trace, used by the chat client's `/graph trace`. The field is **omitted** when
+the observer is off, so the response stays byte-compatible for older clients.
+
+### `GET /health` capabilities
+
+When enabled, the `capabilities` block additionally advertises
+`graph_observer: true`, `graph_url` (the effective same-origin `/graph` URL), and
+`graph_observer_limits` (the bounded TraceHub limits). Older/observer-off servers
+omit these keys.
+
+### Live-trace endpoints (loopback only)
+
+| Endpoint | Purpose |
+|---|---|
+| `GET /graph` | The single-page graph UI (static HTML/JS/CSS bundle). |
+| `GET /graph/api/traces?limit=N` | Newest-first safe trace summaries. |
+| `GET /graph/api/traces/{query_id}` | Reconstructed snapshot (nodes/edges) for one trace. |
+| `GET /graph/api/traces/{query_id}/evidence/{evidence_id}` | One bounded evidence node. |
+| `GET /graph/api/events` | SSE stream of graph deltas (supports `Last-Event-ID`/`last_sequence` replay and `once=true`). |
+| `GET /graph/api/health` | Bounded observer counters + limits. |
+
+### Corpus-explorer endpoints (loopback only)
+
+Read-only projections of the Store inventory (sources, tickers, metrics, facts,
+filings, sections, document families, freshness, scheduler). All responses are
+hard-bounded (page/element caps), use opaque revision-keyed cursors, and never
+invoke embeddings or a model.
+
+| Endpoint | Purpose |
+|---|---|
+| `GET /graph/api/corpus/overview` | Cached source/ticker/freshness projection. |
+| `GET /graph/api/corpus/search` | Label/metadata search (`q`, `kinds`, `sources`, `ticker`, `limit`, `cursor`). |
+| `GET /graph/api/corpus/nodes/{node_id}` | One node detail (at most one excerpt). |
+| `GET /graph/api/corpus/nodes/{node_id}/neighbors` | One bounded neighbor page. |
+| `GET /graph/api/corpus/filings/{accession}/sections` | Section-family page for a filing. |
+| `GET /graph/api/corpus/refresh-status` | Persisted freshness/scheduler state (never refreshes). |
+
+### Graph event/delta schema
+
+Deltas are versioned (`schema_version = 1`) with an `operation`
+(`upsert_node`/`upsert_edge`/`remove`/`trace_complete`/`trace_evicted`/
+`reset_required`). Nodes carry `kind` (`query`/`plan`/`subquery`/`stage`/`tool`/
+`evidence`/`source`/`answer`/`citation`), `status`, `label`, bounded `summary`,
+allowlisted `metadata`, and sequence numbers. Edges carry a `relation`
+(`compiled_to`/`contains`/`routed_to`/`retrieved`/`returned`/`from_source`/
+`expanded_from`/`supports`/`cited_by`/`corrected_by`/`validated_as`). The wire
+shape carries **no** pixel/layout positions — layout is UI behavior; graph
+meaning is the contract. A golden fixture pins this schema at
+`tests/fixtures/graph/query_trace_v1.json`.

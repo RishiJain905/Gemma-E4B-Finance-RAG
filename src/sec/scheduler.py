@@ -171,10 +171,15 @@ class FilingScheduler:
         }
 
         logger.info(
-            "Filing pipeline complete: %d new filings, %d processed, %d failed",
+            "Filing pipeline complete: %d new filings, %d processed, %d failed, "
+            "%d sections, %d chunks, %d replacements, %d pending",
             discovery_result["new_filings"],
             processing_result["processed"],
             processing_result["failed"],
+            processing_result.get("sections_written", 0),
+            processing_result.get("chunks_written", 0),
+            processing_result.get("replacements", 0),
+            processing_result.get("index_pending", 0),
         )
         return report
 

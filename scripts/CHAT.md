@@ -2,9 +2,10 @@
 
 `scripts/chat.py` is the interactive terminal client for the middleware. It
 auto-starts the middleware if needed, streams `/query` answers by default,
-and is the single front door for every Phase 2.1 feature: tool calls,
-grounding mode, retrieval strategy, fetch-on-miss, and resolved-ticker
-confirmation.
+and is the single front door for every Phase 2.1/2.2 feature: tool calls,
+grounding mode, retrieval strategy, fetch-on-miss, resolved-ticker
+confirmation, bounded conversation history (2.2.2), multiline questions
+(2.2.2.3), and streamed progress events (2.2.6.1).
 
 Every field in this doc is optional — the renderer is defensive, so
 `chat.py` also works unchanged against an older middleware that doesn't
@@ -31,6 +32,7 @@ server doesn't report a `capabilities` block.
 | Command | Description |
 |---|---|
 | `<just type a question>` | Ask the RAG (`POST /query`, streamed by default). |
+| `/ask` | Compose a **multiline** question (see below), then submit it once. |
 | `/refresh` | Run **all** ingestion jobs (`scheduler all --force`). |
 | `/refresh daily\|hourly\|weekly\|all\|status` | Run that scheduler mode. |
 | `/refresh NVDA` | Refresh one ticker via `POST /refresh/{ticker}`. |
@@ -40,9 +42,16 @@ server doesn't report a `capabilities` block.
 | `/verbose on\|off` | Toggle the server `timings` breakdown under answers. |
 | `/grounding strict\|graded` | Send `answer_policy` with every query this session (server-side override). |
 | `/grounding clear` | Stop overriding — use the server's configured default. |
+| `/new` or `/clear` | Start a fresh conversation: clear this session's history and rotate its local `session_id`. Explicit settings (`/grounding`, `/verbose`, `/history off`, pinned `/ticker`, `/autorefresh`) are preserved. |
+| `/history` | Preview this conversation's turns locally (turn number, role, short text). No API call. |
+| `/history off\|on` | Stop / resume sending and recording conversation history (for privacy or single-turn comparisons). |
 | `/health` | Show the middleware health + freshness summary. |
 | `/tools` | List model-callable tools (`GET /tools`); degrades gracefully if the endpoint is missing or tools are disabled. |
-| `/eval [N]` | Run `python eval/run_eval.py --limit N` (default 5) against this running server and print the tail. |
+| `/eval [N]` | Run the **single-turn** eval (default 5 cases, `--no-conversations`) against this running server and print the tail. |
+| `/eval conversations [N]` | Run the **conversation** fixtures, then score deterministically and print carryover / topic-reset / subquestion-coverage / leakage metrics. Opt-in; needs an already-running stack. |
+| `/graph` | Open the live retrieval graph (`/graph`) in your default browser. No-op with a note when the server has the graph observer disabled; never starts the middleware or model. |
+| `/graph url` | Print the effective graph URL without opening a browser. |
+| `/graph trace` | Open the graph focused on the most recent query's trace (deep-links `#trace=<id>`); opens the live view if no query has run yet. |
 | `/help` | Show the full command list. |
 | `/quit` or `/exit` | Leave (stops the middleware if this script started it). |
 
@@ -73,14 +82,169 @@ includes, in this order:
    latency breakdown, including retrieval sub-timings
    (`retrieval.embedding`, `retrieval.chroma`, `retrieval.sqlite`).
 
+## Streaming progress (2.2.6.1)
+
+When the server has `enable_stream_progress_events` on, a streamed answer is
+preceded by redacted, versioned progress events (pipeline stages plus safe
+tool starts/completions). On a terminal the client renders them as a single
+line updated **in place**, then clears it when the answer begins:
+
+```text
+  resolve -> hybrid retrieval -> query_facts (12 rows) -> answer
+```
+
+Progress events carry only stage names, safe tool names, statuses, and row/item
+counts — never prompts, tool arguments, or retrieved document text. The events
+are cosmetic: piped/redirected (non-TTY) output shows **no** progress line and
+no ANSI escapes, only the terminal answer and metadata. Under `/verbose on` the
+single line is replaced by a per-event dim log that also shows stage timings and
+corrective reasons. Unknown future event types are ignored.
+
+With tools enabled and tool-final streaming on, the bounded tool/planning rounds
+run non-streaming first (you may see `tool_started`/`tool_completed` progress),
+and only the final answer synthesis streams token by token.
+
+## Conversation memory (2.2.2.1)
+
+Each `ChatSession` owns its own bounded conversation history and a local
+`session_id`. The middleware stays **stateless**: every request carries the
+recent turns and the id, and the server validates and uses them without
+persisting anything. Nothing is written to disk.
+
+- A turn is recorded **only** after the server accepts the request and returns
+  a terminal, non-blank answer. Failed, cancelled, validation-error, or
+  incomplete-streamed requests never enter history.
+- Each assistant turn also stores a small structured context (detected/resolved
+  ticker, intent, grounding, timeframe) so a later follow-up can resolve
+  references like "and AMD?".
+- The server bounds what it uses: at most `conversation_max_turns` recent turns
+  and `conversation_max_history_chars` characters (see
+  `configs/middleware.yaml`). The current question has its own independent
+  16,000-character limit and is **never** silently truncated — an over-limit
+  question is a validation error.
+- Responses include a `conversation` block
+  (`history_turns_received`, `history_turns_used`, `history_truncated`,
+  `topic_reset`) whenever history was sent.
+- `session_id` is tracing metadata only — never a server-side lookup key.
+
+Use `/new` (or `/clear`) to start a fresh conversation, `/history` to preview
+the local turns, and `/history off` to run single-turn (no history sent or
+recorded).
+
+## Multiline questions (2.2.2.3)
+
+Single-line questions are unchanged — type and press enter. For a structured,
+multi-part research prompt, `/ask` opens a small composer (no new dependency;
+it is just `input()` and a pure buffer):
+
+```text
+you> /ask
+  multiline mode — end with /send, discard with /cancel, inspect with /preview.
+... Compare NVDA and AMD revenue growth from FY2023 to FY2025.
+... Include margin changes and summarize the strongest cited risk for each.
+... /send
+```
+
+While composing:
+
+- `/send` — join the lines with `\n`, validate locally, and submit **once**;
+- `/cancel` — discard the draft; history is untouched;
+- `/preview` — show the character count and the exact buffered text;
+- **EOF (Ctrl+D) or Ctrl+C** — cancels the *buffer*, not the session.
+
+Everything else you type is appended verbatim — newlines and punctuation are
+preserved exactly, so the composed question reaches the middleware intact
+rather than being split into several unrelated single-line questions.
+
+### Limits and validation
+
+The client reads the effective question ceiling from the `/health`
+`capabilities` block (`max_question_chars`, default 16,000) and falls back to a
+local default against older servers. It:
+
+- shows a `current/max chars` usage line once a draft passes 80% of the limit;
+- **rejects an over-limit draft locally** — nothing is sent, so you never get a
+  server-side rejection for a question the client could see was too long;
+- prints the **full structured** FastAPI `422` validation detail (every
+  `loc`/`msg`/`type`), never a clipped 200-character preview, so the offending
+  field and its limit are visible;
+- treats a `422` (or `400/401/403/409`) as a per-request error only — it falls
+  back to `POST /query` for that one request and **keeps streaming enabled**;
+  streaming is disabled for the session solely on the documented `404/405`
+  capability response.
+
+## Session visibility (2.2.2.3)
+
+The input prompt carries a compact session/turn suffix so you always know which
+conversation you are in and how much history is attached:
+
+```text
+session 7f2a · 4 turns
+you>
+```
+
+(`session <id4> · history off` when `/history off` is active.) After an answer,
+the renderer also surfaces conversation state:
+
+- **history truncated** — shown when the server used fewer turns than you sent
+  (the conversation exceeded the server's bound).
+- **topic reset** — shown when the server detected a new topic and did not carry
+  earlier context into this question.
+- **`context: AMD · revenue · FY2025`** — the entities/metrics/timeframe carried
+  from earlier turns; shown **only** under `/verbose on`.
+- **`retrieval query: …`** — the standalone rewritten retrieval query; a
+  `/verbose`-only diagnostic. It is **never** echoed as if it were your wording.
+
+`/history` previews only the local turn text (number, role, short preview); it
+never prints hidden system prompts, tool schemas, or retrieved evidence.
+
 ## Capabilities block
 
 At startup, and any time you run `/health`, the client reads (or shows)
 `capabilities` from `GET /health`:
 
 - `tools` — whether the model can call middleware tools this deployment.
-- `streaming` — whether `/query/stream` is enabled (note: streaming is
-  unavailable whenever tools are enabled, since the tool loop is
-  multi-turn).
+- `streaming` — whether this deployment can serve `/query/stream` at all. With
+  tools enabled it is available only when tool-final streaming is on (2.2.6.1);
+  otherwise the endpoint is disabled and the client uses `POST /query`.
+- `streaming_tool_final` — present and `true` when a tools-enabled request runs
+  its bounded tool/planning rounds non-streaming and then streams only the final
+  answer synthesis. Absent/false means tools and streaming don't combine here.
 - `answer_policy` — the server's configured default answer policy
   (`strict` or `graded`), before any per-session `/grounding` override.
+- `history` / `multiline` — whether this build honors bounded conversation
+  history and accepts multi-line questions (2.2.2). Older servers omit these.
+- `max_question_chars` — the effective per-question ceiling the `/ask` composer
+  enforces locally (default 16,000 when the server doesn't advertise it).
+- `conversation_max_turns` / `conversation_max_history_chars` — the server's
+  bound on how much history it will actually use per request.
+- `graph_observer` / `graph_url` / `graph_observer_limits` — advertised **only**
+  when the server has the local retrieval-graph observer enabled (2.2.7.4). The
+  client uses `graph_url` for `/graph`, falling back to its own base URL +
+  `/graph` if an older server omits it.
+
+The startup `Capabilities:` line surfaces `history` and `max_question_chars`
+alongside `tools`/`streaming`/`answer_policy` (plus `graph=on` when the observer
+is enabled) when the server reports them.
+
+## Live retrieval graph (2.2.7.4)
+
+The `/graph` commands open a **local, read-only** visualization of the retrieval
+pipeline: the query, its plan/subqueries, executed stages and tools, retrieved
+evidence with source links, and the final answer, citations, and validation.
+
+- `/graph` opens the graph in your default browser (via Python's stdlib
+  `webbrowser`); `/graph url` prints the URL; `/graph trace` deep-links the most
+  recent query's trace. Launch the client with `--open-graph` to open it once at
+  startup.
+- After every answer, the metadata block prints `trace=<short id>` when the
+  observer is enabled, so you know a trace was captured and can open it.
+- The graph is **disabled by default** and served **loopback-only** with a strict
+  same-origin CSP. To use it, start the middleware with `ENABLE_GRAPH_OBSERVER=1`
+  (see `docs/CONFIGURATION.md`). Without it, `/graph` prints a short note and does
+  nothing — no browser, no processes.
+
+**Troubleshooting:** if `/graph` says the observer is disabled, restart the
+middleware with `ENABLE_GRAPH_OBSERVER=1`. If the browser doesn't open
+automatically, the command prints the URL to open manually. The page is only
+reachable from `127.0.0.1`; a remote browser gets a 404 by design.

@@ -104,6 +104,15 @@ def test_resolve_cik_unknown(fetcher):
     assert fetcher._resolve_cik("NOTAREALTICKER123") is None
 
 
+def test_public_resolve_cik_and_private_wrapper_share_cache():
+    """The public resolver and compatibility wrapper use one implementation."""
+    fetcher = SECEdgarFilingFetcher.__new__(SECEdgarFilingFetcher)
+    fetcher._ticker_cik_cache = {"AAPL": "0000320193"}
+
+    assert fetcher.resolve_cik("aapl") == "0000320193"
+    assert fetcher._resolve_cik("AAPL") == "0000320193"
+
+
 # ── 3. Live download_filing_text ────────────────────
 
 def test_download_filing_text_live(fetcher):

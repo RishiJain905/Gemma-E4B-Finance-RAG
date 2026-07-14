@@ -330,6 +330,15 @@ def test_split_filing_sections_by_headers(parser):
     assert "Markets are volatile." in sections["risk_factors"]
 
 
+def test_shared_filing_heading_markers_include_sec_items():
+    """The deterministic section indexer reuses parser-owned markers."""
+    from src.sec.filing_parser import SEC_ITEM_HEADING_RE, SECTION_HEADINGS
+
+    assert SEC_ITEM_HEADING_RE.match("Item 7A. Market Risk")
+    assert SEC_ITEM_HEADING_RE.match("Item 1.01 Entry into an Agreement")
+    assert "RISK FACTORS" in SECTION_HEADINGS
+
+
 # ── 4. _build_extraction_prompt (deterministic) ─────
 
 def test_build_prompt_includes_fields_and_metadata(parser):

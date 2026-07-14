@@ -1,5 +1,5 @@
 """
-eval/score.py — Stage 2 of the eval harness (2.1.1.2): scoring CLI + report.
+eval/score.py — Stage 2 of the eval harness (2.1.1.2, 2.2.1.2): scoring CLI + report.
 
 Loads a run artifact (the latest by default, or ``--run <path>``), computes every
 metric via ``metrics.score_all``, and emits:
@@ -8,14 +8,17 @@ metric via ``metrics.score_all``, and emits:
   - a console table — overall + per-category scores.
   - ``eval/runs/<ts>.report.md``    — a readable diff vs. the previous run (--report).
 
-Promote the latest summary to the committed baseline with ``--set-baseline``.
+Promote the latest summary to a committed, policy-specific baseline with
+``--set-baseline --policy strict|graded`` (2.2.1.2 Step 5). Baselines live at
+``eval/baselines/<policy>.json`` — replacing the single ``eval/baseline.json``
+so a strict-mode run is never compared against a graded-mode bar or vice versa.
 
 Usage:
     python eval/score.py                  # score the latest run, with LLM-judge
     python eval/score.py --no-judge       # skip the (slow) LLM-judge
     python eval/score.py --run eval/runs/<ts>.jsonl
     python eval/score.py --report         # also write a markdown diff vs prev run
-    python eval/score.py --set-baseline    # copy latest summary -> eval/baseline.json
+    python eval/score.py --set-baseline --policy graded   # promote to eval/baselines/graded.json
 """
 
 from __future__ import annotations
@@ -29,13 +32,14 @@ from typing import Optional
 
 EVAL_DIR = Path(__file__).resolve().parent
 RUNS_DIR = EVAL_DIR / "runs"
-BASELINE = EVAL_DIR / "baseline.json"
+BASELINES_DIR = EVAL_DIR / "baselines"
 
 _REPO_ROOT = EVAL_DIR.parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 from eval import metrics as M  # noqa: E402
+from src.middleware import evidence_trace  # noqa: E402
 
 # Display order + which direction is "better" for each metric.
 _DISPLAY = [
@@ -44,7 +48,8 @@ _DISPLAY = [
     ("retrieval_hit_rate", "higher"),
     ("keyword_coverage", "higher"),
     ("refusal_rate", "lower"),
-    ("faithfulness", "higher"),
+    ("grounded_faithfulness", "higher"),
+    ("policy_compliance", "higher"),
     ("answer_relevance", "higher"),
 ]
 
@@ -81,6 +86,15 @@ def write_summary(summary: dict, run_path: Path) -> Path:
     return out
 
 
+def baseline_path(policy: str, baselines_dir: Optional[Path] = None) -> Path:
+    """Path to the committed baseline for one answer policy.
+
+    Reads the module-level ``BASELINES_DIR`` at call time (not as a bound
+    default) so tests can monkeypatch it.
+    """
+    return (baselines_dir or BASELINES_DIR) / f"{policy}.json"
+
+
 # ── Display ────────────────────────────────────────────────────────────
 
 def _metric_value(summary: dict, name: str):
@@ -103,16 +117,59 @@ def _fmt(v) -> str:
 def console_table(summary: dict) -> str:
     """Render the overall metrics table (string)."""
     ts = summary.get("generated_at", "unknown")
-    lines = [f"=== Eval summary ({ts}) ===", ""]
+    policy = summary.get("answer_policy", "unknown")
+    lines = [f"=== Eval summary ({ts}) - policy={policy} ===", ""]
     for name, direction in _DISPLAY:
         val = _metric_value(summary, name)
         suffix = "   (lower is better)" if direction == "lower" else ""
-        label = "faithfulness (judge)" if name == "faithfulness" else name
-        lines.append(f"{label:<22} {_fmt(val)}{suffix}")
+        lines.append(f"{name:<22} {_fmt(val)}{suffix}")
     lines.append("")
     lines.append(f"cases: {summary.get('n_cases', 0)}  "
                  f"model_available: {summary.get('n_model_available', 0)}  "
-                 f"errors: {summary.get('n_errors', 0)}")
+                 f"errors: {summary.get('n_errors', 0)}  "
+                 f"trace_errors: {summary.get('n_trace_errors', 0)}")
+
+    # Phase 2.2 conversational/compound metrics (2.2.1.3) — shown only when the
+    # run scored them. Each line reports score and its eligible denominator.
+    conv_present = [m for m in M.PHASE22_METRICS if isinstance(summary.get(m), dict)]
+    if conv_present:
+        lines.append("")
+        lines.append("=== Conversational (Phase 2.2) ===")
+        for name in M.PHASE22_METRICS:
+            block = summary.get(name)
+            if not isinstance(block, dict):
+                continue
+            lines.append(f"{name:<38} {_fmt(block.get('score'))}"
+                         f"   (n={block.get('n_eligible', 0)})")
+
+    sufficiency = summary.get("evidence_sufficiency")
+    if isinstance(sufficiency, dict):
+        lines.append("")
+        lines.append("=== Evidence sufficiency (Phase 2.2.4.1) ===")
+        for name in ("coverage_precision", "coverage_recall", "abstention_f1",
+                     "unnecessary_retry_rate", "unsupported_number_rate"):
+            lines.append(f"{name:<38} {_fmt(sufficiency.get(name))}")
+        lines.append(f"{'latency_ms':<38} {sufficiency.get('latency_ms', {})}")
+        lines.append(f"{'retrieval_rounds':<38} {sufficiency.get('retrieval_rounds', {})}")
+
+    decomposition = summary.get("decomposition")
+    if isinstance(decomposition, dict):
+        lines.append("")
+        lines.append("=== Selective decomposition (Phase 2.2.4.2) ===")
+        for name in ("drift_rate", "mean_derived_subqueries", "max_derived_subqueries",
+                     "subquestion_coverage", "simple_with_derived",
+                     "subquery_cap_violations", "retrieval_round_cap_violations"):
+            lines.append(f"{name:<38} {_fmt(decomposition.get(name))}")
+
+    validation = summary.get("citation_validation")
+    if isinstance(validation, dict):
+        lines.append("")
+        lines.append("=== Citation & numeric validation (Phase 2.2.4.3) ===")
+        for name in ("citation_support_rate", "citation_existence_rate",
+                     "numeric_support_rate", "numeric_unsupported_rate",
+                     "accepted_absent_citations", "downgrade_rate", "refusal_rate"):
+            lines.append(f"{name:<38} {_fmt(validation.get(name))}")
+        lines.append(f"{'mismatch_counts':<38} {validation.get('mismatch_counts', {})}")
 
     # Per-category table.
     per = summary.get("per_category") or {}
@@ -138,6 +195,7 @@ def report_md(summary: dict, prev: Optional[dict]) -> str:
     """A readable markdown report, with a diff vs. the previous run."""
     lines = [f"# Eval report ({summary.get('generated_at', 'unknown')})", ""]
     lines.append(f"Run: `{summary.get('source_run', 'n/a')}`  "
+                 f"Policy: {summary.get('answer_policy', 'unknown')}  "
                  f"Cases: {summary.get('n_cases', 0)}  "
                  f"Model available: {summary.get('n_model_available', 0)}/{summary.get('n_cases', 0)}")
     lines.append("")
@@ -158,6 +216,70 @@ def report_md(summary: dict, prev: Optional[dict]) -> str:
             delta = f"{d:+.2f} {arrow}"
         lines.append(f"| {name} | {_fmt(cur)} | {_fmt(prv)} | {delta} |")
     lines.append("")
+
+    # Adaptive-orchestration block (2.2.3.4) — only when the run carried one.
+    adaptive = summary.get("adaptive")
+    if isinstance(adaptive, dict):
+        label = summary.get("config_label") or "unlabeled"
+        lines.append(f"## Adaptive orchestration — config `{label}`")
+        lines.append("")
+
+    sufficiency = summary.get("evidence_sufficiency")
+    if isinstance(sufficiency, dict):
+        lines.append("## Evidence sufficiency — 2.2.4.1")
+        lines.append("")
+        lines.append(f"- coverage precision/recall: "
+                     f"{_fmt(sufficiency.get('coverage_precision'))} / "
+                     f"{_fmt(sufficiency.get('coverage_recall'))}")
+        lines.append(f"- abstention F1: {_fmt(sufficiency.get('abstention_f1'))}")
+        lines.append(f"- unnecessary retry rate: "
+                     f"{_fmt(sufficiency.get('unnecessary_retry_rate'))}")
+        lines.append(f"- unsupported-number rate: "
+                     f"{_fmt(sufficiency.get('unsupported_number_rate'))}")
+        lines.append(f"- latency: {sufficiency.get('latency_ms', {})}")
+        lines.append(f"- retrieval rounds: {sufficiency.get('retrieval_rounds', {})}")
+        lines.append("")
+
+    decomposition = summary.get("decomposition")
+    if isinstance(decomposition, dict):
+        lines.append("## Selective decomposition — 2.2.4.2")
+        lines.append("")
+        lines.append(f"- derived-query drift rate: {_fmt(decomposition.get('drift_rate'))}")
+        lines.append(f"- mean / max derived subqueries: "
+                     f"{_fmt(decomposition.get('mean_derived_subqueries'))} / "
+                     f"{decomposition.get('max_derived_subqueries')}")
+        lines.append(f"- subquestion coverage: {_fmt(decomposition.get('subquestion_coverage'))}")
+        lines.append(f"- simple queries with derived subqueries (must be 0): "
+                     f"{decomposition.get('simple_with_derived')}")
+        lines.append(f"- subquery/round cap violations (must be 0): "
+                     f"{decomposition.get('subquery_cap_violations')} / "
+                     f"{decomposition.get('retrieval_round_cap_violations')}")
+        lines.append(f"- drift reason codes: {decomposition.get('drift_reason_codes', {})}")
+        lines.append("")
+        lines.append(f"- adaptive rows: {adaptive.get('n_adaptive', 0)}")
+        lines.append(f"- lane distribution: {adaptive.get('lane_distribution', {})}")
+        fb = adaptive.get("fallback_rate", {})
+        lines.append(f"- fallback rate: {_fmt(fb.get('rate'))} "
+                     f"({fb.get('n_fallback', 0)}/{fb.get('n_eligible', 0)})")
+        ex = adaptive.get("budget_exhaustion_rate", {})
+        lines.append(f"- budget exhaustion rate: {_fmt(ex.get('rate'))} "
+                     f"({ex.get('n_exhausted', 0)}/{ex.get('n_eligible', 0)})")
+        lines.append(f"- write-tool routes (must be 0): {adaptive.get('write_tool_routes', 0)}")
+        lines.append(f"- budget cap violations (must be 0): "
+                     f"{adaptive.get('budget_cap_violations', {})}")
+        lines.append(f"- avg counters: {adaptive.get('avg_counters', {})}")
+        per_lane = adaptive.get("per_lane") or {}
+        if per_lane:
+            lines.append("")
+            lines.append("| lane | n | intent_acc | ticker_acc | retrieval_hit | p50 ms | p95 ms |")
+            lines.append("|---|---|---|---|---|---|---|")
+            for lane, blk in per_lane.items():
+                lines.append(
+                    f"| {lane} | {blk.get('n', 0)} | {_fmt(blk.get('intent_accuracy'))} | "
+                    f"{_fmt(blk.get('ticker_accuracy'))} | {_fmt(blk.get('retrieval_hit_rate'))} | "
+                    f"{blk.get('p50_latency_ms')} | {blk.get('p95_latency_ms')} |")
+        lines.append("")
+
     if prev:
         lines.append(f"_Previous run: `{prev.get('source_run', 'n/a')}`_")
     return "\n".join(lines)
@@ -172,19 +294,44 @@ DEFAULT_TOLERANCES = {
     "retrieval_hit_rate": 0.05,
     "keyword_coverage": 0.05,
     "refusal_rate": 0.05,
-    "faithfulness": 0.05,
+    "grounded_faithfulness": 0.05,
+    "policy_compliance": 0.05,
     "answer_relevance": 0.05,
 }
 
 
+def _eligible_counts(summary: dict) -> dict:
+    """Eligible-case counts for each judge metric (2.2.1.2 Step 5) — the
+    gate compares these run over run so eligibility can't silently narrow."""
+    out = {}
+    for name in M.JUDGE_METRICS:
+        block = summary.get(name)
+        if isinstance(block, dict):
+            out[name] = block.get("n_eligible")
+    return out
+
+
 def set_baseline(summary: dict, tolerances: Optional[dict] = None,
-                  path: Path = BASELINE) -> Path:
-    """Write the committed baseline from a summary block."""
+                  path: Optional[Path] = None, policy: Optional[str] = None) -> Path:
+    """Write a committed, policy-specific baseline from a summary block.
+
+    ``path`` overrides the destination (tests use a tmp path); otherwise the
+    destination is derived from ``policy`` (or the summary's own
+    ``answer_policy``) as ``eval/baselines/<policy>.json``.
+    """
+    resolved_policy = policy or summary.get("answer_policy") or "graded"
+    out_path = path or baseline_path(resolved_policy)
     base = dict(summary)
+    base["answer_policy"] = resolved_policy
+    base["trace_schema_version"] = summary.get(
+        "trace_schema_version", evidence_trace.SCHEMA_VERSION)
+    base["score_schema_version"] = summary.get("score_schema_version", M.SCORE_SCHEMA_VERSION)
+    base["eligible_counts"] = _eligible_counts(summary)
     base["tolerances"] = tolerances or DEFAULT_TOLERANCES
     base["is_baseline"] = True
-    path.write_text(json.dumps(base, indent=2), encoding="utf-8")
-    return path
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(json.dumps(base, indent=2), encoding="utf-8")
+    return out_path
 
 
 # ── CLI ────────────────────────────────────────────────────────────────
@@ -194,11 +341,15 @@ def main(argv: Optional[list[str]] = None) -> int:
     p.add_argument("--run", type=Path, default=None,
                    help="Run artifact to score (default: latest in eval/runs).")
     p.add_argument("--no-judge", action="store_true",
-                   help="Skip the LLM-judge (faithfulness/relevance -> null).")
+                   help="Skip the LLM-judge (grounded_faithfulness/policy_compliance/"
+                        "answer_relevance -> null).")
     p.add_argument("--report", action="store_true",
                    help="Also write a markdown diff vs the previous run.")
     p.add_argument("--set-baseline", action="store_true",
-                   help="Promote the scored summary to eval/baseline.json and exit.")
+                   help="Promote the scored summary to eval/baselines/<policy>.json and exit.")
+    p.add_argument("--policy", choices=["strict", "graded"], default=None,
+                   help="Baseline policy to promote to with --set-baseline "
+                        "(default: infer from the run's answer_policy).")
     p.add_argument("--model-endpoint", default=M.DEFAULT_MODEL_ENDPOINT,
                    help="LLM-judge endpoint (default :8087).")
     p.add_argument("--timeout", type=float, default=120.0,
@@ -215,6 +366,7 @@ def main(argv: Optional[list[str]] = None) -> int:
                           run_judge=not args.no_judge)
     summary["source_run"] = str(run_path)
     summary["generated_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    summary["trace_schema_version"] = evidence_trace.SCHEMA_VERSION
 
     out = write_summary(summary, run_path)
     print(console_table(summary))
@@ -233,7 +385,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         print(f"Wrote report  -> {rep}")
 
     if args.set_baseline:
-        base = set_baseline(summary)
+        base = set_baseline(summary, policy=args.policy)
         print(f"Baseline set  -> {base}  (commit this file)")
 
     return 0

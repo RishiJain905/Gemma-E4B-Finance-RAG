@@ -202,7 +202,7 @@ def test_scheduler_registers_estimates(store):
     assert UnifiedScheduler.SOURCES["estimates"] == {
         "class": "EstimatesIngestor",
         "ttl_key": "estimates",
-        "weight": 7,
+        "weight": 8,
     }
     assert "estimates" in UnifiedScheduler.DAILY_SOURCES
 

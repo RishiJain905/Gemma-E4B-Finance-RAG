@@ -57,15 +57,42 @@ _LEGAL_SUFFIXES = {
 
 @dataclass(frozen=True)
 class Resolution:
-    """Ticker resolution result with confidence and source metadata."""
+    """Ticker resolution result with confidence and source metadata.
+
+    ``mention`` and ``start`` are populated by :meth:`SymbolResolver.resolve_all`
+    so callers can order multi-entity matches by first appearance and echo the
+    exact text that produced each ticker. Single-result :meth:`resolve` and the
+    internal resolvers leave them at their defaults (unknown span).
+    """
 
     ticker: Optional[str]
     confidence: float
     resolved_name: Optional[str]
     source: str
+    mention: Optional[str] = None
+    start: int = -1
 
 
 NO_MATCH = Resolution(None, 0.0, None, "none")
+
+
+@dataclass(frozen=True)
+class _SpanCandidate:
+    """One resolved entity mention with its span in the original text.
+
+    ``priority`` breaks ties between candidates covering the same span (lower
+    wins): local map and known tickers outrank catalog entries, matching the
+    single-result precedence in :meth:`SymbolResolver.resolve`.
+    """
+
+    start: int
+    end: int
+    ticker: str
+    resolved_name: Optional[str]
+    confidence: float
+    source: str
+    mention: str
+    priority: int
 
 
 class SymbolResolver:
@@ -108,6 +135,140 @@ class SymbolResolver:
 
         self._cache_negative(normalized_query, now)
         return NO_MATCH
+
+    def resolve_all(self, text: str) -> list[Resolution]:
+        """Resolve every explicit entity mention in ``text``, first-mention order.
+
+        Unlike :meth:`resolve` (single best result), this collects local-map
+        company names, catalog aliases, and uppercase symbols with their text
+        spans, prefers the longest overlapping alias, deduplicates by ticker,
+        and preserves the ambiguity guards for ordinary words. Fuzzy matching
+        runs only as one bounded whole-text fallback when no exact entity was
+        found anywhere — never per token of a long question.
+
+        ``resolve`` is intentionally left unchanged; this is an additive,
+        span-aware view built from the same resolution primitives.
+        """
+        if not text or not text.strip():
+            return []
+
+        candidates: list[_SpanCandidate] = []
+        candidates.extend(self._local_map_spans(text))
+        candidates.extend(self._known_ticker_spans(text))
+        self._ensure_catalog_loaded()
+        candidates.extend(self._catalog_name_spans(text))
+        candidates.extend(self._catalog_ticker_spans(text))
+
+        resolved = self._resolve_spans(candidates)
+        if resolved:
+            return resolved
+
+        # No exact entity anywhere → one bounded fuzzy fallback (guards inside).
+        fuzzy = self._fuzzy(text)
+        if fuzzy.ticker:
+            return [fuzzy]
+        return []
+
+    def _local_map_spans(self, text: str) -> list[_SpanCandidate]:
+        """Spans for IntentParser's hardcoded company-name/ticker maps."""
+        from .intent_parser import IntentParser
+
+        lowered = text.lower()
+        out: list[_SpanCandidate] = []
+        for company_name, ticker in IntentParser.COMPANY_TO_TICKER.items():
+            if company_name not in lowered:
+                continue
+            for match in re.finditer(rf"\b{re.escape(company_name)}\b", lowered):
+                out.append(
+                    _SpanCandidate(
+                        match.start(), match.end(), ticker, company_name, 1.0,
+                        "local_map", text[match.start():match.end()], 0,
+                    )
+                )
+        return out
+
+    def _known_ticker_spans(self, text: str) -> list[_SpanCandidate]:
+        """Spans for uppercase symbols in IntentParser's known-ticker set."""
+        from .intent_parser import IntentParser
+
+        out: list[_SpanCandidate] = []
+        for match in re.finditer(r"\b[A-Z]{1,5}\b", text):
+            symbol = match.group(0)
+            if symbol in IntentParser.KNOWN_TICKERS:
+                out.append(
+                    _SpanCandidate(
+                        match.start(), match.end(), symbol, symbol, 1.0,
+                        "known_ticker", symbol, 1,
+                    )
+                )
+        return out
+
+    def _catalog_name_spans(self, text: str) -> list[_SpanCandidate]:
+        """Spans for catalog company names/aliases, ambiguity guards preserved."""
+        lowered = text.lower()
+        normalized = _normalize(text)
+        out: list[_SpanCandidate] = []
+        for alias, (ticker, resolved_name) in self._name_lookup.items():
+            # Ordinary-word aliases ("target", "gap") resolve only when the
+            # whole query is exactly the name, never inside a longer question.
+            if alias in _AMBIGUOUS_ALIASES:
+                if normalized != alias:
+                    continue
+            if alias not in lowered:
+                continue
+            for match in re.finditer(rf"\b{re.escape(alias)}\b", lowered):
+                out.append(
+                    _SpanCandidate(
+                        match.start(), match.end(), ticker, resolved_name, 0.95,
+                        "catalog_exact", text[match.start():match.end()], 2,
+                    )
+                )
+        return out
+
+    def _catalog_ticker_spans(self, text: str) -> list[_SpanCandidate]:
+        """Spans for uppercase symbols present in the loaded catalog."""
+        from .intent_parser import IntentParser
+
+        stopwords = IntentParser.COMMON_QUERY_WORDS
+        out: list[_SpanCandidate] = []
+        for match in re.finditer(r"\b[A-Z]{2,5}\b", text):
+            symbol = match.group(0)
+            if symbol in self._ticker_lookup and symbol not in stopwords:
+                out.append(
+                    _SpanCandidate(
+                        match.start(), match.end(), symbol,
+                        self._ticker_lookup[symbol], 0.95, "catalog_exact",
+                        symbol, 3,
+                    )
+                )
+        return out
+
+    def _resolve_spans(self, candidates: list[_SpanCandidate]) -> list[Resolution]:
+        """Greedy longest-first, non-overlapping selection deduped by ticker."""
+        # Longest span wins for the same start; source priority breaks exact ties.
+        ordered = sorted(
+            candidates, key=lambda c: (c.start, -(c.end - c.start), c.priority)
+        )
+        kept: list[_SpanCandidate] = []
+        for cand in ordered:
+            if any(cand.start < k.end and k.start < cand.end for k in kept):
+                continue  # overlaps an already-kept mention
+            kept.append(cand)
+
+        kept.sort(key=lambda c: c.start)
+        seen: set[str] = set()
+        out: list[Resolution] = []
+        for cand in kept:
+            if cand.ticker in seen:
+                continue
+            seen.add(cand.ticker)
+            out.append(
+                Resolution(
+                    cand.ticker, cand.confidence, cand.resolved_name,
+                    cand.source, cand.mention, cand.start,
+                )
+            )
+        return out
 
     def _local(self, text: str) -> Resolution:
         """Resolve using IntentParser's hardcoded map and known ticker set."""

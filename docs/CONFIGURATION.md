@@ -70,6 +70,12 @@ cache:
   filing_ttl_hours: 168
   earnings_ttl_hours: 336
 
+chunking:
+  strategy: "structural"      # structural | fixed
+  max_chars: 1000
+  overlap_sentences: 1        # structural: sentences carried into the next chunk
+  fixed_overlap_chars: 150    # fixed: legacy char overlap
+
 sec:
   user_agent: "TraceAlchemy Research contact@tracealchemy.example.com"
 ```
@@ -84,7 +90,108 @@ sec:
 | `embedding.pooling` | Must match the server's `--pooling` flag (`mean`). |
 | `embedding.batch_size` | Texts per embedding request (default 10). |
 | `cache.*_ttl_hours` | Descriptive cache TTL hints. Note: the operative per-source TTLs used by the scheduler and freshness logic come from `watchlist.yaml → schedule`, not this block. |
+| `chunking.strategy` | **`structural` is the default** (Phase 2.1.3): splits on SEC section markers / markdown headings and packs whole sentences up to `max_chars` with sentence-based overlap — no mid-sentence cuts. `fixed` reproduces the legacy sliding character window (`max_chars` with `fixed_overlap_chars` overlap). |
+| `chunking.max_chars` | Target chunk size in characters (default 1000). |
+| `chunking.overlap_sentences` | Sentences carried into the next chunk under `structural` (default 1). |
+| `chunking.fixed_overlap_chars` | Character overlap under `fixed` (legacy `DEFAULT_CHUNK_OVERLAP`, 150). |
 | `sec.user_agent` | Fallback SEC EDGAR User-Agent if neither the constructor arg nor `SEC_EDGAR_USER_AGENT` is set. |
+
+---
+
+## `configs/sec.yaml`
+
+SEC filing-text indexing is independently rollout-controlled. The default is
+off, so filing processing retains its legacy behavior until explicitly enabled.
+
+```yaml
+sec:
+  index_filing_text: false
+  max_sections_per_filing: 200
+  max_section_chars: 2000000
+  index_forms: [10-K, 10-Q, 8-K]
+```
+
+| Field | Default | Meaning |
+|-------|---------|---------|
+| `sec.index_filing_text` | `false` | Persist and index actual SEC filing sections through the existing Chroma structural chunker. When false, the legacy filing path is unchanged. |
+| `sec.max_sections_per_filing` | `200` | Safety bound on section parents accepted from one filing (hard-capped at 500). Excess sections are logged and skipped. |
+| `sec.max_section_chars` | `2000000` | Parser sanity cap per section (hard-capped at 10,000,000). Oversized sections are skipped and logged; text is never silently truncated. |
+| `sec.index_forms` | `[10-K, 10-Q, 8-K]` | Filing forms eligible for section indexing when the rollout flag is enabled. |
+
+Parsed artifacts are stored beside the configured SQLite database under
+`sec/parsed/`. A successful artifact whose vector write fails remains in the
+additive `index_pending` state with its failure reason and is selected for a
+later retry. Scheduler status reads persisted pending/section/chunk counters;
+it does not call the embedding service.
+
+### Backfill: `scripts/index_sec_filing_text.py` (Phase 2.2.5.3)
+
+Migrates the **existing** parsed artifacts under `sec/parsed/` into the section
+index — no parser-model call is made. `index_forms` above gates which forms are
+eligible.
+
+```bash
+python scripts/index_sec_filing_text.py                     # dry run (default)
+python scripts/index_sec_filing_text.py --ticker NVDA --limit 1 --apply
+python scripts/index_sec_filing_text.py --apply \
+    --resume-manifest data/sec/backfill-manifest.json --backup data/sec/backups
+```
+
+| Flag | Meaning |
+|------|---------|
+| *(none)* / `--dry-run` | Report eligible filings, parsed artifacts, estimated parent sections/chunks, missing files, and currently indexed section count. Writes nothing. |
+| `--apply` | Index eligible filings one at a time through `Store.add_filing_sections`. |
+| `--ticker` / `--accession` / `--limit` | Slice a pilot subset. |
+| `--resume-manifest <path>` | Record each completed accession + source-file hash. A re-run skips unchanged input; a changed artifact replaces its section family. |
+| `--backup <dir>` | Snapshot the Chroma collection directory (as `chroma-backup-<ts>/`) before the first write. |
+
+Manifests (`*.backfill-manifest.json`) and backup snapshots (`chroma-backup-*/`)
+are gitignored. An interruption leaves the last filing retryable and every prior
+filing valid (the manifest is flushed after each filing; each family replace is
+atomic). Rollback: disable `enable_hierarchical_retrieval` and, if the index
+itself must be reversed, restore the Chroma backup snapshot.
+
+---
+
+## `configs/sec_companyfacts.yaml`
+
+SEC CompanyFacts / XBRL structured ingestion and canonical metric projection
+(Phase 2.2.5.1). Authoritative filed GAAP observations are stored in their own
+`sec_companyfacts` table with full concept/unit/period/accession/fetch
+provenance; the legacy `fundamentals` table is never rewritten. Disabled by
+default — when off, the source makes zero HTTP calls and `Store.get_companyfacts`
+returns `[]`.
+
+```yaml
+enabled: false
+user_agent: "TraceAlchemy Research contact@tracealchemy.example.com"
+allowed_taxonomies: [us-gaap]
+allowed_forms: [10-K, 10-K/A, 10-Q, 10-Q/A]
+timeout_seconds: 30
+retries: 3
+backoff_factor: 0.5
+request_delay_seconds: 0.2
+metrics:
+  total_revenue:
+    concepts: [RevenueFromContractWithCustomerExcludingAssessedTax, Revenues, SalesRevenueNet]
+    units: [USD]
+    period_kinds: [quarterly, ytd, annual]
+  # ... net_income, diluted_eps, total_assets, total_liabilities,
+  # stockholders_equity, operating_cash_flow, shares_outstanding
+```
+
+| Field | Default | Meaning |
+|-------|---------|---------|
+| `enabled` | `false` | Enable CompanyFacts ingestion + the canonical projection. Strict no-op when off. |
+| `user_agent` | *(example)* | SEC-required descriptive User-Agent for `data.sec.gov`. |
+| `allowed_taxonomies` | `[us-gaap]` | XBRL taxonomies accepted into the store. |
+| `allowed_forms` | `[10-K, 10-K/A, 10-Q, 10-Q/A]` | Filing forms whose facts are ingested. |
+| `timeout_seconds` / `retries` / `backoff_factor` / `request_delay_seconds` | `30` / `3` / `0.5` / `0.2` | HTTP timeout, retry count, backoff multiplier, and inter-request delay. |
+| `metrics` | *(8 concepts)* | Canonical metric → ordered concept list (selection priority), accepted units, and period kinds. Raw observations are stored independently of these projection aliases. |
+
+CompanyFacts preference at retrieval is described under **Hierarchical retrieval**
+below and in `docs/ARCHITECTURE.md`; it needs no middleware flag. Rollback = set
+`enabled: false`.
 
 ---
 
@@ -114,6 +221,217 @@ enable_citations: true
 | `top_k_documents` | `5` | Max ChromaDB documents retrieved per query. |
 | `top_k_facts` | `10` | Max SQLite facts retrieved per query. |
 | `enable_citations` | `true` | Whether citation extraction is enabled. |
+
+The remaining middleware keys are grouped by the phase that introduced them.
+Every Phase 2.2.4–2.2.6 feature ships **disabled by default** (the one exception
+is `answer_validation: report`, which is metadata-only and changes no answer).
+For each, **rollback is to flip the flag back to its default** — none involves a
+schema or storage migration. Any key can also be overridden by the environment
+variable listed in its row (used for A/B evaluation).
+
+#### Answer policy & grounding (Phase 2.1.7)
+
+| Field | Default | Env | Meaning |
+|-------|---------|-----|---------|
+| `answer_policy` | `graded` | `ANSWER_POLICY` | `graded` uses the count-based grounding prompt; `strict` keeps the previous context-only system prompt for rollback/regression comparison. |
+| `allow_general_fallback` | `true` | `ALLOW_GENERAL_FALLBACK` | Allow a clearly-labeled general-knowledge answer when no relevant data is retrieved; when `false`, an ungrounded ask is refused instead. |
+
+#### Retrieval & re-ranking (Phase 2.1.2)
+
+Hybrid document retrieval: a BM25 lexical channel fused with the vector channel
+via RRF, then an optional cross-encoder / LLM re-ranker. Every stage fails soft —
+a query never errors because a retrieval stage failed.
+
+| Field | Default | Env | Meaning |
+|-------|---------|-----|---------|
+| `enable_lexical` | `true` | `ENABLE_LEXICAL` | Add the BM25 lexical channel and RRF fusion. |
+| `rrf_k` | `60` | — | RRF constant; larger dampens the contribution of top ranks. |
+| `enable_reranker` | `false` | `ENABLE_RERANKER` | Re-rank fused candidates. The `cross-encoder` backend downloads a HuggingFace model on first use. |
+| `reranker_backend` | `cross-encoder` | `RERANKER_BACKEND` | `cross-encoder` (sentence-transformers) or `llm` (reuse TraceAlchemy on `:8087`, no download). |
+| `reranker_model` | `cross-encoder/ms-marco-MiniLM-L-6-v2` | `RERANKER_MODEL` | Cross-encoder model id. |
+| `rerank_candidates` | `30` | `RERANK_CANDIDATES` | Candidate pool retrieved before re-ranking. |
+| `rerank_top_n` | `5` | `RERANK_TOP_N` | Documents kept after re-ranking (= `top_k_documents`). |
+
+#### Analytical tools (Phase 2.1.4)
+
+| Field | Default | Env | Meaning |
+|-------|---------|-----|---------|
+| `enable_tools` | `true` | `ENABLE_TOOLS` | Advertise the read-mostly finance tools to the model on `/query`. |
+| `max_tool_iterations` | `3` | `MAX_TOOL_ITERATIONS` | Hard cap on model tool-call rounds per query. |
+| `allow_write_tools` | `true` | `ALLOW_WRITE_TOOLS` | Whether the single write tool (`refresh_data`) may run. |
+| `max_refreshes_per_query` | `2` | `MAX_REFRESHES_PER_QUERY` | Per-query budget on refresh writes. |
+
+#### Fetch-on-miss (Phase 2.1.6)
+
+| Field | Default | Env | Meaning |
+|-------|---------|-----|---------|
+| `enable_fetch_on_miss` | `true` | `ENABLE_FETCH_ON_MISS` | Bounded live fetch for a never-seen ticker during a query. |
+| `fetch_on_miss_timeout_s` | `10.0` | `FETCH_ON_MISS_TIMEOUT_S` | Timeout for that fetch. |
+| `fetch_on_miss_per_query` | `1` | `FETCH_ON_MISS_PER_QUERY` | Max fetch-on-miss attempts per query. |
+
+#### Streaming, timings & embedding cache (Phase 2.1.8)
+
+| Field | Default | Env | Meaning |
+|-------|---------|-----|---------|
+| `enable_streaming` | `true` | `ENABLE_STREAMING` | Serve `POST /query/stream` (SSE). See tool-aware streaming (2.2.6.1) below for the tools-enabled interaction. |
+| `return_timings` | `true` | `RETURN_TIMINGS` | Attach the per-stage `timings` breakdown to responses. |
+| `embedding_cache_size` | `256` | `EMBEDDING_CACHE_SIZE` | LRU size of the in-process embedding cache. |
+
+#### Conversation memory & follow-up rewriting (Phase 2.2.2)
+
+The middleware stays stateless; the client owns the turns and sends them per
+request. These bound how much of that client-sent history/question a single
+request may use. Over-ceiling budget values are clamped with one warning
+(`src/middleware/config.py`); an over-limit **question** is a validation error
+(HTTP 422), never silently truncated.
+
+| Field | Default | Env | Meaning |
+|-------|---------|-----|---------|
+| `conversation_max_turns` | `8` | `CONVERSATION_MAX_TURNS` | Max recent turns used per request (ceiling 50). |
+| `conversation_max_history_chars` | `8000` | `CONVERSATION_MAX_HISTORY_CHARS` | Max total history chars used (ceiling 32000). |
+| `conversation_max_question_chars` | `16000` | `CONVERSATION_MAX_QUESTION_CHARS` | Current-question hard cap (ceiling 16000; mirrors the pydantic `MAX_QUESTION_CHARS`). |
+| `enable_conversation_rewrite` | `false` | `ENABLE_CONVERSATION_REWRITE` | Compile the current turn + bounded history into a **separate** retrieval query; the raw question is never changed. |
+| `enable_llm_rewrite_fallback` | `false` | `ENABLE_LLM_REWRITE_FALLBACK` | One bounded, schema-validated model call only when deterministic compilation leaves a slot ambiguous. |
+| `conversation_rewrite_timeout_s` | `15.0` | `CONVERSATION_REWRITE_TIMEOUT_S` | Timeout for that fallback call. |
+
+#### Adaptive orchestration & deterministic tool routing (Phase 2.2.3)
+
+When `enable_adaptive_rag` is on, a request runs through the fast/standard/complex
+lanes under one shared execution budget and one context budget; every adaptive
+stage falls soft to the legacy single-query `Retriever.retrieve()`. Budget values
+outside the safe ranges are clamped with one warning.
+
+| Field | Default | Env | Meaning |
+|-------|---------|-----|---------|
+| `enable_adaptive_rag` | `false` | `ENABLE_ADAPTIVE_RAG` | Route through the bounded adaptive orchestrator. |
+| `adaptive_enable_planning_call` | `false` | `ADAPTIVE_ENABLE_PLANNING_CALL` | Allow one compact pre-answer planning model call (only when deterministic parsing cannot assign retrieval modes). |
+| `adaptive_max_subqueries` | `3` | `ADAPTIVE_MAX_SUBQUERIES` | Max subqueries incl. sq0 (clamp 1–3). |
+| `adaptive_max_retrieval_rounds` | `2` | `ADAPTIVE_MAX_RETRIEVAL_ROUNDS` | Max retrieval rounds incl. a corrective retry (clamp 1–2). |
+| `adaptive_max_planning_calls` | `1` | `ADAPTIVE_MAX_PLANNING_CALLS` | Max planning calls (clamp 0–1). |
+| `adaptive_max_context_chars` | `18000` | `ADAPTIVE_MAX_CONTEXT_CHARS` | Hard context character ceiling (clamp 1000–64000). |
+| `adaptive_conditional_rerank` | `true` | `ADAPTIVE_CONDITIONAL_RERANK` | Let the complex lane invoke at most one re-rank call when justified. |
+| `enable_deterministic_tool_routing` | `false` | `ENABLE_DETERMINISTIC_TOOL_ROUTING` | Route safe analytical/comparison/projection/calculation asks to read-only tools before any model call. |
+| `max_deterministic_tools_per_query` | `3` | `MAX_DETERMINISTIC_TOOLS_PER_QUERY` | Cap on deterministic tool routes per query. |
+| `enable_deterministic_answers` | `false` | `ENABLE_DETERMINISTIC_ANSWERS` | Let a fully-covered deterministic route answer from a template without a model call. |
+
+#### Evidence sufficiency & corrective retrieval (Phase 2.2.4.1–2.2.4.2)
+
+Replaces count-based grounding with a deterministic, route-aware sufficiency
+assessment (`sufficient|borderline|missing`), allowing at most one internal
+corrective retrieval when borderline. Total retrieval rounds stay capped at two.
+
+| Field | Default | Env | Meaning |
+|-------|---------|-----|---------|
+| `enable_evidence_sufficiency` | `false` | `ENABLE_EVIDENCE_SUFFICIENCY` | Grade evidence coverage instead of item count; answer, retry once, or return an honest partial/refusal. |
+| `enable_corrective_retry` | `false` | `ENABLE_CORRECTIVE_RETRY` | Permit the single bounded corrective retrieval when the grader reports `borderline`. |
+| `max_corrective_retries` | `1` | `MAX_CORRECTIVE_RETRIES` | Hard-clamped to 0–1. |
+| `enable_query_decomposition` | `false` | `ENABLE_QUERY_DECOMPOSITION` | In the complex lane, decompose a genuinely compound/low-coverage plan into ≤ 2 derived, drift-validated subqueries fused with the original (strongest signal). Not present in the committed YAML; defined in `src/middleware/config.py`. |
+
+#### Citation provenance & numeric validation (Phase 2.2.4.3)
+
+| Field | Default | Env | Meaning |
+|-------|---------|-----|---------|
+| `answer_validation` | `report` | `ANSWER_VALIDATION` | `off` = legacy byte-identical; `report` = render `[E#]` ids, run the deterministic (stdlib + `Decimal`) validator, attach validation metadata (no answer change); `enforce` = additionally downgrade grounded→partial or refuse a wholly-unsupported answer. Invalid value falls back to `off`. |
+| `require_evidence_ids` | `false` | `REQUIRE_EVIDENCE_IDS` | Tighten enforcement so a specific-figure answer with no resolving `[E#]` counts as a violation. |
+
+#### Tool-aware final streaming & progress events (Phase 2.2.6.1)
+
+Keeps the bounded tool/planning rounds non-streaming, then streams the final
+answer synthesis — so enabling tools no longer disables streaming for the whole
+request. Both feature flags default off (behavior byte-identical to pre-2.2.6).
+
+| Field | Default | Env | Meaning |
+|-------|---------|-----|---------|
+| `enable_tool_final_streaming` | `false` | `ENABLE_TOOL_FINAL_STREAMING` | Serve a tools-enabled `/query/stream` by running tool rounds non-streaming, then streaming only the final answer. Off → `/query/stream` 404s while tools are enabled. |
+| `enable_stream_progress_events` | `false` | `ENABLE_STREAM_PROGRESS_EVENTS` | Emit versioned, redacted progress events (`query_started`, `stage`, `tool_started`, `tool_completed`, `error`) on the SSE stream. Off → only the legacy `token`/`metadata` events. |
+| `stream_progress_include_counts` | `true` | `STREAM_PROGRESS_INCLUDE_COUNTS` | Include row/item counts on retrieve and `tool_completed` progress events. |
+
+#### Versioned retrieval cache & prompt efficiency (Phase 2.2.6.2)
+
+An in-memory cache of a planned request's **pre-prompt** evidence, keyed on the
+compiled query + validated plan + config/model fingerprint + a monotonic
+`store_revision`. Any ingestion write bumps the revision and invalidates the
+cache exactly; a cache miss or internal error is always just a miss, never a
+query failure. **No semantic final-answer cache exists** — volatile finance
+answers (prices, news, estimates, "latest") are never reused by similarity.
+
+| Field | Default | Env | Meaning |
+|-------|---------|-----|---------|
+| `enable_retrieval_cache` | `false` | `ENABLE_RETRIEVAL_CACHE` | Reuse pre-prompt retrieval evidence for an identical request at the same store revision. Explicit-refresh requests never look up the cache. |
+| `retrieval_cache_max_entries` | `256` | `RETRIEVAL_CACHE_MAX_ENTRIES` | LRU entry cap. |
+| `retrieval_cache_ttl_s` | `300` | `RETRIEVAL_CACHE_TTL_S` | Secondary staleness bound beneath the revision key (seconds). |
+| `retrieval_cache_max_value_chars` | `200000` | `RETRIEVAL_CACHE_MAX_VALUE_CHARS` | Refuse to store a single larger evidence snapshot (bounds memory). |
+| `llama_cache_prompt` | `false` | `LLAMA_CACHE_PROMPT` | Send llama-server's `cache_prompt: true` on the final answer request when the backend supports it; on rejection it disables for the process and retries the plain payload once (fail-soft). Off → the request JSON is byte-identical. |
+
+### Hierarchical retrieval (Phase 2.2.5.3)
+
+Bounded filing → section → child expansion of precise SEC hits. Off by default;
+the corrective `EXPAND_PARENT_SECTION` seam keeps its 2.2.4.1 sibling-only
+behavior until the long-document eval gates pass. An entire filing parent is
+never injected into a prompt.
+
+```yaml
+enable_hierarchical_retrieval: false
+hierarchy_max_siblings: 2            # clamp 0–4
+hierarchy_max_adjacent_sections: 1  # clamp 0–3
+hierarchy_max_expanded_items: 12    # clamp 0–50 (0 = bounded only by the budget)
+```
+
+| Field | Default | Meaning |
+|-------|---------|---------|
+| `enable_hierarchical_retrieval` | `false` | When on, a precise child hit is expanded with same-section neighbors and (obligation- or grader-gated) adjacent sections under the shared context character budget. |
+| `hierarchy_max_siblings` | `2` | Max preceding/following same-section children added per hit to complete a sentence/table (clamp 0–4). |
+| `hierarchy_max_adjacent_sections` | `1` | Max adjacent sections added per hit, only on an obligation-heading match or a grader missing-context signal (clamp 0–3). |
+| `hierarchy_max_expanded_items` | `12` | Hard cap on total added neighbors across all hits, regardless of budget (clamp 0–50; `0` = bounded only by `adaptive_max_context_chars`). |
+
+CompanyFacts preference (2.2.5.3) is governed by `configs/sec_companyfacts.yaml`
+(`enabled: false` by default) and needs no middleware flag — when the source is
+enabled, authoritative filed GAAP facts are merged into structured retrieval and
+conflicting values are surfaced as separate evidence, never averaged.
+
+### Live retrieval-graph observer (Phase 2.2.7)
+
+A local, **read-only** visualization of the retrieval pipeline and corpus
+inventory. **Disabled by default.** When on, the UI (`/graph`) and its API
+(`/graph/api/*`) are served **only to loopback clients** (`127.0.0.1`/`::1`) with
+a strict same-origin CSP; a non-loopback request gets 404. There is **no bypass
+flag** — remote exposure is out of scope for Phase 2.2 and would require a
+separate design covering authentication, TLS, proxy trust, and retention. Do not
+put this behind a reverse proxy or bind the middleware to a non-loopback address
+while the observer is on. The observer reuses **no** SEC/FRED/model credentials.
+
+Rollback is to flip `enable_graph_observer` back to `false`; nothing is persisted.
+The in-memory `TraceHub` and the config loader both clamp these limits to safe
+ranges so a misconfiguration cannot request an unbounded footprint.
+
+```yaml
+enable_graph_observer: false
+graph_trace_limit: 100            # clamp 1–1000
+graph_element_limit: 5000         # clamp 1–50000
+graph_trace_ttl_s: 3600           # clamp 1–86400
+graph_excerpt_chars: 1000         # clamp 0–10000
+graph_question_preview_chars: 200 # clamp 0–2000
+# Read-only corpus explorer budgets (2.2.7.2), gated by the same flag:
+corpus_page_limit: 100            # clamp 1–200
+corpus_element_limit: 2000        # clamp 1–2000
+corpus_visible_node_target: 450   # clamp 1–499
+corpus_overview_cache_ttl_s: 2.0  # clamp 0.1–60
+corpus_opaque_id_ttl_s: 300.0     # clamp 1–3600
+```
+
+| Field | Default | Env | Meaning |
+|-------|---------|-----|---------|
+| `enable_graph_observer` | `false` | `ENABLE_GRAPH_OBSERVER` | Enable the loopback-only live retrieval graph UI + API. Off → every `/graph*` route 404s and `/query` responses omit `graph_trace_id`. |
+| `graph_trace_limit` | `100` | `GRAPH_TRACE_LIMIT` | Max concurrent in-memory traces (oldest evicted). |
+| `graph_element_limit` | `5000` | `GRAPH_ELEMENT_LIMIT` | Max total nodes+edges across all traces. |
+| `graph_trace_ttl_s` | `3600` | `GRAPH_TRACE_TTL_S` | Trace time-to-live in seconds. |
+| `graph_excerpt_chars` | `1000` | `GRAPH_EXCERPT_CHARS` | Max evidence excerpt length in a node. |
+| `graph_question_preview_chars` | `200` | `GRAPH_QUESTION_PREVIEW_CHARS` | Max stored question preview (the full question is only a SHA-256 digest). |
+| `corpus_page_limit` | `100` | `CORPUS_PAGE_LIMIT` | Max rows per explorer page. |
+| `corpus_element_limit` | `2000` | `CORPUS_ELEMENT_LIMIT` | Hard cap on nodes+edges per explorer response. |
+| `corpus_visible_node_target` | `450` | `CORPUS_VISIBLE_NODE_TARGET` | Soft target for the overview projection before truncation. |
+| `corpus_overview_cache_ttl_s` | `2.0` | `CORPUS_OVERVIEW_CACHE_TTL_S` | Overview cache TTL (revision-keyed). |
+| `corpus_opaque_id_ttl_s` | `300.0` | `CORPUS_OPAQUE_ID_TTL_S` | Lifetime of an opaque corpus node id / cursor. |
 
 ---
 

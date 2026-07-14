@@ -24,6 +24,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import httpx
 import pytest
 from fastapi.testclient import TestClient
+from pydantic import ValidationError
 
 if "chromadb" not in sys.modules:
     _mock_chroma = type(sys)("chromadb")
@@ -385,8 +386,10 @@ class TestPromptAugmenter:
         assert "No data was found" in prompt
         assert "AAPL" in prompt
 
-    def test_prompt_includes_system_instruction(self):
-        """Prompt always includes system instruction with rules."""
+    def test_prompt_excludes_duplicated_policy_rules(self):
+        """The augmented user prompt no longer duplicates the authoritative
+        answer-policy rules — those live solely in the system message built
+        by prompt_policy.py (2.2.1.1 step 4)."""
         from src.middleware.prompt_augmenter import PromptAugmenter
         augmenter = PromptAugmenter()
 
@@ -396,9 +399,9 @@ class TestPromptAugmenter:
             retrieval={"facts": [], "documents": [], "ticker": None},
         )
 
-        assert "financial research assistant" in prompt
-        assert "Answer using ONLY the provided context" in prompt
-        assert "Cite sources inline" in prompt
+        assert "## Instructions" in prompt
+        assert "financial research assistant" not in prompt
+        assert "Answer using ONLY the provided context" not in prompt
 
     def test_question_type_instructions(self):
         """Question-type-specific instructions are included."""
@@ -750,6 +753,102 @@ class TestMiddlewareIntegration:
 
 
 # ============================================================
+# 5b. Conversation history contract (2.2.2.1)
+# ============================================================
+
+
+class TestConversationContract:
+    """Additive /query history contract — single-turn stays byte-for-byte."""
+
+    def _mock_plain_query_app(self, monkeypatch, answer="NVDA revenue is 26B"):
+        """Wire a minimal mocked /query pipeline (no tools/stream/model server)."""
+        from types import SimpleNamespace
+
+        import src.middleware.app as middleware_app
+
+        config = SimpleNamespace(
+            model_name="tracealchemy",
+            llama_endpoint="http://test/v1/chat/completions",
+            default_temperature=0.3, max_tokens=256,
+            top_k_documents=5, top_k_facts=10,
+            enable_tools=False, enable_streaming=True, enable_fetch_on_miss=False,
+            answer_policy="graded", allow_general_fallback=True, return_timings=True,
+            conversation_max_turns=8, conversation_max_history_chars=8000,
+        )
+        parser = MagicMock()
+        parser.parse.return_value = {
+            "ticker": "NVDA", "ticker_confidence": 1.0,
+            "question_type": "fact_lookup", "metrics": ["total_revenue"],
+        }
+        monkeypatch.setattr("src.middleware.intent_parser.IntentParser",
+                            MagicMock(return_value=parser))
+        monkeypatch.setattr(middleware_app, "config", config)
+        monkeypatch.setattr(middleware_app, "store", object())
+        monkeypatch.setattr(middleware_app, "retriever", SimpleNamespace(
+            retrieve=lambda **_k: {
+                "facts": [{"metric": "total_revenue", "value": 26.0}],
+                "documents": [], "retrieval_strategy": "vector", "timings": {}}))
+        monkeypatch.setattr(middleware_app, "_evaluate_and_refresh",
+                            MagicMock(return_value={"overall": "fresh", "fetched_on_miss": []}))
+        monkeypatch.setattr(middleware_app, "_check_model_health", AsyncMock(return_value=True))
+        monkeypatch.setattr(middleware_app, "_task_params", lambda _t: {})
+
+        completion = MagicMock()
+        completion.raise_for_status.return_value = None
+        completion.json.return_value = {"choices": [{"message": {"content": answer}}]}
+        monkeypatch.setattr(middleware_app, "model_client",
+                            SimpleNamespace(post=AsyncMock(return_value=completion)))
+        return middleware_app
+
+    def test_query_request_without_history_is_backward_compatible(self, monkeypatch):
+        from src.middleware.models import QueryRequest
+
+        # Model defaults: additive fields are empty/None.
+        req = QueryRequest(question="What is NVDA revenue?")
+        assert req.history == []
+        assert req.session_id is None
+
+        app = self._mock_plain_query_app(monkeypatch)
+        client = TestClient(app.app)
+
+        # No history -> conversation metadata omitted (single-turn behavior).
+        r0 = client.post("/query", json={"question": "What is NVDA revenue?"})
+        assert r0.status_code == 200
+        assert r0.json()["conversation"] is None
+
+        # With history -> metadata reports what was received/used.
+        r1 = client.post("/query", json={
+            "question": "And AMD?",
+            "session_id": "sess-1",
+            "history": [
+                {"role": "user", "content": "What is NVDA revenue?"},
+                {"role": "assistant", "content": "NVDA revenue is 26B"},
+            ],
+        })
+        assert r1.status_code == 200
+        convo = r1.json()["conversation"]
+        assert convo == {
+            "history_turns_received": 2,
+            "history_turns_used": 2,
+            "history_truncated": False,
+            "topic_reset": False,
+        }
+
+    def test_current_question_is_never_silently_truncated(self):
+        from src.middleware.models import MAX_QUESTION_CHARS, QueryRequest
+
+        # At the limit: accepted verbatim, no truncation.
+        at_limit = "a" * MAX_QUESTION_CHARS
+        req = QueryRequest(question=at_limit)
+        assert req.question == at_limit
+        assert len(req.question) == MAX_QUESTION_CHARS
+
+        # Over the limit: explicit validation error, not a shortened question.
+        with pytest.raises(ValidationError):
+            QueryRequest(question="a" * (MAX_QUESTION_CHARS + 1))
+
+
+# ============================================================
 # 6. Live Model Tests
 # ============================================================
 
@@ -778,3 +877,277 @@ class TestLiveMiddleware:
         data = response.json()
         assert data.get("answer")
         assert data.get("detected_ticker") == "NVDA"
+
+
+# ══════════════════════════════════════════════════════════════════════
+# Phase 2.2.3.4 — adaptive orchestration integration (offline, deterministic)
+#
+# These exercise the ONE request-path switch in _build_query_context and the
+# response/trace/health wiring. `orchestrate` is patched with a fake that
+# returns a crafted OrchestrationResult, so the app-level wiring is tested in
+# isolation from the orchestrator (covered by test_adaptive_orchestrator.py).
+# No model, network, or ChromaDB process is started.
+# ══════════════════════════════════════════════════════════════════════
+
+import pytest as _pytest  # noqa: E402
+from types import SimpleNamespace as _NS  # noqa: E402
+from unittest.mock import AsyncMock as _AsyncMock  # noqa: E402
+
+from src.middleware import app as _app  # noqa: E402
+from src.middleware import adaptive_orchestrator as _ao  # noqa: E402
+from src.middleware.adaptive_orchestrator import (  # noqa: E402
+    ContextSelection as _ContextSelection,
+    Lane as _Lane,
+    OrchestrationResult as _OrchResult,
+)
+from src.middleware.config import MiddlewareConfig as _MW  # noqa: E402
+from src.middleware.deterministic_router import (  # noqa: E402
+    ExecutedInvocation as _ExecInv,
+    ExecutionResult as _ExecResult,
+)
+from src.middleware.models import QueryRequest as _QReq  # noqa: E402
+
+
+def _adaptive_config(**overrides) -> _MW:
+    cfg = _MW()
+    cfg.enable_adaptive_rag = True
+    cfg.enable_fetch_on_miss = False
+    cfg.enable_conversation_rewrite = False
+    for k, v in overrides.items():
+        setattr(cfg, k, v)
+    return cfg
+
+
+class _FakeRetriever:
+    """Records retrieve() calls; used to prove the legacy fallback ran once."""
+
+    def __init__(self, *, facts=None, documents=None, strategy="vector"):
+        self.retrieve_calls = 0
+        self._facts = facts or []
+        self._documents = documents or []
+        self._strategy = strategy
+
+    def retrieve(self, query, intent, top_k_documents=5, top_k_facts=10):
+        self.retrieve_calls += 1
+        return {
+            "facts": [dict(f) for f in self._facts],
+            "documents": [dict(d) for d in self._documents],
+            "ticker": intent.get("ticker"),
+            "strategy": "hybrid",
+            "retrieval_strategy": self._strategy,
+            "timings": {"embedding": 0.0, "chroma": 0.0, "sqlite": 0.0},
+        }
+
+
+def _fake_result(plan, *, lane=_Lane.STANDARD, facts=None, documents=None,
+                 tool_execution=None, fallback_reason=None,
+                 subqueries=("sq0",), rounds=1, rerank=False, planning=False,
+                 strategy="hybrid", dropped_facts=0, dropped_documents=0):
+    facts = list(facts or [])
+    documents = list(documents or [])
+    ctx = _ContextSelection(
+        facts=facts, documents=documents,
+        context_chars=100 + len(facts) * 10, estimated_tokens=25,
+        dropped_facts=dropped_facts, dropped_documents=dropped_documents,
+    )
+    return _OrchResult(
+        lane=lane, plan=plan, reason_codes=[f"lane_{lane.value}"],
+        merged_facts=facts, merged_documents=documents,
+        tool_execution=tool_execution,
+        subqueries_executed=list(subqueries),
+        retrieval_rounds_used=rounds, planning_ran=planning, rerank_ran=rerank,
+        retrieval_strategy=strategy, context=ctx,
+        context_size=ctx.context_chars, estimated_tokens=ctx.estimated_tokens,
+        fallback_reason=fallback_reason,
+    )
+
+
+def _wire_adaptive(monkeypatch, config, *, retriever=None, fake_orchestrate=None):
+    """Patch middleware globals + freshness/model so the adaptive path can run
+    fully in-process. Leaves the real IntentParser + _build_*_context in place."""
+    store = _NS(sqlite=_NS(list_metrics=lambda: ["total_revenue", "gross_margin"]))
+    monkeypatch.setattr(_app, "store", store)
+    monkeypatch.setattr(_app, "config", config)
+    monkeypatch.setattr(_app, "retriever", retriever or _FakeRetriever())
+    monkeypatch.setattr(
+        _app, "_evaluate_and_refresh",
+        MagicMock(return_value={"overall": "fresh", "fetched_on_miss": []}))
+    monkeypatch.setattr(_app, "_task_params", lambda _t: {})
+    monkeypatch.setattr(_app, "_check_model_health", _AsyncMock(return_value=True))
+    monkeypatch.setattr(
+        _app, "_call_model",
+        _AsyncMock(return_value=("adaptive answer", [])))
+    if fake_orchestrate is not None:
+        monkeypatch.setattr(_ao, "orchestrate", fake_orchestrate)
+
+
+@_pytest.mark.asyncio
+async def test_adaptive_feature_disabled_matches_legacy_route(monkeypatch):
+    """enable_adaptive_rag=false -> pure legacy path, orchestration omitted."""
+    cfg = _adaptive_config(enable_adaptive_rag=False)
+    retriever = _FakeRetriever(
+        facts=[{"metric": "total_revenue", "value": 26.0, "ticker": "NVDA"}],
+        documents=[{"id": "d1", "document": "NVDA revenue context",
+                    "metadata": {"ticker": "NVDA"}}])
+    _wire_adaptive(monkeypatch, cfg, retriever=retriever)
+
+    resp = await _app.query(_QReq(question="What is NVDA revenue?"))
+
+    assert resp.orchestration is None
+    assert retriever.retrieve_calls == 1
+    assert resp.facts_used == 1
+
+
+@_pytest.mark.asyncio
+async def test_adaptive_path_populates_actual_counts(monkeypatch):
+    """Metadata reports ACTUAL executed counters, not configured maxima."""
+    cfg = _adaptive_config()
+
+    def fake_orch(plan, store, config, **kwargs):
+        return _fake_result(
+            plan, lane=_Lane.COMPLEX,
+            facts=[{"metric": "total_revenue", "value": 26.0, "ticker": "NVDA"}],
+            documents=[{"id": "d1", "document": "body",
+                        "metadata": {"ticker": "NVDA"}}],
+            subqueries=("sq0",), rounds=1, rerank=False, planning=False,
+            dropped_documents=7)
+
+    _wire_adaptive(monkeypatch, cfg, fake_orchestrate=fake_orch)
+
+    resp = await _app.query(_QReq(question="compare NVDA AMD revenue and risks"))
+
+    orch = resp.orchestration
+    assert orch is not None
+    assert orch["lane"] == "complex"
+    assert orch["subqueries_executed"] == 1       # actual, cap is 3
+    assert orch["retrieval_rounds"] == 1          # actual, cap is 2
+    assert orch["planning_calls"] == 0
+    assert orch["reranker_calls"] == 0
+    assert orch["evidence_dropped"] == 7
+    assert orch["fallback_reason"] is None
+
+
+@_pytest.mark.asyncio
+async def test_adaptive_deterministic_tools_in_evidence_and_trace(monkeypatch):
+    """Deterministic tool results reach the final evidence AND the trace."""
+    cfg = _adaptive_config()
+    tool_facts = [{"metric": "total_revenue", "value": 26.0, "ticker": "NVDA",
+                   "source_type": "tool"}]
+    execution = _ExecResult(
+        invocations=[_ExecInv(
+            "get_fundamentals", {"ticker": "NVDA", "metrics": ["total_revenue"]},
+            "sq0", "route_get_fundamentals",
+            result={"ticker": "NVDA", "fundamentals": {"total_revenue": 26.0}})],
+        calculations=[], error=False)
+
+    def fake_orch(plan, store, config, **kwargs):
+        return _fake_result(plan, lane=_Lane.FAST, facts=tool_facts,
+                            tool_execution=execution, rounds=0)
+
+    _wire_adaptive(monkeypatch, cfg, fake_orchestrate=fake_orch)
+
+    # Real _call_model records the trace prompt on the successful path; mirror
+    # that here so finalize() produces a trace (the mock otherwise records none).
+    async def _model(prompt, temperature, max_tokens, intent, grounding_level):
+        _app._record_trace_prompt("SYS", prompt)
+        return "adaptive answer", []
+
+    monkeypatch.setattr(_app, "_call_model", _model)
+
+    resp = await _app.query(_QReq(question="What is NVDA revenue?",
+                                  include_evidence_trace=True))
+
+    # Final evidence carries the tool fact.
+    assert resp.facts_used == 1
+    assert resp.orchestration["deterministic_tools"] == ["get_fundamentals"]
+    # Trace records the executed tool on the successful path.
+    trace = resp.evidence_trace
+    assert trace is not None
+    orch_trace = trace["orchestration"]
+    names = [t["name"] for t in orch_trace["deterministic_tool_results"]]
+    assert names == ["get_fundamentals"]
+    assert orch_trace["query_plan"]["retrieval_query"]
+    assert any(f.get("metric") == "total_revenue" for f in trace["facts"])
+
+
+@_pytest.mark.asyncio
+async def test_adaptive_plan_failure_falls_back_to_legacy_once(monkeypatch):
+    """An invalid plan -> legacy retrieval runs once, raw question preserved."""
+    cfg = _adaptive_config()
+    retriever = _FakeRetriever(
+        documents=[{"id": "legacy-doc", "document": "legacy body",
+                    "metadata": {"ticker": "NVDA"}}])
+    _wire_adaptive(monkeypatch, cfg, retriever=retriever)
+
+    from src.middleware.query_plan import QueryPlanError
+
+    def boom(self, question, retrieval_query=None, override_ticker=None):
+        raise QueryPlanError(["blank_retrieval_query"])
+
+    monkeypatch.setattr(
+        "src.middleware.intent_parser.IntentParser.parse_plan", boom)
+
+    resp = await _app.query(_QReq(question="What is NVDA revenue?"))
+
+    assert retriever.retrieve_calls == 1
+    assert resp.orchestration == {"lane": None, "fallback_reason": "adaptive_fallback"}
+    assert resp.answer == "adaptive answer"
+
+
+@_pytest.mark.asyncio
+async def test_adaptive_normal_and_stream_share_context(monkeypatch):
+    """Both answer functions consume the same compiled adaptive context."""
+    cfg = _adaptive_config()
+
+    def fake_orch(plan, store, config, **kwargs):
+        return _fake_result(
+            plan, lane=_Lane.STANDARD,
+            documents=[{"id": "d1", "document": "shared body",
+                        "metadata": {"ticker": "NVDA"}}])
+
+    _wire_adaptive(monkeypatch, cfg, fake_orchestrate=fake_orch)
+
+    request = _QReq(question="why did NVDA drop")
+    context = await _app._build_query_context(request)
+
+    # Normal path response.
+    normal = await _app._answer_query_context(request, context)
+    # Streaming terminal metadata is built from the SAME context via the shared
+    # _build_query_response, so its orchestration/grounding must match.
+    streamed = _app._build_query_response(
+        context=context, answer_text="x", citations=[], model_available=True)
+
+    assert context["orchestration"]["lane"] == "standard"
+    assert normal.orchestration == streamed.orchestration
+    assert normal.grounding == streamed.grounding
+    assert normal.documents_used == streamed.documents_used == 1
+
+
+def test_health_reports_adaptive_capabilities(monkeypatch):
+    """/health advertises effective adaptive_rag + deterministic routing flags."""
+    cfg = _adaptive_config(enable_deterministic_tool_routing=True)
+    monkeypatch.setattr(_app, "config", cfg)
+    monkeypatch.setattr(
+        _app, "store", _NS(heartbeat=lambda: {"sqlite": True, "chroma": True}))
+    monkeypatch.setattr(_app, "_check_model_health", _AsyncMock(return_value=True))
+    monkeypatch.setattr(
+        _app, "_cached_health_summary", lambda: {"scheduler": None, "freshness": {}})
+
+    caps = TestClient(_app.app).get("/health").json()["capabilities"]
+
+    assert caps["adaptive_rag"] is True
+    assert caps["deterministic_tool_routing"] is True
+
+
+def test_old_client_tolerates_omitted_orchestration_metadata():
+    """A QueryResponse without orchestration validates and dumps to null; the
+    chat renderer tolerates a response dict missing the field entirely."""
+    from src.middleware.models import QueryResponse
+    from scripts import chat
+
+    resp = QueryResponse(answer="hi")
+    assert resp.orchestration is None
+    assert resp.model_dump()["orchestration"] is None
+
+    # No orchestration key at all -> renderer must not raise.
+    chat._render_metadata({"answer": "hi", "grounding": "grounded"}, verbose=True)

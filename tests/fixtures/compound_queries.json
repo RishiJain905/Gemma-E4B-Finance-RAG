@@ -1,0 +1,87 @@
+{
+  "_comment": "2.2.3.1 compound-query quality-gate fixture. `expected` holds human gold labels for entities/intents/metrics/periods; the test computes micro-F1 of IntentParser.parse_plan against it (>=0.90 gate, zero raw-question mutations). Deliberately not equal to raw parser output: the parser over-matches a couple of intents/metrics, and the gate measures precision against the human labels. Companies are all in IntentParser.COMPANY_TO_TICKER, so an empty catalog keeps the fixture offline and deterministic. Period strings are the parser's lowercased matched form.",
+  "cases": [
+    {
+      "id": "cmp-nvda-amd-rev",
+      "question": "Compare NVDA and AMD revenue",
+      "expected": {"entities": ["NVDA", "AMD"], "intents": ["comparison"], "metrics": ["total_revenue"], "periods": []}
+    },
+    {
+      "id": "cmp-margin-trend",
+      "question": "Compare NVIDIA and AMD gross margin trend over the last year",
+      "expected": {"entities": ["NVDA", "AMD"], "intents": ["comparison", "trend"], "metrics": ["gross_margin_pct"], "periods": ["last year"]}
+    },
+    {
+      "id": "multi-intent-risk",
+      "question": "Show NVDA revenue trend and its key risks",
+      "expected": {"entities": ["NVDA"], "intents": ["trend", "risk"], "metrics": ["total_revenue"], "periods": []}
+    },
+    {
+      "id": "multi-metric-msft",
+      "question": "What is the PE ratio and EPS for MSFT in Q1 2026?",
+      "expected": {"entities": ["MSFT"], "intents": ["fact_lookup"], "metrics": ["pe_ratio", "eps_diluted"], "periods": ["q1 2026"]}
+    },
+    {
+      "id": "periods-range",
+      "question": "What was Apple revenue from 2023 through 2025?",
+      "expected": {"entities": ["AAPL"], "intents": ["fact_lookup"], "metrics": ["total_revenue"], "periods": ["2023", "2025"]}
+    },
+    {
+      "id": "compound-nvda",
+      "question": "What were NVIDIA revenue and net income in Q2 2026?",
+      "expected": {"entities": ["NVDA"], "intents": ["fact_lookup"], "metrics": ["total_revenue", "net_income"], "periods": ["q2 2026"]}
+    },
+    {
+      "id": "why-tsla",
+      "question": "Why did Tesla net income drop and what are the risks?",
+      "expected": {"entities": ["TSLA"], "intents": ["explanation", "risk"], "metrics": ["net_income"], "periods": []}
+    },
+    {
+      "id": "news-amzn",
+      "question": "Any recent news on Amazon and its free cash flow?",
+      "expected": {"entities": ["AMZN"], "intents": ["news"], "metrics": ["free_cash_flow"], "periods": []}
+    },
+    {
+      "id": "three-entity",
+      "question": "Compare NVDA, AMD and Intel market cap",
+      "expected": {"entities": ["NVDA", "AMD", "INTC"], "intents": ["comparison"], "metrics": ["market_cap"], "periods": []}
+    },
+    {
+      "id": "override-comp",
+      "question": "Compare revenue with AMD",
+      "override_ticker": "NVDA",
+      "expected": {"entities": ["NVDA", "AMD"], "intents": ["comparison"], "metrics": ["total_revenue"], "periods": []}
+    },
+    {
+      "id": "carry-retrieval",
+      "question": "What about AMD?",
+      "retrieval_query": "Compare NVDA and AMD revenue for FY 2025",
+      "expected": {"entities": ["NVDA", "AMD"], "intents": ["comparison"], "metrics": ["total_revenue"], "periods": ["fy 2025"]}
+    },
+    {
+      "id": "proj-meta",
+      "question": "What is the price target and forward PE for Meta?",
+      "expected": {"entities": ["META"], "intents": ["projection"], "metrics": ["price_target_mean", "forward_pe"], "periods": []}
+    },
+    {
+      "id": "trend-history",
+      "question": "How has Microsoft operating margin performed over time?",
+      "expected": {"entities": ["MSFT"], "intents": ["trend"], "metrics": ["operating_margin_pct"], "periods": []}
+    },
+    {
+      "id": "dividend-roe",
+      "question": "What is the dividend yield and ROE for Broadcom?",
+      "expected": {"entities": ["AVGO"], "intents": ["fact_lookup"], "metrics": ["dividend_yield", "roe"], "periods": []}
+    },
+    {
+      "id": "multi-period-q",
+      "question": "Compare NVDA revenue in Q1 2026 and Q2 2026",
+      "expected": {"entities": ["NVDA"], "intents": ["comparison"], "metrics": ["total_revenue"], "periods": ["q1 2026", "q2 2026"]}
+    },
+    {
+      "id": "sentiment-amd",
+      "question": "What is the analyst outlook for AMD next quarter?",
+      "expected": {"entities": ["AMD"], "intents": ["sentiment", "projection"], "metrics": [], "periods": []}
+    }
+  ]
+}

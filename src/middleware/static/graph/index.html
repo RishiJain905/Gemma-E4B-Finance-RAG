@@ -1,0 +1,187 @@
+<!doctype html>
+<html lang="en" data-mode="live" data-connection="init">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="referrer" content="no-referrer">
+  <meta name="color-scheme" content="dark">
+  <title>Trace Telemetry — local retrieval graph</title>
+  <link rel="icon" href="data:,">
+  <link rel="stylesheet" href="/graph/static/graph.css">
+</head>
+<body>
+  <a class="skip-link" href="#graph-canvas">Skip to graph</a>
+
+  <header class="app-header" role="banner">
+    <div class="header-left">
+      <span class="wordmark" aria-hidden="true">TRACE&nbsp;TELEMETRY</span>
+      <div class="mode-tabs" role="tablist" aria-label="View mode">
+        <button id="tab-live" class="mode-tab" role="tab" aria-selected="true"
+                aria-controls="graph-canvas" data-mode="live" type="button">Live Trace</button>
+        <button id="tab-corpus" class="mode-tab" role="tab" aria-selected="false"
+                aria-controls="graph-canvas" data-mode="corpus" type="button">Corpus Explorer</button>
+      </div>
+    </div>
+
+    <div class="header-right">
+      <label class="picker-field" id="query-picker-field">
+        <span class="field-label">Trace</span>
+        <select id="query-picker" class="mono" aria-label="Select query trace"></select>
+      </label>
+      <label class="field corpus-field" id="corpus-revision-field" hidden>
+        <span class="field-label">Corpus rev</span>
+        <span id="corpus-revision" class="mono" aria-live="polite">—</span>
+      </label>
+      <button id="toggle-follow" class="pill" type="button" role="switch"
+              aria-checked="true" data-on="true">
+        <span class="dot-follow" aria-hidden="true"></span>Follow live
+      </button>
+      <div class="conn-state" id="conn-state" role="status" aria-live="polite">
+        <span class="conn-dot" id="conn-dot" aria-hidden="true"></span>
+        <span id="conn-label" class="mono">starting…</span>
+      </div>
+    </div>
+  </header>
+
+  <main class="app-body">
+    <section class="stage-region" aria-label="Retrieval graph">
+      <div class="toolbar" role="toolbar" aria-label="Graph controls">
+        <div class="toolbar-group" id="live-controls">
+          <button id="btn-fit" class="tool-btn" type="button">Fit view</button>
+          <button id="btn-reset" class="tool-btn" type="button">Reset</button>
+          <button id="btn-pin" class="tool-btn" type="button" aria-pressed="false"
+                  disabled>Pin node</button>
+          <button id="btn-collapse" class="tool-btn" type="button" disabled>Collapse stage</button>
+          <button id="btn-export" class="tool-btn" type="button">Export snapshot</button>
+        </div>
+        <div class="toolbar-group" id="corpus-controls" hidden>
+          <label class="field search-field">
+            <span class="field-label">Search</span>
+            <input id="corpus-search" class="mono" type="search" autocomplete="off"
+                   placeholder="ticker · metric · accession · source"
+                   aria-label="Search the corpus">
+          </label>
+          <button id="btn-corpus-search" class="tool-btn" type="button">Search</button>
+          <button id="btn-corpus-overview" class="tool-btn" type="button">Overview</button>
+          <button id="btn-corpus-more" class="tool-btn" type="button" hidden>Load next page</button>
+        </div>
+        <div class="toolbar-spacer"></div>
+        <button id="btn-view-toggle" class="tool-btn" type="button"
+                aria-pressed="false" aria-controls="table-view">Table view</button>
+        <span id="hidden-count" class="hidden-count mono" role="status" aria-live="polite"></span>
+      </div>
+
+      <div class="filters" id="live-filters" aria-label="Trace filters">
+        <label class="filter"><span class="field-label">Status</span>
+          <select id="filter-status" class="mono" aria-label="Filter by status">
+            <option value="">all</option>
+            <option value="active">active</option>
+            <option value="complete">complete</option>
+            <option value="partial">partial</option>
+            <option value="pending">pending</option>
+            <option value="fallback">fallback</option>
+            <option value="dropped">dropped</option>
+            <option value="error">error</option>
+          </select>
+        </label>
+        <label class="filter"><span class="field-label">Subquery</span>
+          <select id="filter-subquery" class="mono" aria-label="Filter by subquery"><option value="">all</option></select>
+        </label>
+        <label class="filter"><span class="field-label">Source</span>
+          <select id="filter-source" class="mono" aria-label="Filter by source"><option value="">all</option></select>
+        </label>
+        <label class="filter"><span class="field-label">Ticker</span>
+          <select id="filter-ticker" class="mono" aria-label="Filter by ticker"><option value="">all</option></select>
+        </label>
+        <label class="filter"><span class="field-label">Evidence</span>
+          <select id="filter-kind" class="mono" aria-label="Filter by evidence kind"><option value="">all</option></select>
+        </label>
+        <label class="filter check">
+          <input id="filter-cited" type="checkbox" aria-label="Show cited evidence only">
+          <span class="field-label">Cited only</span>
+        </label>
+        <button id="btn-clear-filters" class="tool-btn subtle" type="button">Clear</button>
+      </div>
+
+      <div class="canvas-wrap">
+        <div class="stage-rail" id="stage-rail" aria-hidden="true"></div>
+        <div id="graph-canvas" class="graph-canvas" tabindex="0" role="application"
+             aria-label="Interactive retrieval graph. Use the node list or arrow keys to inspect nodes."></div>
+
+        <div id="error-panel" class="error-panel" role="alert" hidden>
+          <h2 class="error-title">Graph view unavailable</h2>
+          <p id="error-detail" class="error-detail"></p>
+          <button id="btn-retry" class="tool-btn" type="button">Retry</button>
+          <p class="error-note">A read-only table of the current trace is shown below.</p>
+        </div>
+
+        <p id="canvas-empty" class="canvas-empty" role="status">
+          No traces yet. Ask a question in chat and it appears here.
+        </p>
+      </div>
+
+      <div class="scrubber-bar" id="scrubber-bar">
+        <span class="field-label">Timeline</span>
+        <input id="scrubber" class="scrubber" type="range" min="0" max="0" value="0" step="1"
+               aria-label="Timeline scrubber by event sequence" aria-valuetext="live">
+        <span id="scrubber-value" class="mono">live</span>
+        <div class="legend" id="legend" aria-label="Legend"></div>
+      </div>
+
+      <div id="table-view" class="table-view" hidden>
+        <div class="table-scroll">
+          <table aria-label="Visible graph nodes and edges">
+            <caption class="visually-hidden">Synchronized list of currently visible nodes</caption>
+            <thead>
+              <tr><th scope="col">Kind</th><th scope="col">Label</th>
+                  <th scope="col">Status</th><th scope="col">Detail</th></tr>
+            </thead>
+            <tbody id="table-body"></tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+
+    <aside class="inspector" id="inspector" role="complementary" aria-label="Node inspector">
+      <div class="inspector-head">
+        <h2 class="inspector-title" id="inspector-title">Inspector</h2>
+        <button id="inspector-close" class="icon-btn" type="button" aria-label="Clear selection" hidden>✕</button>
+      </div>
+      <p id="inspector-empty" class="inspector-empty">
+        Select a node to inspect its provenance. Selecting an answer, citation, or
+        evidence node lights the supporting path.
+      </p>
+      <div id="inspector-body" class="inspector-body" hidden>
+        <div class="chip-row">
+          <span id="insp-kind" class="chip mono"></span>
+          <span id="insp-status" class="chip status-chip mono"></span>
+        </div>
+        <p id="insp-label" class="insp-label"></p>
+        <dl id="insp-meta" class="insp-meta"></dl>
+        <div id="insp-excerpt-wrap" class="insp-excerpt-wrap" hidden>
+          <span class="field-label">Excerpt</span>
+          <p id="insp-excerpt" class="insp-excerpt"></p>
+        </div>
+        <div id="insp-provenance-wrap" class="insp-prov-wrap" hidden>
+          <span class="field-label">Provenance path</span>
+          <ul id="insp-provenance" class="insp-prov"></ul>
+        </div>
+      </div>
+
+      <div class="node-list-wrap">
+        <div class="node-list-head">
+          <span class="field-label">Nodes</span>
+          <span id="node-count" class="mono"></span>
+        </div>
+        <ul id="node-list" class="node-list" role="listbox"
+            aria-label="Visible nodes" tabindex="0"></ul>
+      </div>
+    </aside>
+  </main>
+
+  <div id="live-status" class="visually-hidden" role="status" aria-live="polite"></div>
+
+  <script src="/graph/static/vendor/cytoscape.min.js"></script>
+  <script src="/graph/static/graph.js"></script>
+</body>
+</html>

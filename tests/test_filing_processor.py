@@ -60,6 +60,19 @@ def test_process_pending_filings_empty(mock_processor):
     assert result == {"processed": 0, "failed": 0, "errors": []}
 
 
+def test_process_pending_filings_enabled_reports_zero_index_counts(mock_processor):
+    mock_processor.index_filing_text = True
+    mock_processor.store.sqlite.get_unprocessed_filings.return_value = []
+
+    result = mock_processor.process_pending_filings()
+
+    assert result == {
+        "processed": 0, "failed": 0, "errors": [],
+        "sections_written": 0, "chunks_written": 0, "replacements": 0,
+        "skipped": 0, "index_pending": 0,
+    }
+
+
 def test_process_pending_filings_mixed(mock_processor):
     """Mixed success / no-facts / exception yields correct counts + errors."""
     filings = [
@@ -177,6 +190,88 @@ def test_process_single_filing_happy_path(mock_processor):
     assert parse_kwargs["period"] == "2024"
 
 
+def test_enabled_section_indexing_persists_artifact_then_marks_parsed(tmp_path):
+    store = MagicMock()
+    store.add_filing_sections.return_value = {
+        "sections_written": 2, "chunks_written": 3, "replacements": 0, "skipped": 0,
+    }
+    store.count_filing_sections.return_value = 2
+    fetcher = MagicMock()
+    fetcher.download_filing_text.return_value = (
+        "Item 1. Business\nWe sell products.\n"
+        "Item 7. Management's Discussion and Analysis\nRevenue was $42.\n"
+    )
+    parser = MagicMock()
+    parser.extract_facts_from_filing.return_value = [
+        {"metric": "revenue", "value": 42.0, "unit": "usd"}
+    ]
+    processor = FilingProcessor(
+        store=store, fetcher=fetcher, parser=parser,
+        sec_config={
+            "index_filing_text": True,
+            "max_sections_per_filing": 100,
+            "max_section_chars": 1_000_000,
+            "index_forms": ["10-K", "10-Q", "8-K"],
+        },
+        parsed_dir=tmp_path / "parsed",
+    )
+
+    assert processor._process_single_filing(_make_filing(accession="ACC-INDEX")) is True
+
+    sections = store.add_filing_sections.call_args.args[0]
+    assert len(sections) == 2
+    artifact = tmp_path / "parsed" / "ACC-INDEX.txt"
+    assert artifact.read_text(encoding="utf-8").startswith("Item 1. Business")
+    assert all(section.parsed_path == str(artifact) for section in sections)
+    store.process_filing.assert_called_once()
+    assert store.process_filing.call_args.kwargs["index_document"] is False
+    assert store.process_filing.call_args.kwargs["mark_parsed"] is False
+    store.sqlite.mark_filing_parsed.assert_called_once_with(
+        "ACC-INDEX", embedding_id="sec:ACC-INDEX", file_path=str(artifact),
+        section_count=2, chunk_count=3,
+    )
+
+
+def test_chroma_failure_records_retryable_index_pending(tmp_path):
+    store = MagicMock()
+    store.add_filing_sections.side_effect = RuntimeError("Chroma unavailable")
+    fetcher = MagicMock()
+    fetcher.download_filing_text.return_value = "Item 1. Business\nUsable filing prose."
+    parser = MagicMock()
+    parser.extract_facts_from_filing.return_value = [
+        {"metric": "revenue", "value": 42.0, "unit": "usd"}
+    ]
+    processor = FilingProcessor(
+        store=store, fetcher=fetcher, parser=parser,
+        sec_config={"index_filing_text": True, "max_sections_per_filing": 100,
+                    "max_section_chars": 1_000_000, "index_forms": ["10-K"]},
+        parsed_dir=tmp_path / "parsed",
+    )
+
+    assert processor._process_single_filing(_make_filing(accession="ACC-PENDING")) is False
+
+    artifact = tmp_path / "parsed" / "ACC-PENDING.txt"
+    assert artifact.exists()
+    store.sqlite.mark_filing_index_pending.assert_called_once_with(
+        "ACC-PENDING", file_path=str(artifact), error="Chroma unavailable",
+    )
+    store.sqlite.mark_filing_parsed.assert_not_called()
+
+
+def test_index_pending_rows_remain_retryable(tmp_path):
+    store = Store(db_path=tmp_path / "pending.db", chroma_path=tmp_path / "chroma")
+    store.register_filing("AAPL", "10-K", "2025-01-15", "2024", "ACC-P", "url")
+    store.sqlite.mark_filing_index_pending(
+        "ACC-P", file_path=str(tmp_path / "ACC-P.txt"), error="offline",
+    )
+
+    rows = store.sqlite.get_unprocessed_filings()
+
+    assert [row["accession"] for row in rows] == ["ACC-P"]
+    assert rows[0]["status"] == "index_pending"
+    assert rows[0]["index_error"] == "offline"
+
+
 # ── 4. Discovery delegation ─────────────────────────
 
 def test_discover_new_filings_delegates(mock_processor):
@@ -262,6 +357,25 @@ def test_status_report_real_sqlite(tmp_path):
     assert report["filings_by_ticker"]["MSFT"] == {"unprocessed": 1, "parsed": 0}
 
 
+def test_status_report_includes_persisted_index_counts(tmp_path):
+    store = Store(db_path=tmp_path / "status.db", chroma_path=tmp_path / "chroma")
+    store.register_filing("AAPL", "10-K", "2025-01-15", "2024", "A-1", "u1")
+    store.register_filing("AAPL", "10-Q", "2025-04-15", "2025-Q1", "A-2", "u2")
+    store.sqlite.mark_filing_parsed(
+        "A-1", embedding_id="sec:A-1", file_path="a.txt", section_count=3, chunk_count=8,
+    )
+    store.sqlite.mark_filing_index_pending("A-2", file_path="b.txt", error="offline")
+
+    report = FilingProcessor(store=store, fetcher=MagicMock(), parser=MagicMock()).status_report()
+
+    assert report["total_index_pending"] == 1
+    assert report["indexed_sections"] == 3
+    assert report["indexed_chunks"] == 8
+    assert report["filings_by_ticker"]["AAPL"] == {
+        "unprocessed": 0, "index_pending": 1, "parsed": 1,
+    }
+
+
 # ── 7. LIVE end-to-end (skip-guarded) ───────────────
 
 EDGAR_HOST = "www.sec.gov"
@@ -293,6 +407,7 @@ def _model_alive(timeout: float = 5.0) -> bool:
         return False
 
 
+@pytest.mark.live
 def test_live_end_to_end_pipeline(tmp_path):
     """Live: register AAPL filings then process one through the full pipeline."""
     if not _endpoint_reachable(f"https://{EDGAR_HOST}"):

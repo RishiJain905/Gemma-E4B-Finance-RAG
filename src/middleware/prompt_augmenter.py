@@ -13,21 +13,31 @@ Usage:
 """
 
 import logging
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 from .config import MiddlewareConfig
+from .evidence import document_body, evidence_counts, usable_documents
 
 logger = logging.getLogger(__name__)
+
+if TYPE_CHECKING:
+    from .evidence import EvidenceItem
+    from .evidence_grader import SufficiencyResult
 
 
 class PromptAugmenter:
     """
-    Builds structured, grounded prompts for the TraceAlchemy model.
+    Builds the augmented USER message for the TraceAlchemy model — retrieved
+    evidence, intent-specific task guidance, the raw question, and output
+    format. Authoritative answer-policy rules (grounding modes, citation
+    requirements, the "no fabricated numbers" rule) are not duplicated here;
+    they live solely in the system message built by
+    ``src/middleware/prompt_policy.py``.
 
     Prompt structure:
-      1. System instruction (role + rules)
-      2. Retrieved facts (structured data from SQLite)
-      3. Retrieved documents (semantic context from ChromaDB)
+      1. Retrieved facts (structured data from SQLite)
+      2. Retrieved documents (semantic context from ChromaDB)
+      3. Question-type-specific task guidance
       4. User question
       5. Output format instruction
 
@@ -68,6 +78,9 @@ class PromptAugmenter:
         intent: dict,
         retrieval: dict,
         grounding_level: Optional[str] = None,
+        preselected: Optional[dict] = None,
+        evidence_sufficiency: Optional["SufficiencyResult"] = None,
+        evidence_ledger: Optional[list["EvidenceItem"]] = None,
     ) -> str:
         """
         Build the full augmented prompt.
@@ -76,16 +89,44 @@ class PromptAugmenter:
             question: Original user question
             intent: Parsed intent from IntentParser
             retrieval: Retrieved data from Retriever
+            grounding_level: Optional grounding label; derived from ``retrieval``
+                when omitted.
+            preselected: Optional pre-budgeted evidence from the adaptive
+                orchestrator's :class:`ContextBudget` (2.2.3.3), a dict with
+                ``facts``/``documents`` already selected, de-duplicated, and
+                sized. When provided, it is the single budget owner: these rows
+                are rendered as-is (no re-filtering, no independent per-document
+                truncation). When ``None``, behavior is byte-for-byte identical
+                to the pre-2.2.3.3 path.
+            evidence_sufficiency: Optional deterministic obligation coverage.
+            evidence_ledger: Optional request-local ``[E#]`` evidence items
+                (2.2.4.3). When non-empty, an ``## Evidence`` header with each
+                item's ``[E#]`` id is prepended so answers can cite them.
+                Passed only when ``answer_validation`` is report|enforce, so the
+                ``off`` path stays byte-for-byte identical.
 
         Returns:
             The complete prompt string ready to send to the model
         """
         question_type = intent.get("question_type", "general")
         ticker = intent.get("ticker")
-        facts = retrieval.get("facts", [])
-        documents = retrieval.get("documents", [])
+        adaptive = preselected is not None
+        if adaptive:
+            facts = list(preselected.get("facts", []))
+            # Pre-budgeted rows: already usable (blank bodies dropped upstream)
+            # and pre-sized, so no re-filtering here.
+            documents = list(preselected.get("documents", []))
+        else:
+            facts = retrieval.get("facts", [])
+            # Filter unusable rows before prompt assembly so an empty
+            # "## Retrieved Documents" section is never emitted (2.2.1.1).
+            documents = usable_documents(retrieval)
         if grounding_level is None:
-            n = len(facts) + len(documents)
+            if adaptive:
+                n = len(facts) + len(documents)
+            else:
+                n_facts, n_docs = evidence_counts(retrieval)
+                n = n_facts + n_docs
             grounding_level = "grounded" if n >= 3 else "partial" if n >= 1 else "none"
         estimate_facts = facts if question_type == "projection" else []
         realized_facts = facts
@@ -94,26 +135,34 @@ class PromptAugmenter:
 
         sections = []
 
-        # 1. System instruction
-        sections.append(self._build_system_instruction(question_type, grounding_level))
+        # 0. Evidence ledger with [E#] ids (2.2.4.3). Only rendered when the
+        # caller supplied a non-empty ledger (answer_validation != off), so the
+        # legacy prompt is byte-for-byte unchanged when validation is off.
+        if evidence_ledger:
+            sections.append(self._format_evidence_ledger(evidence_ledger))
 
-        # 2. Projection context (if any)
+        if evidence_sufficiency is not None:
+            sections.append(self._format_evidence_coverage(evidence_sufficiency))
+
+        # 1. Projection context (if any)
         projection_section = self._format_projection_section(estimate_facts)
         if projection_section:
             sections.append(projection_section)
 
-        # 3. Retrieved realized facts (if any)
+        # 2. Retrieved realized facts (if any)
         if realized_facts:
             sections.append(self._format_facts_section(realized_facts, ticker))
 
-        # 3.5 Macro context (if any)
+        # 2.5 Macro context (if any)
         macro_section = self._format_macro_context(realized_facts)
         if macro_section:
             sections.append(macro_section)
 
-        # 3. Retrieved documents (if any)
+        # 3. Retrieved documents (if any). On the adaptive path the ContextBudget
+        # already sized every chunk, so render bodies whole (no 2000-char cut).
         if documents:
-            sections.append(self._format_documents_section(documents))
+            sections.append(self._format_documents_section(
+                documents, max_body=None if adaptive else 2000))
 
         # 4. Handle empty retrieval
         if not facts and not documents:
@@ -126,101 +175,46 @@ class PromptAugmenter:
         sections.append(f"## User Question\n\n{question}")
 
         # 7. Output format
-        sections.append(self._build_output_format(question_type))
+        sections.append(self._build_output_format(
+            question_type, evidence_ids=bool(evidence_ledger)))
 
         return "\n\n".join(sections)
 
-    # ── System Instruction ─────────────────────────────
-
-    def _build_system_instruction(self, question_type: str, grounding_level: str) -> str:
-        """Build the system-level instruction for the model."""
-        base = (
-            "You are a financial research assistant powered by the TraceAlchemy model. "
-            "You answer questions about stocks, markets, and financial data using "
-            "the provided context below."
-        )
-
-        rules = [
-            "Answer using ONLY the provided context. Do not use your training data.",
-            "If the context doesn't contain enough information, say so clearly.",
-            "Cite sources inline using [Source: type/ticker] notation.",
-            "Use precise numbers from the context — do not approximate or round.",
-            "If a metric is not found in the context, state that it's unavailable.",
-            "Be concise but thorough. Prioritize accuracy over verbosity.",
+    def _format_evidence_ledger(self, items: list["EvidenceItem"]) -> str:
+        """Render the request-local ``[E#]`` evidence index (2.2.4.3)."""
+        lines = [
+            "## Evidence",
+            "",
+            "Each item below has a stable id. Cite the evidence you use inline "
+            "with its id, e.g. [E1].",
         ]
+        for item in items:
+            parts = [f"[{item.evidence_id}]", item.kind]
+            if item.ticker:
+                parts.append(str(item.ticker))
+            if item.metric is not None and item.value is not None:
+                value_str = self._format_value(item.value)
+                unit_str = f" {item.unit}" if item.unit else ""
+                parts.append(f"{item.metric}={value_str}{unit_str}")
+            elif item.store_id:
+                parts.append(str(item.store_id))
+            if item.period:
+                parts.append(f"({item.period})")
+            if item.source_type:
+                parts.append(f"source:{item.source_type}")
+            lines.append(" | ".join(parts))
+        return "\n".join(lines)
 
-        if getattr(self.config, "answer_policy", "graded") != "strict":
-            general_rule = (
-                "If no relevant data was retrieved, you may use general knowledge "
-                "only when clearly prefixed with 'Not from your data - general "
-                "knowledge:' and paired with a primary-source verification caveat."
-            )
-            if not getattr(self.config, "allow_general_fallback", True):
-                general_rule = (
-                    "If no relevant data was retrieved, do not use general knowledge; "
-                    "say the knowledge base does not have enough data."
-                )
-            rules = [
-                f"Intent: {question_type}. Grounding level: {grounding_level}.",
-                "Answer using ONLY the provided context when grounding level is grounded.",
-                "When grounding level is partial, answer supported parts, state what is "
-                "missing, and do not fill the gaps with outside knowledge.",
-                "The 'Not from your data - general knowledge:' prefix is reserved for "
-                "answers with no retrieved data.",
-                general_rule,
-                "Refuse only for genuinely unknowable or unsafe asks.",
-                "Never invent specific numbers. Specific figures must come from context or tools.",
-                "Cite sources inline using [Source: type/ticker] notation for retrieved facts.",
-                "Be concise but thorough. Prioritize accuracy over verbosity.",
-            ]
-
-        type_specific = {
-            "fact_lookup": (
-                "The user wants a specific financial metric. Provide the exact "
-                "value and the period it covers."
-            ),
-            "comparison": (
-                "The user wants a comparison. Present data for each ticker side-by-side "
-                "and highlight key differences."
-            ),
-            "trend": (
-                "The user wants to understand a trend over time. Present historical "
-                "data points and describe the trajectory."
-            ),
-            "explanation": (
-                "The user wants an explanation. Use the context to explain the "
-                "underlying factors or causes."
-            ),
-            "projection": (
-                "The user asks about future expectations. Report the analyst "
-                "consensus from the Analyst Consensus section, then interpret it "
-                "briefly. Clearly separate sourced figures from your "
-                "interpretation. These are analyst estimates, not guarantees, and "
-                "not financial advice. Never state a price target or forecast "
-                "figure of your own invention. If the Analyst Consensus section "
-                "is missing or empty, say the estimate data is not available "
-                "instead of guessing."
-            ),
-            "sentiment": (
-                "The user wants market sentiment or analyst views. Summarize the "
-                "tone and key opinions from the provided documents."
-            ),
-            "news": (
-                "The user wants recent news or developments. Summarize the key "
-                "events and their potential impact."
-            ),
-            "risk": (
-                "The user wants risk factors or concerns. Extract relevant risk "
-                "information from the provided documents."
-            ),
-        }
-
-        instruction = base + "\n\n## Rules\n" + "\n".join(f"- {r}" for r in rules)
-
-        if question_type in type_specific:
-            instruction += f"\n\n## Question Type Guidance\n{type_specific[question_type]}"
-
-        return instruction
+    def _format_evidence_coverage(self, result: "SufficiencyResult") -> str:
+        """Expose exact covered/missing obligations to the answer model."""
+        covered = [field for row in result.coverage for field in row.covered_fields]
+        missing = [field for row in result.coverage for field in row.missing_fields]
+        lines = ["## Evidence Coverage", ""]
+        lines.append("Covered obligations: " + (", ".join(covered) if covered else "none"))
+        lines.append("Missing obligations: " + (", ".join(missing) if missing else "none"))
+        lines.append("Reason codes: " + (
+            ", ".join(result.reason_codes) if result.reason_codes else "none"))
+        return "\n".join(lines)
 
     # ── Facts Section ─────────────────────────────────
 
@@ -238,6 +232,10 @@ class PromptAugmenter:
             unit = fact.get("unit", "")
             period = fact.get("period", "")
             source = fact.get("source_type", "unknown")
+            # The request-level ticker is only a fallback for facts that
+            # lack their own — never overwrite a fact from a different
+            # ticker (comparison/macro retrieval mixes tickers per row).
+            fact_ticker = fact.get("ticker") or ticker or "unknown"
 
             # Format value nicely
             if value is not None:
@@ -259,7 +257,7 @@ class PromptAugmenter:
             period_str = f" ({period})" if period else ""
             lines.append(
                 f"- **{metric}**: {value_str}{unit_str}{period_str} "
-                f"[Source: {source}/{ticker or 'unknown'}]"
+                f"[Source: {source}/{fact_ticker}]"
             )
 
         return "\n".join(lines)
@@ -321,21 +319,29 @@ class PromptAugmenter:
 
     # ── Documents Section ──────────────────────────────
 
-    def _format_documents_section(self, documents: list[dict]) -> str:
-        """Format retrieved documents into a readable context section."""
+    def _format_documents_section(self, documents: list[dict],
+                                  max_body: Optional[int] = 2000) -> str:
+        """Format retrieved documents into a readable context section.
+
+        ``documents`` must already be filtered to usable rows (see
+        ``evidence.usable_documents``) — this only renders bodies, it does
+        not re-check for blanks. ``max_body`` caps each rendered body at that
+        many characters (legacy default 2000); pass ``None`` on the adaptive
+        path where the ContextBudget already owns sizing.
+        """
         lines = ["## Retrieved Documents\n"]
 
         for i, doc in enumerate(documents, 1):
-            text = doc.get("text", "")
+            text = document_body(doc)
             metadata = doc.get("metadata", {})
             doc_id = doc.get("id", f"doc_{i}")
             ticker = metadata.get("ticker", doc.get("ticker", "unknown"))
             source = metadata.get("source", doc.get("source", "unknown"))
             date = metadata.get("date", doc.get("date", ""))
 
-            # Truncate very long documents
-            if len(text) > 2000:
-                text = text[:2000] + "..."
+            # Truncate very long documents (legacy path only).
+            if max_body is not None and len(text) > max_body:
+                text = text[:max_body] + "..."
 
             header_parts = [f"### Document {i}: {doc_id}"]
             if ticker:
@@ -421,15 +427,23 @@ class PromptAugmenter:
 
     # ── Output Format ─────────────────────────────────
 
-    def _build_output_format(self, question_type: str) -> str:
+    def _build_output_format(self, question_type: str,
+                             evidence_ids: bool = False) -> str:
         """Build the output format instruction."""
+        # When an [E#] ledger is present, prefer those ids for citations while
+        # legacy [Source: type/ticker] labels remain accepted (compat window).
+        id_hint = (
+            " When an ## Evidence list is shown, cite each figure with its "
+            "bracketed id, e.g. [E1]."
+            if evidence_ids else ""
+        )
         if getattr(self.config, "answer_policy", "graded") != "strict":
             return (
                 "## Output Format\n\n"
                 "Provide your answer in plain text. Use inline citations like "
                 "[Source: sec_10k/NVDA] or [Source: yfinance/NVDA] for each "
-                "retrieved fact you reference. If you use multiple sources, cite "
-                "each one.\n\n"
+                f"retrieved fact you reference.{id_hint} If you use multiple "
+                "sources, cite each one.\n\n"
                 "For general fallback answers, start with: "
                 '"Not from your data - general knowledge:" and include a '
                 "primary-source verification caveat. If you refuse, briefly say "
@@ -439,7 +453,7 @@ class PromptAugmenter:
             "## Output Format\n\n"
             "Provide your answer in plain text. Use inline citations like "
             "[Source: sec_10k/NVDA] or [Source: yfinance/NVDA] for each "
-            "fact you reference. If you use multiple sources, cite each one.\n\n"
+            f"fact you reference.{id_hint} If you use multiple sources, cite each one.\n\n"
             "If the data is insufficient, say: "
             '"I don\'t have enough data in my knowledge base to answer this fully."'
         )
@@ -449,6 +463,19 @@ class PromptAugmenter:
     def estimate_tokens(self, prompt: str) -> int:
         """Rough estimate of token count (4 chars ≈ 1 token)."""
         return len(prompt) // 4
+
+    @staticmethod
+    def evidence_char_count(facts: list, documents: list) -> int:
+        """Total characters of the rendered evidence (2.2.6.2 Step 3 telemetry).
+
+        Sums fact reprs and document bodies so latency reporting can track how
+        much of the prompt is retrieved evidence vs the fixed prefix. Pure
+        measurement — never mutates or reshapes the prompt.
+        """
+        fact_chars = sum(len(str(f)) for f in (facts or []))
+        doc_chars = sum(
+            len(document_body(d)) for d in (documents or []) if isinstance(d, dict))
+        return fact_chars + doc_chars
 
     def _is_estimate_fact(self, fact: dict) -> bool:
         metric = str(fact.get("metric", ""))
@@ -493,10 +520,14 @@ class PromptAugmenter:
             max_tokens, len(prompt),
         )
 
-        # Split into sections
-        sections = prompt.split("\n\n## ")
+        # Split into sections. Prepend a boundary marker first: the prompt
+        # may now start directly with a "## "-headed section (there is no
+        # mandatory non-"##" preamble since 2.2.1.1 removed the duplicated
+        # system instruction), and without this the leading section would
+        # keep its "## " prefix and fail the startswith() checks below.
+        sections = ("\n\n" + prompt).split("\n\n## ")
 
-        # Keep system instruction + question + output format
+        # Keep task guidance + question + output format
         keep = []
         docs_section = None
         facts_section = None

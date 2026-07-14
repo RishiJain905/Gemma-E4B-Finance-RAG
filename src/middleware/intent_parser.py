@@ -21,6 +21,7 @@ import re
 from typing import TYPE_CHECKING, Optional
 
 if TYPE_CHECKING:
+    from .query_plan import QueryEntity, QueryPlan
     from .symbol_resolver import SymbolResolver
 
 logger = logging.getLogger(__name__)
@@ -106,7 +107,11 @@ class IntentParser:
         (r"\brevenue\b", "total_revenue"),
         (r"\bsales\b", "total_revenue"),
         (r"\btop[- ]line\b", "total_revenue"),
-        (r"\bgross (profit|margin)\b", "gross_profit"),
+        # "gross profit" -> gross_profit; "gross margin" -> gross_margin_pct
+        # only (2.2.3.4 review finding 6). The old `gross (profit|margin)`
+        # alternation double-matched "gross margin" as both metrics, creating a
+        # false multi-metric ambiguity that made the router abstain.
+        (r"\bgross profit\b", "gross_profit"),
         (r"\bgross margin\b", "gross_margin_pct"),
 
         # Earnings / Profit
@@ -281,6 +286,15 @@ class IntentParser:
         (r"\bytd\b", "ytd"),
     ]
 
+    # Macro series that answer without a company entity — used only as an
+    # advisory retrieval-mode hint on the query plan (2.2.3.1).
+    _MACRO_TERM_RE = re.compile(
+        r"\b(gdp|cpi|inflation|unemployment|treasury|interest rate|fed funds"
+        r"|federal funds|yield curve|ppi|nonfarm|payroll|jobs report"
+        r"|consumer confidence|retail sales)\b",
+        re.IGNORECASE,
+    )
+
     def __init__(self, resolver: Optional["SymbolResolver"] = None):
         from .symbol_resolver import NO_MATCH, get_default_resolver
 
@@ -348,6 +362,223 @@ class IntentParser:
             intent["metrics"], intent["timeframe"],
         )
         return intent
+
+    def parse_plan(
+        self,
+        question: str,
+        retrieval_query: Optional[str] = None,
+        override_ticker: Optional[str] = None,
+    ) -> "QueryPlan":
+        """Parse a question into an explicit, validated multi-entity query plan.
+
+        ``question`` is preserved verbatim as ``original_question``; all
+        entity/intent/metric/period matching runs on ``retrieval_query or
+        question`` (the 2.2.2-compiled standalone query when one exists, else the
+        raw question). Every matched intent (priority order), every unique
+        metric, and every explicit period are retained — not just the first of
+        each. ``primary_intent``/``primary_period`` mirror the legacy single
+        result for backward compatibility.
+
+        Only baseline ``sq0`` is populated; selective decomposition into further
+        subqueries belongs to 2.2.4.2. The returned plan is validated before
+        return, so a caller that catches :class:`QueryPlanError` can fall back to
+        :meth:`parse` without ever failing the user request.
+        """
+        from .query_plan import QueryPlan, QuerySubquery, normalize_question
+
+        original_question = question
+        match_text = retrieval_query if retrieval_query else question
+
+        entities = self._plan_entities(match_text, override_ticker)
+        intents = self._classify_all_types(match_text) or ["general"]
+        primary_intent = intents[0]
+        metrics = self._extract_metrics(match_text)
+        periods = self._extract_all_timeframes(match_text)
+
+        reason_codes = self._plan_reason_codes(
+            entities, intents, metrics, periods, override_ticker
+        )
+        modes = self._subquery_modes(primary_intent, metrics, entities, match_text)
+
+        sq0 = QuerySubquery(
+            id="sq0",
+            text=match_text,
+            entity_tickers=tuple(entity.ticker for entity in entities),
+            intents=tuple(intents),
+            metrics=tuple(metrics),
+            periods=tuple(periods),
+            retrieval_modes=modes,
+            derived=False,
+            parent_id=None,
+        )
+
+        plan = QueryPlan(
+            original_question=original_question,
+            retrieval_query=match_text,
+            normalized_question=normalize_question(match_text),
+            entities=entities,
+            intents=intents,
+            metrics=metrics,
+            periods=periods,
+            subqueries=[sq0],
+            primary_intent=primary_intent,
+            primary_period=self._extract_timeframe(match_text),
+            primary_period_type=self._extract_timeframe_type(match_text),
+            reason_codes=reason_codes,
+        )
+        plan.validate()
+        return plan
+
+    def _plan_entities(
+        self, text: str, override_ticker: Optional[str]
+    ) -> list["QueryEntity"]:
+        """Resolve all explicit entities; place any override first.
+
+        The override is added with ``source="override"`` ahead of the resolved
+        entities and other explicitly mentioned tickers are kept for
+        comparisons. When the text names no other entity, the override is the
+        only entity.
+        """
+        from .query_plan import QueryEntity
+
+        entities: list[QueryEntity] = []
+        seen: set[str] = set()
+
+        if override_ticker:
+            override = str(override_ticker).strip().upper()
+            if override:
+                entities.append(
+                    QueryEntity(
+                        ticker=override,
+                        resolved_name=None,
+                        confidence=1.0,
+                        source="override",
+                        mention=override,
+                        start=-1,
+                    )
+                )
+                seen.add(override)
+
+        for resolution in self._resolver.resolve_all(text):
+            if not resolution.ticker:
+                continue
+            ticker = resolution.ticker.upper()
+            if ticker in seen:
+                continue
+            seen.add(ticker)
+            entities.append(
+                QueryEntity(
+                    ticker=ticker,
+                    resolved_name=resolution.resolved_name,
+                    confidence=resolution.confidence,
+                    source=resolution.source,
+                    mention=resolution.mention or ticker,
+                    start=resolution.start,
+                )
+            )
+        return entities
+
+    def _classify_all_types(self, text: str) -> list[str]:
+        """All matched question types in the existing priority order.
+
+        Mirrors :meth:`_classify_question_type` (same fact_lookup weak-cue guard)
+        but collects every match instead of returning the first, so a compound
+        request ("revenue trend, then risks") retains ``trend`` and ``risk``.
+        """
+        normalized = text.lower()
+        matched: list[str] = []
+        for qtype in self._TYPE_PRIORITY:
+            if qtype == "fact_lookup":
+                if self._matches_fact_lookup(normalized, text):
+                    matched.append(qtype)
+                continue
+            for pattern in self._type_regexes[qtype]:
+                if pattern.search(normalized):
+                    matched.append(qtype)
+                    break
+        return matched
+
+    def _extract_all_timeframes(self, text: str) -> list[str]:
+        """Every explicit timeframe in mention order (deduped).
+
+        Unlike :meth:`_extract_timeframe` (first match only), this retains all
+        distinct periods — "2023 through 2025" yields both years — while
+        dropping matches fully contained in a more specific one (the bare year
+        inside "Q1 2026").
+        """
+        normalized = text.lower()
+        spans: list[tuple[int, int, str]] = []
+        for regex, _ in self._timeframe_regexes:
+            for match in regex.finditer(normalized):
+                spans.append((match.start(), match.end(), match.group(0).strip()))
+
+        # Longest-first per start so a specific period supersedes a contained one.
+        spans.sort(key=lambda s: (s[0], -(s[1] - s[0])))
+        kept: list[tuple[int, int, str]] = []
+        for start, end, value in spans:
+            if any(k_start <= start and end <= k_end for k_start, k_end, _ in kept):
+                continue
+            kept.append((start, end, value))
+
+        kept.sort(key=lambda s: s[0])
+        periods: list[str] = []
+        seen: set[str] = set()
+        for _, _, value in kept:
+            if value and value not in seen:
+                seen.add(value)
+                periods.append(value)
+        return periods
+
+    def _subquery_modes(
+        self,
+        primary_intent: str,
+        metrics: list[str],
+        entities: list["QueryEntity"],
+        text: str,
+    ) -> tuple[str, ...]:
+        """Advisory retrieval-mode hints for ``sq0`` (the 2.2.3.2 router decides).
+
+        Deterministic and conservative: structured ``facts`` for metric/exact
+        intents, ``documents`` for qualitative intents, ``macro`` when the
+        request has no company entity but names a macro series. The router in
+        2.2.3.2 makes the binding lane decision; these are only hints.
+        """
+        modes: list[str] = []
+        if metrics or primary_intent in {"fact_lookup", "comparison", "projection"}:
+            modes.append("facts")
+        if primary_intent in {
+            "explanation", "news", "risk", "sentiment", "trend",
+        } or not metrics:
+            modes.append("documents")
+        if not entities and self._MACRO_TERM_RE.search(text.lower()):
+            modes.append("macro")
+        if not modes:
+            modes.append("documents")
+        return tuple(dict.fromkeys(modes))
+
+    @staticmethod
+    def _plan_reason_codes(
+        entities: list["QueryEntity"],
+        intents: list[str],
+        metrics: list[str],
+        periods: list[str],
+        override_ticker: Optional[str],
+    ) -> list[str]:
+        """Observable rule matches for the plan (telemetry / debugging)."""
+        codes: list[str] = []
+        if override_ticker:
+            codes.append("override_entity")
+        codes.append(
+            "multi_entity" if len(entities) > 1
+            else "single_entity" if entities else "no_entity"
+        )
+        if len(intents) > 1:
+            codes.append("multi_intent")
+        if len(metrics) > 1:
+            codes.append("multi_metric")
+        if len(periods) > 1:
+            codes.append("multi_period")
+        return codes
 
     # ── Ticker Detection ────────────────────────────────
 

@@ -115,3 +115,167 @@ class TestRetriever:
         tickers = retriever._extract_all_tickers("Compare NVDA and AMD")
         assert "NVDA" in tickers
         assert "AMD" in tickers
+
+    def test_carried_intent_drives_retrieval_for_pronoun_followup(self, store):
+        """A pronoun follow-up carries the entity so retrieval still finds it (2.2.2.2).
+
+        The raw turn ("Why did it grow?") names no ticker, so the parsed intent
+        alone retrieves nothing. compile_question carries NVDA from the grounded
+        prior answer; retrieving with that effective intent returns the fact.
+        """
+        from src.middleware.conversation import compile_question
+        from src.middleware.models import ChatTurn
+        from src.middleware.retriever import Retriever
+
+        store.save_fundamental("NVDA", "total_revenue", 26.0, "billion_usd",
+                               "2026-Q1", "quarterly", "sec_10q")
+        history = [
+            ChatTurn(role="user", content="Show NVDA revenue for FY2025"),
+            ChatTurn(role="assistant", content="an answer",
+                     context={"grounding": "grounded", "ticker": "NVDA"}),
+        ]
+        compiled = compile_question("Why did it grow?", history)
+        assert compiled.entity == "NVDA"
+
+        retriever = Retriever(store=store)
+        # Without the carried entity, retrieving for an unrelated ticker finds
+        # nothing...
+        raw = retriever.retrieve(
+            query="Why did it grow?",
+            intent={"ticker": "ZZZZ", "metrics": ["total_revenue"],
+                    "question_type": "fact_lookup"},
+        )
+        assert raw["facts"] == []
+        # ...but the effective (carried) intent recovers the fact.
+        effective = retriever.retrieve(
+            query=compiled.retrieval_query,
+            intent={"ticker": compiled.entity, "metrics": compiled.metrics,
+                    "question_type": "explanation"},
+        )
+        assert any(f.get("metric") == "total_revenue" for f in effective["facts"])
+
+
+# ── 2.2.3.4 review D: retrieve_candidates channel ids are request-local ──
+
+from types import SimpleNamespace as _NS  # noqa: E402
+
+
+class _FakeSearchStore:
+    """Minimal store whose vector search returns a fixed doc set."""
+
+    def __init__(self, docs):
+        self._docs = docs
+        self.chroma = _NS(last_search_timings={})
+
+    def search(self, query, n_results, ticker=None):
+        return {"documents": [dict(d) for d in self._docs], "facts": []}
+
+
+def _candidates_config():
+    from src.middleware.config import MiddlewareConfig
+    cfg = MiddlewareConfig()
+    cfg.enable_lexical = False       # vector-only path keeps the test hermetic
+    cfg.enable_reranker = False
+    return cfg
+
+
+def test_retrieve_candidates_channel_ids_are_request_local():
+    from src.middleware.retriever import Retriever
+
+    cfg = _candidates_config()
+    intent = {"ticker": "NVDA", "question_type": "news", "metrics": []}
+
+    r = Retriever(store=_FakeSearchStore(
+        [{"id": "a1", "document": "x"}, {"id": "a2", "document": "y"}]), config=cfg)
+    res_a = r.retrieve_candidates("q", intent, top_k_documents=5, top_k_facts=10)
+
+    # A DIFFERENT store/result on the SAME retriever instance must not bleed the
+    # previous call's channel ids (the bug was shared _last_* instance fields).
+    r.store = _FakeSearchStore([{"id": "b1", "document": "z"}])
+    res_b = r.retrieve_candidates("q", intent, top_k_documents=5, top_k_facts=10)
+
+    assert res_a["vector_ids"] == ["a1", "a2"]
+    assert res_a["lexical_ids"] == []
+    assert res_b["vector_ids"] == ["b1"]
+    # The ids came from the returned dict, not from instance state.
+    assert not hasattr(r, "_last_vector_ids")
+    assert not hasattr(r, "_last_lexical_ids")
+
+
+def test_retrieve_omits_channel_ids_from_legacy_dict():
+    from src.middleware.retriever import Retriever
+
+    cfg = _candidates_config()
+    intent = {"ticker": "NVDA", "question_type": "news", "metrics": []}
+    r = Retriever(store=_FakeSearchStore([{"id": "a1", "document": "x"}]), config=cfg)
+
+    legacy = r.retrieve("q", intent, top_k_documents=5, top_k_facts=10)
+    # Legacy retrieve() shape is unchanged — no channel-id keys leak in.
+    assert "vector_ids" not in legacy
+    assert "lexical_ids" not in legacy
+
+
+# ── CompanyFacts integration (Phase 2.2.5.3) ───────────────
+
+class TestCompanyFactsMerge:
+    """Authoritative SEC CompanyFacts prefer/merge into structured retrieval."""
+
+    def _authoritative(self, value=26000000000.0, unit="USD", period="2025-12-31",
+                       conflict=False, alternatives=None):
+        return [{
+            "metric": "total_revenue", "value": value, "value_text": str(value),
+            "ticker": "NVDA", "period": period, "period_type": "annual",
+            "unit": unit, "source_type": "sec_companyfacts",
+            "source_url": "https://sec.gov/x", "as_of": "2026-07-01",
+            "taxonomy": "us-gaap", "concept": "Revenues",
+            "accession": "0001-25", "form": "10-K", "filed_at": "2026-02-01",
+            "conflict": conflict,
+        }]
+
+    def test_disabled_source_is_noop(self, store):
+        from src.middleware.retriever import Retriever
+        store.save_fundamental("NVDA", "total_revenue", 25.0, "usd", "FY2025",
+                               source_type="yfinance")
+        store.companyfacts_evidence = MagicMock(return_value=[])
+        r = Retriever(store=store)
+        facts = r._retrieve_facts("NVDA", ["total_revenue"], None, 10)
+        # Legacy fact preserved; no CompanyFacts rows added.
+        assert any(f.get("source_type") in ("yfinance", "sqlite") for f in facts)
+        assert not any(f.get("source_type") == "sec_companyfacts" for f in facts)
+
+    def test_authoritative_fact_included(self, store):
+        from src.middleware.retriever import Retriever
+        store.companyfacts_evidence = MagicMock(return_value=self._authoritative())
+        r = Retriever(store=store)
+        facts = r._retrieve_facts("NVDA", ["total_revenue"], None, 10)
+        auth = [f for f in facts if f.get("source_type") == "sec_companyfacts"]
+        assert len(auth) == 1
+        assert auth[0]["value"] == 26000000000.0
+        assert auth[0]["concept"] == "Revenues"
+
+    def test_conflicting_legacy_value_kept_separate(self, store):
+        from src.middleware.retriever import Retriever
+        # Legacy fundamental for the exact same metric+period, different value.
+        store.save_fundamental("NVDA", "total_revenue", 30000000000.0, "usd",
+                               "2025-12-31", source_type="yfinance")
+        store.companyfacts_evidence = MagicMock(return_value=self._authoritative())
+        r = Retriever(store=store)
+        facts = r._retrieve_facts("NVDA", ["total_revenue"], None, 10)
+        auth = [f for f in facts if f.get("source_type") == "sec_companyfacts"]
+        disputed = [f for f in facts if f.get("conflict")]
+        assert auth and disputed
+        # Never averaged: both distinct values survive as separate items.
+        values = {f["value"] for f in facts if f.get("metric") == "total_revenue"}
+        assert 26000000000.0 in values and 30000000000.0 in values
+
+    def test_agreeing_legacy_value_deduped(self, store):
+        from src.middleware.retriever import Retriever
+        store.save_fundamental("NVDA", "total_revenue", 26000000000.0, "usd",
+                               "2025-12-31", source_type="yfinance")
+        store.companyfacts_evidence = MagicMock(return_value=self._authoritative())
+        r = Retriever(store=store)
+        facts = r._retrieve_facts("NVDA", ["total_revenue"], None, 10)
+        rev = [f for f in facts if f.get("metric") == "total_revenue"]
+        # CompanyFacts wins; the duplicate legacy value is dropped.
+        assert len(rev) == 1
+        assert rev[0]["source_type"] == "sec_companyfacts"

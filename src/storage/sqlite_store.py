@@ -6,6 +6,7 @@ SQLite storage layer for structured financial data.
 import logging
 import sqlite3
 import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -14,6 +15,9 @@ logger = logging.getLogger(__name__)
 
 class SQLiteStore:
     """Handles all SQLite operations for structured financial data."""
+
+    MAX_INVENTORY_LIMIT = 200
+    MAX_INVENTORY_OFFSET = 10_000
 
     SCHEMA_SQL = Path(__file__).parent.parent.parent / "docs/phase1.2/schema.sql"
     DEFAULT_DB_PATH = Path(__file__).parent.parent.parent / "data/finance.db"
@@ -36,13 +40,28 @@ class SQLiteStore:
     def _init_schema(self):
         """Create all tables and indexes if they don't exist."""
         if self.SCHEMA_SQL.exists():
-            with open(self.SCHEMA_SQL) as f:
+            with open(self.SCHEMA_SQL, encoding="utf-8") as f:
                 sql = f.read()
         else:
             sql = self._inline_schema()
 
         with self._connect() as conn:
             conn.executescript(sql)
+            existing = {
+                row[1] for row in conn.execute("PRAGMA table_info(filings)").fetchall()
+            }
+            migrations = {
+                "index_error": "ALTER TABLE filings ADD COLUMN index_error TEXT",
+                "index_section_count": (
+                    "ALTER TABLE filings ADD COLUMN index_section_count INTEGER DEFAULT 0"
+                ),
+                "index_chunk_count": (
+                    "ALTER TABLE filings ADD COLUMN index_chunk_count INTEGER DEFAULT 0"
+                ),
+            }
+            for column, statement in migrations.items():
+                if column not in existing:
+                    conn.execute(statement)
             conn.commit()
 
     @staticmethod
@@ -65,6 +84,36 @@ CREATE TABLE IF NOT EXISTS fundamentals (
     UNIQUE(ticker, metric, period)
 );
 
+-- â”€â”€ SEC CompanyFacts â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+CREATE TABLE IF NOT EXISTS sec_companyfacts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ticker TEXT NOT NULL,
+    cik TEXT NOT NULL,
+    taxonomy TEXT NOT NULL,
+    concept TEXT NOT NULL,
+    label TEXT,
+    description TEXT,
+    value_text TEXT NOT NULL,
+    value_numeric REAL NOT NULL,
+    unit TEXT NOT NULL,
+    period_start TEXT NOT NULL DEFAULT '',
+    period_end TEXT NOT NULL,
+    period_kind TEXT NOT NULL,
+    fiscal_year INTEGER,
+    fiscal_period TEXT,
+    form TEXT NOT NULL,
+    filed_at TEXT NOT NULL,
+    accession TEXT NOT NULL,
+    frame TEXT NOT NULL DEFAULT '',
+    source_url TEXT NOT NULL,
+    source_accessed_at TEXT NOT NULL,
+    ingested_at TEXT NOT NULL DEFAULT (datetime('now')),
+    UNIQUE (
+        ticker, taxonomy, concept, unit, period_start,
+        period_end, accession, frame
+    )
+);
+
 -- ── Filing Index ────────────────────────────────────
 CREATE TABLE IF NOT EXISTS filings (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -78,6 +127,9 @@ CREATE TABLE IF NOT EXISTS filings (
     status TEXT DEFAULT 'unprocessed',
     parsed_at TEXT,
     summary_embedding_id TEXT,
+    index_error TEXT,
+    index_section_count INTEGER DEFAULT 0,
+    index_chunk_count INTEGER DEFAULT 0,
     ingested_at TEXT DEFAULT (datetime('now'))
 );
 
@@ -92,6 +144,14 @@ CREATE TABLE IF NOT EXISTS cache_meta (
     error_message TEXT,
     PRIMARY KEY (ticker, source, metric_scope)
 );
+
+-- ── Store Revision (2.2.6.2) ───────────────────────
+CREATE TABLE IF NOT EXISTS store_revision (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    revision INTEGER NOT NULL DEFAULT 0,
+    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+INSERT OR IGNORE INTO store_revision (id, revision) VALUES (1, 0);
 
 -- ── Ingestion Log ──────────────────────────────────
 CREATE TABLE IF NOT EXISTS ingestion_log (
@@ -114,6 +174,14 @@ CREATE INDEX IF NOT EXISTS idx_fundamentals_ticker ON fundamentals(ticker);
 CREATE INDEX IF NOT EXISTS idx_fundamentals_metric ON fundamentals(metric);
 CREATE INDEX IF NOT EXISTS idx_fundamentals_ticker_metric ON fundamentals(ticker, metric);
 CREATE INDEX IF NOT EXISTS idx_fundamentals_period ON fundamentals(period);
+CREATE INDEX IF NOT EXISTS idx_sec_companyfacts_ticker_concept_period
+    ON sec_companyfacts(ticker, concept, period_end);
+CREATE INDEX IF NOT EXISTS idx_sec_companyfacts_ticker_filed_at
+    ON sec_companyfacts(ticker, filed_at);
+CREATE INDEX IF NOT EXISTS idx_sec_companyfacts_accession
+    ON sec_companyfacts(accession);
+CREATE INDEX IF NOT EXISTS idx_sec_companyfacts_ticker_kind_period
+    ON sec_companyfacts(ticker, period_kind, period_end);
 CREATE INDEX IF NOT EXISTS idx_filings_ticker ON filings(ticker);
 CREATE INDEX IF NOT EXISTS idx_filings_status ON filings(status);
 CREATE INDEX IF NOT EXISTS idx_cache_meta_status ON cache_meta(status);
@@ -192,6 +260,116 @@ CREATE INDEX IF NOT EXISTS idx_ingestion_log_run ON ingestion_log(run_id);
             rows = conn.execute(sql, params).fetchall()
             return {row["metric"]: row["value"] for row in rows}
 
+    # â”€â”€ SEC CompanyFacts CRUD â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+    def upsert_sec_companyfacts(self, rows: list[dict]) -> dict:
+        """Insert or refresh CompanyFacts observations in one transaction."""
+        if not rows:
+            return {"rows_received": 0, "rows_written": 0}
+        sql = """
+        INSERT INTO sec_companyfacts (
+            ticker, cik, taxonomy, concept, label, description,
+            value_text, value_numeric, unit, period_start, period_end,
+            period_kind, fiscal_year, fiscal_period, form, filed_at,
+            accession, frame, source_url, source_accessed_at
+        ) VALUES (
+            :ticker, :cik, :taxonomy, :concept, :label, :description,
+            :value_text, :value_numeric, :unit, :period_start, :period_end,
+            :period_kind, :fiscal_year, :fiscal_period, :form, :filed_at,
+            :accession, :frame, :source_url, :source_accessed_at
+        )
+        ON CONFLICT(
+            ticker, taxonomy, concept, unit, period_start,
+            period_end, accession, frame
+        ) DO UPDATE SET
+            cik = excluded.cik,
+            label = excluded.label,
+            description = excluded.description,
+            value_text = excluded.value_text,
+            value_numeric = excluded.value_numeric,
+            period_kind = excluded.period_kind,
+            fiscal_year = excluded.fiscal_year,
+            fiscal_period = excluded.fiscal_period,
+            form = excluded.form,
+            filed_at = excluded.filed_at,
+            source_url = excluded.source_url,
+            source_accessed_at = excluded.source_accessed_at,
+            ingested_at = datetime('now')
+        """
+        normalized_rows = [
+            {**row, "period_start": row.get("period_start") or "", "frame": row.get("frame") or ""}
+            for row in rows
+        ]
+        with self._connect() as conn:
+            conn.executemany(sql, normalized_rows)
+            conn.commit()
+        return {"rows_received": len(rows), "rows_written": len(rows)}
+
+    @staticmethod
+    def _validate_as_of(as_of: Optional[str]) -> str:
+        """Validate an ISO date before constructing or executing SQL."""
+        value = as_of or datetime.now(timezone.utc).date().isoformat()
+        if not isinstance(value, str):
+            raise ValueError("as_of must be an ISO date in YYYY-MM-DD format")
+        try:
+            parsed = datetime.strptime(value, "%Y-%m-%d").date()
+        except ValueError as exc:
+            raise ValueError("as_of must be an ISO date in YYYY-MM-DD format") from exc
+        if parsed.isoformat() != value:
+            raise ValueError("as_of must be an ISO date in YYYY-MM-DD format")
+        return value
+
+    def query_sec_companyfacts(
+        self,
+        ticker: str,
+        concepts: list[str],
+        *,
+        units: Optional[list[str]] = None,
+        period_kinds: Optional[list[str]] = None,
+        period_end: Optional[str] = None,
+        as_of: Optional[str] = None,
+    ) -> list[dict]:
+        """Return provenance-preserving CompanyFacts rows eligible as of a date."""
+        cutoff = self._validate_as_of(as_of)
+        if not concepts or units == [] or period_kinds == []:
+            return []
+
+        conditions = ["ticker = ?", "filed_at <= ?"]
+        params: list = [ticker.upper(), cutoff]
+        concept_placeholders = ",".join("?" for _ in concepts)
+        conditions.append(f"concept IN ({concept_placeholders})")
+        params.extend(concepts)
+        if units is not None:
+            placeholders = ",".join("?" for _ in units)
+            conditions.append(f"unit IN ({placeholders})")
+            params.extend(units)
+        if period_kinds is not None:
+            placeholders = ",".join("?" for _ in period_kinds)
+            conditions.append(f"period_kind IN ({placeholders})")
+            params.extend(period_kinds)
+        if period_end is not None:
+            conditions.append("period_end = ?")
+            params.append(period_end)
+
+        sql = f"""
+            SELECT * FROM sec_companyfacts
+            WHERE {' AND '.join(conditions)}
+            ORDER BY period_end DESC, concept ASC, filed_at DESC,
+                     accession DESC, source_accessed_at DESC, id ASC
+        """
+        with self._connect() as conn:
+            return [dict(row) for row in conn.execute(sql, params).fetchall()]
+
+    def count_sec_companyfacts(self, ticker: Optional[str] = None) -> int:
+        """Count stored CompanyFacts observations, optionally for one ticker."""
+        sql = "SELECT COUNT(*) FROM sec_companyfacts"
+        params: tuple = ()
+        if ticker is not None:
+            sql += " WHERE ticker = ?"
+            params = (ticker.upper(),)
+        with self._connect() as conn:
+            return int(conn.execute(sql, params).fetchone()[0])
+
     # ── Filing Tracking ───────────────────────────────
 
     def register_filing(self, ticker: str, filing_type: str,
@@ -208,20 +386,43 @@ CREATE INDEX IF NOT EXISTS idx_ingestion_log_run ON ingestion_log(run_id);
             conn.commit()
             return cursor.rowcount > 0
 
-    def mark_filing_parsed(self, accession: str, embedding_id: str = None):
+    def mark_filing_parsed(
+        self,
+        accession: str,
+        embedding_id: str = None,
+        file_path: str = None,
+        section_count: int = 0,
+        chunk_count: int = 0,
+    ):
         """Mark a filing as successfully parsed by TraceAlchemy."""
         sql = """
-        UPDATE filings SET status='parsed', parsed_at=datetime('now'), summary_embedding_id=?
+        UPDATE filings SET status='parsed', parsed_at=datetime('now'),
+            summary_embedding_id=?, file_path=COALESCE(?, file_path), index_error=NULL,
+            index_section_count=?, index_chunk_count=?
         WHERE accession=?
         """
         with self._connect() as conn:
-            conn.execute(sql, (embedding_id, accession))
+            conn.execute(
+                sql, (embedding_id, file_path, section_count, chunk_count, accession),
+            )
+            conn.commit()
+
+    def mark_filing_index_pending(
+        self, accession: str, *, file_path: str, error: str,
+    ) -> None:
+        """Record a durable parsed artifact whose vector indexing must retry."""
+        sql = """
+        UPDATE filings SET status='index_pending', file_path=?, index_error=?
+        WHERE accession=?
+        """
+        with self._connect() as conn:
+            conn.execute(sql, (file_path, error, accession))
             conn.commit()
 
     def get_unprocessed_filings(self, limit: int = 10) -> list[dict]:
         """Get filings that haven't been parsed yet."""
         sql = (
-            "SELECT * FROM filings WHERE status='unprocessed' "
+            "SELECT * FROM filings WHERE status IN ('unprocessed', 'index_pending') "
             "ORDER BY filing_date DESC LIMIT ?"
         )
         with self._connect() as conn:
@@ -318,6 +519,38 @@ CREATE INDEX IF NOT EXISTS idx_ingestion_log_run ON ingestion_log(run_id);
         with self._connect() as conn:
             conn.execute(sql, (status, items, new, updated, run_id))
             conn.commit()
+
+    # ── Store Revision (2.2.6.2) ───────────────────────
+
+    def get_store_revision(self) -> int:
+        """Return the current monotonic data revision (0 if never bumped)."""
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT revision FROM store_revision WHERE id=1"
+            ).fetchone()
+        return int(row[0]) if row else 0
+
+    def bump_store_revision(self, reason: Optional[str] = None) -> int:
+        """Increment the data revision and return the new value.
+
+        Called BEFORE any model-visible mutation begins so the versioned
+        retrieval cache keyed on this revision can never serve pre-mutation
+        evidence. ``reason`` is diagnostic only (logged, never persisted).
+        """
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT INTO store_revision (id, revision, updated_at) "
+                "VALUES (1, 1, datetime('now')) "
+                "ON CONFLICT(id) DO UPDATE SET "
+                "    revision = revision + 1, updated_at = datetime('now')"
+            )
+            conn.commit()
+            row = conn.execute(
+                "SELECT revision FROM store_revision WHERE id=1"
+            ).fetchone()
+        revision = int(row[0]) if row else 0
+        logger.debug("Store revision bumped to %d (%s)", revision, reason or "")
+        return revision
 
     # ── Query Support (for middleware) ─────────────────
 
@@ -427,3 +660,378 @@ CREATE INDEX IF NOT EXISTS idx_ingestion_log_run ON ingestion_log(run_id);
         with self._connect() as conn:
             rows = conn.execute(sql, params).fetchall()
             return [dict(r) for r in rows]
+
+    # ── Corpus explorer inventory reads (2.2.7.2) ─────────────────────────
+
+    @classmethod
+    def _validate_inventory_page(cls, limit: int, offset: int = 0) -> None:
+        """Reject unbounded inventory pages before executing SQL."""
+        if not isinstance(limit, int) or isinstance(limit, bool):
+            raise ValueError("limit must be an integer")
+        if not 1 <= limit <= cls.MAX_INVENTORY_LIMIT:
+            raise ValueError(
+                f"limit must be between 1 and {cls.MAX_INVENTORY_LIMIT}")
+        if not isinstance(offset, int) or isinstance(offset, bool):
+            raise ValueError("offset must be an integer")
+        if not 0 <= offset <= cls.MAX_INVENTORY_OFFSET:
+            raise ValueError(
+                f"offset must be between 0 and {cls.MAX_INVENTORY_OFFSET}")
+
+    def get_source_counts(self, *, limit: int = 100, offset: int = 0) -> list[dict]:
+        """Return bounded counts by stored logical source, without document bodies."""
+        self._validate_inventory_page(limit, offset)
+        sql = """
+            WITH inventory(source) AS (
+                SELECT source_type FROM fundamentals
+                UNION ALL SELECT 'sec_companyfacts' FROM sec_companyfacts
+                UNION ALL SELECT 'sec_filings' FROM filings
+                UNION ALL
+                    SELECT source FROM cache_meta WHERE ticker <> 'SCHEDULER'
+            )
+            SELECT source, COUNT(*) AS count
+            FROM inventory
+            WHERE source IS NOT NULL AND source <> ''
+            GROUP BY source
+            ORDER BY source
+            LIMIT ? OFFSET ?
+        """
+        with self._connect() as conn:
+            rows = conn.execute(sql, (limit, offset)).fetchall()
+        return [{"source": row["source"], "count": int(row["count"])} for row in rows]
+
+    def get_ticker_counts(self, *, limit: int = 100, offset: int = 0) -> list[dict]:
+        """Return bounded ticker coverage counts and source memberships."""
+        self._validate_inventory_page(limit, offset)
+        sql = """
+            WITH inventory(ticker, source) AS (
+                SELECT ticker, source_type FROM fundamentals
+                UNION ALL SELECT ticker, 'sec_companyfacts' FROM sec_companyfacts
+                UNION ALL SELECT ticker, 'sec_filings' FROM filings
+                UNION ALL
+                    SELECT ticker, source FROM cache_meta WHERE ticker <> 'SCHEDULER'
+            ), grouped AS (
+                SELECT ticker, source, COUNT(*) AS source_count
+                FROM inventory
+                WHERE ticker IS NOT NULL AND ticker <> ''
+                GROUP BY ticker, source
+            )
+            SELECT ticker, SUM(source_count) AS record_count,
+                   GROUP_CONCAT(source || ':' || source_count) AS source_counts
+            FROM grouped
+            GROUP BY ticker
+            ORDER BY ticker
+            LIMIT ? OFFSET ?
+        """
+        with self._connect() as conn:
+            rows = conn.execute(sql, (limit, offset)).fetchall()
+
+        result = []
+        for row in rows:
+            source_counts = {}
+            for item in str(row["source_counts"] or "").split(","):
+                if ":" not in item:
+                    continue
+                source, count = item.rsplit(":", 1)
+                try:
+                    source_counts[source] = int(count)
+                except ValueError:
+                    continue
+            result.append({
+                "ticker": row["ticker"].upper(),
+                "record_count": int(row["record_count"] or 0),
+                "sources": sorted(source_counts),
+                "source_counts": source_counts,
+            })
+        return result
+
+    def search_corpus_metrics(
+        self,
+        query: Optional[str] = None,
+        *,
+        ticker: Optional[str] = None,
+        unit: Optional[str] = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> list[dict]:
+        """Search canonical metrics and SEC concepts with safe SQL filters."""
+        self._validate_inventory_page(limit, offset)
+        query_text = str(query or "").strip()
+        conditions = []
+        params: list = []
+        if query_text:
+            pattern = f"%{query_text}%"
+            conditions.append("(metric LIKE ? OR concept LIKE ? OR label LIKE ?)")
+            params.extend([pattern, pattern, pattern])
+        if ticker:
+            conditions.append("ticker = ?")
+            params.append(ticker.upper())
+        if unit:
+            conditions.append("unit = ?")
+            params.append(unit)
+        where = " AND ".join(conditions) or "1=1"
+        sql = f"""
+            WITH metric_rows AS (
+                SELECT metric AS metric, NULL AS concept, NULL AS label,
+                       ticker, unit, source_type AS source, COUNT(*) AS observation_count
+                FROM fundamentals
+                GROUP BY metric, ticker, unit, source_type
+                UNION ALL
+                SELECT concept AS metric, concept, label,
+                       ticker, unit, 'sec_companyfacts' AS source,
+                       COUNT(*) AS observation_count
+                FROM sec_companyfacts
+                GROUP BY concept, label, ticker, unit
+            )
+            SELECT metric, concept, label, ticker, unit, source, observation_count
+            FROM metric_rows
+            WHERE {where}
+            ORDER BY metric, ticker, unit, source
+            LIMIT ? OFFSET ?
+        """
+        params.extend([limit, offset])
+        with self._connect() as conn:
+            rows = conn.execute(sql, params).fetchall()
+        return [
+            {
+                "metric": row["metric"],
+                "concept": row["concept"],
+                "label": row["label"],
+                "ticker": row["ticker"].upper(),
+                "unit": row["unit"],
+                "source": row["source"],
+                "observation_count": int(row["observation_count"] or 0),
+            }
+            for row in rows
+        ]
+
+    def search_corpus_facts(
+        self,
+        query: Optional[str] = None,
+        *,
+        ticker: Optional[str] = None,
+        unit: Optional[str] = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> list[dict]:
+        """Return bounded fact metadata for corpus search and detail reads."""
+        self._validate_inventory_page(limit, offset)
+        query_text = str(query or "").strip()
+        conditions = []
+        params: list = []
+        if query_text:
+            pattern = f"%{query_text}%"
+            conditions.append("(metric LIKE ? OR concept LIKE ? OR ticker LIKE ?)")
+            params.extend([pattern, pattern, pattern])
+        if ticker:
+            conditions.append("ticker = ?")
+            params.append(ticker.upper())
+        if unit:
+            conditions.append("unit = ?")
+            params.append(unit)
+        where = " AND ".join(conditions) or "1=1"
+        sql = f"""
+            WITH facts AS (
+                SELECT 'fundamental' AS record_kind, id AS record_id,
+                       ticker, metric, NULL AS concept, value,
+                       CAST(value AS TEXT) AS value_text, unit, period,
+                       ingested_at AS as_of, source_type AS source, source_url,
+                       NULL AS accession, NULL AS filed_at
+                FROM fundamentals
+                UNION ALL
+                SELECT 'companyfact' AS record_kind, id AS record_id,
+                       ticker, concept AS metric, concept, value_numeric AS value,
+                       value_text, unit, period_end AS period, ingested_at AS as_of,
+                       'sec_companyfacts' AS source, source_url, accession, filed_at
+                FROM sec_companyfacts
+            )
+            SELECT record_kind, record_id, ticker, metric, concept, value,
+                   value_text, unit, period, as_of, source, source_url,
+                   accession, filed_at
+            FROM facts
+            WHERE {where}
+            ORDER BY ticker, metric, period DESC, record_kind, record_id
+            LIMIT ? OFFSET ?
+        """
+        params.extend([limit, offset])
+        with self._connect() as conn:
+            rows = conn.execute(sql, params).fetchall()
+        return [
+            {
+                "record_kind": row["record_kind"],
+                "record_id": int(row["record_id"]),
+                "ticker": row["ticker"].upper(),
+                "metric": row["metric"],
+                "concept": row["concept"],
+                "value": row["value"],
+                "value_text": row["value_text"],
+                "unit": row["unit"],
+                "period": row["period"],
+                "as_of": row["as_of"],
+                "source": row["source"],
+                "source_url": row["source_url"],
+                "accession": row["accession"],
+                "filed_at": row["filed_at"],
+            }
+            for row in rows
+        ]
+
+    def get_corpus_fact(self, record_kind: str, record_id: int) -> Optional[dict]:
+        """Read one bounded fact record by an allowlisted internal kind/id."""
+        if record_kind not in {"fundamental", "companyfact"}:
+            raise ValueError("unsupported fact kind")
+        try:
+            record_id = int(record_id)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("record_id must be an integer") from exc
+        if record_id < 1:
+            raise ValueError("record_id must be positive")
+        if record_kind == "fundamental":
+            sql = """
+                SELECT id, ticker, metric, value, CAST(value AS TEXT) AS value_text,
+                       unit, period, ingested_at AS as_of, source_type AS source,
+                       source_url, NULL AS accession, NULL AS filed_at
+                FROM fundamentals WHERE id = ?
+            """
+        else:
+            sql = """
+                SELECT id, ticker, concept AS metric, value_numeric AS value,
+                       value_text, unit, period_end AS period, ingested_at AS as_of,
+                       'sec_companyfacts' AS source, source_url, accession, filed_at
+                FROM sec_companyfacts WHERE id = ?
+            """
+        with self._connect() as conn:
+            row = conn.execute(sql, (record_id,)).fetchone()
+        if row is None:
+            return None
+        return {
+            "record_kind": record_kind,
+            "record_id": int(row["id"]),
+            "ticker": row["ticker"].upper(),
+            "metric": row["metric"],
+            "value": row["value"],
+            "value_text": row["value_text"],
+            "unit": row["unit"],
+            "period": row["period"],
+            "as_of": row["as_of"],
+            "source": row["source"],
+            "source_url": row["source_url"],
+            "accession": row["accession"],
+            "filed_at": row["filed_at"],
+        }
+
+    def list_filings(
+        self,
+        *,
+        query: Optional[str] = None,
+        ticker: Optional[str] = None,
+        filing_type: Optional[str] = None,
+        date_from: Optional[str] = None,
+        date_to: Optional[str] = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> list[dict]:
+        """List bounded filing metadata without returning local file paths."""
+        self._validate_inventory_page(limit, offset)
+        conditions = []
+        params: list = []
+        if query:
+            pattern = f"%{str(query).strip()}%"
+            conditions.append(
+                "(accession LIKE ? OR ticker LIKE ? OR filing_type LIKE ? OR period LIKE ?)"
+            )
+            params.extend([pattern] * 4)
+        if ticker:
+            conditions.append("ticker = ?")
+            params.append(ticker.upper())
+        if filing_type:
+            conditions.append("filing_type = ?")
+            params.append(filing_type)
+        if date_from:
+            conditions.append("filing_date >= ?")
+            params.append(date_from)
+        if date_to:
+            conditions.append("filing_date <= ?")
+            params.append(date_to)
+        where = " AND ".join(conditions) or "1=1"
+        sql = f"""
+            SELECT id, ticker, filing_type, filing_date, period, accession,
+                   source_url, status, parsed_at, summary_embedding_id,
+                   index_error, index_section_count, index_chunk_count, ingested_at
+            FROM filings
+            WHERE {where}
+            ORDER BY filing_date DESC, accession DESC
+            LIMIT ? OFFSET ?
+        """
+        params.extend([limit, offset])
+        with self._connect() as conn:
+            rows = conn.execute(sql, params).fetchall()
+        return [dict(row) for row in rows]
+
+    def get_filing(self, accession: str) -> Optional[dict]:
+        """Read one filing's safe metadata by accession."""
+        sql = """
+            SELECT id, ticker, filing_type, filing_date, period, accession,
+                   source_url, status, parsed_at, summary_embedding_id,
+                   index_error, index_section_count, index_chunk_count, ingested_at
+            FROM filings WHERE accession = ?
+        """
+        with self._connect() as conn:
+            row = conn.execute(sql, (accession,)).fetchone()
+        return dict(row) if row else None
+
+    def list_freshness(
+        self,
+        *,
+        ticker: Optional[str] = None,
+        source: Optional[str] = None,
+        include_scheduler: bool = False,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> list[dict]:
+        """Return bounded cache freshness rows, optionally including scheduler rows."""
+        self._validate_inventory_page(limit, offset)
+        conditions = []
+        params: list = []
+        if not include_scheduler:
+            conditions.append("ticker <> 'SCHEDULER'")
+        if ticker:
+            conditions.append("ticker = ?")
+            params.append(ticker.upper())
+        if source:
+            conditions.append("source = ?")
+            params.append(source)
+        where = " AND ".join(conditions) or "1=1"
+        sql = f"""
+            SELECT ticker, source, metric_scope, last_updated,
+                   next_scheduled_update, status, error_message
+            FROM cache_meta
+            WHERE {where}
+            ORDER BY ticker, source, metric_scope
+            LIMIT ? OFFSET ?
+        """
+        params.extend([limit, offset])
+        with self._connect() as conn:
+            rows = conn.execute(sql, params).fetchall()
+        return [dict(row) for row in rows]
+
+    def list_scheduler_sources(self, *, limit: int = 100, offset: int = 0) -> list[dict]:
+        """Return scheduler cadence rows without invoking the scheduler."""
+        self._validate_inventory_page(limit, offset)
+        sql = """
+            SELECT source, last_updated AS last_run, next_scheduled_update,
+                   status, error_message
+            FROM cache_meta
+            WHERE ticker = 'SCHEDULER' AND source LIKE 'unified:%'
+            ORDER BY source
+            LIMIT ? OFFSET ?
+        """
+        with self._connect() as conn:
+            rows = conn.execute(sql, (limit, offset)).fetchall()
+        return [dict(row) for row in rows]
+
+    # Descriptive aliases keep the explorer seam discoverable without exposing
+    # a second implementation or an arbitrary SQL interface.
+    search_metrics = search_corpus_metrics
+    search_facts_for_corpus = search_corpus_facts
+    list_filing_inventory = list_filings
+    get_freshness_summaries = list_freshness

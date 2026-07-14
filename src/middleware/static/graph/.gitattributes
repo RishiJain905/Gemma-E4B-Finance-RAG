@@ -1,0 +1,4 @@
+# The graph UI bundle is served verbatim and vendor/SHA256SUMS pins byte-exact
+# hashes for cytoscape.min.js and the woff2 fonts. Disable all line-ending
+# conversion here so the pinned hashes hold on every platform (autocrlf-safe).
+* -text
