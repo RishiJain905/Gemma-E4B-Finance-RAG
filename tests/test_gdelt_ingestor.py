@@ -253,25 +253,49 @@ class TestGDELTIngestor:
         assert mock_get.call_count == 2
         assert mock_get.call_args_list[1].args[0]["query"] == "NVIDIA"
 
-    def test_search_gdelt_falls_back_after_429(self, store):
-        """429 exhaustion on domain query still retries bare keyword once."""
-        from src.macros.gdelt_ingestor import GDELTIngestor
+    def test_http_429_exhaustion_raises_rate_limit_error(self, store):
+        """The HTTP layer preserves an exhausted 429 as a typed failure."""
+        from src.macros.gdelt_ingestor import GDELTIngestor, GDELTRateLimitError
+
+        ingestor = GDELTIngestor(store=store)
+        ingestor.config["request_delay"] = 5.0
+        ingestor.config["max_retries_on_429"] = 2
+
+        response = MagicMock()
+        response.status_code = 429
+        response.headers = {"retry-after": "60"}
+
+        with patch(
+            "src.macros.gdelt_ingestor.httpx.get", return_value=response,
+        ) as mock_get, patch("src.macros.gdelt_ingestor.time.sleep") as mock_sleep:
+            with pytest.raises(GDELTRateLimitError, match="retry after 60"):
+                ingestor._doc_api_get({"query": "NVIDIA"})
+
+        assert mock_get.call_count == 3
+        assert [call.args[0] for call in mock_sleep.call_args_list] == [60.0, 60.0]
+
+    def test_rate_limit_exhaustion_aborts_alias_and_fallback_queries(self, store):
+        """A rate-limited ticker stops after one query's three attempts."""
+        from src.macros.gdelt_ingestor import GDELTIngestor, GDELTRateLimitError
+
         ingestor = GDELTIngestor(store=store)
         ingestor.config["finance_domains"] = ["reuters.com"]
+        ingestor.config["request_delay"] = 0
+        ingestor.config["max_retries_on_429"] = 2
 
-        json_response = MagicMock()
-        json_response.text = (
-            '{"articles": [{"url": "https://example.com/nvda", "title": "NVDA news"}]}'
-        )
-        json_response.headers = {"content-type": "application/json"}
+        response = MagicMock()
+        response.status_code = 429
+        response.headers = {}
 
-        with patch.object(
-            ingestor, "_doc_api_get", side_effect=[None, json_response],
-        ) as mock_get:
-            articles = ingestor._search_gdelt("NVIDIA", max_records=5, lookback_days=7)
+        with patch(
+            "src.macros.gdelt_ingestor.httpx.get", return_value=response,
+        ) as mock_get, patch("src.macros.gdelt_ingestor.time.sleep"):
+            with pytest.raises(GDELTRateLimitError):
+                ingestor.fetch_news_for_ticker("NVDA", max_records=10)
 
-        assert len(articles) == 1
-        assert mock_get.call_count == 2
+        assert mock_get.call_count == 3
+        queries = [call.kwargs["params"]["query"] for call in mock_get.call_args_list]
+        assert all(query.startswith("NVIDIA ") for query in queries)
 
     def test_parse_doc_api_articles_non_json(self, store):
         """Non-JSON DOC API bodies log a warning and return []."""
@@ -472,6 +496,17 @@ class TestGDELTIngestor:
             rows = ingestor._load_gkg_file("20260608040000")
 
         assert rows["https://example.com/nvda-gkg"] == 2.5
+
+    def test_load_gkg_file_propagates_exhausted_rate_limit(self, store):
+        """GKG enrichment stops the GDELT run when its retries are exhausted."""
+        from src.macros.gdelt_ingestor import GDELTIngestor, GDELTRateLimitError
+
+        ingestor = GDELTIngestor(store=store)
+        error = GDELTRateLimitError("GDELT rate limit exhausted")
+
+        with patch.object(ingestor, "_gdelt_http_get", side_effect=error):
+            with pytest.raises(GDELTRateLimitError):
+                ingestor._load_gkg_file("20260608040000")
 
     def test_fetch_news_for_ticker_enriches_tone(self, store):
         """fetch_news_for_ticker enriches DOC articles with tone metadata."""

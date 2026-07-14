@@ -180,6 +180,27 @@ class TestUnifiedSchedulerPartialFailure:
         result = scheduler.run_all_stale()
         assert all(r["status"] == "error" for r in result.values())
 
+    def test_gdelt_rate_limit_does_not_stop_other_sources(self, scheduler):
+        """A failed GDELT run is stale while later sources still execute."""
+        def side(name, deep=False, force=False):
+            if name == "gdelt":
+                raise RuntimeError("GDELT rate limit exhausted")
+            return {"ok": True}
+
+        mock_run = _stub_run_source(scheduler, side_effect=side)
+        result = scheduler.run_all_stale()
+
+        assert result["gdelt"]["status"] == "error"
+        assert "rate limit" in result["gdelt"]["error"]
+        assert result["earnings_transcripts"]["status"] == "success"
+        assert result["ir_pages"]["status"] == "success"
+        assert result["estimates"]["status"] == "success"
+        ran_sources = [call.args[0] for call in mock_run.call_args_list]
+        assert ran_sources[-3:] == ["earnings_transcripts", "ir_pages", "estimates"]
+        gdelt_status = scheduler.status_report()["sources"]["gdelt"]
+        assert gdelt_status["status"] == "stale"
+        assert "rate limit" in gdelt_status["error"]
+
     def test_source_skipped(self, scheduler):
         scheduler.store.mark_cache_fresh(
             scheduler.SCHEDULER_TICKER,

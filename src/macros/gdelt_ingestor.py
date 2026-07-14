@@ -35,6 +35,11 @@ from src.storage.store import Store
 
 logger = logging.getLogger(__name__)
 
+
+class GDELTRateLimitError(RuntimeError):
+    """Raised when GDELT keeps returning HTTP 429 after all retries."""
+
+
 # Shared across all GDELTIngestor instances — serializes DOC API + GKG downloads.
 _last_gdelt_request_at: float = 0.0
 _gdelt_request_lock = threading.Lock()
@@ -320,8 +325,8 @@ class GDELTIngestor:
             if articles:
                 return articles
 
-            # Domain-scoped queries may hit length limits (HTTP 200, plain-text error)
-            # or 429 exhaustion; retry bare keyword once via the shared throttle.
+            # Domain-scoped queries may hit length limits (HTTP 200, plain-text
+            # error); retry a bare keyword once via the shared throttle.
             if query != term:
                 logger.info(
                     "GDELT domain query returned no articles for '%s'; retrying without domain filter",
@@ -334,6 +339,8 @@ class GDELTIngestor:
 
             return []
 
+        except GDELTRateLimitError:
+            raise
         except Exception as e:
             logger.error("GDELT search failed for '%s': %s", term, e)
             return []
@@ -380,14 +387,28 @@ class GDELTIngestor:
                     return response
 
                 if attempt >= max_retries:
+                    retry_after = response.headers.get("retry-after")
+                    retry_hint = (
+                        f"; retry after {retry_after}s" if retry_after else ""
+                    )
                     logger.error(
-                        "GDELT rate limit (429) for '%s' after %d attempts; giving up",
+                        "GDELT rate limit (429) for '%s' after %d attempts; giving up%s",
                         label,
                         attempt + 1,
+                        retry_hint,
                     )
-                    return None
+                    raise GDELTRateLimitError(
+                        f"GDELT rate limit exhausted for '{label}' after "
+                        f"{attempt + 1} attempts{retry_hint}"
+                    )
 
                 backoff = delay * (2 ** attempt)
+                retry_after = response.headers.get("retry-after")
+                if retry_after:
+                    try:
+                        backoff = max(0.0, float(retry_after))
+                    except ValueError:
+                        pass
                 logger.warning(
                     "GDELT rate limit (429) for '%s' (attempt %d/%d); "
                     "waiting %.1fs before retry",
@@ -533,6 +554,8 @@ class GDELTIngestor:
                         if doc_url and tone is not None:
                             rows[doc_url] = tone
 
+        except GDELTRateLimitError:
+            raise
         except Exception as e:
             logger.debug("GKG file %s unavailable: %s", stamp, e)
 
