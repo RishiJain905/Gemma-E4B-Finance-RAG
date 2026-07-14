@@ -1,5 +1,47 @@
 # 2.3.2 — Multi-Source Finance Ingestion — Results
 
+## 2.3.2.3 Official Macro, Regulatory, and Sector Feeds
+
+**Implemented:** 2026-07-14, branch `phase-2.3.2`, gpt-5.6-luna (effort max) via Codex, orchestrated by Claude (Fable 5).
+
+### Setup
+
+- `src/ingestion/official/` — one module per agency (federal_reserve, treasury,
+  bls, bea, eia, ny_fed, cftc, openfda, nhtsa, usaspending) sharing only small
+  HTTP/date helpers; RSS/XML/CSV/JSON differences stay inside adapters; each
+  exposes `parse()` + `ingest()` through the 2.3.3.1 record contract.
+- Curated catalog `configs/official_sources.yaml` (32 entries: Fed 5, Treasury 3,
+  BLS 5, BEA 4, EIA 4, NY Fed 3, CFTC 2, openFDA 3, NHTSA 2, USAspending 1) —
+  only cataloged datasets are ingested; complements FRED rather than duplicating
+  it.
+- Vintage preservation: observation identity is
+  `(source, metric, provider_record_id, vintage_at)` — a revision creates a new
+  vintage row, same-vintage replay is idempotent, historical vintages are never
+  overwritten (required a change to the observation uniqueness index in the
+  supporting schema files).
+- Sector mapping is exact-identifier-only (issuer aliases, manufacturer names,
+  recipient UEIs from the registry); ambiguous names stay unattached (tested,
+  incl. a UEI regression test); agency identity is the dedup authority.
+- Per-agency key isolation: missing BLS/BEA/EIA/OPENFDA key →
+  `disabled_missing_key` for that agency only; no-key feeds continue (tested).
+
+### Regression gate
+
+Focused 17 passed; full offline suite 1,479 passed / 1 skipped / 8 deselected;
+ruff clean; `scripts/verify.ps1` → **VERIFY: PASS** (implementer + independent
+orchestrator re-run).
+
+### Caveats
+
+- Scheduler cadence registration deferred to Phase 2.3.4, same as 2.3.2.2.
+- The observation uniqueness index changed to include `vintage_at` — additive
+  migration handled by idempotent DDL.
+
+### Decision
+
+**Ship.** Ingestion-side only; no answer-quality surface touched. Rollback =
+revert the task commit.
+
 ## 2.3.2.2 Company News, Market Data, and Corporate Actions
 
 **Implemented:** 2026-07-14, branch `phase-2.3.2`, gpt-5.6-luna (effort max) via Codex, orchestrated by Claude (Fable 5).

@@ -112,6 +112,15 @@ class SQLiteStore:
                 "CREATE INDEX IF NOT EXISTS idx_corpus_observations_market_key "
                 "ON corpus_observations(source_name, metric_id, period_end, tickers_json)"
             )
+            # Official revisions share an agency record id across vintages.  The
+            # migration is intentionally additive: existing rows remain intact,
+            # while metric + provider id + vintage becomes the observation key.
+            conn.execute("DROP INDEX IF EXISTS idx_corpus_observations_provider")
+            conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_corpus_observations_provider "
+                "ON corpus_observations(source_name, metric_id, provider_record_id, vintage_at) "
+                "WHERE provider_record_id IS NOT NULL AND provider_record_id <> ''"
+            )
             conn.commit()
 
     @staticmethod
@@ -280,7 +289,10 @@ CREATE TABLE IF NOT EXISTS security_aliases (
     alias TEXT NOT NULL,
     normalized_alias TEXT NOT NULL,
     alias_type TEXT NOT NULL CHECK (
-        alias_type IN ('ticker', 'vendor_symbol', 'former_ticker')
+        alias_type IN (
+            'ticker', 'vendor_symbol', 'former_ticker', 'issuer_alias',
+            'manufacturer', 'recipient_uei'
+        )
     ),
     provider TEXT,
     valid_from TEXT,
@@ -505,7 +517,7 @@ CREATE INDEX IF NOT EXISTS idx_corpus_item_sources_source
 CREATE INDEX IF NOT EXISTS idx_corpus_item_securities_security
     ON corpus_item_securities(security_id, corpus_item_id);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_corpus_observations_provider
-    ON corpus_observations(source_name, provider_record_id)
+    ON corpus_observations(source_name, metric_id, provider_record_id, vintage_at)
     WHERE provider_record_id IS NOT NULL AND provider_record_id <> '';
 CREATE INDEX IF NOT EXISTS idx_corpus_observations_metric_period
     ON corpus_observations(metric_id, period_end, vintage_at);
@@ -1290,10 +1302,16 @@ CREATE INDEX IF NOT EXISTS idx_corpus_events_type_effective
             if record.provider_record_id:
                 existing = existing or conn.execute(
                     "SELECT * FROM corpus_observations WHERE source_name=? "
-                    "AND provider_record_id=?",
-                    (record.source_name, record.provider_record_id),
+                    "AND metric_id=? AND provider_record_id=? "
+                    "AND vintage_at IS ?",
+                    (
+                        record.source_name,
+                        record.metric_id,
+                        record.provider_record_id,
+                        record.vintage_at,
+                    ),
                 ).fetchone()
-            if existing is None:
+            if existing is None and not record.provider_record_id:
                 existing = conn.execute(
                     "SELECT * FROM corpus_observations WHERE observation_id=?",
                     (record.observation_id,),
@@ -1350,6 +1368,54 @@ CREATE INDEX IF NOT EXISTS idx_corpus_events_type_effective
             return int(conn.execute(
                 "SELECT COUNT(*) FROM corpus_observations"
             ).fetchone()[0])
+
+    def list_observations(
+        self,
+        *,
+        source_name: Optional[str] = None,
+        metric_id: Optional[str] = None,
+        period_end: Optional[str] = None,
+        vintage_at: Optional[str] = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> list[dict]:
+        """Return bounded structured observations, including every vintage."""
+        self._validate_inventory_page(limit, offset)
+        conditions: list[str] = []
+        params: list[object] = []
+        for column, value in (
+            ("source_name", source_name),
+            ("metric_id", metric_id),
+            ("period_end", period_end),
+            ("vintage_at", vintage_at),
+        ):
+            if value is not None:
+                conditions.append(f"{column} = ?")
+                params.append(str(value))
+        where = " AND ".join(conditions) or "1=1"
+        params.extend([limit, offset])
+        with self._connect() as conn:
+            rows = conn.execute(
+                f"SELECT * FROM corpus_observations WHERE {where} "
+                "ORDER BY period_end DESC, vintage_at DESC, metric_id, observation_id "
+                "LIMIT ? OFFSET ?",
+                params,
+            ).fetchall()
+            observations: list[dict] = []
+            for row in rows:
+                item = dict(row)
+                item["metadata"] = json.loads(item.pop("metadata_json"))
+                item["tickers"] = json.loads(item.pop("tickers_json"))
+                item["security_ids"] = [
+                    linked[0]
+                    for linked in conn.execute(
+                        "SELECT security_id FROM observation_securities "
+                        "WHERE observation_id=? ORDER BY security_id",
+                        (item["observation_id"],),
+                    ).fetchall()
+                ]
+                observations.append(item)
+        return observations
 
     # -- Incremental source cursors -----------------------------------------
 
@@ -2284,6 +2350,92 @@ CREATE INDEX IF NOT EXISTS idx_corpus_events_type_effective
             ).fetchall()
         candidates = self._security_candidates(alias_rows)
         return candidates[0] if len(candidates) == 1 else None
+
+    def resolve_exact_security(self, identifier: str) -> Optional[dict]:
+        """Resolve one exact ticker, registry alias, or company-name identifier.
+
+        Company names are compared after case/whitespace/punctuation normalization
+        only; no substring or fuzzy matching is performed.  Multiple exact
+        candidates intentionally return ``None`` so an official event remains
+        unattached for review.
+        """
+        value = str(identifier or "").strip()
+        if not value:
+            return None
+        symbol_key = self._normalize_universe_symbol(value)
+        company_key = self._normalize_company_identity(value)
+        with self._connect() as conn:
+            candidates: dict[str, dict] = {}
+            for row in conn.execute(
+                "SELECT * FROM securities WHERE normalized_ticker=? OR normalized_ticker=?",
+                (symbol_key, value.upper()),
+            ).fetchall():
+                candidates[str(row["security_id"])] = dict(row)
+            for row in conn.execute("SELECT * FROM securities").fetchall():
+                if self._normalize_company_identity(row["company_name"]) == company_key:
+                    candidates[str(row["security_id"])] = dict(row)
+            aliases = conn.execute(
+                "SELECT a.alias, a.normalized_alias, s.* FROM security_aliases a "
+                "JOIN securities s ON s.security_id=a.security_id "
+                "WHERE a.valid_to IS NULL"
+            ).fetchall()
+            for row in aliases:
+                if (
+                    self._normalize_universe_symbol(row["alias"]) == symbol_key
+                    or self._normalize_company_identity(row["alias"]) == company_key
+                ):
+                    candidates[str(row["security_id"])] = {
+                        key: row[key] for key in row.keys() if key not in {"alias", "normalized_alias"}
+                    }
+        return next(iter(candidates.values())) if len(candidates) == 1 else None
+
+    def register_security_alias(
+        self,
+        security_id: str,
+        alias: str,
+        *,
+        alias_type: str = "issuer_alias",
+        provider: Optional[str] = None,
+        source: str = "registry",
+    ) -> bool:
+        """Register one exact issuer/manufacturer/UEI identity in the registry."""
+        allowed = {"issuer_alias", "manufacturer", "recipient_uei", "vendor_symbol"}
+        alias_type = str(alias_type or "issuer_alias").strip().lower()
+        value = str(alias or "").strip()
+        if alias_type not in allowed:
+            raise ValueError(f"unsupported security alias type: {alias_type}")
+        if not value or not security_id:
+            raise ValueError("security_id and alias are required")
+        normalized = self._normalize_company_identity(value)
+        with self._connect() as conn:
+            if not conn.execute(
+                "SELECT 1 FROM securities WHERE security_id=?", (security_id,)
+            ).fetchone():
+                raise ValueError(f"unknown security_id: {security_id}")
+            existing = conn.execute(
+                "SELECT 1 FROM security_aliases WHERE security_id=? "
+                "AND alias=? AND alias_type=? AND provider IS ? AND valid_to IS NULL",
+                (security_id, value, alias_type, provider),
+            ).fetchone()
+            if existing:
+                return False
+            conflicting = conn.execute(
+                "SELECT 1 FROM security_aliases WHERE security_id<>? "
+                "AND normalized_alias=? AND provider IS ? AND valid_to IS NULL",
+                (security_id, normalized, provider),
+            ).fetchone()
+            if conflicting:
+                # Preserve the exact ambiguity for review rather than selecting a
+                # ticker.  The resolver will return None for multiple candidates.
+                return False
+            conn.execute(
+                "INSERT INTO security_aliases ("
+                "security_id, alias, normalized_alias, alias_type, provider, source"
+                ") VALUES (?, ?, ?, ?, ?, ?)",
+                (security_id, value, normalized, alias_type, provider, source),
+            )
+            conn.commit()
+        return True
 
     def list_memberships(
         self,

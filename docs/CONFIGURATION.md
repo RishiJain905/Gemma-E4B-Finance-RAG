@@ -18,6 +18,10 @@ defaults.
 | `SEC_EDGAR_USER_AGENT` | SEC EDGAR access | `src/sec/edgar_fetcher.py` | SEC requires a descriptive User-Agent (name + contact email). Resolution order: constructor arg → `SEC_EDGAR_USER_AGENT` env var → `sec.user_agent` in `configs/storage.yaml` → built-in default. |
 | `FINNHUB_API_KEY` | Finnhub company news | `src/ingestion/finnhub_ingestor.py` | Missing or invalid credentials disable only the Finnhub news capability; the adapter never crawls publisher URLs. |
 | `MASSIVE_API_KEY` | Massive grouped market data/actions | `src/ingestion/massive_ingestor.py` | Missing or limited entitlements disable only the affected Massive capability. Grouped US market data remains one request per market date. |
+| `BLS_API_KEY` | Optional BLS extended API access | `src/ingestion/official/bls.py` | Missing credentials set only the BLS source to `disabled_missing_key`; other official feeds continue. |
+| `BEA_API_KEY` | BEA national-accounts API | `src/ingestion/official/bea.py` | Missing credentials set only the BEA source to `disabled_missing_key`. |
+| `EIA_API_KEY` | EIA energy API | `src/ingestion/official/eia.py` | Missing credentials set only the EIA source to `disabled_missing_key`. |
+| `OPENFDA_API_KEY` | Optional openFDA event queries | `src/ingestion/official/openfda.py` | Missing credentials disable only openFDA sector events. |
 | `TWELVE_DATA_API_KEY` | Optional Twelve Data fallback | Future optional adapter | Disabled unless explicitly configured; it is not used as a required Massive fallback. |
 
 Example `.env`:
@@ -27,6 +31,10 @@ FRED_API_KEY=your_fred_api_key_here
 SEC_EDGAR_USER_AGENT=Your Name your.email@example.com
 FINNHUB_API_KEY=your_finnhub_api_key_here
 MASSIVE_API_KEY=your_massive_api_key_here
+BLS_API_KEY=your_bls_api_key_here
+BEA_API_KEY=your_bea_api_key_here
+EIA_API_KEY=your_eia_api_key_here
+OPENFDA_API_KEY=your_openfda_api_key_here
 ```
 
 ---
@@ -562,6 +570,41 @@ under `finnhub_news`; the adapter refetches a bounded overlap window and only
 advances the cursor after accepted rows have been stored. Massive market
 cursors are stored under `massive_market/US` and use a market-date overlap.
 `cache_meta` freshness and `source_cursors` progress are intentionally separate.
+
+### Official macro, regulatory, and sector feeds (2.3.2.3)
+
+`configs/official_sources.yaml` is the allowlisted catalog for first-party
+feeds. Each entry declares a stable internal metric/event name, the agency
+dataset or series identifier, unit, frequency, expected cadence, source
+category, applicable sectors, payload type, and endpoint. Adapters never crawl
+an agency outside this catalog.
+
+| Source | Module | Key | Payloads | Default scope |
+|---|---|---|---|---|
+| Federal Reserve | `src/ingestion/official/federal_reserve.py` | none | RSS/XML releases | global |
+| Treasury | `src/ingestion/official/treasury.py` | none | CSV/JSON rates | global |
+| BLS | `src/ingestion/official/bls.py` | `BLS_API_KEY` | JSON observations/releases | global |
+| BEA | `src/ingestion/official/bea.py` | `BEA_API_KEY` | JSON observations | global |
+| EIA | `src/ingestion/official/eia.py` | `EIA_API_KEY` | JSON observations | global |
+| New York Fed | `src/ingestion/official/ny_fed.py` | none | CSV/JSON rates/operations | global |
+| CFTC | `src/ingestion/official/cftc.py` | none | CSV/JSON COT | global |
+| openFDA | `src/ingestion/official/openfda.py` | `OPENFDA_API_KEY` | JSON events/releases | health care |
+| NHTSA | `src/ingestion/official/nhtsa.py` | none | JSON events/releases | automotive |
+| USAspending | `src/ingestion/official/usaspending.py` | none | JSON awards/releases | government contractors |
+
+Structured observations and agency events are stored in SQLite only. RSS and
+release context use the narrative path and therefore retain searchable
+provenance in SQLite plus Chroma. Every record keeps its official URL,
+provider/agency identifier, release date, observation period, and retrieval
+vintage. A later revision is a new `(metric, provider id, vintage)` observation
+and does not overwrite the earlier vintage; replaying the same vintage is
+idempotent.
+
+Sector events attach to securities only through exact registry identifiers
+(ticker, registered company/issuer name, manufacturer, or recipient UEI). An
+ambiguous exact name is deliberately left unattached for review; fuzzy text
+similarity is never used to attach a ticker. Missing keyed-agency credentials
+produce `disabled_missing_key`, while no-key feeds continue independently.
 
 ### Company news, market data, and corporate actions (2.3.2.2)
 

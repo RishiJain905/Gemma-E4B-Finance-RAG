@@ -432,6 +432,50 @@ class Store:
         """Resolve canonical, vendor, or historical security symbols."""
         return self.sqlite.resolve_security(symbol, provider=provider, as_of=as_of)
 
+    def resolve_exact_security(self, identifier: str) -> Optional[dict]:
+        """Resolve one exact registry identity; ambiguous names never attach."""
+        return self.sqlite.resolve_exact_security(identifier)
+
+    def register_security_alias(
+        self,
+        security_id: str,
+        alias: str,
+        *,
+        alias_type: str = "issuer_alias",
+        provider: Optional[str] = None,
+        source: str = "registry",
+    ) -> bool:
+        """Register an exact issuer, manufacturer, or recipient UEI identity."""
+        return self.sqlite.register_security_alias(
+            security_id,
+            alias,
+            alias_type=alias_type,
+            provider=provider,
+            source=source,
+        )
+
+    add_security_alias = register_security_alias
+
+    def list_observations(
+        self,
+        *,
+        source_name: Optional[str] = None,
+        metric_id: Optional[str] = None,
+        period_end: Optional[str] = None,
+        vintage_at: Optional[str] = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> list[dict]:
+        """List structured observations through the Store facade, including vintages."""
+        return self.sqlite.list_observations(
+            source_name=source_name,
+            metric_id=metric_id,
+            period_end=period_end,
+            vintage_at=vintage_at,
+            limit=limit,
+            offset=offset,
+        )
+
     def list_memberships(
         self,
         security_id: Optional[str] = None,

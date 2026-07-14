@@ -162,7 +162,10 @@ CREATE TABLE IF NOT EXISTS security_aliases (
     alias TEXT NOT NULL,
     normalized_alias TEXT NOT NULL,
     alias_type TEXT NOT NULL CHECK (
-        alias_type IN ('ticker', 'vendor_symbol', 'former_ticker')
+        alias_type IN (
+            'ticker', 'vendor_symbol', 'former_ticker', 'issuer_alias',
+            'manufacturer', 'recipient_uei'
+        )
     ),
     provider TEXT,
     valid_from TEXT,
@@ -387,7 +390,7 @@ CREATE INDEX IF NOT EXISTS idx_corpus_item_sources_source
 CREATE INDEX IF NOT EXISTS idx_corpus_item_securities_security
     ON corpus_item_securities(security_id, corpus_item_id);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_corpus_observations_provider
-    ON corpus_observations(source_name, provider_record_id)
+    ON corpus_observations(source_name, metric_id, provider_record_id, vintage_at)
     WHERE provider_record_id IS NOT NULL AND provider_record_id <> '';
 CREATE INDEX IF NOT EXISTS idx_corpus_observations_metric_period
     ON corpus_observations(metric_id, period_end, vintage_at);
