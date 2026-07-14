@@ -200,8 +200,25 @@ class PromptAugmenter:
                 parts.append(str(item.store_id))
             if item.period:
                 parts.append(f"({item.period})")
-            if item.source_type:
-                parts.append(f"source:{item.source_type}")
+            if item.item_type:
+                parts.append(f"item:{item.item_type}")
+            if item.event_type:
+                parts.append(f"event:{item.event_type}")
+            if item.authority_tier:
+                parts.append(f"authority:{item.authority_tier}")
+            if item.source or item.source_type:
+                parts.append(f"source:{item.source or item.source_type}")
+            if item.canonical_security:
+                parts.append(f"canonical:{item.canonical_security}")
+            if item.coverage_tier:
+                parts.append(f"coverage:{item.coverage_tier}")
+            for name in (
+                "published_at", "effective_at", "observation_period",
+                "source_vintage", "ingested_at",
+            ):
+                value = item.date_semantics.get(name)
+                if value:
+                    parts.append(f"{name}={value}")
             lines.append(" | ".join(parts))
         return "\n".join(lines)
 
@@ -350,6 +367,16 @@ class PromptAugmenter:
                 header_parts.append(f"Source: {source}")
             if date:
                 header_parts.append(f"Date: {date}")
+            for label, key in (
+                ("Item", "item_type"), ("Event", "event_type"),
+                ("Authority", "authority_tier"),
+                ("Canonical", "canonical_security"),
+                ("Coverage", "coverage_tier"),
+                ("Date semantics", "domain_timestamp_kind"),
+            ):
+                value = metadata.get(key)
+                if value:
+                    header_parts.append(f"{label}: {value}")
 
             lines.append(" | ".join(header_parts))
             lines.append("")

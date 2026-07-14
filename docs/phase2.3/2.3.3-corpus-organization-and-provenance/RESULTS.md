@@ -1,5 +1,58 @@
 # 2.3.3 — Corpus Organization and Provenance — Results
 
+## 2.3.3.3 Retrieval Taxonomy, Filtering, and Ranking
+
+**Implemented:** 2026-07-14, branch `phase-2.3.3`, gpt-5.6-sol (effort high) via Codex, orchestrated by Claude (Fable 5).
+
+### Setup
+
+- `src/middleware/evidence_taxonomy.py` — versioned vocabulary
+  `finance-evidence-taxonomy-v1`: 12 source categories, 14 item types, event
+  types = `sec-events-v1` + stable macro/sector events. Provider labels stay
+  metadata, never facets.
+- Composable filters across Store search + normalized evidence:
+  security/ticker/alias, index membership, sector/industry, source
+  category/source, item/event type, form/item/exhibit, date ranges,
+  freshness/indexing status, authority tier (seeded evaluation fixture
+  `tests/fixtures/evaluation/phase2_3_sources.json`).
+- Intent parsing recognizes financing / corporate-action / ownership /
+  regulatory / macro-release / company-news requests without provider names
+  (additive `evidence_topic`/`evidence_filters` on parse output; legacy adapter
+  contract unchanged).
+- Authority-aware ranking: normalized two-channel RRF relevance first, then
+  bounded deterministic boosts — exact entity ≤0.040, item/event ≤0.030,
+  requested-date ≤0.020, recency ≤0.050 (latest/news) / ≤0.015 (neutral) /
+  ≤0.005 (historical, 7-day decay on the domain timestamp, never
+  `ingested_at`), authority ≤0.025 by tier. Duplicate packing: primary + at
+  most 2 materially different secondaries per event.
+- Self-describing evidence: prompt + Live Trace metadata carry item/event
+  type, authority tier, source, date semantics, canonical security, coverage
+  tier; citations resolve to exact evidence ledger ids; graph nodes carry the
+  same taxonomy (parity tested).
+
+### Answer-quality regression check
+
+Existing intent/retriever/prompt/reranker/graph/chat contract tests pass; only
+one expectation changed (`test_legacy_adapter_matches_existing_parse_contract`
+now compares the legacy key subset because parse output gained additive
+fields — legacy adapter output itself unchanged). Fail-soft stage behavior,
+degraded mode, and Phase 2.2 citation contracts intact. A fresh-context review
+inside the run fixed four compatibility risks (incl. keeping candidate pools
+untouched until final context selection) before handoff.
+
+### Regression gate
+
+Focused 153 passed; full offline suite 1,541 passed / 1 skipped / 8 deselected;
+ruff clean; `scripts/verify.ps1` → **VERIFY: PASS** (implementer + independent
+orchestrator re-run).
+
+### Decision
+
+**Ship.** Ranking boosts are bounded and applied after relevance, new behavior
+is config-toggleable in `configs/middleware.yaml`, and the full offline suite —
+including all pre-existing answer-pipeline tests — is green. Rollback = revert
+the task commit or disable the new stage toggles.
+
 ## 2.3.3.2 Dual-Store Placement, Chunking, and Retention
 
 **Implemented:** 2026-07-14, branch `phase-2.3.3`, gpt-5.6-sol (effort high) via Codex, orchestrated by Claude (Fable 5).

@@ -48,6 +48,47 @@ STRUCTURED_ONLY_NARRATIVE_TYPES = frozenset({
 STRUCTURED_ONLY_SOURCE_CATEGORIES = frozenset({"market_data", "economic_data"})
 
 
+def _chroma_evidence_filter(filters: dict, ticker: Optional[str]) -> Optional[dict]:
+    """Translate exact/range stable facets into Chroma metadata predicates."""
+    clauses: list[dict] = []
+    if ticker:
+        clauses.append({"ticker": ticker})
+
+    exact_fields = {
+        "source_category": "source_category",
+        "source": "source_name",
+        "item_type": "item_type",
+        "event_type": "event_type",
+        "form": "form",
+        "item": "item",
+        "exhibit": "exhibit",
+        "freshness_status": "freshness_status",
+        "indexing_status": "indexing_status",
+        "authority_tier": "authority_tier",
+    }
+    for facet, metadata_field in exact_fields.items():
+        value = filters.get(facet)
+        if value not in (None, ""):
+            clauses.append({metadata_field: value})
+
+    for prefix, metadata_field in (
+        ("published", "published_at"),
+        ("effective", "effective_at"),
+        ("as_of", "as_of_at"),
+    ):
+        bounds = {}
+        if filters.get(f"{prefix}_from"):
+            bounds["$gte"] = str(filters[f"{prefix}_from"])
+        if filters.get(f"{prefix}_to"):
+            bounds["$lte"] = str(filters[f"{prefix}_to"])
+        if bounds:
+            clauses.append({metadata_field: bounds})
+
+    if not clauses:
+        return None
+    return clauses[0] if len(clauses) == 1 else {"$and": clauses}
+
+
 def _companyfacts_cutoff(as_of: Optional[str]) -> str:
     value = as_of or datetime.now(timezone.utc).date().isoformat()
     if not isinstance(value, str):
@@ -1128,8 +1169,13 @@ class Store:
 
     # ── Hybrid Search ─────────────────────────────────
 
-    def search(self, query: str, n_results: int = 5,
-               ticker: str = None) -> dict:
+    def search(
+        self,
+        query: str,
+        n_results: int = 5,
+        ticker: Optional[str] = None,
+        filters: Optional[dict] = None,
+    ) -> dict:
         """
         Search BOTH stores and return combined results.
 
@@ -1137,6 +1183,8 @@ class Store:
             query: Natural language query
             n_results: Max semantic results
             ticker: Optional ticker filter
+            filters: Optional composable stable evidence facets. ``as_of`` is
+                used to resolve historical ticker aliases before searching.
 
         Returns:
             {
@@ -1146,20 +1194,43 @@ class Store:
             }
         """
         # Detect ticker from query if not provided
+        stable_filters = dict(filters or {})
+        requested_security = (
+            stable_filters.get("security") or stable_filters.get("ticker")
+            or stable_filters.get("alias") or ticker
+        )
         detected_ticker = ticker or self._detect_ticker(query)
+        if requested_security:
+            try:
+                resolved = self.resolve_security(
+                    str(requested_security), as_of=stable_filters.get("as_of")
+                )
+            except Exception:  # noqa: BLE001 - alias resolution is best-effort
+                logger.warning("Historical security resolution failed", exc_info=True)
+                resolved = None
+            if resolved:
+                detected_ticker = str(resolved.get("ticker") or requested_security).upper()
+                stable_filters["security"] = detected_ticker
+            elif ticker or stable_filters.get("ticker"):
+                detected_ticker = str(ticker or stable_filters["ticker"]).upper()
+
+        candidate_n = n_results
+        if stable_filters:
+            candidate_n = min(100, max(n_results, n_results * 4))
 
         # Parallel search
+        chroma_filter = _chroma_evidence_filter(stable_filters, detected_ticker)
         documents = self.chroma.search(
             query=query,
-            n_results=n_results,
-            filter_dict={"ticker": detected_ticker} if detected_ticker else None
+            n_results=candidate_n,
+            filter_dict=chroma_filter,
         )
 
         # Also search without ticker filter for broader context
-        if detected_ticker:
+        if detected_ticker and not requested_security:
             broad_results = self.chroma.search(
                 query=query,
-                n_results=n_results // 2,
+                n_results=max(1, candidate_n // 2),
             )
             # Merge: ticker-filtered first, then broad results (deduped)
             seen_ids = {d["id"] for d in documents}
@@ -1167,6 +1238,17 @@ class Store:
                 if doc["id"] not in seen_ids:
                     documents.append(doc)
                     seen_ids.add(doc["id"])
+
+        if stable_filters:
+            try:
+                from src.middleware.evidence_taxonomy import filter_evidence
+
+                documents = filter_evidence(documents, stable_filters)[:n_results]
+            except Exception:  # noqa: BLE001 - taxonomy must never fail a query
+                logger.warning("Evidence filtering failed; using semantic order", exc_info=True)
+                documents = documents[:n_results]
+        else:
+            documents = documents[:n_results]
 
         # Get structured facts if ticker detected
         facts = []

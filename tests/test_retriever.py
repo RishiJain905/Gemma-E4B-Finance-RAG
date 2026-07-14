@@ -154,6 +154,78 @@ class TestRetriever:
         )
         assert any(f.get("metric") == "total_revenue" for f in effective["facts"])
 
+    def test_post_relevance_policy_prefers_sec_and_packs_duplicate_coverage(self, store):
+        from src.middleware.retriever import Retriever
+
+        retriever = Retriever(store=store)
+        docs = [
+            {
+                "id": "vendor", "document": "Investor reaction to the notes financing.",
+                "fusion_score": 0.032,
+                "metadata": {
+                    "ticker": "ORCL", "source": "finnhub",
+                    "source_category": "news_vendor", "item_type": "news",
+                    "event_type": "debt_raise", "event_id": "notes-1",
+                    "published_at": "2026-07-10T14:00:00Z", "authority_tier": "provider",
+                },
+            },
+            {
+                "id": "sec", "document": "The filed prospectus for the notes financing.",
+                "fusion_score": 0.032,
+                "metadata": {
+                    "ticker": "ORCL", "source": "sec",
+                    "source_category": "regulatory_filing", "item_type": "sec_filing",
+                    "event_type": "debt_raise", "event_id": "notes-1",
+                    "published_at": "2026-07-10T13:00:00Z", "authority_tier": "direct_sec",
+                },
+            },
+            {
+                "id": "duplicate-a", "document": "Oracle launches notes.",
+                "fusion_score": 0.031,
+                "metadata": {
+                    "ticker": "ORCL", "source": "massive",
+                    "source_category": "news_vendor", "item_type": "news",
+                    "event_type": "debt_raise", "event_id": "notes-1",
+                    "syndicated_key": "same-story", "authority_tier": "provider",
+                },
+            },
+            {
+                "id": "duplicate-b", "document": "Oracle launches notes.",
+                "fusion_score": 0.030,
+                "metadata": {
+                    "ticker": "ORCL", "source": "gdelt",
+                    "source_category": "global_news", "item_type": "news",
+                    "event_type": "debt_raise", "event_id": "notes-1",
+                    "syndicated_key": "same-story", "authority_tier": "discovery",
+                },
+            },
+        ]
+        ranked = retriever._postprocess_documents(
+            "Oracle debt financing", docs,
+            {"ticker": "ORCL", "question_type": "news", "evidence_filters": {
+                "event_type": "debt_raise"
+            }},
+            limit=4,
+        )
+        ids = [row["id"] for row in ranked]
+        assert ids[:2] == ["sec", "vendor"]
+        assert not ({"duplicate-a", "duplicate-b"} <= set(ids))
+
+    def test_taxonomy_policy_flags_off_preserve_document_order_and_shape(self, store):
+        from src.middleware.retriever import Retriever
+
+        retriever = Retriever(store=store)
+        retriever.config.enable_evidence_taxonomy = False
+        retriever.config.enable_authority_ranking = False
+        retriever.config.enable_duplicate_coverage_packing = False
+        documents = [
+            {"id": "vendor", "document": "secondary"},
+            {"id": "sec", "document": "primary"},
+        ]
+        assert retriever._postprocess_documents(
+            "query", documents, {}, limit=2,
+        ) == documents
+
 
 # ── 2.2.3.4 review D: retrieve_candidates channel ids are request-local ──
 

@@ -567,6 +567,27 @@ def test_context_budget_preserves_raw_question_and_required_coverage():
     assert any(d["id"] == "d1" for d in sel.documents)
 
 
+def test_context_budget_applies_authority_ranking_at_final_selection():
+    config = make_config()
+    plan = make_plan("latest Oracle financing", entities=["ORCL"])
+    secondary = doc("news", body="Analyst reaction", ticker="ORCL", fusion=0.032)
+    secondary["metadata"].update({
+        "source": "finnhub", "source_category": "news_vendor",
+        "item_type": "news", "event_type": "debt_raise",
+    })
+    primary = doc("sec", body="Debt prospectus terms", ticker="ORCL", fusion=0.032)
+    primary["metadata"].update({
+        "source": "sec", "source_category": "regulatory_filing",
+        "item_type": "filing", "event_type": "debt_raise",
+    })
+
+    selection = ContextBudget(config).select(
+        plan, [], [secondary, primary], Lane.STANDARD,
+    )
+
+    assert [row["id"] for row in selection.documents[:2]] == ["sec", "news"]
+
+
 # ── 8. Blank document body is dropped ─────────────────────
 
 

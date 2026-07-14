@@ -55,12 +55,15 @@ _NODE_METADATA_ALLOWLIST = {
     "evidence": frozenset({
         "evidence_id", "kind", "ticker", "metric", "period", "source_type",
         "rank", "score", "freshness", "unit", "as_of", "store_id", "section",
-        "parent_id",
+        "parent_id", "item_type", "event_type", "authority_tier", "source",
+        "date_semantics", "canonical_security", "coverage_tier",
     }),
     "source": frozenset({"source_type", "ticker", "freshness", "count"}),
     "answer": frozenset({"status", "facts", "documents", "elapsed_ms"}),
     "citation": frozenset({
         "evidence_id", "source_type", "ticker", "metric", "period", "support_status",
+        "item_type", "event_type", "authority_tier", "source",
+        "date_semantics", "canonical_security", "coverage_tier",
     }),
 }
 _EDGE_METADATA_ALLOWLIST = frozenset({"rank", "score", "status", "elapsed_ms", "reason"})

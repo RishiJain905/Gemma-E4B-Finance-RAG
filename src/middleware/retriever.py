@@ -394,6 +394,17 @@ class Retriever:
         metrics = intent.get("metrics", [])
         question_type = intent.get("question_type", "general")
         timeframe = intent.get("timeframe")
+        evidence_filters = self._intent_search_filters(intent)
+        if ticker and evidence_filters.get("as_of"):
+            try:
+                resolved = self.store.resolve_security(
+                    ticker, as_of=evidence_filters["as_of"]
+                )
+                if resolved and resolved.get("ticker"):
+                    ticker = str(resolved["ticker"]).upper()
+                    evidence_filters["security"] = ticker
+            except Exception as exc:  # noqa: BLE001 - historical alias is fail-soft
+                logger.warning("Historical ticker resolution failed: %s", exc)
 
         strategy = self._select_strategy(question_type, ticker, metrics)
 
@@ -415,12 +426,14 @@ class Retriever:
 
         elif strategy == "documents_only":
             documents = self._retrieve_documents(
-                query, ticker, top_k_documents, pool=pool, channels=channels)
+                query, ticker, top_k_documents, pool=pool, channels=channels,
+                filters=evidence_filters)
 
         elif strategy == "macro":
             facts = self._time_sqlite(self._retrieve_macro_facts, top_k_facts)
             documents = self._retrieve_documents(
-                query, ticker=None, n_results=top_k_documents, pool=pool, channels=channels)
+                query, ticker=None, n_results=top_k_documents, pool=pool, channels=channels,
+                filters=evidence_filters)
 
         elif strategy == "macro_hybrid":
             facts = self._time_sqlite(
@@ -428,14 +441,16 @@ class Retriever:
             )
             facts.extend(self._time_sqlite(self._retrieve_macro_facts, top_k_facts))
             documents = self._retrieve_documents(
-                query, ticker, top_k_documents, pool=pool, channels=channels)
+                query, ticker, top_k_documents, pool=pool, channels=channels,
+                filters=evidence_filters)
 
         elif strategy == "hybrid":
             facts = self._time_sqlite(
                 self._retrieve_facts, ticker, metrics, timeframe, top_k_facts,
             )
             documents = self._retrieve_documents(
-                query, ticker, top_k_documents, pool=pool, channels=channels)
+                query, ticker, top_k_documents, pool=pool, channels=channels,
+                filters=evidence_filters)
 
         elif strategy == "comparison":
             # Multi-ticker: extract all tickers from query
@@ -446,17 +461,34 @@ class Retriever:
                 )
                 facts.extend(t_facts)
                 t_docs = self._retrieve_documents(
-                    query, t, top_k_documents // len(tickers), pool=pool, channels=channels)
+                    query, t, top_k_documents // len(tickers), pool=pool, channels=channels,
+                    filters={**evidence_filters, "security": t})
                 documents.extend(t_docs)
 
         elif strategy == "broad":
             # No ticker detected — search everything
             documents = self._retrieve_documents(
-                query, ticker=None, n_results=top_k_documents, pool=pool, channels=channels)
+                query, ticker=None, n_results=top_k_documents, pool=pool, channels=channels,
+                filters=evidence_filters)
             facts = self._time_sqlite(self._retrieve_all_facts, top_k_facts)
 
         if question_type == "projection" and ticker:
             facts = self._time_sqlite(self._merge_projection_facts, ticker, facts)
+
+        if documents and not pool:
+            document_limit = (
+                max(self.config.rerank_candidates, top_k_documents)
+                if pool else top_k_documents
+            )
+            ranking_intent = dict(intent)
+            ranking_filters = dict(intent.get("evidence_filters") or {})
+            if ticker:
+                ranking_filters["security"] = ticker
+            ranking_intent["ticker"] = ticker
+            ranking_intent["evidence_filters"] = ranking_filters
+            documents = self._postprocess_documents(
+                query, documents, ranking_intent, limit=document_limit,
+            )
 
         logger.info(
             "Retrieval strategy=%s ticker=%s: %d facts, %d documents",
@@ -669,17 +701,101 @@ class Retriever:
 
     # ── Document Retrieval (ChromaDB) ──────────────────
 
+    @staticmethod
+    def _intent_search_filters(intent: dict) -> dict:
+        """Convert intent facets into hard retrieval filters.
+
+        Item/source categories produced by intent parsing are ranking preferences,
+        not exclusions: keeping them soft preserves materially different secondary
+        coverage for the same event. Only entity and historical ``as_of`` remain
+        hard constraints; taxonomy types stay bounded exact-match boosts.
+        """
+        preferred = dict(intent.get("evidence_filters") or {})
+        if not preferred:
+            return {}
+        filters = {
+            key: value for key, value in preferred.items()
+            if key not in {
+                "item_type", "item_types", "source_category",
+                "source_categories", "event_type", "event_types", "recency",
+            }
+        }
+        if intent.get("ticker"):
+            filters["security"] = intent["ticker"]
+        return filters
+
+    def _postprocess_documents(
+        self,
+        query: str,
+        documents: list[dict],
+        intent: dict,
+        *,
+        limit: int,
+    ) -> list[dict]:
+        """Apply taxonomy, bounded post-relevance ranking, and coverage packing."""
+        try:
+            from .evidence_taxonomy import (
+                normalize_evidence,
+                pack_event_coverage,
+                rank_evidence,
+            )
+
+            taxonomy_enabled = bool(
+                getattr(self.config, "enable_evidence_taxonomy", True)
+            )
+            ranking_enabled = bool(
+                getattr(self.config, "enable_authority_ranking", True)
+            )
+            packing_enabled = bool(
+                getattr(self.config, "enable_duplicate_coverage_packing", True)
+            )
+            if not (taxonomy_enabled or ranking_enabled or packing_enabled):
+                return list(documents)[:limit]
+            rows = [normalize_evidence(row) for row in documents]
+            if ranking_enabled:
+                rows = rank_evidence(
+                    rows,
+                    query=query,
+                    filters=dict(intent.get("evidence_filters") or {}),
+                    authority_max_boost=max(0.0, min(0.025, float(
+                        getattr(self.config, "authority_max_boost", 0.025)
+                    ))),
+                )
+            if packing_enabled:
+                rows = pack_event_coverage(
+                    rows,
+                    limit=limit,
+                    max_secondary_per_event=int(
+                        getattr(self.config, "max_secondary_per_event", 2)
+                    ),
+                )
+            return rows[:limit]
+        except Exception as exc:  # noqa: BLE001 - policy stages never fail a query
+            logger.warning("Evidence taxonomy stage failed, preserving order: %s", exc)
+            return list(documents)[:limit]
+
     def retrieve_documents(self, query: str, ticker: Optional[str],
                            n_results: int) -> list[dict]:
         """Public document retrieval (hybrid + re-rank per config).
 
         Used by ``/search`` so it exposes ``fusion_score`` / ``rerank_score``.
         """
-        return self._retrieve_documents(query, ticker, n_results)
+        documents = self._retrieve_documents(query, ticker, n_results)
+        return self._postprocess_documents(
+            query,
+            documents,
+            {
+                "ticker": ticker,
+                "question_type": "general",
+                "evidence_filters": {"security": ticker} if ticker else {},
+            },
+            limit=n_results,
+        )
 
     def _retrieve_documents(self, query: str, ticker: Optional[str],
                             n_results: int, *, pool: bool = False,
-                            channels: Optional[dict] = None) -> list[dict]:
+                            channels: Optional[dict] = None,
+                            filters: Optional[dict] = None) -> list[dict]:
         """Retrieve relevant documents — hybrid (vector+BM25+RRF, optional
         re-rank) when enabled, else the original vector-only path.
 
@@ -694,8 +810,15 @@ class Retriever:
         if not self.config.enable_lexical:
             candidate_n = max(self.config.rerank_candidates, n_results) if pool else n_results
             start = time.perf_counter()
-            results = self.store.search(query=query, n_results=candidate_n,
-                                        ticker=ticker)
+            try:
+                results = self.store.search(
+                    query=query, n_results=candidate_n, ticker=ticker, filters=filters,
+                )
+            except TypeError:
+                # Compatibility for injected/older Store doubles.
+                results = self.store.search(
+                    query=query, n_results=candidate_n, ticker=ticker,
+                )
             elapsed_ms = (time.perf_counter() - start) * 1000
             chroma = getattr(self.store, "chroma", None)
             search_timings = getattr(chroma, "last_search_timings", {}) or {}
@@ -708,10 +831,11 @@ class Retriever:
             self._doc_retrieval_strategy = "vector"
             return docs
         return self._retrieve_documents_hybrid(
-            query, ticker, n_results, pool=pool, channels=channels)
+            query, ticker, n_results, pool=pool, channels=channels, filters=filters)
 
     def _fuse_channels(self, query: str, ticker: Optional[str],
-                       n_results: int, *, channels: Optional[dict] = None) -> list[dict]:
+                       n_results: int, *, channels: Optional[dict] = None,
+                       filters: Optional[dict] = None) -> list[dict]:
         """Vector + BM25 → RRF → hydrated fused docs (no re-rank, no truncation).
 
         Records the strategy (``hybrid`` when lexical produced hits, else
@@ -736,15 +860,24 @@ class Retriever:
                 if h["id"] not in seen:
                     vector_hits.append(h)
                     seen.add(h["id"])
+        if filters:
+            try:
+                from .evidence_taxonomy import filter_evidence
+
+                vector_hits = filter_evidence(vector_hits, filters)
+            except Exception as exc:  # noqa: BLE001 - preserve vector fallback
+                logger.warning("Vector evidence filtering failed: %s", exc)
 
         # 2. Lexical (BM25) channel — same ticker + broad shape; best-effort.
         lexical_hits: list[dict] = []
         try:
             lexical_hits = self.lexical.search(query=query, k=candidates,
-                                                where=vfilter)
+                                                where=vfilter, filters=filters)
             if ticker:
                 seen = {h["id"] for h in lexical_hits}
-                for h in self.lexical.search(query=query, k=broad_n, where=None):
+                for h in self.lexical.search(
+                    query=query, k=broad_n, where=None, filters=filters,
+                ):
                     if h["id"] not in seen:
                         lexical_hits.append(h)
                         seen.add(h["id"])
@@ -777,13 +910,16 @@ class Retriever:
 
     def _retrieve_documents_hybrid(self, query: str, ticker: Optional[str],
                                    n_results: int, *, pool: bool = False,
-                                   channels: Optional[dict] = None) -> list[dict]:
+                                   channels: Optional[dict] = None,
+                                   filters: Optional[dict] = None) -> list[dict]:
         """Vector + BM25 → RRF → (optional) cross-encoder re-rank → top n.
 
         With ``pool=True`` the full fused candidate pool is returned unranked and
         untruncated (the adaptive orchestrator owns re-ranking/truncation).
         """
-        fused_docs = self._fuse_channels(query, ticker, n_results, channels=channels)
+        fused_docs = self._fuse_channels(
+            query, ticker, n_results, channels=channels, filters=filters,
+        )
         if pool:
             return fused_docs
 

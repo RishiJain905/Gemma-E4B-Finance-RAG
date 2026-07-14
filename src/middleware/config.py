@@ -249,6 +249,16 @@ class MiddlewareConfig:
         self.rerank_candidates: int = 30   # broad retrieve, then re-rank
         self.rerank_top_n: int = 5         # final docs after re-rank
 
+        # Phase 2.3.3.3 — additive stable evidence metadata plus bounded
+        # post-relevance policy ranking/packing. Taxonomy normalization is
+        # additive. Authority can add at most 0.025 and duplicate packing keeps
+        # one primary plus at most two materially different secondaries.
+        self.enable_evidence_taxonomy: bool = True
+        self.enable_authority_ranking: bool = True
+        self.enable_duplicate_coverage_packing: bool = True
+        self.authority_max_boost: float = 0.025
+        self.max_secondary_per_event: int = 2
+
         if config_path.exists():
             self._load_from_file(config_path)
         self._apply_env_overrides()
@@ -258,6 +268,7 @@ class MiddlewareConfig:
         self._clamp_hierarchy_limits()
         self._clamp_graph_limits()
         self._clamp_corpus_limits()
+        self._clamp_evidence_policy()
         self._normalize_answer_validation()
 
     def _load_from_file(self, path: Path):
@@ -303,6 +314,14 @@ class MiddlewareConfig:
         _str("RERANKER_MODEL", "reranker_model")
         _int("RERANK_CANDIDATES", "rerank_candidates")
         _int("RERANK_TOP_N", "rerank_top_n")
+        _bool("ENABLE_EVIDENCE_TAXONOMY", "enable_evidence_taxonomy")
+        _bool("ENABLE_AUTHORITY_RANKING", "enable_authority_ranking")
+        _bool(
+            "ENABLE_DUPLICATE_COVERAGE_PACKING",
+            "enable_duplicate_coverage_packing",
+        )
+        _float("AUTHORITY_MAX_BOOST", "authority_max_boost")
+        _int("MAX_SECONDARY_PER_EVENT", "max_secondary_per_event")
         _bool("ENABLE_TOOLS", "enable_tools")
         _int("MAX_TOOL_ITERATIONS", "max_tool_iterations")
         _bool("ALLOW_WRITE_TOOLS", "allow_write_tools")
@@ -530,3 +549,16 @@ class MiddlewareConfig:
                 value, bounded,
             )
         self.max_corrective_retries = bounded
+
+    def _clamp_evidence_policy(self) -> None:
+        """Clamp Phase 2.3 authority and event-packing policy bounds."""
+        try:
+            authority = float(self.authority_max_boost)
+        except (TypeError, ValueError):
+            authority = 0.025
+        self.authority_max_boost = max(0.0, min(0.025, authority))
+        try:
+            secondary = int(self.max_secondary_per_event)
+        except (TypeError, ValueError):
+            secondary = 2
+        self.max_secondary_per_event = max(0, min(5, secondary))

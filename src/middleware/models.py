@@ -128,6 +128,13 @@ class EvidenceCitation(BaseModel):
     period: Optional[str] = None
     source_url: Optional[str] = None
     support_status: Literal["supported", "missing", "malformed"] = "supported"
+    item_type: Optional[str] = None
+    event_type: Optional[str] = None
+    authority_tier: Optional[str] = None
+    source: Optional[str] = None
+    date_semantics: Optional[dict] = None
+    canonical_security: Optional[str] = None
+    coverage_tier: Optional[str] = None
 
 
 class QueryResponse(BaseModel):

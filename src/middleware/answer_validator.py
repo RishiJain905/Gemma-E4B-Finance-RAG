@@ -97,9 +97,16 @@ class CitationRecord:
     period: Optional[str]
     source_url: Optional[str]
     support_status: str  # supported | missing | malformed
+    item_type: Optional[str] = None
+    event_type: Optional[str] = None
+    authority_tier: Optional[str] = None
+    source: Optional[str] = None
+    date_semantics: Optional[dict] = None
+    canonical_security: Optional[str] = None
+    coverage_tier: Optional[str] = None
 
     def to_dict(self) -> dict:
-        return {
+        data = {
             "evidence_id": self.evidence_id,
             "source_type": self.source_type,
             "ticker": self.ticker,
@@ -108,10 +115,25 @@ class CitationRecord:
             "source_url": self.source_url,
             "support_status": self.support_status,
         }
+        data.update(self._taxonomy_reference())
+        return data
+
+    def _taxonomy_reference(self) -> dict:
+        """Return populated stable taxonomy fields without changing legacy rows."""
+        values = {
+            "item_type": self.item_type,
+            "event_type": self.event_type,
+            "authority_tier": self.authority_tier,
+            "source": self.source,
+            "date_semantics": self.date_semantics,
+            "canonical_security": self.canonical_security,
+            "coverage_tier": self.coverage_tier,
+        }
+        return {key: value for key, value in values.items() if value not in (None, {})}
 
     def graph_reference(self) -> dict:
         """Return the allowlisted provenance fields used by graph citations."""
-        return {
+        data = {
             "evidence_id": self.evidence_id,
             "source_type": self.source_type,
             "ticker": self.ticker,
@@ -119,6 +141,8 @@ class CitationRecord:
             "period": self.period,
             "support_status": self.support_status,
         }
+        data.update(self._taxonomy_reference())
+        return data
 
 
 @dataclass
@@ -394,6 +418,13 @@ def _parse_citations(answer: str, by_id: dict) -> list[CitationRecord]:
                     period=item.period,
                     source_url=item.source_url,
                     support_status="supported",
+                    item_type=item.item_type,
+                    event_type=item.event_type,
+                    authority_tier=item.authority_tier,
+                    source=item.source or item.source_type,
+                    date_semantics=dict(item.date_semantics),
+                    canonical_security=item.canonical_security,
+                    coverage_tier=item.coverage_tier,
                 ))
             else:
                 records.append(CitationRecord(

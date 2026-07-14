@@ -248,7 +248,9 @@ def _doc_identities(doc: dict) -> list[tuple]:
 
 
 def _doc_score(doc: dict) -> float:
-    score = doc.get("rerank_score")
+    score = doc.get("ranking_score")
+    if score is None:
+        score = doc.get("rerank_score")
     if score is None:
         score = doc.get("fusion_score")
     try:
@@ -335,9 +337,42 @@ class ContextBudget:
             _pack_fact(f)
 
         # ── Documents: dedupe (any independent identity), drop blanks ──
+        # Apply policy at the final context boundary. Candidate retrieval stays
+        # complete and untruncated for adaptive merge and obligation coverage.
+        policy_documents = list(documents)
+        try:
+            from .evidence_taxonomy import normalize_evidence, pack_event_coverage, rank_evidence
+
+            taxonomy_enabled = bool(getattr(self.config, "enable_evidence_taxonomy", True))
+            ranking_enabled = bool(getattr(self.config, "enable_authority_ranking", True))
+            packing_enabled = bool(
+                getattr(self.config, "enable_duplicate_coverage_packing", True)
+            )
+            if taxonomy_enabled or ranking_enabled or packing_enabled:
+                policy_documents = [normalize_evidence(row) for row in policy_documents]
+            if ranking_enabled:
+                policy_documents = rank_evidence(
+                    policy_documents,
+                    query=plan.retrieval_query,
+                    filters=dict(getattr(plan, "evidence_filters", {}) or {}),
+                    authority_max_boost=max(0.0, min(0.025, float(
+                        getattr(self.config, "authority_max_boost", 0.025)
+                    ))),
+                )
+            if packing_enabled:
+                policy_documents = pack_event_coverage(
+                    policy_documents,
+                    limit=len(policy_documents),
+                    max_secondary_per_event=int(
+                        getattr(self.config, "max_secondary_per_event", 2)
+                    ),
+                )
+        except Exception:  # noqa: BLE001 - evidence policy is fail-soft
+            logger.warning("Final evidence policy failed; preserving merged pool", exc_info=True)
+
         seen: set = set()
         deduped: list[dict] = []
-        for d in documents:
+        for d in policy_documents:
             if not isinstance(d, dict):
                 continue
             if not document_body(d):

@@ -223,8 +223,15 @@ class EvidenceItem:
     period: Optional[str] = None
     as_of: Optional[str] = None
     source_type: Optional[str] = None
+    source: Optional[str] = None
     source_url: Optional[str] = None
     freshness: Optional[str] = None
+    item_type: Optional[str] = None
+    event_type: Optional[str] = None
+    authority_tier: Optional[str] = None
+    date_semantics: dict = field(default_factory=dict)
+    canonical_security: Optional[str] = None
+    coverage_tier: Optional[str] = None
     document: str = ""
     parent_id: Optional[str] = None
     section: Optional[str] = None
@@ -237,6 +244,12 @@ class EvidenceItem:
     @classmethod
     def from_row(cls, row: dict, *, kind: str) -> "EvidenceItem":
         """Build an item from a retrieval fact/document row."""
+        try:
+            from .evidence_taxonomy import normalize_evidence
+
+            row = normalize_evidence(row)
+        except Exception:  # noqa: BLE001 - additive metadata is fail-soft
+            logger.warning("Evidence taxonomy normalization failed", exc_info=True)
         metadata = row.get("metadata") or {}
         raw_entities = evidence_field(row, "entities")
         if isinstance(raw_entities, (list, tuple, set)):
@@ -260,8 +273,21 @@ class EvidenceItem:
             period=evidence_field(row, "period"),
             as_of=evidence_field(row, "as_of"),
             source_type=evidence_field(row, "source_type", evidence_field(row, "source")),
+            source=evidence_field(row, "source", evidence_field(row, "source_name")),
             source_url=evidence_field(row, "source_url", evidence_field(row, "url")),
             freshness=evidence_field(row, "freshness_status", evidence_field(row, "freshness")),
+            item_type=evidence_field(row, "item_type"),
+            event_type=evidence_field(row, "event_type"),
+            authority_tier=evidence_field(
+                row, "authority_tier", evidence_field(row, "evidence_authority")
+            ),
+            date_semantics=dict(evidence_field(row, "date_semantics", {}) or {}),
+            canonical_security=evidence_field(
+                row, "canonical_security", evidence_field(row, "ticker")
+            ),
+            coverage_tier=evidence_field(
+                row, "coverage_tier", evidence_field(row, "discovery_scope")
+            ),
             document=document_body(row),
             parent_id=metadata.get("parent_id") or row.get("parent_id"),
             section=metadata.get("section") or metadata.get("section_title"),
@@ -286,8 +312,15 @@ class EvidenceItem:
             "period": self.period,
             "as_of": self.as_of,
             "source_type": self.source_type,
+            "source": self.source,
             "source_url": self.source_url,
             "freshness": self.freshness,
+            "item_type": self.item_type,
+            "event_type": self.event_type,
+            "authority_tier": self.authority_tier,
+            "date_semantics": dict(self.date_semantics),
+            "canonical_security": self.canonical_security,
+            "coverage_tier": self.coverage_tier,
             "parent_id": self.parent_id,
             "section": self.section,
             "chunk_index": self.chunk_index,
@@ -295,6 +328,18 @@ class EvidenceItem:
             "scores": dict(self.scores),
             "operands": list(self.operands),
             "formula": self.formula,
+        }
+
+    def taxonomy_metadata(self) -> dict:
+        """Return the shared prompt/citation/graph taxonomy projection."""
+        return {
+            "item_type": self.item_type,
+            "event_type": self.event_type,
+            "authority_tier": self.authority_tier,
+            "source": self.source or self.source_type,
+            "date_semantics": dict(self.date_semantics),
+            "canonical_security": self.canonical_security,
+            "coverage_tier": self.coverage_tier,
         }
 
 

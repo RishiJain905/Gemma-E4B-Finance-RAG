@@ -295,6 +295,60 @@ class IntentParser:
         re.IGNORECASE,
     )
 
+    _EVIDENCE_TOPIC_PATTERNS = (
+        ("financing", re.compile(
+            r"\b(financ(?:e|ed|ing)|debt raise|raise(?:d|s|ing)? (?:debt|capital)|"
+            r"equity offering|convertible offering|shelf registration|prospectus)\b", re.I)),
+        ("corporate_action", re.compile(
+            r"\b(corporate actions?|buybacks?|repurchases?|dividends?|stock splits?|"
+            r"acqui(?:re[ds]?|sitions?)|mergers?|divest(?:ed|itures?)|dispositions?)\b", re.I)),
+        ("ownership", re.compile(
+            r"\b(beneficial ownership|ownership changes?|insider transactions?|"
+            r"schedule 13[DG]|form [345])\b", re.I)),
+        ("regulatory", re.compile(
+            r"\b(regulatory|regulator|enforcement|investigation|recall|safety alert)\b", re.I)),
+        ("macro_release", re.compile(
+            r"\b(inflation|cpi|gdp|jobs report|payroll|unemployment|economic release|"
+            r"policy decision|rate decision|treasury auction)\b", re.I)),
+        ("company_news", re.compile(
+            r"\b(company news|press release|latest news|recent news|what happened)\b", re.I)),
+    )
+
+    _EVIDENCE_TOPIC_FILTERS = {
+        "financing": {
+            "item_type": "filing",
+            "event_types": [
+                "debt_raise", "equity_raise", "convertible_offering",
+                "shelf_registration", "prospectus_update",
+            ],
+        },
+        "corporate_action": {
+            "item_type": "corporate_action",
+            "event_types": [
+                "acquisition", "divestiture", "buyback", "dividend_change",
+                "split", "dividend", "corporate_action",
+            ],
+        },
+        "ownership": {
+            "item_type": "filing",
+            "event_types": ["beneficial_ownership_change", "insider_transaction"],
+        },
+        "regulatory": {
+            "item_type": "regulatory_event",
+            "event_types": ["enforcement_action", "investigation", "recall", "safety_alert"],
+            "source_categories": ["sec", "regulator", "sector_agency"],
+        },
+        "macro_release": {
+            "item_type": "economic_release",
+            "event_types": ["economic_release", "monetary_policy_decision", "treasury_auction"],
+            "source_categories": ["central_bank", "treasury", "economic_agency"],
+        },
+        "company_news": {
+            "item_type": "news",
+            "source_categories": ["issuer", "company_news"],
+        },
+    }
+
     def __init__(self, resolver: Optional["SymbolResolver"] = None):
         from .symbol_resolver import NO_MATCH, get_default_resolver
 
@@ -345,6 +399,7 @@ class IntentParser:
             ticker = self._detect_ticker(question)
             ticker_resolution = self._last_resolution
 
+        evidence_topic, evidence_filters = self._extract_evidence_intent(question)
         intent = {
             "ticker": ticker,
             "metrics": self._extract_metrics(question),
@@ -355,6 +410,8 @@ class IntentParser:
             "ticker_confidence": ticker_resolution.confidence,
             "resolved_name": ticker_resolution.resolved_name,
             "ticker_source": ticker_resolution.source,
+            "evidence_topic": evidence_topic,
+            "evidence_filters": evidence_filters,
         }
         logger.debug(
             "Parsed intent: ticker=%s type=%s metrics=%s timeframe=%s",
@@ -394,6 +451,7 @@ class IntentParser:
         primary_intent = intents[0]
         metrics = self._extract_metrics(match_text)
         periods = self._extract_all_timeframes(match_text)
+        evidence_topic, evidence_filters = self._extract_evidence_intent(match_text)
 
         reason_codes = self._plan_reason_codes(
             entities, intents, metrics, periods, override_ticker
@@ -424,6 +482,8 @@ class IntentParser:
             primary_intent=primary_intent,
             primary_period=self._extract_timeframe(match_text),
             primary_period_type=self._extract_timeframe_type(match_text),
+            evidence_topic=evidence_topic,
+            evidence_filters=evidence_filters,
             reason_codes=reason_codes,
         )
         plan.validate()
@@ -555,6 +615,19 @@ class IntentParser:
         if not modes:
             modes.append("documents")
         return tuple(dict.fromkeys(modes))
+
+    def _extract_evidence_intent(self, text: str) -> tuple[Optional[str], dict]:
+        """Return provider-independent finance evidence routing facets."""
+        topic = next((name for name, pattern in self._EVIDENCE_TOPIC_PATTERNS if pattern.search(text)), None)
+        filters = dict(self._EVIDENCE_TOPIC_FILTERS.get(topic, {}))
+        years = re.findall(r"\b(?:19|20)\d{2}\b", text)
+        if years:
+            filters["as_of"] = f"{years[0]}-12-31"
+        if re.search(r"\b(latest|newest|current|recent|today)\b", text, re.I):
+            filters["recency"] = "strong"
+        elif re.search(r"\b(historical|history)\b", text, re.I) or years:
+            filters["recency"] = "weak"
+        return topic, filters
 
     @staticmethod
     def _plan_reason_codes(
