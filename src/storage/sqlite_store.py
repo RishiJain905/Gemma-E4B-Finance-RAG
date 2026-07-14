@@ -87,6 +87,31 @@ class SQLiteStore:
             for column, statement in migrations.items():
                 if column not in existing:
                     conn.execute(statement)
+            conn.execute(
+                """CREATE TABLE IF NOT EXISTS source_cursors (
+                    source TEXT NOT NULL,
+                    partition_key TEXT NOT NULL,
+                    cursor_value TEXT,
+                    cursor_type TEXT NOT NULL DEFAULT 'none',
+                    overlap_value TEXT,
+                    last_successful_run_id TEXT,
+                    version TEXT NOT NULL DEFAULT '1',
+                    status TEXT NOT NULL DEFAULT 'unknown',
+                    error_class TEXT,
+                    error_message TEXT,
+                    retry_after REAL,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY (source, partition_key)
+                )"""
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_source_cursors_status "
+                "ON source_cursors(source, status, updated_at)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_corpus_observations_market_key "
+                "ON corpus_observations(source_name, metric_id, period_end, tickers_json)"
+            )
             conn.commit()
 
     @staticmethod
@@ -177,6 +202,25 @@ CREATE TABLE IF NOT EXISTS store_revision (
     updated_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 INSERT OR IGNORE INTO store_revision (id, revision) VALUES (1, 0);
+
+-- -- Incremental source cursors (2.3.2/2.3.4 forward-compatible seam) -----
+CREATE TABLE IF NOT EXISTS source_cursors (
+    source TEXT NOT NULL,
+    partition_key TEXT NOT NULL,
+    cursor_value TEXT,
+    cursor_type TEXT NOT NULL DEFAULT 'none',
+    overlap_value TEXT,
+    last_successful_run_id TEXT,
+    version TEXT NOT NULL DEFAULT '1',
+    status TEXT NOT NULL DEFAULT 'unknown',
+    error_class TEXT,
+    error_message TEXT,
+    retry_after REAL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (source, partition_key)
+);
+CREATE INDEX IF NOT EXISTS idx_source_cursors_status
+    ON source_cursors(source, status, updated_at);
 
 -- ── Ingestion Log ──────────────────────────────────
 CREATE TABLE IF NOT EXISTS ingestion_log (
@@ -1231,8 +1275,20 @@ CREATE INDEX IF NOT EXISTS idx_corpus_events_type_effective
         }
         with self._connect() as conn:
             existing = None
-            if record.provider_record_id:
+            if record.source_category == "market_data" and record.tickers:
                 existing = conn.execute(
+                    "SELECT * FROM corpus_observations WHERE source_name=? "
+                    "AND metric_id=? AND period_end=? AND tickers_json=? "
+                    "ORDER BY updated_at DESC LIMIT 1",
+                    (
+                        record.source_name,
+                        record.metric_id,
+                        record.period_end,
+                        values["tickers_json"],
+                    ),
+                ).fetchone()
+            if record.provider_record_id:
+                existing = existing or conn.execute(
                     "SELECT * FROM corpus_observations WHERE source_name=? "
                     "AND provider_record_id=?",
                     (record.source_name, record.provider_record_id),
@@ -1294,6 +1350,114 @@ CREATE INDEX IF NOT EXISTS idx_corpus_events_type_effective
             return int(conn.execute(
                 "SELECT COUNT(*) FROM corpus_observations"
             ).fetchone()[0])
+
+    # -- Incremental source cursors -----------------------------------------
+
+    def get_source_cursor_state(
+        self, source: str, partition_key: str,
+    ) -> Optional[dict]:
+        """Return one cursor/status row without conflating it with freshness."""
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM source_cursors WHERE source=? AND partition_key=?",
+                (str(source), str(partition_key)),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def get_source_cursor(self, source: str, partition_key: str) -> Optional[str]:
+        """Return the last committed cursor value for one source partition."""
+        state = self.get_source_cursor_state(source, partition_key)
+        return str(state["cursor_value"]) if state and state.get("cursor_value") is not None else None
+
+    def set_source_cursor(
+        self,
+        source: str,
+        partition_key: str,
+        cursor_value: Optional[str],
+        *,
+        cursor_type: str = "none",
+        overlap_value: Optional[str] = None,
+        last_successful_run_id: Optional[str] = None,
+        version: str = "1",
+        status: str = "success",
+        error_class: Optional[str] = None,
+        error_message: Optional[str] = None,
+        retry_after: Optional[float] = None,
+    ) -> dict:
+        """Upsert a committed cursor and its bounded source status metadata."""
+        source = str(source or "").strip()
+        partition_key = str(partition_key or "").strip()
+        cursor_type = str(cursor_type or "none").strip()
+        status = str(status or "unknown").strip()
+        if not source or not partition_key:
+            raise ValueError("source and partition_key are required")
+        if cursor_value is not None:
+            cursor_value = str(cursor_value)
+        if overlap_value is not None:
+            overlap_value = str(overlap_value)
+        if error_message is not None:
+            error_message = str(error_message)[:2_000]
+        with self._connect() as conn:
+            conn.execute(
+                """INSERT INTO source_cursors (
+                    source, partition_key, cursor_value, cursor_type,
+                    overlap_value, last_successful_run_id, version, status,
+                    error_class, error_message, retry_after, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(source, partition_key) DO UPDATE SET
+                    cursor_value=excluded.cursor_value,
+                    cursor_type=excluded.cursor_type,
+                    overlap_value=excluded.overlap_value,
+                    last_successful_run_id=excluded.last_successful_run_id,
+                    version=excluded.version,
+                    status=excluded.status,
+                    error_class=excluded.error_class,
+                    error_message=excluded.error_message,
+                    retry_after=excluded.retry_after,
+                    updated_at=excluded.updated_at""",
+                (
+                    source,
+                    partition_key,
+                    cursor_value,
+                    cursor_type,
+                    overlap_value,
+                    last_successful_run_id,
+                    str(version or "1"),
+                    status,
+                    error_class,
+                    error_message,
+                    retry_after,
+                    datetime.now(timezone.utc).isoformat(),
+                ),
+            )
+            conn.commit()
+        return self.get_source_cursor_state(source, partition_key) or {}
+
+    def set_source_status(
+        self,
+        source: str,
+        partition_key: str,
+        status: str,
+        *,
+        error_class: Optional[str] = None,
+        error_message: Optional[str] = None,
+        retry_after: Optional[float] = None,
+    ) -> dict:
+        """Persist a source capability state while retaining its last cursor."""
+        previous = self.get_source_cursor_state(source, partition_key) or {}
+        return self.set_source_cursor(
+            source,
+            partition_key,
+            previous.get("cursor_value"),
+            cursor_type=str(previous.get("cursor_type") or "none"),
+            overlap_value=previous.get("overlap_value"),
+            last_successful_run_id=previous.get("last_successful_run_id"),
+            version=str(previous.get("version") or "1"),
+            status=status,
+            error_class=error_class,
+            error_message=error_message,
+            retry_after=retry_after,
+        )
 
     def upsert_event_record(self, record: EventRecord) -> dict:
         """Atomically upsert one event and all item/security relationships."""

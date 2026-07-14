@@ -524,6 +524,66 @@ class Store:
         """Persist a structured event and its item/security links."""
         return self.sqlite.upsert_event_record(record)
 
+    # -- Incremental source cursors -----------------------------------------
+
+    def get_source_cursor_state(self, source: str, partition_key: str) -> Optional[dict]:
+        """Read source cursor/status state through the persistence facade."""
+        return self.sqlite.get_source_cursor_state(source, partition_key)
+
+    def get_source_cursor(self, source: str, partition_key: str) -> Optional[str]:
+        """Read the last committed source cursor for one logical partition."""
+        return self.sqlite.get_source_cursor(source, partition_key)
+
+    def set_source_cursor(
+        self,
+        source: str,
+        partition_key: str,
+        cursor_value: Optional[str],
+        *,
+        cursor_type: str = "none",
+        overlap_value: Optional[str] = None,
+        last_successful_run_id: Optional[str] = None,
+        version: str = "1",
+        status: str = "success",
+        error_class: Optional[str] = None,
+        error_message: Optional[str] = None,
+        retry_after: Optional[float] = None,
+    ) -> dict:
+        """Commit a source cursor and its bounded status metadata."""
+        return self.sqlite.set_source_cursor(
+            source,
+            partition_key,
+            cursor_value,
+            cursor_type=cursor_type,
+            overlap_value=overlap_value,
+            last_successful_run_id=last_successful_run_id,
+            version=version,
+            status=status,
+            error_class=error_class,
+            error_message=error_message,
+            retry_after=retry_after,
+        )
+
+    def set_source_status(
+        self,
+        source: str,
+        partition_key: str,
+        status: str,
+        *,
+        error_class: Optional[str] = None,
+        error_message: Optional[str] = None,
+        retry_after: Optional[float] = None,
+    ) -> dict:
+        """Persist a source status without changing its last committed cursor."""
+        return self.sqlite.set_source_status(
+            source,
+            partition_key,
+            status,
+            error_class=error_class,
+            error_message=error_message,
+            retry_after=retry_after,
+        )
+
     def save_document(self,
                       document_id: str,
                       text: str,
@@ -1036,6 +1096,9 @@ class Store:
     FRESHNESS_SOURCES = {
         "yfinance_fundamentals": {"cache_source": "yfinance_fundamentals", "ttl_key": "fundamentals"},
         "yfinance_news":         {"cache_source": "yfinance_news",         "ttl_key": "news"},
+        "finnhub_news":          {"cache_source": "finnhub_news",          "ttl_key": "finnhub_news"},
+        "massive_market":        {"cache_source": "massive_market",        "ttl_key": "massive_market"},
+        "massive_actions":       {"cache_source": "massive_actions",       "ttl_key": "massive_actions"},
         "sec_filings":           {"cache_source": "sec_filings_discovery", "ttl_key": "sec_filings"},
         "sec_companyfacts":      {"cache_source": "sec_companyfacts",      "ttl_key": "sec_companyfacts"},
         "gdelt_news":            {"cache_source": "gdelt_news",            "ttl_key": "gdelt_news"},
@@ -1047,6 +1110,7 @@ class Store:
     _DEFAULT_TTLS = {
         "fundamentals": 24, "news": 6, "macro": 24, "sec_filings": 12,
         "sec_companyfacts": 24,
+        "finnhub_news": 6, "massive_market": 24, "massive_actions": 24,
         "gdelt_news": 6, "transcripts": 168, "ir_pages": 24, "estimates": 24,
     }
 

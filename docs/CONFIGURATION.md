@@ -16,12 +16,17 @@ defaults.
 |----------|--------------|---------|-------|
 | `FRED_API_KEY` | FRED macro ingestion | `src/macros/fred_ingestor.py` | Resolution order: constructor arg → value of the `${FRED_API_KEY}` placeholder in `configs/fred.yaml` → `FRED_API_KEY` env var. Get a free key at <https://fred.stlouisfed.org/docs/api/api_key.html>. |
 | `SEC_EDGAR_USER_AGENT` | SEC EDGAR access | `src/sec/edgar_fetcher.py` | SEC requires a descriptive User-Agent (name + contact email). Resolution order: constructor arg → `SEC_EDGAR_USER_AGENT` env var → `sec.user_agent` in `configs/storage.yaml` → built-in default. |
+| `FINNHUB_API_KEY` | Finnhub company news | `src/ingestion/finnhub_ingestor.py` | Missing or invalid credentials disable only the Finnhub news capability; the adapter never crawls publisher URLs. |
+| `MASSIVE_API_KEY` | Massive grouped market data/actions | `src/ingestion/massive_ingestor.py` | Missing or limited entitlements disable only the affected Massive capability. Grouped US market data remains one request per market date. |
+| `TWELVE_DATA_API_KEY` | Optional Twelve Data fallback | Future optional adapter | Disabled unless explicitly configured; it is not used as a required Massive fallback. |
 
 Example `.env`:
 
 ```
 FRED_API_KEY=your_fred_api_key_here
 SEC_EDGAR_USER_AGENT=Your Name your.email@example.com
+FINNHUB_API_KEY=your_finnhub_api_key_here
+MASSIVE_API_KEY=your_massive_api_key_here
 ```
 
 ---
@@ -460,6 +465,24 @@ sources:
     enabled: true
     scopes: [broad]
     capabilities: [sec_event_discovery]
+  finnhub:
+    enabled: true
+    optional: true
+    required_env: FINNHUB_API_KEY
+    scopes: [broad]
+    capabilities: [company_news]
+  massive:
+    enabled: true
+    optional: true
+    required_env: MASSIVE_API_KEY
+    scopes: [broad]
+    capabilities: [market_summary, corporate_actions, company_news, vendor_filing_metadata]
+  twelve_data:
+    enabled: false
+    optional: true
+    required_env: TWELVE_DATA_API_KEY
+    scopes: [broad]
+    capabilities: [market_summary]
   sec_filing_text:
     enabled: true
     scopes: [deep]
@@ -483,7 +506,8 @@ sources:
 | `sources.<name>.sector_rules` | Named sector rules applied by a sector-scoped source. |
 | `sources.<name>.capabilities` | Safe capability labels exposed by policy explanations. |
 
-Default policy keeps SEC event discovery and Yahoo market/news work broad;
+Default policy keeps SEC event discovery, Finnhub company news, and Massive
+market/corporate-action work broad;
 full filing text, CompanyFacts, IR pages, transcripts, estimates, and optional
 GDELT work deep; FRED global; and future openFDA/NHTSA/USAspending adapters
 disabled and bounded to their configured sector rules. Universe-provider
@@ -516,6 +540,9 @@ macro_tickers: [SPY, QQQ, TLT, GLD]
 schedule:
   fundamentals: 24    # Re-fetch fundamentals daily
   news: 6             # Re-fetch news every 6 hours
+  finnhub_news: 6     # Re-fetch Finnhub publication windows every 6 hours
+  massive_market: 24  # Re-fetch grouped US market summaries daily
+  massive_actions: 24 # Re-fetch splits/dividends daily
   macro: 24           # Macro indicators daily
   sec_filings: 12     # Check for new SEC filings every 12 hours
   gdelt_news: 6       # GDELT global news every 6 hours
@@ -529,6 +556,32 @@ schedule:
 | `extended` | Deprecated compatibility mirror of `coverage.yaml -> broad.additions`. |
 | `macro_tickers` | Market-proxy ETFs fetched but not tied to a single company. |
 | `schedule.<key>` | TTL in **hours** per logical source. Keys map to sources via `Store.FRESHNESS_SOURCES` and `UnifiedScheduler.SOURCES`. |
+
+Finnhub publication cursors are stored per ticker in SQLite `source_cursors`
+under `finnhub_news`; the adapter refetches a bounded overlap window and only
+advances the cursor after accepted rows have been stored. Massive market
+cursors are stored under `massive_market/US` and use a market-date overlap.
+`cache_meta` freshness and `source_cursors` progress are intentionally separate.
+
+### Company news, market data, and corporate actions (2.3.2.2)
+
+`FinnhubIngestor` stores only provider-supplied headline, summary, publisher,
+URL, publication timestamp, and provider identity through `Store.upsert_narrative`.
+The existing provider-identity → canonical-URL → conservative headline-window
+deduplication preserves syndicated provider origins on the surviving corpus item.
+
+`MassiveIngestor` calls the grouped US daily summary endpoint once per market
+date and filters the response against the active broad universe locally. OHLCV
+rows are `ObservationRecord` values in SQLite and are never sent to Chroma;
+corrected bars replace the same symbol/metric/market-date row. Splits and
+dividends are `EventRecord` values with applicable declaration, ex, record, and
+payable dates retained in bounded metadata.
+
+Provider states are explicit: `disabled_missing_key`,
+`disabled_authentication`, `disabled_entitlement`, `rate_limited`, `partial`,
+and `error`. Entitlement/authentication states are non-retryable and capability
+local. Yahoo remains a soft fallback/cross-check; SEC remains authoritative for
+filings; Twelve Data remains disabled unless a later source policy enables it.
 
 ---
 

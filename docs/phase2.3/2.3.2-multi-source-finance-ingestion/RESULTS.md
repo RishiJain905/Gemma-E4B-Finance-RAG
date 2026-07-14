@@ -1,5 +1,50 @@
 # 2.3.2 — Multi-Source Finance Ingestion — Results
 
+## 2.3.2.2 Company News, Market Data, and Corporate Actions
+
+**Implemented:** 2026-07-14, branch `phase-2.3.2`, gpt-5.6-luna (effort max) via Codex, orchestrated by Claude (Fable 5).
+
+### Setup
+
+- `src/ingestion/finnhub_ingestor.py`: company news since the stored per-ticker
+  cursor with overlap window; only provider-supplied
+  headline/summary/source/URL/timestamp/ids stored; cursor advances only after
+  successful storage; pagination inside the adapter; no publisher crawling.
+- `src/ingestion/massive_ingestor.py`: grouped US daily market summary — one
+  request per day, filtered locally to the active broad universe (never
+  per-ticker price polling); splits/dividends as structured `EventRecord`s with
+  effective/ex/payable/record dates; optional news as secondary dedupe input;
+  vendor filing metadata secondary to SEC.
+- Entitlement mapping: missing key → `disabled_missing_key` (no request);
+  401 → `disabled_authentication`; plan/403 → `disabled_entitlement` (never
+  retried as transient); 429 → bounded retry honoring `Retry-After` with cursor
+  unchanged on exhaustion; malformed/partial rows isolated. All exercised
+  offline.
+- OHLCV persisted as SQLite observations with adjusted state, market date,
+  provider, accessed time, revision metadata; corrected bars upsert without
+  duplicate dates; **never embedded**. News dedup reuses the 2.3.3.1 layered
+  machinery; syndicated duplicates keep both provider origins.
+- Fallback order: SEC authoritative for filings; Massive preferred grouped
+  market source; Yahoo soft fallback/cross-check; Twelve Data disabled unless
+  configured.
+
+### Regression gate
+
+Focused 13 passed; full offline suite 1,462 passed / 1 skipped / 8 deselected;
+ruff clean; `scripts/verify.ps1` → **VERIFY: PASS** (implementer + independent
+orchestrator re-run).
+
+### Caveats
+
+- Scheduler registration of the two new adapters is deliberately deferred to
+  Phase 2.3.4 (refresh orchestration) per the phase build order — adapters are
+  callable and fully tested but not yet on a cadence.
+
+### Decision
+
+**Ship.** Ingestion adapters only; no retrieval/prompt change, no answer
+regression path. Rollback = revert the task commit.
+
 ## 2.3.2.1 SEC Event and Capital-Markets Ingestion
 
 **Implemented:** 2026-07-14, branch `phase-2.3.2`, gpt-5.6-sol (effort high) via Codex, orchestrated by Claude (Fable 5).

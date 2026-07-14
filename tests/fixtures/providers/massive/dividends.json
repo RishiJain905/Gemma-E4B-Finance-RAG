@@ -1,0 +1,16 @@
+{
+  "status": "OK",
+  "results": [
+    {
+      "id": "div-1",
+      "ticker": "BBB",
+      "declaration_date": "2026-07-01",
+      "ex_dividend_date": "2026-07-15",
+      "record_date": "2026-07-16",
+      "pay_date": "2026-07-31",
+      "cash_amount": 0.5,
+      "currency": "USD",
+      "frequency": "quarterly"
+    }
+  ]
+}
