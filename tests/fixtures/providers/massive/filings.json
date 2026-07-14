@@ -1,0 +1,15 @@
+{
+  "status": "OK",
+  "results": [
+    {
+      "id": "filing-1",
+      "ticker": "AAA",
+      "filing_type": "8-K",
+      "accession_number": "0000000000-26-000001",
+      "filing_date": "2026-07-14",
+      "title": "Alpha files a current report",
+      "summary": "Alpha filed a current report.",
+      "url": "https://filings.example/alpha-1"
+    }
+  ]
+}

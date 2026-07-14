@@ -432,6 +432,50 @@ class Store:
         """Resolve canonical, vendor, or historical security symbols."""
         return self.sqlite.resolve_security(symbol, provider=provider, as_of=as_of)
 
+    def resolve_exact_security(self, identifier: str) -> Optional[dict]:
+        """Resolve one exact registry identity; ambiguous names never attach."""
+        return self.sqlite.resolve_exact_security(identifier)
+
+    def register_security_alias(
+        self,
+        security_id: str,
+        alias: str,
+        *,
+        alias_type: str = "issuer_alias",
+        provider: Optional[str] = None,
+        source: str = "registry",
+    ) -> bool:
+        """Register an exact issuer, manufacturer, or recipient UEI identity."""
+        return self.sqlite.register_security_alias(
+            security_id,
+            alias,
+            alias_type=alias_type,
+            provider=provider,
+            source=source,
+        )
+
+    add_security_alias = register_security_alias
+
+    def list_observations(
+        self,
+        *,
+        source_name: Optional[str] = None,
+        metric_id: Optional[str] = None,
+        period_end: Optional[str] = None,
+        vintage_at: Optional[str] = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> list[dict]:
+        """List structured observations through the Store facade, including vintages."""
+        return self.sqlite.list_observations(
+            source_name=source_name,
+            metric_id=metric_id,
+            period_end=period_end,
+            vintage_at=vintage_at,
+            limit=limit,
+            offset=offset,
+        )
+
     def list_memberships(
         self,
         security_id: Optional[str] = None,
@@ -493,7 +537,7 @@ class Store:
             chroma_metadata["sectors"] = ",".join(record.sectors)
 
         try:
-            if result["content_changed"]:
+            if result["content_changed"] or result.get("authority_promoted"):
                 self.chroma.delete_document(item_id)
                 self.chroma.delete_filing_section_family(item_id)
             self.chroma.add_document(
@@ -523,6 +567,66 @@ class Store:
     def upsert_event(self, record: EventRecord) -> dict:
         """Persist a structured event and its item/security links."""
         return self.sqlite.upsert_event_record(record)
+
+    # -- Incremental source cursors -----------------------------------------
+
+    def get_source_cursor_state(self, source: str, partition_key: str) -> Optional[dict]:
+        """Read source cursor/status state through the persistence facade."""
+        return self.sqlite.get_source_cursor_state(source, partition_key)
+
+    def get_source_cursor(self, source: str, partition_key: str) -> Optional[str]:
+        """Read the last committed source cursor for one logical partition."""
+        return self.sqlite.get_source_cursor(source, partition_key)
+
+    def set_source_cursor(
+        self,
+        source: str,
+        partition_key: str,
+        cursor_value: Optional[str],
+        *,
+        cursor_type: str = "none",
+        overlap_value: Optional[str] = None,
+        last_successful_run_id: Optional[str] = None,
+        version: str = "1",
+        status: str = "success",
+        error_class: Optional[str] = None,
+        error_message: Optional[str] = None,
+        retry_after: Optional[float] = None,
+    ) -> dict:
+        """Commit a source cursor and its bounded status metadata."""
+        return self.sqlite.set_source_cursor(
+            source,
+            partition_key,
+            cursor_value,
+            cursor_type=cursor_type,
+            overlap_value=overlap_value,
+            last_successful_run_id=last_successful_run_id,
+            version=version,
+            status=status,
+            error_class=error_class,
+            error_message=error_message,
+            retry_after=retry_after,
+        )
+
+    def set_source_status(
+        self,
+        source: str,
+        partition_key: str,
+        status: str,
+        *,
+        error_class: Optional[str] = None,
+        error_message: Optional[str] = None,
+        retry_after: Optional[float] = None,
+    ) -> dict:
+        """Persist a source status without changing its last committed cursor."""
+        return self.sqlite.set_source_status(
+            source,
+            partition_key,
+            status,
+            error_class=error_class,
+            error_message=error_message,
+            retry_after=retry_after,
+        )
 
     def save_document(self,
                       document_id: str,
@@ -918,12 +1022,47 @@ class Store:
 
     def register_filing(self, ticker: str, filing_type: str,
                         filing_date: str, period: str,
-                        accession: str, source_url: str) -> bool:
+                        accession: str, source_url: str, *,
+                        cik: Optional[str] = None,
+                        primary_document: Optional[str] = None,
+                        discovery_scope: str = "deep",
+                        items: Optional[list[str]] = None,
+                        exhibits: Optional[list[dict]] = None) -> bool:
         """Register a filing as received (before parsing)."""
+        metadata = {}
+        if cik is not None:
+            metadata["cik"] = cik
+        if primary_document is not None:
+            metadata["primary_document"] = primary_document
+        if discovery_scope != "deep":
+            metadata["discovery_scope"] = discovery_scope
+        if items is not None:
+            metadata["items"] = items
+        if exhibits is not None:
+            metadata["exhibits"] = exhibits
         return self.sqlite.register_filing(
             ticker, filing_type, filing_date, period,
-            accession, source_url
+            accession, source_url,
+            **metadata,
         )
+
+    def register_sec_daily_index(
+        self, index_date: str, source_url: str, filings: list[dict],
+    ) -> dict[str, object]:
+        """Atomically register a filtered daily index and advance its cursor."""
+        return self.sqlite.register_sec_daily_index(index_date, source_url, filings)
+
+    def register_sec_filings(self, filings: list[dict]) -> int:
+        """Atomically register a normalized SEC filing batch."""
+        return self.sqlite.register_sec_filings(filings)
+
+    def get_sec_daily_index_status(self, index_date: str) -> Optional[str]:
+        """Return the processed status for one SEC daily index date."""
+        return self.sqlite.get_sec_daily_index_status(index_date)
+
+    def get_sec_daily_index_cursor(self) -> Optional[str]:
+        """Return the latest fully committed SEC daily-index date."""
+        return self.sqlite.get_sec_daily_index_cursor()
 
     def process_filing(self, filing_record: dict,
                        extracted_text: str,
@@ -1001,6 +1140,9 @@ class Store:
     FRESHNESS_SOURCES = {
         "yfinance_fundamentals": {"cache_source": "yfinance_fundamentals", "ttl_key": "fundamentals"},
         "yfinance_news":         {"cache_source": "yfinance_news",         "ttl_key": "news"},
+        "finnhub_news":          {"cache_source": "finnhub_news",          "ttl_key": "finnhub_news"},
+        "massive_market":        {"cache_source": "massive_market",        "ttl_key": "massive_market"},
+        "massive_actions":       {"cache_source": "massive_actions",       "ttl_key": "massive_actions"},
         "sec_filings":           {"cache_source": "sec_filings_discovery", "ttl_key": "sec_filings"},
         "sec_companyfacts":      {"cache_source": "sec_companyfacts",      "ttl_key": "sec_companyfacts"},
         "gdelt_news":            {"cache_source": "gdelt_news",            "ttl_key": "gdelt_news"},
@@ -1012,6 +1154,7 @@ class Store:
     _DEFAULT_TTLS = {
         "fundamentals": 24, "news": 6, "macro": 24, "sec_filings": 12,
         "sec_companyfacts": 24,
+        "finnhub_news": 6, "massive_market": 24, "massive_actions": 24,
         "gdelt_news": 6, "transcripts": 168, "ir_pages": 24, "estimates": 24,
     }
 
@@ -1271,6 +1414,7 @@ class Store:
                 DROP TABLE IF EXISTS security_aliases;
                 DROP TABLE IF EXISTS securities;
                 DROP TABLE IF EXISTS fundamentals;
+                DROP TABLE IF EXISTS sec_daily_indexes;
                 DROP TABLE IF EXISTS filings;
                 DROP TABLE IF EXISTS cache_meta;
                 DROP TABLE IF EXISTS ingestion_log;

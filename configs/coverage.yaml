@@ -1,6 +1,6 @@
 # configs/coverage.yaml
 # Source-aware security coverage policy. This file contains no provider credentials.
-revision: "2.3.1.2-r1"
+revision: "2.3.2.3-r1"
 fallback_when_registry_empty: deep
 
 deep:
@@ -42,6 +42,24 @@ sources:
     enabled: true
     scopes: [broad]
     capabilities: [company_news]
+  finnhub:
+    enabled: true
+    optional: true
+    required_env: FINNHUB_API_KEY
+    scopes: [broad]
+    capabilities: [company_news]
+  massive:
+    enabled: true
+    optional: true
+    required_env: MASSIVE_API_KEY
+    scopes: [broad]
+    capabilities: [market_summary, corporate_actions, company_news, vendor_filing_metadata]
+  twelve_data:
+    enabled: false
+    optional: true
+    required_env: TWELVE_DATA_API_KEY
+    scopes: [broad]
+    capabilities: [market_summary]
   sec_filings:
     enabled: true
     scopes: [broad]
@@ -76,18 +94,55 @@ sources:
     scopes: [global]
     capabilities: [official_macro]
 
+  federal_reserve:
+    enabled: true
+    scopes: [global]
+    capabilities: [official_policy, official_releases]
+  treasury:
+    enabled: true
+    scopes: [global]
+    capabilities: [official_rates]
+  bls:
+    enabled: true
+    optional: true
+    required_env: BLS_API_KEY
+    scopes: [global]
+    capabilities: [official_labor_statistics]
+  bea:
+    enabled: true
+    optional: true
+    required_env: BEA_API_KEY
+    scopes: [global]
+    capabilities: [official_national_accounts]
+  eia:
+    enabled: true
+    optional: true
+    required_env: EIA_API_KEY
+    scopes: [global]
+    capabilities: [official_energy_statistics]
+  ny_fed:
+    enabled: true
+    scopes: [global]
+    capabilities: [official_rates, market_operations]
+  cftc:
+    enabled: true
+    scopes: [global]
+    capabilities: [official_positioning]
+
   openfda:
-    enabled: false
+    enabled: true
+    optional: true
+    required_env: OPENFDA_API_KEY
     scopes: [sector]
     sector_rules: [health_care]
     capabilities: [regulatory_events]
   nhtsa:
-    enabled: false
+    enabled: true
     scopes: [sector]
     sector_rules: [automotive]
     capabilities: [vehicle_safety_events]
   usaspending:
-    enabled: false
+    enabled: true
     scopes: [sector]
     sector_rules: [government_contractors]
     capabilities: [government_awards]

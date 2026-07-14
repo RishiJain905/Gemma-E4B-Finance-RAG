@@ -1,0 +1,14 @@
+{
+  "status": "OK",
+  "results": [
+    {
+      "id": "news-1",
+      "ticker": "AAA",
+      "title": "Alpha announces a new product",
+      "description": "Alpha announced a new product today.",
+      "article_url": "https://news.example/alpha-1",
+      "published_utc": "2026-07-14T11:30:00Z",
+      "publisher": "Reuters"
+    }
+  ]
+}

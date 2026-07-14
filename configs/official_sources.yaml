@@ -1,0 +1,365 @@
+# Curated first-party datasets and releases for Phase 2.3.2.3.
+# Only entries in this file may be requested by the official adapters.
+version: "2.3.2.3-r1"
+
+entries:
+  - name: federal_reserve_policy_statements
+    agency: federal_reserve
+    dataset_id: federal-reserve-rss-policy-statements
+    unit: document
+    frequency: per_release
+    expected_cadence: event_driven
+    source_category: official_release
+    sectors: [global]
+    payload_type: narrative
+    endpoint: https://www.federalreserve.gov/feeds/press_all.xml
+    category: policy
+  - name: federal_reserve_minutes
+    agency: federal_reserve
+    dataset_id: federal-reserve-rss-minutes
+    unit: document
+    frequency: per_release
+    expected_cadence: meeting_cycle
+    source_category: official_release
+    sectors: [global]
+    payload_type: narrative
+    endpoint: https://www.federalreserve.gov/feeds/press_all.xml
+    category: minutes
+  - name: federal_reserve_speeches
+    agency: federal_reserve
+    dataset_id: federal-reserve-rss-speeches
+    unit: document
+    frequency: per_release
+    expected_cadence: event_driven
+    source_category: official_release
+    sectors: [global]
+    payload_type: narrative
+    endpoint: https://www.federalreserve.gov/feeds/press_all.xml
+    category: speech
+  - name: federal_reserve_regulation
+    agency: federal_reserve
+    dataset_id: federal-reserve-rss-regulation
+    unit: document
+    frequency: per_release
+    expected_cadence: event_driven
+    source_category: official_regulatory
+    sectors: [financials]
+    payload_type: narrative
+    endpoint: https://www.federalreserve.gov/feeds/press_all.xml
+    category: regulation
+  - name: federal_reserve_statistical_releases
+    agency: federal_reserve
+    dataset_id: federal-reserve-rss-statistical-releases
+    unit: document
+    frequency: per_release
+    expected_cadence: scheduled_release
+    source_category: official_release
+    sectors: [global]
+    payload_type: narrative
+    endpoint: https://www.federalreserve.gov/feeds/press_all.xml
+    category: statistical
+
+  - name: treasury_nominal_yield_10y
+    agency: treasury
+    dataset_id: treasury-nominal-yield-curve
+    unit: percent
+    frequency: daily
+    expected_cadence: business_daily
+    source_category: official_macro
+    sectors: [global]
+    payload_type: structured
+    endpoint: https://home.treasury.gov/resource-center/data-chart-center/interest-rates
+    field: BC_10YEAR
+    series_id: DGS10
+  - name: treasury_real_yield_10y
+    agency: treasury
+    dataset_id: treasury-real-yield-curve
+    unit: percent
+    frequency: daily
+    expected_cadence: business_daily
+    source_category: official_macro
+    sectors: [global]
+    payload_type: structured
+    endpoint: https://home.treasury.gov/resource-center/data-chart-center/interest-rates
+    field: REAL_10YEAR
+    series_id: DFII10
+  - name: treasury_bill_rate_4w
+    agency: treasury
+    dataset_id: treasury-bill-rates
+    unit: percent
+    frequency: daily
+    expected_cadence: business_daily
+    source_category: official_macro
+    sectors: [global]
+    payload_type: structured
+    endpoint: https://home.treasury.gov/resource-center/data-chart-center/interest-rates
+    field: BILL_4WEEK
+    series_id: DTB4WK
+
+  - name: bls_cpi
+    agency: bls
+    dataset_id: CUUR0000SA0
+    unit: index
+    frequency: monthly
+    expected_cadence: monthly_release
+    source_category: official_macro
+    sectors: [global]
+    payload_type: both
+    endpoint: https://api.bls.gov/publicAPI/v2/timeseries/data/
+    series_id: CUUR0000SA0
+  - name: bls_ppi
+    agency: bls
+    dataset_id: WPUFD4
+    unit: index
+    frequency: monthly
+    expected_cadence: monthly_release
+    source_category: official_macro
+    sectors: [global]
+    payload_type: both
+    endpoint: https://api.bls.gov/publicAPI/v2/timeseries/data/
+    series_id: WPUFD4
+  - name: bls_employment
+    agency: bls
+    dataset_id: CES0000000001
+    unit: thousands_of_persons
+    frequency: monthly
+    expected_cadence: monthly_release
+    source_category: official_macro
+    sectors: [global]
+    payload_type: both
+    endpoint: https://api.bls.gov/publicAPI/v2/timeseries/data/
+    series_id: CES0000000001
+  - name: bls_wages
+    agency: bls
+    dataset_id: CES0500000003
+    unit: dollars_per_hour
+    frequency: monthly
+    expected_cadence: monthly_release
+    source_category: official_macro
+    sectors: [global]
+    payload_type: both
+    endpoint: https://api.bls.gov/publicAPI/v2/timeseries/data/
+    series_id: CES0500000003
+  - name: bls_release_metadata
+    agency: bls
+    dataset_id: bls-release-calendar
+    unit: document
+    frequency: per_release
+    expected_cadence: scheduled_release
+    source_category: official_release
+    sectors: [global]
+    payload_type: narrative
+    endpoint: https://www.bls.gov/schedule/news_release/
+    series_id: release
+
+  - name: bea_gdp
+    agency: bea
+    dataset_id: T10101
+    unit: billions_usd
+    frequency: quarterly
+    expected_cadence: quarterly_release
+    source_category: official_macro
+    sectors: [global]
+    payload_type: structured
+    endpoint: https://apps.bea.gov/api/data/
+    line_contains: gross domestic product
+  - name: bea_corporate_profits
+    agency: bea
+    dataset_id: T40100
+    unit: billions_usd
+    frequency: quarterly
+    expected_cadence: quarterly_release
+    source_category: official_macro
+    sectors: [global]
+    payload_type: structured
+    endpoint: https://apps.bea.gov/api/data/
+    line_contains: corporate profits
+  - name: bea_personal_income
+    agency: bea
+    dataset_id: T20100
+    unit: billions_usd
+    frequency: quarterly
+    expected_cadence: quarterly_release
+    source_category: official_macro
+    sectors: [global]
+    payload_type: structured
+    endpoint: https://apps.bea.gov/api/data/
+    line_contains: personal income
+  - name: bea_trade
+    agency: bea
+    dataset_id: T30100
+    unit: billions_usd
+    frequency: quarterly
+    expected_cadence: quarterly_release
+    source_category: official_macro
+    sectors: [global]
+    payload_type: structured
+    endpoint: https://apps.bea.gov/api/data/
+    line_contains: trade in goods and services
+
+  - name: eia_energy_prices
+    agency: eia
+    dataset_id: PET.RWTC.D
+    unit: dollars_per_barrel
+    frequency: daily
+    expected_cadence: business_daily
+    source_category: official_macro
+    sectors: [energy]
+    payload_type: structured
+    endpoint: https://api.eia.gov/v2/petroleum/pri/spt/data/
+  - name: eia_energy_inventories
+    agency: eia
+    dataset_id: PET.WCRSTUS1.W
+    unit: million_barrels
+    frequency: weekly
+    expected_cadence: weekly_release
+    source_category: official_macro
+    sectors: [energy]
+    payload_type: structured
+    endpoint: https://api.eia.gov/v2/petroleum/stoc/wstk/data/
+  - name: eia_generation
+    agency: eia
+    dataset_id: ELEC.GEN.ALL-US-99.M
+    unit: thousand_megawatthours
+    frequency: monthly
+    expected_cadence: monthly_release
+    source_category: official_macro
+    sectors: [utilities]
+    payload_type: structured
+    endpoint: https://api.eia.gov/v2/electricity/electric-power-operational-data/data/
+  - name: eia_energy_production
+    agency: eia
+    dataset_id: NG.PROD.TX-1.M
+    unit: billion_cubic_feet
+    frequency: monthly
+    expected_cadence: monthly_release
+    source_category: official_macro
+    sectors: [energy]
+    payload_type: structured
+    endpoint: https://api.eia.gov/v2/natural-gas/prod/sum/data/
+
+  - name: ny_fed_sofr
+    agency: ny_fed
+    dataset_id: SOFR
+    unit: percent
+    frequency: daily
+    expected_cadence: business_daily
+    source_category: official_macro
+    sectors: [global]
+    payload_type: structured
+    endpoint: https://markets.newyorkfed.org/api/rates/secured/sofr/last/1.json
+    field: sofr
+  - name: ny_fed_effr
+    agency: ny_fed
+    dataset_id: EFFR
+    unit: percent
+    frequency: daily
+    expected_cadence: business_daily
+    source_category: official_macro
+    sectors: [global]
+    payload_type: structured
+    endpoint: https://markets.newyorkfed.org/api/rates/unsecured/effr/last/1.json
+    field: effr
+  - name: ny_fed_market_operations
+    agency: ny_fed
+    dataset_id: market-operations
+    unit: usd_millions
+    frequency: per_operation
+    expected_cadence: event_driven
+    source_category: official_market_operation
+    sectors: [global]
+    payload_type: structured
+    endpoint: https://markets.newyorkfed.org/api/rp/reverserepo/propositions/search.json
+    field: operation_amount
+
+  - name: cftc_cot_open_interest
+    agency: cftc
+    dataset_id: COT-open-interest
+    unit: contracts
+    frequency: weekly
+    expected_cadence: weekly_release
+    source_category: official_macro
+    sectors: [global]
+    payload_type: structured
+    endpoint: https://www.cftc.gov/dea/options/deaviewcit.htm
+    field: Open_Interest_All
+  - name: cftc_cot_noncommercial_net
+    agency: cftc
+    dataset_id: COT-noncommercial-net
+    unit: contracts
+    frequency: weekly
+    expected_cadence: weekly_release
+    source_category: official_macro
+    sectors: [global]
+    payload_type: structured
+    endpoint: https://www.cftc.gov/dea/options/deaviewcit.htm
+    field: Noncommercial_Net
+
+  - name: openfda_recalls
+    agency: openfda
+    dataset_id: device-recalls
+    unit: event
+    frequency: per_event
+    expected_cadence: event_driven
+    source_category: official_regulatory
+    sectors: [health_care]
+    payload_type: both
+    endpoint: https://api.fda.gov/device/recall.json
+    event_type: recall
+  - name: openfda_safety
+    agency: openfda
+    dataset_id: drug-device-safety
+    unit: event
+    frequency: per_event
+    expected_cadence: event_driven
+    source_category: official_regulatory
+    sectors: [health_care]
+    payload_type: both
+    endpoint: https://api.fda.gov/drug/event.json
+    event_type: safety
+  - name: openfda_shortages
+    agency: openfda
+    dataset_id: drug-shortages
+    unit: event
+    frequency: per_event
+    expected_cadence: event_driven
+    source_category: official_regulatory
+    sectors: [health_care]
+    payload_type: both
+    endpoint: https://api.fda.gov/drug/shortages.json
+    event_type: shortage
+
+  - name: nhtsa_recalls
+    agency: nhtsa
+    dataset_id: vehicle-recalls
+    unit: event
+    frequency: per_event
+    expected_cadence: event_driven
+    source_category: official_regulatory
+    sectors: [automotive]
+    payload_type: both
+    endpoint: https://api.nhtsa.gov/recalls/recallsByVehicle
+    event_type: recall
+  - name: nhtsa_investigations
+    agency: nhtsa
+    dataset_id: vehicle-investigations
+    unit: event
+    frequency: per_event
+    expected_cadence: event_driven
+    source_category: official_regulatory
+    sectors: [automotive]
+    payload_type: both
+    endpoint: https://www.nhtsa.gov/api/vehicle-safety
+    event_type: investigation
+
+  - name: usaspending_awards
+    agency: usaspending
+    dataset_id: federal-awards
+    unit: usd
+    frequency: per_award
+    expected_cadence: daily_refresh
+    source_category: official_regulatory
+    sectors: [government_contractors]
+    payload_type: both
+    endpoint: https://api.usaspending.gov/api/v2/search/spending_by_award/
+    event_type: award

@@ -18,6 +18,9 @@ macro_tickers:
 schedule:
   fundamentals: 24
   news: 6
+  finnhub_news: 6
+  massive_market: 24
+  massive_actions: 24
   macro: 24
   sec_filings: 12
   sec_companyfacts: 24

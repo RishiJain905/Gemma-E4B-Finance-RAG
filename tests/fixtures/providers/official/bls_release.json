@@ -1,0 +1,42 @@
+{
+  "status": "REQUEST_SUCCEEDED",
+  "responseTime": 42,
+  "Results": {
+    "release": {
+      "id": "cpi-2026-07",
+      "name": "Economic indicators release",
+      "release_date": "2026-07-14",
+      "link": "https://www.bls.gov/news.release/"
+    },
+    "series": [
+      {
+        "seriesID": "CUUR0000SA0",
+        "series_title": "Consumer Price Index for All Urban Consumers",
+        "data": [
+          {"year": "2026", "period": "M06", "periodName": "June", "value": "324.1", "period_start": "2026-06-01", "period_end": "2026-06-30", "vintage_date": "2026-07-14"}
+        ]
+      },
+      {
+        "seriesID": "WPUFD4",
+        "series_title": "Producer Price Index for Final Demand",
+        "data": [
+          {"year": "2026", "period": "M06", "periodName": "June", "value": "148.2", "period_start": "2026-06-01", "period_end": "2026-06-30", "vintage_date": "2026-07-14"}
+        ]
+      },
+      {
+        "seriesID": "CES0000000001",
+        "series_title": "All employees, total nonfarm",
+        "data": [
+          {"year": "2026", "period": "M06", "periodName": "June", "value": "162900", "period_start": "2026-06-01", "period_end": "2026-06-30", "vintage_date": "2026-07-14"}
+        ]
+      },
+      {
+        "seriesID": "CES0500000003",
+        "series_title": "Average hourly earnings of all private employees",
+        "data": [
+          {"year": "2026", "period": "M06", "periodName": "June", "value": "36.42", "period_start": "2026-06-01", "period_end": "2026-06-30", "vintage_date": "2026-07-14"}
+        ]
+      }
+    ]
+  }
+}

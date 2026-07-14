@@ -1,0 +1,7 @@
+{
+  "count": 2,
+  "results": [
+    {"NHTSA_ID": "NHTSA-REC-1", "event_type": "recall", "Manufacturer": "Alpha Motors", "Component": "Brakes", "ModelYear": "2026", "ReportDate": "2026-07-09", "Summary": "Brake component may fail", "URL": "https://www.nhtsa.gov/recalls?nhtsaId=NHTSA-REC-1"},
+    {"NHTSA_ID": "NHTSA-INV-1", "event_type": "investigation", "Manufacturer": "Ambiguous Motors", "Component": "Steering", "ModelYear": "2025", "ReportDate": "2026-07-10", "Summary": "Investigation opened", "URL": "https://www.nhtsa.gov/investigations?nhtsaId=NHTSA-INV-1"}
+  ]
+}

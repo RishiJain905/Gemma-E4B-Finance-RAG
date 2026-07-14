@@ -1,0 +1,13 @@
+{
+  "data": [
+    {
+      "id": "aaa-1",
+      "headline": "Alpha announces a new product",
+      "summary": "Alpha announced a new product today.",
+      "source": "Reuters",
+      "url": "https://news.example/alpha-1",
+      "datetime": 1784026800
+    }
+  ],
+  "next": "page-2"
+}

@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0">
+  <channel>
+    <title>Federal Reserve official releases</title>
+    <item>
+      <guid>fed-policy-2026-07-01</guid>
+      <title>Federal Reserve issues FOMC statement</title>
+      <link>https://www.federalreserve.gov/newsevents/pressreleases/monetary20260701a.htm</link>
+      <description>The Committee decided to maintain the target range for the federal funds rate.</description>
+      <pubDate>Wed, 01 Jul 2026 14:00:00 GMT</pubDate>
+      <category>Policy Statements</category>
+    </item>
+    <item>
+      <guid>fed-minutes-2026-07-01</guid>
+      <title>Minutes of the Federal Open Market Committee</title>
+      <link>https://www.federalreserve.gov/monetarypolicy/fomcminutes20260701.htm</link>
+      <description>Participants discussed inflation, labor-market conditions, and financial conditions.</description>
+      <pubDate>Wed, 08 Jul 2026 18:00:00 GMT</pubDate>
+      <category>Minutes</category>
+    </item>
+    <item>
+      <guid>fed-speech-2026-07-10</guid>
+      <title>Speech by Governor Taylor on monetary policy</title>
+      <link>https://www.federalreserve.gov/newsevents/speech/taylor20260710a.htm</link>
+      <description>Governor Taylor discussed the outlook for monetary policy and the economy.</description>
+      <pubDate>Fri, 10 Jul 2026 15:30:00 GMT</pubDate>
+      <category>Speeches</category>
+    </item>
+    <item>
+      <guid>fed-regulation-2026-07-11</guid>
+      <title>Federal Reserve requests comment on proposed regulation</title>
+      <link>https://www.federalreserve.gov/newsevents/pressreleases/bcreg20260711a.htm</link>
+      <description>The proposal would update prudential reporting requirements.</description>
+      <pubDate>Sat, 11 Jul 2026 13:00:00 GMT</pubDate>
+      <category>Regulation</category>
+    </item>
+    <item>
+      <guid>fed-stat-2026-07-13</guid>
+      <title>Federal Reserve releases industrial production data</title>
+      <link>https://www.federalreserve.gov/releases/g17/20260713.htm</link>
+      <description>Industrial production increased in June.</description>
+      <pubDate>Mon, 13 Jul 2026 14:15:00 GMT</pubDate>
+      <category>Statistical Releases</category>
+    </item>
+  </channel>
+</rss>

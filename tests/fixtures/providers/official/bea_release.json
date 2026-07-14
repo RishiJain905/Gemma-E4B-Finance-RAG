@@ -1,0 +1,14 @@
+{
+  "BEAAPI": {
+    "Request": {"RequestParam": [{"ParameterName": "UserID", "ParameterValue": "fixture"}]},
+    "Results": {
+      "ReleaseDate": "2026-07-14",
+      "Data": [
+        {"TableName": "T10101", "LineNumber": "1", "LineDescription": "Gross domestic product", "TimePeriod": "2026Q1", "DataValue": "31200.4", "CL_UNIT": "Billions of dollars", "RecordID": "bea-gdp-2026q1"},
+        {"TableName": "T40100", "LineNumber": "1", "LineDescription": "Corporate profits", "TimePeriod": "2026Q1", "DataValue": "2980.1", "CL_UNIT": "Billions of dollars", "RecordID": "bea-profits-2026q1"},
+        {"TableName": "T20100", "LineNumber": "1", "LineDescription": "Personal income", "TimePeriod": "2026Q1", "DataValue": "24500.0", "CL_UNIT": "Billions of dollars", "RecordID": "bea-income-2026q1"},
+        {"TableName": "T30100", "LineNumber": "1", "LineDescription": "Trade in goods and services", "TimePeriod": "2026Q1", "DataValue": "-410.2", "CL_UNIT": "Billions of dollars", "RecordID": "bea-trade-2026q1"}
+      ]
+    }
+  }
+}

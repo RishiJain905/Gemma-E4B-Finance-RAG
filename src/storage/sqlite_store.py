@@ -56,6 +56,15 @@ class SQLiteStore:
 
         with self._connect() as conn:
             conn.executescript(sql)
+            conn.execute(
+                """CREATE TABLE IF NOT EXISTS sec_daily_indexes (
+                    index_date TEXT PRIMARY KEY,
+                    source_url TEXT NOT NULL,
+                    status TEXT NOT NULL CHECK (status IN ('processed')),
+                    registered_count INTEGER NOT NULL DEFAULT 0,
+                    processed_at TEXT NOT NULL DEFAULT (datetime('now'))
+                )"""
+            )
             existing = {
                 row[1] for row in conn.execute("PRAGMA table_info(filings)").fetchall()
             }
@@ -67,10 +76,51 @@ class SQLiteStore:
                 "index_chunk_count": (
                     "ALTER TABLE filings ADD COLUMN index_chunk_count INTEGER DEFAULT 0"
                 ),
+                "cik": "ALTER TABLE filings ADD COLUMN cik TEXT",
+                "primary_document": "ALTER TABLE filings ADD COLUMN primary_document TEXT",
+                "discovery_scope": (
+                    "ALTER TABLE filings ADD COLUMN discovery_scope TEXT DEFAULT 'deep'"
+                ),
+                "items_json": "ALTER TABLE filings ADD COLUMN items_json TEXT DEFAULT '[]'",
+                "exhibits_json": "ALTER TABLE filings ADD COLUMN exhibits_json TEXT DEFAULT '[]'",
             }
             for column, statement in migrations.items():
                 if column not in existing:
                     conn.execute(statement)
+            conn.execute(
+                """CREATE TABLE IF NOT EXISTS source_cursors (
+                    source TEXT NOT NULL,
+                    partition_key TEXT NOT NULL,
+                    cursor_value TEXT,
+                    cursor_type TEXT NOT NULL DEFAULT 'none',
+                    overlap_value TEXT,
+                    last_successful_run_id TEXT,
+                    version TEXT NOT NULL DEFAULT '1',
+                    status TEXT NOT NULL DEFAULT 'unknown',
+                    error_class TEXT,
+                    error_message TEXT,
+                    retry_after REAL,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY (source, partition_key)
+                )"""
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_source_cursors_status "
+                "ON source_cursors(source, status, updated_at)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_corpus_observations_market_key "
+                "ON corpus_observations(source_name, metric_id, period_end, tickers_json)"
+            )
+            # Official revisions share an agency record id across vintages.  The
+            # migration is intentionally additive: existing rows remain intact,
+            # while metric + provider id + vintage becomes the observation key.
+            conn.execute("DROP INDEX IF EXISTS idx_corpus_observations_provider")
+            conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_corpus_observations_provider "
+                "ON corpus_observations(source_name, metric_id, provider_record_id, vintage_at) "
+                "WHERE provider_record_id IS NOT NULL AND provider_record_id <> ''"
+            )
             conn.commit()
 
     @staticmethod
@@ -162,6 +212,25 @@ CREATE TABLE IF NOT EXISTS store_revision (
 );
 INSERT OR IGNORE INTO store_revision (id, revision) VALUES (1, 0);
 
+-- -- Incremental source cursors (2.3.2/2.3.4 forward-compatible seam) -----
+CREATE TABLE IF NOT EXISTS source_cursors (
+    source TEXT NOT NULL,
+    partition_key TEXT NOT NULL,
+    cursor_value TEXT,
+    cursor_type TEXT NOT NULL DEFAULT 'none',
+    overlap_value TEXT,
+    last_successful_run_id TEXT,
+    version TEXT NOT NULL DEFAULT '1',
+    status TEXT NOT NULL DEFAULT 'unknown',
+    error_class TEXT,
+    error_message TEXT,
+    retry_after REAL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (source, partition_key)
+);
+CREATE INDEX IF NOT EXISTS idx_source_cursors_status
+    ON source_cursors(source, status, updated_at);
+
 -- ── Ingestion Log ──────────────────────────────────
 CREATE TABLE IF NOT EXISTS ingestion_log (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -220,7 +289,10 @@ CREATE TABLE IF NOT EXISTS security_aliases (
     alias TEXT NOT NULL,
     normalized_alias TEXT NOT NULL,
     alias_type TEXT NOT NULL CHECK (
-        alias_type IN ('ticker', 'vendor_symbol', 'former_ticker')
+        alias_type IN (
+            'ticker', 'vendor_symbol', 'former_ticker', 'issuer_alias',
+            'manufacturer', 'recipient_uei'
+        )
     ),
     provider TEXT,
     valid_from TEXT,
@@ -445,7 +517,7 @@ CREATE INDEX IF NOT EXISTS idx_corpus_item_sources_source
 CREATE INDEX IF NOT EXISTS idx_corpus_item_securities_security
     ON corpus_item_securities(security_id, corpus_item_id);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_corpus_observations_provider
-    ON corpus_observations(source_name, provider_record_id)
+    ON corpus_observations(source_name, metric_id, provider_record_id, vintage_at)
     WHERE provider_record_id IS NOT NULL AND provider_record_id <> '';
 CREATE INDEX IF NOT EXISTS idx_corpus_observations_metric_period
     ON corpus_observations(metric_id, period_end, vintage_at);
@@ -644,17 +716,107 @@ CREATE INDEX IF NOT EXISTS idx_corpus_events_type_effective
 
     def register_filing(self, ticker: str, filing_type: str,
                         filing_date: str, period: str,
-                        accession: str, source_url: str) -> bool:
+                        accession: str, source_url: str, *,
+                        cik: Optional[str] = None,
+                        primary_document: Optional[str] = None,
+                        discovery_scope: str = "deep",
+                        items: Optional[list[str]] = None,
+                        exhibits: Optional[list[dict]] = None) -> bool:
         """Register a filing as processed. Returns True if new, False if duplicate."""
         sql = """
         INSERT OR IGNORE INTO filings
-            (ticker, filing_type, filing_date, period, accession, source_url, status)
-        VALUES (?, ?, ?, ?, ?, ?, 'unprocessed')
+            (ticker, filing_type, filing_date, period, accession, source_url, status,
+             cik, primary_document, discovery_scope, items_json, exhibits_json)
+        VALUES (?, ?, ?, ?, ?, ?, 'unprocessed', ?, ?, ?, ?, ?)
         """
         with self._connect() as conn:
-            cursor = conn.execute(sql, (ticker, filing_type, filing_date, period, accession, source_url))
+            cursor = conn.execute(sql, (
+                ticker, filing_type, filing_date, period, accession, source_url,
+                cik, primary_document, discovery_scope,
+                json.dumps(items or []), json.dumps(exhibits or []),
+            ))
             conn.commit()
             return cursor.rowcount > 0
+
+    def register_sec_daily_index(
+        self, index_date: str, source_url: str, filings: list[dict],
+    ) -> dict[str, object]:
+        """Atomically register an SEC daily-index batch and its cursor checkpoint."""
+        with self._connect() as conn:
+            existing = conn.execute(
+                "SELECT status FROM sec_daily_indexes WHERE index_date=?", (index_date,),
+            ).fetchone()
+            if existing:
+                return {"registered": 0, "replayed": True}
+            try:
+                conn.execute("BEGIN")
+                registered = self._insert_filing_rows(conn, filings)
+                conn.execute(
+                    "INSERT INTO sec_daily_indexes "
+                    "(index_date, source_url, status, registered_count) VALUES (?, ?, 'processed', ?)",
+                    (index_date, source_url, registered),
+                )
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+        return {"registered": registered, "replayed": False}
+
+    @staticmethod
+    def _insert_filing_rows(conn: sqlite3.Connection, filings: list[dict]) -> int:
+        """Insert accession-unique filing rows within the caller's transaction."""
+        registered = 0
+        for filing in filings:
+            cursor = conn.execute(
+                """INSERT OR IGNORE INTO filings (
+                    ticker, filing_type, filing_date, period, accession,
+                    source_url, status, cik, primary_document, discovery_scope,
+                    items_json, exhibits_json
+                ) VALUES (?, ?, ?, ?, ?, ?, 'unprocessed', ?, ?, ?, ?, ?)""",
+                (
+                    filing["ticker"], filing["filing_type"], filing.get("filing_date", ""),
+                    filing.get("period", ""), filing["accession"], filing["source_url"],
+                    filing.get("cik"), filing.get("primary_document"),
+                    filing.get("discovery_scope", "broad"),
+                    json.dumps(filing.get("items") or []),
+                    json.dumps(filing.get("exhibits") or []),
+                ),
+            )
+            registered += int(cursor.rowcount > 0)
+        return registered
+
+    def register_sec_filings(self, filings: list[dict]) -> int:
+        """Atomically register an accession-unique SEC filing batch."""
+        with self._connect() as conn:
+            try:
+                conn.execute("BEGIN")
+                registered = self._insert_filing_rows(conn, filings)
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+        return registered
+
+    def get_sec_daily_index_status(self, index_date: str) -> Optional[str]:
+        """Return the durable status for one SEC daily index date."""
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT status FROM sec_daily_indexes WHERE index_date=?", (index_date,),
+            ).fetchone()
+        return str(row[0]) if row else None
+
+    def get_sec_daily_index_cursor(self) -> Optional[str]:
+        """Return the latest completely registered SEC daily-index date."""
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT MAX(index_date) FROM sec_daily_indexes WHERE status='processed'"
+            ).fetchone()
+        return str(row[0]) if row and row[0] else None
+
+    def count_filings(self) -> int:
+        """Return the number of accession-unique registered SEC filings."""
+        with self._connect() as conn:
+            return int(conn.execute("SELECT COUNT(*) FROM filings").fetchone()[0])
 
     def mark_filing_parsed(
         self,
@@ -919,6 +1081,11 @@ CREATE INDEX IF NOT EXISTS idx_corpus_events_type_effective
                 )
             )
             previous_status = None if existing is None else str(existing["indexing_status"])
+            authority_promoted = bool(
+                existing is not None
+                and record.evidence_authority == "direct_sec"
+                and existing["evidence_authority"] != "direct_sec"
+            )
             common_values = (
                 record.event_type, record.title, headline, news_key, record.summary,
                 record.language, record.published_at, record.effective_at,
@@ -945,6 +1112,25 @@ CREATE INDEX IF NOT EXISTS idx_corpus_events_type_effective
                         item_id, record.source_name, record.source_category,
                         record.provider_record_id, record.original_publisher,
                         record.item_type, *common_values,
+                    ),
+                )
+            elif authority_promoted:
+                conn.execute(
+                    """UPDATE corpus_items SET
+                        source=?, source_category=?, provider_record_id=?,
+                        original_publisher=?, item_type=?, event_type=?, title=?,
+                        normalized_headline=?, syndicated_key=?, summary=?, language=?,
+                        published_at=?, effective_at=?, as_of_at=?, observed_at=?,
+                        accessed_at=?, ingested_at=?, source_url=?, canonical_url=?,
+                        tickers_json=?, index_codes_json=?, sectors_json=?, content_hash=?,
+                        metadata_json=?, document_family=?, indexing_status=?, index_error=NULL,
+                        license_label=?, normalization_version=?, evidence_authority=?,
+                        updated_at=datetime('now')
+                    WHERE corpus_item_id=?""",
+                    (
+                        record.source_name, record.source_category,
+                        record.provider_record_id, record.original_publisher,
+                        record.item_type, *common_values, item_id,
                     ),
                 )
             elif content_changed:
@@ -1003,7 +1189,8 @@ CREATE INDEX IF NOT EXISTS idx_corpus_events_type_effective
             revision = self._bump_revision_in_transaction(conn)
             conn.commit()
         needs_index = initial_status != "not_applicable" and (
-            created or content_changed or previous_status in {"pending", "error"}
+            created or content_changed or authority_promoted
+            or previous_status in {"pending", "error"}
         )
         return {
             "corpus_item_id": item_id,
@@ -1011,6 +1198,7 @@ CREATE INDEX IF NOT EXISTS idx_corpus_events_type_effective
             "deduplicated": not created,
             "deduplication_layer": layer,
             "content_changed": content_changed,
+            "authority_promoted": authority_promoted,
             "needs_index": needs_index,
             "indexing_status": initial_status if created or content_changed else previous_status,
             "revision": revision,
@@ -1099,13 +1287,31 @@ CREATE INDEX IF NOT EXISTS idx_corpus_events_type_effective
         }
         with self._connect() as conn:
             existing = None
-            if record.provider_record_id:
+            if record.source_category == "market_data" and record.tickers:
                 existing = conn.execute(
                     "SELECT * FROM corpus_observations WHERE source_name=? "
-                    "AND provider_record_id=?",
-                    (record.source_name, record.provider_record_id),
+                    "AND metric_id=? AND period_end=? AND tickers_json=? "
+                    "ORDER BY updated_at DESC LIMIT 1",
+                    (
+                        record.source_name,
+                        record.metric_id,
+                        record.period_end,
+                        values["tickers_json"],
+                    ),
                 ).fetchone()
-            if existing is None:
+            if record.provider_record_id:
+                existing = existing or conn.execute(
+                    "SELECT * FROM corpus_observations WHERE source_name=? "
+                    "AND metric_id=? AND provider_record_id=? "
+                    "AND vintage_at IS ?",
+                    (
+                        record.source_name,
+                        record.metric_id,
+                        record.provider_record_id,
+                        record.vintage_at,
+                    ),
+                ).fetchone()
+            if existing is None and not record.provider_record_id:
                 existing = conn.execute(
                     "SELECT * FROM corpus_observations WHERE observation_id=?",
                     (record.observation_id,),
@@ -1162,6 +1368,162 @@ CREATE INDEX IF NOT EXISTS idx_corpus_events_type_effective
             return int(conn.execute(
                 "SELECT COUNT(*) FROM corpus_observations"
             ).fetchone()[0])
+
+    def list_observations(
+        self,
+        *,
+        source_name: Optional[str] = None,
+        metric_id: Optional[str] = None,
+        period_end: Optional[str] = None,
+        vintage_at: Optional[str] = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> list[dict]:
+        """Return bounded structured observations, including every vintage."""
+        self._validate_inventory_page(limit, offset)
+        conditions: list[str] = []
+        params: list[object] = []
+        for column, value in (
+            ("source_name", source_name),
+            ("metric_id", metric_id),
+            ("period_end", period_end),
+            ("vintage_at", vintage_at),
+        ):
+            if value is not None:
+                conditions.append(f"{column} = ?")
+                params.append(str(value))
+        where = " AND ".join(conditions) or "1=1"
+        params.extend([limit, offset])
+        with self._connect() as conn:
+            rows = conn.execute(
+                f"SELECT * FROM corpus_observations WHERE {where} "
+                "ORDER BY period_end DESC, vintage_at DESC, metric_id, observation_id "
+                "LIMIT ? OFFSET ?",
+                params,
+            ).fetchall()
+            observations: list[dict] = []
+            for row in rows:
+                item = dict(row)
+                item["metadata"] = json.loads(item.pop("metadata_json"))
+                item["tickers"] = json.loads(item.pop("tickers_json"))
+                item["security_ids"] = [
+                    linked[0]
+                    for linked in conn.execute(
+                        "SELECT security_id FROM observation_securities "
+                        "WHERE observation_id=? ORDER BY security_id",
+                        (item["observation_id"],),
+                    ).fetchall()
+                ]
+                observations.append(item)
+        return observations
+
+    # -- Incremental source cursors -----------------------------------------
+
+    def get_source_cursor_state(
+        self, source: str, partition_key: str,
+    ) -> Optional[dict]:
+        """Return one cursor/status row without conflating it with freshness."""
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM source_cursors WHERE source=? AND partition_key=?",
+                (str(source), str(partition_key)),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def get_source_cursor(self, source: str, partition_key: str) -> Optional[str]:
+        """Return the last committed cursor value for one source partition."""
+        state = self.get_source_cursor_state(source, partition_key)
+        return str(state["cursor_value"]) if state and state.get("cursor_value") is not None else None
+
+    def set_source_cursor(
+        self,
+        source: str,
+        partition_key: str,
+        cursor_value: Optional[str],
+        *,
+        cursor_type: str = "none",
+        overlap_value: Optional[str] = None,
+        last_successful_run_id: Optional[str] = None,
+        version: str = "1",
+        status: str = "success",
+        error_class: Optional[str] = None,
+        error_message: Optional[str] = None,
+        retry_after: Optional[float] = None,
+    ) -> dict:
+        """Upsert a committed cursor and its bounded source status metadata."""
+        source = str(source or "").strip()
+        partition_key = str(partition_key or "").strip()
+        cursor_type = str(cursor_type or "none").strip()
+        status = str(status or "unknown").strip()
+        if not source or not partition_key:
+            raise ValueError("source and partition_key are required")
+        if cursor_value is not None:
+            cursor_value = str(cursor_value)
+        if overlap_value is not None:
+            overlap_value = str(overlap_value)
+        if error_message is not None:
+            error_message = str(error_message)[:2_000]
+        with self._connect() as conn:
+            conn.execute(
+                """INSERT INTO source_cursors (
+                    source, partition_key, cursor_value, cursor_type,
+                    overlap_value, last_successful_run_id, version, status,
+                    error_class, error_message, retry_after, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(source, partition_key) DO UPDATE SET
+                    cursor_value=excluded.cursor_value,
+                    cursor_type=excluded.cursor_type,
+                    overlap_value=excluded.overlap_value,
+                    last_successful_run_id=excluded.last_successful_run_id,
+                    version=excluded.version,
+                    status=excluded.status,
+                    error_class=excluded.error_class,
+                    error_message=excluded.error_message,
+                    retry_after=excluded.retry_after,
+                    updated_at=excluded.updated_at""",
+                (
+                    source,
+                    partition_key,
+                    cursor_value,
+                    cursor_type,
+                    overlap_value,
+                    last_successful_run_id,
+                    str(version or "1"),
+                    status,
+                    error_class,
+                    error_message,
+                    retry_after,
+                    datetime.now(timezone.utc).isoformat(),
+                ),
+            )
+            conn.commit()
+        return self.get_source_cursor_state(source, partition_key) or {}
+
+    def set_source_status(
+        self,
+        source: str,
+        partition_key: str,
+        status: str,
+        *,
+        error_class: Optional[str] = None,
+        error_message: Optional[str] = None,
+        retry_after: Optional[float] = None,
+    ) -> dict:
+        """Persist a source capability state while retaining its last cursor."""
+        previous = self.get_source_cursor_state(source, partition_key) or {}
+        return self.set_source_cursor(
+            source,
+            partition_key,
+            previous.get("cursor_value"),
+            cursor_type=str(previous.get("cursor_type") or "none"),
+            overlap_value=previous.get("overlap_value"),
+            last_successful_run_id=previous.get("last_successful_run_id"),
+            version=str(previous.get("version") or "1"),
+            status=status,
+            error_class=error_class,
+            error_message=error_message,
+            retry_after=retry_after,
+        )
 
     def upsert_event_record(self, record: EventRecord) -> dict:
         """Atomically upsert one event and all item/security relationships."""
@@ -1988,6 +2350,92 @@ CREATE INDEX IF NOT EXISTS idx_corpus_events_type_effective
             ).fetchall()
         candidates = self._security_candidates(alias_rows)
         return candidates[0] if len(candidates) == 1 else None
+
+    def resolve_exact_security(self, identifier: str) -> Optional[dict]:
+        """Resolve one exact ticker, registry alias, or company-name identifier.
+
+        Company names are compared after case/whitespace/punctuation normalization
+        only; no substring or fuzzy matching is performed.  Multiple exact
+        candidates intentionally return ``None`` so an official event remains
+        unattached for review.
+        """
+        value = str(identifier or "").strip()
+        if not value:
+            return None
+        symbol_key = self._normalize_universe_symbol(value)
+        company_key = self._normalize_company_identity(value)
+        with self._connect() as conn:
+            candidates: dict[str, dict] = {}
+            for row in conn.execute(
+                "SELECT * FROM securities WHERE normalized_ticker=? OR normalized_ticker=?",
+                (symbol_key, value.upper()),
+            ).fetchall():
+                candidates[str(row["security_id"])] = dict(row)
+            for row in conn.execute("SELECT * FROM securities").fetchall():
+                if self._normalize_company_identity(row["company_name"]) == company_key:
+                    candidates[str(row["security_id"])] = dict(row)
+            aliases = conn.execute(
+                "SELECT a.alias, a.normalized_alias, s.* FROM security_aliases a "
+                "JOIN securities s ON s.security_id=a.security_id "
+                "WHERE a.valid_to IS NULL"
+            ).fetchall()
+            for row in aliases:
+                if (
+                    self._normalize_universe_symbol(row["alias"]) == symbol_key
+                    or self._normalize_company_identity(row["alias"]) == company_key
+                ):
+                    candidates[str(row["security_id"])] = {
+                        key: row[key] for key in row.keys() if key not in {"alias", "normalized_alias"}
+                    }
+        return next(iter(candidates.values())) if len(candidates) == 1 else None
+
+    def register_security_alias(
+        self,
+        security_id: str,
+        alias: str,
+        *,
+        alias_type: str = "issuer_alias",
+        provider: Optional[str] = None,
+        source: str = "registry",
+    ) -> bool:
+        """Register one exact issuer/manufacturer/UEI identity in the registry."""
+        allowed = {"issuer_alias", "manufacturer", "recipient_uei", "vendor_symbol"}
+        alias_type = str(alias_type or "issuer_alias").strip().lower()
+        value = str(alias or "").strip()
+        if alias_type not in allowed:
+            raise ValueError(f"unsupported security alias type: {alias_type}")
+        if not value or not security_id:
+            raise ValueError("security_id and alias are required")
+        normalized = self._normalize_company_identity(value)
+        with self._connect() as conn:
+            if not conn.execute(
+                "SELECT 1 FROM securities WHERE security_id=?", (security_id,)
+            ).fetchone():
+                raise ValueError(f"unknown security_id: {security_id}")
+            existing = conn.execute(
+                "SELECT 1 FROM security_aliases WHERE security_id=? "
+                "AND alias=? AND alias_type=? AND provider IS ? AND valid_to IS NULL",
+                (security_id, value, alias_type, provider),
+            ).fetchone()
+            if existing:
+                return False
+            conflicting = conn.execute(
+                "SELECT 1 FROM security_aliases WHERE security_id<>? "
+                "AND normalized_alias=? AND provider IS ? AND valid_to IS NULL",
+                (security_id, normalized, provider),
+            ).fetchone()
+            if conflicting:
+                # Preserve the exact ambiguity for review rather than selecting a
+                # ticker.  The resolver will return None for multiple candidates.
+                return False
+            conn.execute(
+                "INSERT INTO security_aliases ("
+                "security_id, alias, normalized_alias, alias_type, provider, source"
+                ") VALUES (?, ?, ?, ?, ?, ?)",
+                (security_id, value, normalized, alias_type, provider, source),
+            )
+            conn.commit()
+        return True
 
     def list_memberships(
         self,
