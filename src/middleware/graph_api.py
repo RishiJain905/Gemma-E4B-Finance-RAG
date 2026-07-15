@@ -214,6 +214,36 @@ def create_graph_router(
             corpus_error(exc, missing_is_404=isinstance(exc, KeyError))
         return {}  # pragma: no cover
 
+    @router.get("/corpus/aggregates", response_model=CorpusGraphResponse)
+    def corpus_aggregates(
+        group_by: str = Query("source_category", max_length=32),
+        source_category: Optional[str] = Query(None, max_length=64),
+        source: Optional[str] = Query(None, max_length=64),
+        item_type: Optional[str] = Query(None, max_length=64),
+        security: Optional[str] = Query(None, max_length=64),
+        year: Optional[str] = Query(None, max_length=8),
+        month: Optional[str] = Query(None, max_length=8),
+        indexing_state: Optional[str] = Query(None, max_length=32),
+        limit: Optional[int] = Query(None),
+        cursor: Optional[str] = Query(None, max_length=2_048),
+    ) -> dict:
+        """Return bounded authoritative facet counts; never scans Chroma bodies."""
+        projector = enabled_corpus()
+        page_limit = corpus_limit(projector, limit)
+        try:
+            return projector.aggregates(
+                group_by,
+                filters={
+                    "source_category": source_category, "source": source,
+                    "item_type": item_type, "security": security,
+                    "year": year, "month": month, "indexing_state": indexing_state,
+                },
+                limit=page_limit, cursor=cursor,
+            )
+        except (CorpusRevisionChanged, ValueError) as exc:
+            corpus_error(exc)
+        return {}  # pragma: no cover
+
     @router.get("/corpus/refresh-status", response_model=CorpusGraphResponse)
     def corpus_refresh_status() -> dict:
         """Return persisted freshness/scheduler state; never refresh or heartbeat."""

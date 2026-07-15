@@ -167,6 +167,79 @@ def test_corpus_routes_return_404_when_graph_is_disabled(offline_store):
     assert client.get("/graph/api/corpus/refresh-status").status_code == 404
 
 
+# ── 2.3.5.2: aggregation-first facet counts ──────────────────────────────────
+
+class _FakeAggStore:
+    """Minimal Store surface the aggregates projection touches, so facet-count
+    behavior is tested without seeding the full corpus schema."""
+
+    def __init__(self, rows):
+        self._rows = rows
+        self.calls = []
+
+    def retrieval_revision(self):
+        return 7
+
+    def get_corpus_accounting(self, group_by, *, limit=100, offset=0, **filters):
+        self.calls.append((group_by, dict(filters), limit, offset))
+        rows = self._rows.get(group_by, [])
+        return rows[offset:offset + limit]
+
+
+def test_corpus_aggregates_projects_authoritative_counts_and_authority():
+    store = _FakeAggStore({"source_category": [
+        {"key": "sec", "count": 14203, "approximate_bytes": 100},
+        {"key": "company_news", "count": 86110, "approximate_bytes": 200},
+        {"key": "central_bank", "count": 3, "approximate_bytes": 30},
+    ]})
+    resp = _corpus_client(store).get(
+        "/graph/api/corpus/aggregates?group_by=source_category&limit=2")
+    assert resp.status_code == 200
+    body = resp.json()
+    agg = body["aggregates"]
+    assert agg["group_by"] == "source_category"
+    assert body["corpus_revision"] == 7
+    first = agg["buckets"][0]
+    assert first["key"] == "sec" and first["count"] == 14203
+    assert first["label"] == "SEC / EDGAR" and first["authority_tier"] == "primary"
+    # Global (non-issuer) authorities are flagged for the parallel branch.
+    news = agg["buckets"][1]
+    assert news["authority_tier"] == "licensed" and news["global_source"] is False
+    # limit=2 over 3 rows pages via a revision-bound cursor.
+    assert body["truncated"] is True and body["next_cursor"]
+
+
+def test_corpus_aggregates_second_page_and_filter_passthrough():
+    store = _FakeAggStore({"source_category": [
+        {"key": "sec", "count": 5, "approximate_bytes": 1},
+        {"key": "treasury", "count": 4, "approximate_bytes": 1},
+        {"key": "regulator", "count": 1, "approximate_bytes": 1},
+    ]})
+    client = _corpus_client(store)
+    page1 = client.get(
+        "/graph/api/corpus/aggregates?group_by=source_category&item_type=filing").json()
+    assert page1["aggregates"]["filters"] == {"item_type": "filing"}
+    page2 = client.get(
+        "/graph/api/corpus/aggregates?group_by=source_category&item_type=filing"
+        f"&cursor={page1['next_cursor']}").json()
+    keys = [bucket["key"] for bucket in page2["aggregates"]["buckets"]]
+    assert keys == ["regulator"] and page2["next_cursor"] is None
+    # Every accounting call carried the combinable filter through unchanged.
+    assert all(call[1] == {"item_type": "filing"} for call in store.calls)
+
+
+def test_corpus_aggregates_rejects_unknown_dimension():
+    resp = _corpus_client(_FakeAggStore({})).get(
+        "/graph/api/corpus/aggregates?group_by=not_a_dimension")
+    assert resp.status_code == 422
+
+
+def test_corpus_aggregates_404_when_graph_is_disabled():
+    resp = _corpus_client(_FakeAggStore({}), enabled=False).get(
+        "/graph/api/corpus/aggregates")
+    assert resp.status_code == 404
+
+
 # ── 2.2.7.4: app-level loopback + CSP + no-store security posture ────────────
 
 @pytest.fixture

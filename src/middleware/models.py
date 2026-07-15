@@ -337,6 +337,7 @@ class CorpusGraphResponse(BaseModel):
     truncated: bool = False
     corpus_revision: int = 0
     refresh: Optional[dict] = None
+    aggregates: Optional[dict] = None
 
 
 class SearchRequest(BaseModel):

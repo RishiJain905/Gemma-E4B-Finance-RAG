@@ -26,6 +26,36 @@ CORPUS_RELATIONS = frozenset({
     "has_chunk_family", "freshness_for", "scheduled_by",
 })
 
+# Aggregation-first explorer (2.3.5.2): the bounded dimensions the landing view
+# and facet rail count over. Each maps 1:1 to a Store.get_corpus_accounting
+# group_by, which returns COUNT/SUM rows straight from SQLite metadata (never
+# Chroma bodies), so every count is authoritative and bounded.
+AGGREGATE_DIMENSIONS = frozenset({
+    "source_category", "source", "item_type", "security",
+    "year", "month", "indexing_state",
+})
+
+# Human labels + authority tier per canonical source category. The tier mirrors
+# evidence_taxonomy._authority_rank so the explorer badges agree with the
+# retrieval ranker; global (non-issuer) authorities form the parallel branch.
+_CATEGORY_LABELS = {
+    "sec": "SEC / EDGAR", "issuer": "Issuer / IR", "market_data": "Market data",
+    "company_news": "Company news", "central_bank": "Central bank",
+    "treasury": "Treasury", "economic_agency": "Economic agency",
+    "regulator": "Regulator", "sector_agency": "Sector agency",
+    "transcript": "Transcript", "estimates": "Estimates",
+    "global_news": "Global news",
+}
+_CATEGORY_AUTHORITY = {
+    "sec": "primary", "issuer": "primary", "central_bank": "primary",
+    "treasury": "primary", "economic_agency": "primary", "regulator": "primary",
+    "sector_agency": "primary", "market_data": "structured",
+    "company_news": "licensed", "transcript": "analysis",
+    "estimates": "analysis", "global_news": "discovery",
+}
+_GLOBAL_CATEGORIES = frozenset(
+    {"central_bank", "treasury", "economic_agency", "regulator"})
+
 MAX_PAGE_LIMIT = 200
 MAX_ELEMENT_LIMIT = 2_000
 DEFAULT_PAGE_LIMIT = 100
@@ -884,6 +914,78 @@ class CorpusGraph:
             nodes, edges, revision=revision, next_cursor=next_cursor,
             truncated=has_more,
         )
+
+    # ── Aggregation-first facet counts (2.3.5.2) ──────────────────────────
+
+    @staticmethod
+    def _agg_filters(filters: Optional[dict]) -> dict:
+        """Keep only recognized, bounded accounting filters from a query map."""
+        allowed = {
+            "source_category", "source", "item_type",
+            "security", "year", "month", "indexing_state",
+        }
+        result: dict[str, str] = {}
+        for key, value in (filters or {}).items():
+            if key in allowed and value not in (None, ""):
+                result[key] = str(value)[:128]
+        return result
+
+    def _bucket(self, group_by: str, row: dict) -> dict:
+        """Shape one accounting row into a labelled, redacted facet bucket."""
+        key = str(row.get("key") or "unknown")
+        bucket = {
+            "key": _redact_text(key, 128),
+            "count": int(row.get("count") or 0),
+            "approximate_bytes": int(row.get("approximate_bytes") or 0),
+        }
+        if group_by == "source_category":
+            bucket["label"] = _CATEGORY_LABELS.get(key, key)
+            bucket["authority_tier"] = _CATEGORY_AUTHORITY.get(key, "discovery")
+            bucket["global_source"] = key in _GLOBAL_CATEGORIES
+        else:
+            bucket["label"] = _redact_text(key, 128)
+        return bucket
+
+    def aggregates(
+        self,
+        group_by: str,
+        *,
+        filters: Optional[dict] = None,
+        limit: int = DEFAULT_PAGE_LIMIT,
+        cursor: Optional[str] = None,
+    ) -> dict:
+        """Return one bounded, revision-keyed page of facet counts.
+
+        Projects ``Store.get_corpus_accounting`` so the landing view and facet
+        rail can show authoritative "counts before expansion" without rendering
+        the corpus. Combinable filters narrow the same authoritative aggregate.
+        """
+        if group_by not in AGGREGATE_DIMENSIONS:
+            raise ValueError(f"group_by must be one of {sorted(AGGREGATE_DIMENSIONS)}")
+        limit = self._validate_limit(limit)
+        applied = self._agg_filters(filters)
+        revision = self._revision()
+        scope = self._scope(
+            {"operation": "aggregates", "group_by": group_by, "filters": applied})
+        offset = self._decode_cursor(cursor, scope=scope, revision=revision)
+        fetch_limit = min(MAX_PAGE_LIMIT, limit + 1)
+        rows = self.store.get_corpus_accounting(
+            group_by, limit=fetch_limit, offset=offset, **applied)
+        has_more = len(rows) > limit
+        rows = rows[:limit]
+        buckets = [self._bucket(group_by, row) for row in rows]
+        next_cursor = self._encode_cursor(
+            offset=offset + limit, revision=revision, scope=scope,
+        ) if has_more else None
+        return self._response([], [], revision=revision, truncated=has_more) | {
+            "next_cursor": next_cursor,
+            "aggregates": {
+                "group_by": group_by,
+                "filters": applied,
+                "buckets": buckets,
+                "page_total": sum(bucket["count"] for bucket in buckets),
+            },
+        }
 
     # ── Refresh/freshness status ──────────────────────────────────────────
 
