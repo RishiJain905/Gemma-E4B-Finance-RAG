@@ -70,10 +70,10 @@ class TestGDELTIngestor:
         assert len(ingestor.TICKER_TO_QUERY) > 20
         assert "NVDA" in ingestor.TICKER_TO_QUERY
 
-    def test_process_articles_dedup(self):
+    def test_process_articles_dedup(self, store):
         """Duplicate URLs are removed during processing."""
         from src.macros.gdelt_ingestor import GDELTIngestor
-        ingestor = GDELTIngestor()
+        ingestor = GDELTIngestor(store=store)
 
         articles = [
             {"url": "https://example.com/news1", "title": "News 1",
@@ -87,10 +87,10 @@ class TestGDELTIngestor:
         processed = ingestor._process_articles(articles, "NVDA")
         assert len(processed) == 2
 
-    def test_process_articles_parses_tone(self):
+    def test_process_articles_parses_tone(self, store):
         """Tone scores are parsed correctly as floats."""
         from src.macros.gdelt_ingestor import GDELTIngestor
-        ingestor = GDELTIngestor()
+        ingestor = GDELTIngestor(store=store)
 
         articles = [
             {"url": "https://example.com/nvda1", "title": "NVDA Up",
@@ -106,10 +106,10 @@ class TestGDELTIngestor:
         assert processed[0]["tone"] == 12.5
         assert processed[1]["tone"] == -8.3
 
-    def test_process_articles_missing_fields(self):
+    def test_process_articles_missing_fields(self, store):
         """Articles missing critical fields are filtered."""
         from src.macros.gdelt_ingestor import GDELTIngestor
-        ingestor = GDELTIngestor()
+        ingestor = GDELTIngestor(store=store)
 
         articles = [
             {"url": "", "title": "No URL", "content": "Missing URL"},
@@ -268,11 +268,15 @@ class TestGDELTIngestor:
         with patch(
             "src.macros.gdelt_ingestor.httpx.get", return_value=response,
         ) as mock_get, patch("src.macros.gdelt_ingestor.time.sleep") as mock_sleep:
-            with pytest.raises(GDELTRateLimitError, match="retry after 60"):
+            with pytest.raises(GDELTRateLimitError, match="retry after 60") as caught:
                 ingestor._doc_api_get({"query": "NVIDIA"})
 
         assert mock_get.call_count == 3
         assert [call.args[0] for call in mock_sleep.call_args_list] == [60.0, 60.0]
+        assert caught.value.error_class == "rate_limited"
+        assert caught.value.attempts == 3
+        assert len(caught.value.retry_timestamps) == 2
+        assert caught.value.reset_at is not None
 
     def test_rate_limit_exhaustion_aborts_alias_and_fallback_queries(self, store):
         """A rate-limited ticker stops after one query's three attempts."""
@@ -401,10 +405,10 @@ class TestGDELTIngestor:
         topics = ingestor.config.get("financial_topics", [])
         assert mock_search.call_count == len(topics)
 
-    def test_parse_v2tone(self):
+    def test_parse_v2tone(self, store):
         """V2Tone CSV field parses to average tone float."""
         from src.macros.gdelt_ingestor import GDELTIngestor
-        ingestor = GDELTIngestor()
+        ingestor = GDELTIngestor(store=store)
 
         assert ingestor._parse_v2tone(
             "1.86,2.83,0.97,3.80,18.70,0.22,1165",
@@ -412,10 +416,10 @@ class TestGDELTIngestor:
         assert ingestor._parse_v2tone("") is None
         assert ingestor._parse_v2tone("not-a-number,1,2") is None
 
-    def test_estimate_title_tone(self):
+    def test_estimate_title_tone(self, store):
         """Title lexicon produces bounded sentiment scores."""
         from src.macros.gdelt_ingestor import GDELTIngestor
-        ingestor = GDELTIngestor()
+        ingestor = GDELTIngestor(store=store)
 
         positive = ingestor._estimate_title_tone("NVIDIA stock soars on record earnings beat")
         negative = ingestor._estimate_title_tone("Tech stocks plunge amid sell-off fears")
@@ -450,10 +454,10 @@ class TestGDELTIngestor:
         assert articles[0]["tone"] == 3.5
         assert articles[1]["tone"] > 0
 
-    def test_process_articles_without_doc_tone(self):
+    def test_process_articles_without_doc_tone(self, store):
         """DOC ArtList articles get tone via enrichment or title fallback."""
         from src.macros.gdelt_ingestor import GDELTIngestor
-        ingestor = GDELTIngestor()
+        ingestor = GDELTIngestor(store=store)
 
         articles = [
             {

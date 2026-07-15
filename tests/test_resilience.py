@@ -221,3 +221,26 @@ class TestDeadLetterQueue:
 
         # Removing a non-existent item returns False.
         assert dlq.retry("fred", "GDP") is False
+
+    def test_source_wide_failures_deduplicate_with_structured_identity(self, store):
+        dlq = DeadLetterQueue(store)
+
+        for message in ("token=first-secret throttled", "token=second-secret throttled"):
+            dlq.add_failure(
+                source="finnhub",
+                partition="__provider__",
+                provider_record_id=None,
+                cursor=None,
+                error_class="rate_limited",
+                message=message,
+                attempts=3,
+            )
+
+        pending = dlq.get_pending()
+        assert len(pending) == 1
+        assert pending[0]["partition"] == "__provider__"
+        assert pending[0]["error_class"] == "rate_limited"
+        assert pending[0]["attempt_count"] == 6
+        assert pending[0]["first_seen"]
+        assert pending[0]["last_seen"]
+        assert "secret" not in pending[0]["last_error"]

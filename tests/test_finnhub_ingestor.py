@@ -167,6 +167,49 @@ def test_finnhub_auth_and_entitlement_denials_are_not_retried(
     assert http_get.call_count == 1
 
 
+def test_finnhub_permanent_404_isolates_ticker_and_continues(
+    tmp_path: Path,
+) -> None:
+    """A missing resource is partition-local while the provider remains healthy."""
+    from src.ingestion.finnhub_ingestor import FinnhubIngestor
+
+    store, _chroma = _store(tmp_path)
+    requested: list[str] = []
+
+    def http_get(_url: str, **kwargs) -> FakeResponse:
+        symbol = str(kwargs["params"]["symbol"])
+        requested.append(symbol)
+        if symbol == "AAA":
+            return FakeResponse({"error": "not found"}, status_code=404)
+        return FakeResponse(
+            [
+                {
+                    "id": "bbb-1",
+                    "headline": "Beta update",
+                    "summary": "Beta released an update.",
+                    "source": "Reuters",
+                    "url": "https://news.example/beta-1",
+                    "datetime": 1_784_048_400,
+                }
+            ]
+        )
+
+    result = FinnhubIngestor(
+        store=store,
+        coverage_resolver=_coverage(),
+        api_key="test-finnhub-key",
+        http_get=http_get,
+        now_fn=lambda: "2026-07-14T13:00:00Z",
+        sleep_fn=lambda _seconds: None,
+    ).ingest_news()
+
+    assert requested == ["AAA", "BBB"]
+    assert result["tickers"] == 2
+    assert result["stored"] == 1
+    assert result["error_class"] == "permanent"
+    assert result["rejected_items"] == 1
+
+
 def test_finnhub_429_honors_retry_metadata_and_keeps_cursor(tmp_path: Path) -> None:
     """A bounded 429 retry exposes Retry-After and does not checkpoint on exhaustion."""
     from src.ingestion.finnhub_ingestor import FinnhubIngestor
@@ -194,6 +237,12 @@ def test_finnhub_429_honors_retry_metadata_and_keeps_cursor(tmp_path: Path) -> N
     assert result["status"] == "rate_limited"
     assert result["error_class"] == "rate_limited"
     assert result["retry_after"] == 7.0
+    assert result["requests"] == 3
+    assert result["attempts"] == 3
+    assert result["terminal_status"] == "rate_limited"
+    assert result["accepted_items"] == 0
+    assert result["rejected_items"] == 0
+    assert result["remaining_work_skipped"] is True
     assert http_get.call_count == 3
     assert sleeps == [7.0, 7.0]
     assert store.get_source_cursor("finnhub_news", "AAA") == before

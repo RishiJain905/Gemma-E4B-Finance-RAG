@@ -15,6 +15,12 @@ from typing import Any, Callable, Optional
 
 import requests
 
+from src.ingestion.errors import (
+    ErrorClass,
+    ProviderError,
+    error_class_for_http,
+    parse_retry_after,
+)
 from src.ingestion.normalization import NORMALIZATION_VERSION, content_hash, normalize_canonical_url
 from src.ingestion.records import EventRecord, NarrativeRecord, ObservationRecord
 from src.storage.store import Store
@@ -23,7 +29,7 @@ from src.universe.coverage import CoverageResolver
 logger = logging.getLogger(__name__)
 
 
-class MassiveProviderError(RuntimeError):
+class MassiveProviderError(ProviderError):
     """Bounded, normalized Massive transport or contract failure."""
 
     def __init__(
@@ -33,11 +39,17 @@ class MassiveProviderError(RuntimeError):
         error_class: str,
         status_code: Optional[int] = None,
         retry_after: Optional[float] = None,
+        reset_at: Optional[str] = None,
+        attempts: int = 1,
     ) -> None:
-        super().__init__(message)
-        self.error_class = error_class
-        self.status_code = status_code
-        self.retry_after = retry_after
+        super().__init__(
+            message,
+            error_class=error_class,
+            status_code=status_code,
+            retry_after=retry_after,
+            reset_at=reset_at,
+            attempts=attempts,
+        )
 
 
 def _utc_now() -> str:
@@ -66,19 +78,24 @@ def _is_entitlement_message(message: str) -> bool:
     )
 
 
-def _retry_after(headers: object, payload: object) -> Optional[float]:
-    """Read and cap a numeric Retry-After value."""
+def _retry_after(
+    headers: object,
+    payload: object,
+    *,
+    now: datetime,
+) -> tuple[Optional[float], Optional[str]]:
+    """Read numeric/date Retry-After metadata."""
     value = None
     if hasattr(headers, "get"):
         value = headers.get("Retry-After") or headers.get("retry-after")
     if value is None and isinstance(payload, dict):
         value = payload.get("retry_after") or payload.get("retryAfter")
     if value is None:
-        return None
-    try:
-        return max(0.0, min(float(value), 300.0))
-    except (TypeError, ValueError):
-        return None
+        return None, None
+    window = parse_retry_after(value, now=now)
+    if window is None:
+        return None, None
+    return window.delay_seconds, window.reset_at
 
 
 def _format_number(value: object) -> str:
@@ -160,6 +177,8 @@ class MassiveIngestor:
         self.retry_max_delay = max(float(retry_max_delay), self.retry_base_delay)
         self.now_fn = now_fn
         self.sleep_fn = sleep_fn
+        self._last_request_attempts = 0
+        self._last_retry_timestamps: list[str] = []
 
     def ingest_market_data(
         self,
@@ -194,12 +213,24 @@ class MassiveIngestor:
             url = f"{self.base_url}{self.GROUPED_PATH}/{market_date.isoformat()}"
             try:
                 payload = self._request_json(url, {"adjusted": "true", "apiKey": self.api_key})
-                result["requests"] += 1
+                self._record_request(result)
             except MassiveProviderError as exc:
-                result["requests"] += 1
+                self._record_request(result, exc)
+                if (
+                    exc.error_class is ErrorClass.PERMANENT
+                    and exc.status_code == 404
+                ):
+                    result["rejected"] += 1
+                    result["errors"].append(
+                        f"{market_date}: provider resource not found"
+                    )
+                    continue
                 status = self._status_for_error(exc)
                 self._set_status(self.MARKET_CURSOR_SOURCE, "US", status, exc.error_class, str(exc), exc.retry_after)
-                return self._finish(result, status, error_class=exc.error_class, retry_after=exc.retry_after)
+                return self._finish(
+                    result, status, error_class=exc.error_class,
+                    retry_after=exc.retry_after, reset_at=exc.reset_at,
+                )
 
             rows = self._rows_from_payload(payload)
             if rows is None:
@@ -245,10 +276,14 @@ class MassiveIngestor:
                 last_successful_run_id=hashlib.sha256(
                     f"massive-market:{market_date}".encode("utf-8")
                 ).hexdigest()[:32],
-                status="partial" if result["malformed"] else "success",
+                status=(
+                    "partial"
+                    if result["malformed"] or result["rejected"]
+                    else "success"
+                ),
             )
 
-        status = "partial" if result["malformed"] else "ok"
+        status = "partial" if result["malformed"] or result["rejected"] else "ok"
         return self._finish(result, status, cursor_after=market_dates[-1].isoformat())
 
     def ingest_corporate_actions(
@@ -282,6 +317,7 @@ class MassiveIngestor:
             page_url = url
             page_params = params
             seen_pages: set[str] = set()
+            payload: object = None
             while page_url and len(seen_pages) < self.max_pages:
                 if page_url in seen_pages:
                     result["malformed"] += 1
@@ -291,14 +327,31 @@ class MassiveIngestor:
                 seen_pages.add(page_url)
                 try:
                     payload = self._request_json(page_url, page_params)
-                    result["requests"] += 1
+                    self._record_request(result)
                 except MassiveProviderError as exc:
-                    result["requests"] += 1
+                    self._record_request(result, exc)
+                    if (
+                        exc.error_class is ErrorClass.PERMANENT
+                        and exc.status_code == 404
+                    ):
+                        result["rejected"] += 1
+                        result["errors"].append(
+                            f"{action_type}: provider resource not found"
+                        )
+                        fetch_incomplete = True
+                        page_url = ""
+                        break
                     status = self._status_for_error(exc)
                     self._set_status(self.ACTION_CURSOR_SOURCE, "US", status, exc.error_class, str(exc), exc.retry_after)
                     if result["stored"] or result["duplicates"]:
-                        return self._finish(result, "partial", error_class=exc.error_class, retry_after=exc.retry_after)
-                    return self._finish(result, status, error_class=exc.error_class, retry_after=exc.retry_after)
+                        return self._finish(
+                            result, "partial", error_class=exc.error_class,
+                            retry_after=exc.retry_after, reset_at=exc.reset_at,
+                        )
+                    return self._finish(
+                        result, status, error_class=exc.error_class,
+                        retry_after=exc.retry_after, reset_at=exc.reset_at,
+                    )
                 rows = self._rows_from_payload(payload)
                 if rows is None:
                     result["malformed"] += 1
@@ -384,12 +437,15 @@ class MassiveIngestor:
                 url,
                 {"published_utc.gte": first, "published_utc.lte": last, "limit": 1_000, "apiKey": self.api_key},
             )
-            result["requests"] += 1
+            self._record_request(result)
         except MassiveProviderError as exc:
-            result["requests"] += 1
+            self._record_request(result, exc)
             status = self._status_for_error(exc)
             self._set_status(self.NEWS_STATUS_SOURCE, "US", status, exc.error_class, str(exc), exc.retry_after)
-            return self._finish(result, status, error_class=exc.error_class, retry_after=exc.retry_after)
+            return self._finish(
+                result, status, error_class=exc.error_class,
+                retry_after=exc.retry_after, reset_at=exc.reset_at,
+            )
         rows = self._rows_from_payload(payload)
         if rows is None:
             return self._finish(result, "error", error_class="contract")
@@ -446,12 +502,15 @@ class MassiveIngestor:
                     "apiKey": self.api_key,
                 },
             )
-            result["requests"] += 1
+            self._record_request(result)
         except MassiveProviderError as exc:
-            result["requests"] += 1
+            self._record_request(result, exc)
             status = self._status_for_error(exc)
             self._set_status(self.FILINGS_STATUS_SOURCE, "US", status, exc.error_class, str(exc), exc.retry_after)
-            return self._finish(result, status, error_class=exc.error_class, retry_after=exc.retry_after)
+            return self._finish(
+                result, status, error_class=exc.error_class,
+                retry_after=exc.retry_after, reset_at=exc.reset_at,
+            )
         rows = self._rows_from_payload(payload)
         if rows is None:
             return self._finish(result, "error", error_class="contract")
@@ -492,10 +551,30 @@ class MassiveIngestor:
         include_filings: bool = False,
     ) -> dict:
         """Run configured Massive capabilities independently."""
-        result = {
-            "market": self.ingest_market_data(start_date=start_date, end_date=end_date),
-            "corporate_actions": self.ingest_corporate_actions(start_date=start_date, end_date=end_date),
-        }
+        market = self.ingest_market_data(start_date=start_date, end_date=end_date)
+        result = {"market": market}
+        if market.get("error_class") in {
+            ErrorClass.AUTHENTICATION.value,
+            ErrorClass.ENTITLEMENT.value,
+            ErrorClass.RATE_LIMITED.value,
+            ErrorClass.QUOTA_EXHAUSTED.value,
+        }:
+            result["corporate_actions"] = {
+                "status": "skipped_provider_circuit",
+                "source": self.SOURCE_NAME,
+                "capability": "corporate_actions",
+                "error_class": market["error_class"],
+                "attempts": 0,
+                "requests": 0,
+                "accepted_items": 0,
+                "rejected_items": 0,
+                "remaining_work_skipped": True,
+                "reset_at": market.get("reset_at"),
+            }
+            return result
+        result["corporate_actions"] = self.ingest_corporate_actions(
+            start_date=start_date, end_date=end_date
+        )
         if include_news:
             result["news"] = self.ingest_news(start_date=start_date, end_date=end_date)
         if include_filings:
@@ -504,7 +583,10 @@ class MassiveIngestor:
 
     def _request_json(self, url: str, params: dict[str, object]) -> object:
         """Request one provider page with bounded retry semantics."""
+        self._last_request_attempts = 0
+        self._last_retry_timestamps = []
         for attempt in range(1, self.max_attempts + 1):
+            self._last_request_attempts = attempt
             try:
                 response = self.http_get(
                     url,
@@ -522,15 +604,26 @@ class MassiveIngestor:
                 message = _error_text(payload)
                 if status_code >= 400:
                     error_class = self._error_class(status_code, message)
+                    retry_after, reset_at = _retry_after(
+                        getattr(response, "headers", {}),
+                        payload,
+                        now=datetime.fromisoformat(
+                            self._now_timestamp().replace("Z", "+00:00")
+                        ),
+                    )
                     error = MassiveProviderError(
                         message or f"Massive HTTP {status_code}",
                         error_class=error_class,
                         status_code=status_code,
-                        retry_after=_retry_after(getattr(response, "headers", {}), payload),
+                        retry_after=retry_after,
+                        reset_at=reset_at,
+                        attempts=attempt,
                     )
                     if error_class in {"rate_limited", "transient"} and attempt < self.max_attempts:
+                        self._last_retry_timestamps.append(self._now_timestamp())
                         self.sleep_fn(self._retry_delay(error, attempt))
                         continue
+                    error.circuit_open = error.provider_wide
                     raise error
                 if isinstance(payload, dict) and payload.get("error"):
                     if _is_entitlement_message(message):
@@ -542,8 +635,10 @@ class MassiveIngestor:
             except (requests.RequestException, ConnectionError, TimeoutError, OSError) as exc:
                 error = MassiveProviderError(str(exc), error_class="transient")
                 if attempt < self.max_attempts:
+                    self._last_retry_timestamps.append(self._now_timestamp())
                     self.sleep_fn(self._retry_delay(error, attempt))
                     continue
+                error.attempts = attempt
                 raise error from exc
         raise MassiveProviderError("Massive request exhausted", error_class="transient")
 
@@ -874,8 +969,11 @@ class MassiveIngestor:
             "updated": 0,
             "duplicates": 0,
             "malformed": 0,
+            "rejected": 0,
             "requests": 0,
+            "attempts": 0,
             "pages": 0,
+            "retry_timestamps": [],
             "errors": [],
         }
 
@@ -883,7 +981,33 @@ class MassiveIngestor:
     def _finish(result: dict, status: str, **values: object) -> dict:
         result["status"] = status
         result.update(values)
+        result["terminal_status"] = status
+        result["accepted_items"] = sum(
+            int(result.get(key, 0) or 0)
+            for key in ("stored", "updated", "duplicates")
+        )
+        result["rejected_items"] = int(result.get("malformed", 0) or 0) + int(
+            result.get("rejected", 0) or 0
+        )
+        error_class = result.get("error_class")
+        error_text = str(
+            error_class.value if isinstance(error_class, ErrorClass) else error_class or ""
+        )
+        result["remaining_work_skipped"] = error_text in {
+            "authentication", "entitlement", "rate_limited", "quota_exhausted"
+        }
         return result
+
+    def _record_request(
+        self,
+        result: dict,
+        error: Optional[MassiveProviderError] = None,
+    ) -> None:
+        """Copy one logical request's physical attempts into its result."""
+        attempts = error.attempts if error is not None else self._last_request_attempts
+        result["requests"] += attempts
+        result["attempts"] += attempts
+        result["retry_timestamps"].extend(self._last_retry_timestamps)
 
     def _set_status(
         self,
@@ -916,15 +1040,7 @@ class MassiveIngestor:
 
     @staticmethod
     def _error_class(status_code: int, message: str) -> str:
-        if status_code == 401:
-            return "authentication"
-        if status_code == 403 or _is_entitlement_message(message):
-            return "entitlement"
-        if status_code == 429:
-            return "rate_limited"
-        if status_code >= 500:
-            return "transient"
-        return "permanent"
+        return error_class_for_http(status_code, message).value
 
     def _retry_delay(self, error: MassiveProviderError, attempt: int) -> float:
         if error.retry_after is not None:

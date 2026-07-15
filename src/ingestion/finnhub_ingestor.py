@@ -20,6 +20,12 @@ from src.ingestion.normalization import (
     normalize_canonical_url,
     parse_timestamp,
 )
+from src.ingestion.errors import (
+    ErrorClass,
+    ProviderError,
+    error_class_for_http,
+    parse_retry_after,
+)
 from src.ingestion.records import NarrativeRecord
 from src.storage.store import Store
 from src.universe.coverage import CoverageResolver
@@ -27,7 +33,7 @@ from src.universe.coverage import CoverageResolver
 logger = logging.getLogger(__name__)
 
 
-class FinnhubProviderError(RuntimeError):
+class FinnhubProviderError(ProviderError):
     """Bounded, normalized Finnhub transport or contract failure."""
 
     def __init__(
@@ -37,11 +43,17 @@ class FinnhubProviderError(RuntimeError):
         error_class: str,
         status_code: Optional[int] = None,
         retry_after: Optional[float] = None,
+        reset_at: Optional[str] = None,
+        attempts: int = 1,
     ) -> None:
-        super().__init__(message)
-        self.error_class = error_class
-        self.status_code = status_code
-        self.retry_after = retry_after
+        super().__init__(
+            message,
+            error_class=error_class,
+            status_code=status_code,
+            retry_after=retry_after,
+            reset_at=reset_at,
+            attempts=attempts,
+        )
 
 
 def _utc_now() -> str:
@@ -72,19 +84,24 @@ def _as_date(value: str) -> str:
     return parse_timestamp(value, "timestamp").date().isoformat()
 
 
-def _retry_after(headers: object, payload: object) -> Optional[float]:
-    """Read a bounded numeric Retry-After value from headers or JSON."""
+def _retry_after(
+    headers: object,
+    payload: object,
+    *,
+    now: datetime,
+) -> tuple[Optional[float], Optional[str]]:
+    """Read numeric/date Retry-After metadata from headers or JSON."""
     header_value = None
     if hasattr(headers, "get"):
         header_value = headers.get("Retry-After") or headers.get("retry-after")
     if header_value is None and isinstance(payload, dict):
         header_value = payload.get("retry_after") or payload.get("retryAfter")
     if header_value is None:
-        return None
-    try:
-        return max(0.0, min(float(header_value), 300.0))
-    except (TypeError, ValueError):
-        return None
+        return None, None
+    window = parse_retry_after(header_value, now=now)
+    if window is None:
+        return None, None
+    return window.delay_seconds, window.reset_at
 
 
 def _error_text(payload: object) -> str:
@@ -152,6 +169,8 @@ class FinnhubIngestor:
         self.retry_max_delay = max(float(retry_max_delay), self.retry_base_delay)
         self.now_fn = now_fn
         self.sleep_fn = sleep_fn
+        self._last_request_attempts = 0
+        self._last_retry_timestamps: list[str] = []
 
     def ingest_news(self, tickers: Optional[list[str]] = None) -> dict:
         """Ingest broad-universe news, isolating ticker partitions."""
@@ -165,7 +184,9 @@ class FinnhubIngestor:
             "stored": 0,
             "duplicates": 0,
             "malformed": 0,
+            "rejected": 0,
             "requests": 0,
+            "attempts": 0,
             "pages": 0,
             "errors": [],
             "cursor_before": {},
@@ -182,6 +203,8 @@ class FinnhubIngestor:
             aggregate["tickers"] += 1
             for key in ("stored", "duplicates", "malformed", "requests", "pages"):
                 aggregate[key] += int(result.get(key, 0) or 0)
+            aggregate["attempts"] += int(result.get("attempts", 0) or 0)
+            aggregate["rejected"] += int(result.get("rejected_items", 0) or 0)
             ticker_key = str(ticker).upper()
             aggregate["cursor_before"][ticker_key] = result.get("cursor_before")
             aggregate["cursor_after"][ticker_key] = result.get("cursor_after")
@@ -193,10 +216,17 @@ class FinnhubIngestor:
             aggregate["errors"].extend(errors)
             if result.get("status") in terminal_statuses:
                 aggregate["status"] = result["status"]
+                aggregate["remaining_work_skipped"] = True
                 break
             if result.get("status") in {"error", "partial"}:
                 if aggregate["status"] == "ok":
                     aggregate["status"] = result["status"]
+        aggregate["terminal_status"] = aggregate["status"]
+        aggregate["accepted_items"] = int(aggregate["stored"]) + int(
+            aggregate["duplicates"]
+        )
+        aggregate["rejected_items"] = int(aggregate["rejected"])
+        aggregate.setdefault("remaining_work_skipped", False)
         return aggregate
 
     def ingest_ticker_news(self, ticker: str) -> dict:
@@ -234,11 +264,15 @@ class FinnhubIngestor:
             seen_pages.add(page_key)
             try:
                 payload = self._request_json(params)
-                result["requests"] += 1
+                result["requests"] += self._last_request_attempts
+                result["attempts"] += self._last_request_attempts
+                result["retry_timestamps"].extend(self._last_retry_timestamps)
                 result["pages"] += 1
             except FinnhubProviderError as exc:
                 provider_failure = exc
-                result["requests"] += 1
+                result["requests"] += exc.attempts
+                result["attempts"] += exc.attempts
+                result["retry_timestamps"].extend(self._last_retry_timestamps)
                 break
 
             rows = self._rows_from_payload(payload)
@@ -302,6 +336,7 @@ class FinnhubIngestor:
                 status,
                 error_class=provider_failure.error_class,
                 retry_after=provider_failure.retry_after,
+                reset_at=provider_failure.reset_at,
             )
         if storage_failed:
             self._set_status(ticker, "error", "storage", "one or more news records failed to store")
@@ -338,7 +373,10 @@ class FinnhubIngestor:
     def _request_json(self, params: dict[str, object]) -> object:
         """Request one page with bounded transient/429 retries."""
         url = f"{self.base_url}{self.COMPANY_NEWS_PATH}"
+        self._last_request_attempts = 0
+        self._last_retry_timestamps = []
         for attempt in range(1, self.max_attempts + 1):
+            self._last_request_attempts = attempt
             try:
                 response = self.http_get(
                     url,
@@ -356,15 +394,24 @@ class FinnhubIngestor:
                 message = _error_text(payload)
                 if status_code >= 400:
                     error_class = self._error_class(status_code, message)
+                    retry_after, reset_at = _retry_after(
+                        getattr(response, "headers", {}),
+                        payload,
+                        now=parse_timestamp(self._now_timestamp(), "now"),
+                    )
                     error = FinnhubProviderError(
                         message or f"Finnhub HTTP {status_code}",
                         error_class=error_class,
                         status_code=status_code,
-                        retry_after=_retry_after(getattr(response, "headers", {}), payload),
+                        retry_after=retry_after,
+                        reset_at=reset_at,
+                        attempts=attempt,
                     )
                     if error_class in {"rate_limited", "transient"} and attempt < self.max_attempts:
+                        self._last_retry_timestamps.append(self._now_timestamp())
                         self.sleep_fn(self._retry_delay(error, attempt))
                         continue
+                    error.circuit_open = error.provider_wide
                     raise error
                 if isinstance(payload, dict) and payload.get("error"):
                     if _is_entitlement_message(message):
@@ -380,8 +427,10 @@ class FinnhubIngestor:
             except (requests.RequestException, ConnectionError, TimeoutError, OSError) as exc:
                 error = FinnhubProviderError(str(exc), error_class="transient")
                 if attempt < self.max_attempts:
+                    self._last_retry_timestamps.append(self._now_timestamp())
                     self.sleep_fn(self._retry_delay(error, attempt))
                     continue
+                error.attempts = attempt
                 raise error from exc
         raise FinnhubProviderError("Finnhub request exhausted", error_class="transient")
 
@@ -498,7 +547,9 @@ class FinnhubIngestor:
             "duplicates": 0,
             "malformed": 0,
             "requests": 0,
+            "attempts": 0,
             "pages": 0,
+            "retry_timestamps": [],
             "errors": [],
             **values,
         }
@@ -511,6 +562,7 @@ class FinnhubIngestor:
         cursor_after: Optional[str] = None,
         error_class: Optional[str] = None,
         retry_after: Optional[float] = None,
+        reset_at: Optional[str] = None,
     ) -> dict:
         result["status"] = status
         result["cursor_after"] = cursor_after if cursor_after is not None else result.get("cursor_before")
@@ -518,6 +570,21 @@ class FinnhubIngestor:
             result["error_class"] = error_class
         if retry_after is not None:
             result["retry_after"] = retry_after
+        if reset_at is not None:
+            result["reset_at"] = reset_at
+        result["terminal_status"] = status
+        normalized_class = str(
+            error_class.value if isinstance(error_class, ErrorClass) else error_class or ""
+        )
+        result["accepted_items"] = int(result.get("stored", 0)) + int(
+            result.get("duplicates", 0)
+        )
+        result["rejected_items"] = int(result.get("malformed", 0)) + (
+            1 if normalized_class == "permanent" else 0
+        )
+        result["remaining_work_skipped"] = normalized_class in {
+            "authentication", "entitlement", "rate_limited", "quota_exhausted"
+        }
         return result
 
     def _set_status(
@@ -549,15 +616,7 @@ class FinnhubIngestor:
 
     @staticmethod
     def _error_class(status_code: int, message: str) -> str:
-        if status_code == 401:
-            return "authentication"
-        if status_code == 403 or _is_entitlement_message(message):
-            return "entitlement"
-        if status_code == 429:
-            return "rate_limited"
-        if status_code >= 500:
-            return "transient"
-        return "permanent"
+        return error_class_for_http(status_code, message).value
 
     def _retry_delay(self, error: FinnhubProviderError, attempt: int) -> float:
         if error.retry_after is not None:

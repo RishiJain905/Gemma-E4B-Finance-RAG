@@ -19,6 +19,12 @@ from typing import Any, Callable, Iterable, Mapping, Optional
 
 import yaml
 
+from src.ingestion.errors import (
+    ProviderError,
+    error_class_for_http,
+    parse_retry_after,
+    safe_message,
+)
 from src.ingestion.normalization import (
     NORMALIZATION_VERSION,
     content_hash,
@@ -33,7 +39,7 @@ CATALOG_PATH = Path(__file__).resolve().parents[3] / "configs" / "official_sourc
 PUBLIC_LICENSE = "public_record"
 
 
-class OfficialProviderError(RuntimeError):
+class OfficialProviderError(ProviderError):
     """Provider response failure classified for source-status reporting."""
 
     def __init__(
@@ -43,11 +49,15 @@ class OfficialProviderError(RuntimeError):
         error_class: str,
         status_code: Optional[int] = None,
         retry_after: Optional[float] = None,
+        reset_at: Optional[str] = None,
     ) -> None:
-        super().__init__(message)
-        self.error_class = error_class
-        self.status_code = status_code
-        self.retry_after = retry_after
+        super().__init__(
+            message,
+            error_class=error_class,
+            status_code=status_code,
+            retry_after=retry_after,
+            reset_at=reset_at,
+        )
 
 
 def utc_now() -> str:
@@ -248,29 +258,15 @@ def request_text(
 
 def provider_error_class(status_code: int, message: str = "") -> str:
     """Map HTTP/provider messages to the established entitlement state model."""
-    lowered = message.lower()
-    if status_code == 401:
-        return "authentication"
-    if status_code == 403 or any(
-        marker in lowered
-        for marker in ("entitlement", "plan", "subscription", "upgrade", "permission", "access", "forbidden")
-    ):
-        return "entitlement"
-    if status_code == 429:
-        return "rate_limited"
-    if status_code >= 500:
-        return "transient"
-    return "permanent"
+    return error_class_for_http(status_code, message).value
 
 
 def retry_after(response: object) -> Optional[float]:
-    """Read a bounded Retry-After value for scheduler/resilience handoff."""
+    """Read numeric/date Retry-After seconds for scheduler handoff."""
     headers = getattr(response, "headers", {})
     value = headers.get("Retry-After") or headers.get("retry-after") if hasattr(headers, "get") else None
-    try:
-        return max(0.0, min(float(value), 300.0)) if value is not None else None
-    except (TypeError, ValueError):
-        return None
+    window = parse_retry_after(value, now=datetime.now(timezone.utc))
+    return window.delay_seconds if window is not None else None
 
 
 def _response_error_text(response: object) -> str:
@@ -281,11 +277,11 @@ def _response_error_text(response: object) -> str:
             if isinstance(payload, Mapping):
                 for key in ("error", "message", "detail", "status"):
                     if payload.get(key):
-                        return str(payload[key])[:500]
-            return str(payload)[:500]
+                        return safe_message(payload[key])
+            return safe_message(payload)
         except (TypeError, ValueError, json.JSONDecodeError):
             pass
-    return str(getattr(response, "text", ""))[:500]
+    return safe_message(getattr(response, "text", ""))
 
 
 def status_for_error(error: OfficialProviderError) -> str:
@@ -532,7 +528,7 @@ def persist_records(store: object, records: Iterable[object], output: dict[str, 
                 raise TypeError(f"unsupported official record: {type(record).__name__}")
         except Exception as exc:  # noqa: BLE001 - one provider row must not abort its agency
             output["malformed"] = int(output["malformed"]) + 1
-            output["errors"].append(str(exc)[:500])
+            output["errors"].append(safe_message(exc))
 
 
 def finish(store: object, output: dict[str, object], *, partition: str = "catalog") -> dict[str, object]:

@@ -262,6 +262,89 @@ def test_massive_429_exposes_retry_metadata_without_advancing_date_cursor(
     assert store.get_source_cursor("massive_market", "US") is None
 
 
+def test_massive_provider_429_skips_remaining_capabilities(tmp_path: Path) -> None:
+    """One exhausted provider circuit prevents corporate-action requests."""
+    from src.ingestion.massive_ingestor import MassiveIngestor
+
+    store, _chroma = _store(tmp_path)
+    response = FakeResponse(
+        {"error": "rate limit"}, 429, {"Retry-After": "0"}
+    )
+    http_get = MagicMock(return_value=response)
+    result = MassiveIngestor(
+        store=store,
+        coverage_resolver=_coverage(),
+        api_key="test-massive-key",
+        http_get=http_get,
+        sleep_fn=lambda _seconds: None,
+        max_attempts=3,
+    ).ingest_all(start_date="2026-07-13", end_date="2026-07-13")
+
+    assert http_get.call_count == 3
+    assert result["market"]["error_class"] == "rate_limited"
+    assert result["corporate_actions"]["status"] == "skipped_provider_circuit"
+    assert result["corporate_actions"]["remaining_work_skipped"] is True
+
+
+def test_massive_permanent_market_404_continues_next_date(tmp_path: Path) -> None:
+    """A missing daily resource is isolated without opening the provider circuit."""
+    from src.ingestion.massive_ingestor import MassiveIngestor
+
+    store, _chroma = _store(tmp_path)
+    requested: list[str] = []
+
+    def http_get(url: str, **_kwargs) -> FakeResponse:
+        requested.append(url)
+        if url.endswith("2026-07-13"):
+            return FakeResponse({"error": "not found"}, 404)
+        return FakeResponse(_load("grouped-2026-07-13.json"))
+
+    result = MassiveIngestor(
+        store=store,
+        coverage_resolver=_coverage(),
+        api_key="test-massive-key",
+        http_get=http_get,
+        sleep_fn=lambda _seconds: None,
+    ).ingest_market_data(start_date="2026-07-13", end_date="2026-07-14")
+
+    assert len(requested) == 2
+    assert result["status"] == "partial"
+    assert result["stored"] > 0
+    assert result["rejected_items"] == 1
+    assert store.get_source_cursor("massive_market", "US") == "2026-07-14"
+
+
+def test_massive_permanent_action_404_continues_next_endpoint(
+    tmp_path: Path,
+) -> None:
+    """One unavailable action resource does not suppress another entitled resource."""
+    from src.ingestion.massive_ingestor import MassiveIngestor
+
+    store, _chroma = _store(tmp_path)
+    requested: list[str] = []
+
+    def http_get(url: str, **_kwargs) -> FakeResponse:
+        requested.append(url)
+        if "/splits" in url:
+            return FakeResponse({"error": "not found"}, 404)
+        return FakeResponse(_load("dividends.json"))
+
+    result = MassiveIngestor(
+        store=store,
+        coverage_resolver=_coverage(),
+        api_key="test-massive-key",
+        http_get=http_get,
+        sleep_fn=lambda _seconds: None,
+    ).ingest_corporate_actions(
+        start_date="2026-07-01", end_date="2026-07-14"
+    )
+
+    assert len(requested) == 2
+    assert result["status"] == "partial"
+    assert result["stored"] == 1
+    assert result["rejected_items"] == 1
+
+
 @pytest.mark.parametrize(
     ("status_code", "payload", "expected_status"),
     [

@@ -380,6 +380,9 @@ def test_scheduler_skips_disabled_policy_and_exposes_coverage_status(store: Stor
     result = scheduler.run_all_stale(force=True)
     report = scheduler.status_report()
 
-    assert result["gdelt"] == {"status": "skipped", "reason": "policy_disabled"}
+    assert result["gdelt"]["status"] == "skipped"
+    assert result["gdelt"]["reason"] == "policy_disabled"
+    assert result["gdelt"]["terminal_status"] == "skipped"
+    assert result["gdelt"]["requests"] == 0
     assert "gdelt" not in [call.args[0] for call in scheduler._run_source.call_args_list]
     assert report["sources"]["yfinance"]["coverage"]["policy_revision"] == "test-r1"

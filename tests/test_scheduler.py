@@ -15,6 +15,7 @@ Usage:
 
 import sys
 from dataclasses import replace
+from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -32,6 +33,7 @@ if "chromadb" not in sys.modules:
 from src.scheduler import UnifiedScheduler
 from src.scheduler.budget import RunBudget
 from src.scheduler.source_registry import SourceRegistry
+from src.ingestion.errors import ErrorClass, ProviderError
 from src.storage.store import Store
 
 
@@ -222,6 +224,83 @@ class TestUnifiedSchedulerPartialFailure:
         assert gdelt_status["status"] == "stale"
         assert "rate limit" in gdelt_status["error"]
 
+    def test_provider_circuit_failure_is_observable_and_next_source_runs(
+        self, scheduler
+    ):
+        reset_at = "2026-07-14T12:05:00Z"
+
+        def side(name, deep=False, force=False):
+            if name == "gdelt":
+                raise ProviderError(
+                    "token=secret provider throttled",
+                    error_class=ErrorClass.RATE_LIMITED,
+                    retry_after=60,
+                    reset_at=reset_at,
+                    attempts=3,
+                    circuit_open=True,
+                )
+            return {"ok": True}
+
+        mock_run = _stub_run_source(scheduler, side_effect=side)
+        result = scheduler.run_all_stale(force=True)
+
+        gdelt = result["gdelt"]
+        assert gdelt["terminal_status"] == "skipped"
+        assert gdelt["error_class"] == "rate_limited"
+        assert gdelt["attempts"] == 3
+        assert gdelt["reset_at"] == reset_at
+        assert gdelt["remaining_work_skipped"] is True
+        assert "secret" not in gdelt["error"]
+        assert result["earnings_transcripts"]["status"] == "success"
+        assert "earnings_transcripts" in [
+            call.args[0] for call in mock_run.call_args_list
+        ]
+        provider_status = scheduler.status_report(source="gdelt")["sources"][
+            "gdelt"
+        ]["provider"]
+        assert provider_status["error_class"] == "rate_limited"
+        assert provider_status["reset_at"] == reset_at
+        assert provider_status["circuit_opened_at"] is not None
+
+    def test_persisted_provider_cooldown_skips_then_resumes(
+        self, scheduler
+    ):
+        now = [datetime(2026, 7, 14, 23, 58, tzinfo=timezone.utc)]
+        scheduler._now_fn = lambda: now[0]
+        reset_at = now[0] + timedelta(minutes=5)
+        scheduler.store.record_source_budget_usage(
+            "finnhub",
+            day_start=now[0].date().isoformat(),
+            minute_start=now[0].strftime("%Y-%m-%dT%H:%MZ"),
+            attempted_requests=0,
+            successful_requests=0,
+            provider_remaining=0,
+            provider_reset=reset_at.isoformat().replace("+00:00", "Z"),
+        )
+        scheduler.store.set_source_cursor(
+            "finnhub",
+            "__provider__",
+            reset_at.isoformat().replace("+00:00", "Z"),
+            cursor_type="timestamp",
+            status="circuit_open",
+            error_class="rate_limited",
+            retry_after=300,
+        )
+        scheduler.coverage.tickers_for = MagicMock(return_value=["AAA"])
+        mock_run = _stub_run_source(scheduler, return_value={"status": "ok"})
+
+        during = scheduler.run_daily(force=True, source="finnhub")
+        now[0] = datetime(2026, 7, 15, 0, 1, tzinfo=timezone.utc)
+        next_day = scheduler.run_daily(force=True, source="finnhub")
+        now[0] = reset_at + timedelta(seconds=1)
+        after = scheduler.run_daily(force=True, source="finnhub")
+
+        assert during["finnhub"]["reason"] == "provider_cooldown"
+        assert during["finnhub"]["remaining_work_skipped"] is True
+        assert next_day["finnhub"]["reason"] == "provider_cooldown"
+        assert mock_run.call_count == 1
+        assert after["finnhub"]["status"] == "success"
+
     def test_returned_rate_limit_is_skipped_and_remains_stale(self, scheduler):
         def side(name, deep=False, force=False):
             if name == "gdelt":
@@ -275,11 +354,11 @@ class TestUnifiedSchedulerPartialFailure:
 
         result = sched.run_daily(force=True)
 
-        assert result["finnhub"] == {
-            "status": "skipped",
-            "reason": "disabled_missing_key",
-            "detail": "missing FINNHUB_API_KEY",
-        }
+        assert result["finnhub"]["status"] == "skipped"
+        assert result["finnhub"]["reason"] == "disabled_missing_key"
+        assert result["finnhub"]["detail"] == "missing FINNHUB_API_KEY"
+        assert result["finnhub"]["error_class"] == "authentication"
+        assert result["finnhub"]["remaining_work_skipped"] is True
         assert result["fred"]["status"] == "success"
         assert "finnhub" not in [call.args[0] for call in mock_run.call_args_list]
 

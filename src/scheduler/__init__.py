@@ -23,10 +23,16 @@ import logging
 import os
 import time
 from dataclasses import asdict
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
+from src.ingestion.errors import (
+    ErrorClass,
+    ProviderError,
+    normalize_error_class,
+    safe_message,
+)
 from src.scheduler.budget import BudgetExhaustedError, RunBudget
 from src.scheduler.cursors import CursorManager
 from src.scheduler.source_registry import VALID_SCOPES, SourceRegistry, SourceSpec
@@ -130,6 +136,7 @@ class UnifiedScheduler:
         coverage_resolver: Optional[CoverageResolver] = None,
         registry: Optional[SourceRegistry] = None,
         sources_path: Optional[Path] = None,
+        now_fn: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
     ) -> None:
         self.store = store or Store()
         self.inter_source_delay = inter_source_delay
@@ -156,8 +163,10 @@ class UnifiedScheduler:
         self.cursors = CursorManager(self.store)
         self._selected_partitions: dict[str, list[str]] = {}
         self._active_budgets: dict[str, RunBudget] = {}
+        self._provider_policies: dict[str, object] = {}
         self._budget_windows: dict[str, tuple[str, str]] = {}
         self._dlq = None  # lazy
+        self._now_fn = now_fn
 
     # ── Config ─────────────────────────────────────────
 
@@ -199,7 +208,9 @@ class UnifiedScheduler:
 
     def _new_budget(self, spec: SourceSpec) -> RunBudget:
         """Create a run budget from durable provider usage windows."""
-        now = datetime.now(timezone.utc)
+        now = self._now_fn()
+        if now.tzinfo is None:
+            now = now.replace(tzinfo=timezone.utc)
         day_start = now.date().isoformat()
         minute_start = now.strftime("%Y-%m-%dT%H:%MZ")
         usage = self.store.get_source_budget_usage(
@@ -209,6 +220,16 @@ class UnifiedScheduler:
         )
         provider_remaining = usage.get("provider_remaining")
         provider_reset = usage.get("provider_reset")
+        provider_state = self.store.get_source_cursor_state(
+            spec.name, "__provider__"
+        ) or {}
+        if (
+            provider_remaining is None
+            and provider_state.get("status") == "circuit_open"
+            and provider_state.get("cursor_value")
+        ):
+            provider_remaining = 0
+            provider_reset = provider_state["cursor_value"]
         if provider_remaining is not None and provider_reset is not None:
             try:
                 reset_at = float(provider_reset)
@@ -232,6 +253,7 @@ class UnifiedScheduler:
             minute_requests=int(usage.get("minute_requests") or 0),
             provider_remaining=provider_remaining,
             provider_reset=provider_reset,
+            wall_now_fn=self._now_fn,
         )
 
     def _remember_budget(self, name: str, budget: RunBudget) -> None:
@@ -266,10 +288,24 @@ class UnifiedScheduler:
             logger.error("Could not mark scheduler source %s stale: %s", name, exc)
 
     def _budgeted_http_get(self, name: str):
-        """Return a requests-compatible callable gated by the active source budget."""
+        """Return a budgeted, retrying HTTP callable with one source circuit."""
         import requests
+        from src.utils.resilience import provider_request_policy
 
-        return self._active_budgets[name].wrap_http_get(requests.get)
+        budgeted_get = self._active_budgets[name].wrap_http_get(requests.get)
+        policy = self._provider_policies.get(name)
+        if policy is None:
+            policy = provider_request_policy(
+                name,
+                self.SOURCES[name].retry_policy,
+                now_fn=self._now_fn,
+            )
+            self._provider_policies[name] = policy
+
+        def request(*args: object, **kwargs: object) -> object:
+            return policy.request(lambda: budgeted_get(*args, **kwargs))
+
+        return request
 
     def _is_stale(self, name: str) -> bool:
         """True if the source has never run, is marked stale, or is past TTL."""
@@ -527,6 +563,7 @@ class UnifiedScheduler:
             "disabled_authentication",
             "disabled_entitlement",
             "rate_limited",
+            "skipped_provider_circuit",
             "skipped_no_key",
         }
         top_status = str(detail.get("status") or "").lower()
@@ -554,6 +591,135 @@ class UnifiedScheduler:
             return "error", "provider_error"
         return "success", None
 
+    @staticmethod
+    def _detail_value(detail: object, key: str) -> object:
+        """Find one top-level-or-nested adapter result value."""
+        if not isinstance(detail, dict):
+            return None
+        if detail.get(key) not in (None, ""):
+            return detail[key]
+        for value in detail.values():
+            found = UnifiedScheduler._detail_value(value, key)
+            if found not in (None, ""):
+                return found
+        return None
+
+    @staticmethod
+    def _detail_metric(detail: object, keys: tuple[str, ...]) -> int:
+        """Read aggregate counters without double-counting nested envelopes."""
+        if not isinstance(detail, dict):
+            return 0
+        present = [key for key in keys if key in detail]
+        if present:
+            return sum(int(detail.get(key) or 0) for key in present)
+        return sum(
+            UnifiedScheduler._detail_metric(value, keys)
+            for value in detail.values()
+            if isinstance(value, dict)
+        )
+
+    def _add_observability(
+        self,
+        source: str,
+        result: dict,
+        budget: Optional[RunBudget],
+    ) -> None:
+        """Attach the bounded common source-result contract in place."""
+        detail = result.get("details")
+        detail_requests = self._detail_metric(detail, ("requests",))
+        budget_attempts = budget.attempted_requests if budget is not None else 0
+        result.setdefault("attempts", max(detail_requests, budget_attempts))
+        result.setdefault("requests", max(detail_requests, budget_attempts))
+        result.setdefault(
+            "accepted_items",
+            self._detail_metric(detail, ("stored", "updated", "duplicates")),
+        )
+        result.setdefault(
+            "rejected_items",
+            self._detail_metric(detail, ("malformed", "rejected")),
+        )
+        result.setdefault("terminal_status", result.get("status", "error"))
+        detail_error = self._detail_value(detail, "error_class")
+        result["error_class"] = normalize_error_class(
+            result.get("error_class") or detail_error
+        )
+        policy = self._provider_policies.get(source)
+        retry_timestamps = self._detail_value(detail, "retry_timestamps")
+        result.setdefault(
+            "retry_timestamps",
+            (
+                list(retry_timestamps)
+                if isinstance(retry_timestamps, list)
+                else list(getattr(policy, "retry_timestamps", []))
+            ),
+        )
+        detail_reset = self._detail_value(detail, "reset_at")
+        policy_reset = getattr(getattr(policy, "last_error", None), "reset_at", None)
+        result.setdefault(
+            "reset_at",
+            detail_reset
+            or policy_reset
+            or (budget.provider_reset if budget is not None else None),
+        )
+        result.setdefault(
+            "circuit_opened_at",
+            getattr(policy, "circuit_opened_at", None),
+        )
+        result.setdefault(
+            "last_committed_cursor",
+            self._detail_value(detail, "cursor_after"),
+        )
+        result.setdefault(
+            "remaining_work_skipped",
+            bool(self._detail_value(detail, "remaining_work_skipped")),
+        )
+
+    def _dead_letter_source_failure(
+        self,
+        source: str,
+        error: ProviderError,
+    ) -> None:
+        """Best-effort one-row provider-wide failure recording."""
+        if self.dlq is None:
+            return
+        try:
+            self.dlq.add_failure(
+                source=source,
+                partition="__provider__" if error.provider_wide else "scheduler",
+                provider_record_id=None,
+                cursor=None,
+                error_class=error.error_class.value,
+                message=error.safe_message,
+                attempts=error.attempts,
+            )
+        except Exception:  # noqa: BLE001 - DLQ cannot couple sources
+            logger.debug("Could not add %s provider failure to DLQ", source, exc_info=True)
+
+    def _persist_provider_status(
+        self,
+        source: str,
+        status: str,
+        *,
+        error_class: Optional[str] = None,
+        message: Optional[str] = None,
+        retry_after: Optional[float] = None,
+        reset_at: Optional[str] = None,
+    ) -> None:
+        """Persist one source-wide circuit state without touching data cursors."""
+        try:
+            self.store.set_source_cursor(
+                source,
+                "__provider__",
+                reset_at,
+                cursor_type="timestamp" if reset_at else "none",
+                status=status,
+                error_class=normalize_error_class(error_class),
+                error_message=safe_message(message) if message else None,
+                retry_after=retry_after,
+            )
+        except Exception:  # noqa: BLE001 - observability cannot couple sources
+            logger.debug("Could not persist provider status for %s", source, exc_info=True)
+
     def _run_sources(
         self, names: list[str], force: bool = False, deep_sec: bool = False,
     ) -> dict:
@@ -567,6 +733,12 @@ class UnifiedScheduler:
                     "status": "skipped",
                     "reason": spec.status,
                     "detail": spec.disabled_reason,
+                    "error_class": (
+                        ErrorClass.AUTHENTICATION.value
+                        if spec.status == "disabled_missing_key"
+                        else None
+                    ),
+                    "remaining_work_skipped": True,
                 }
                 continue
             try:
@@ -575,17 +747,18 @@ class UnifiedScheduler:
                 results[name] = {
                     "status": "skipped",
                     "reason": "policy_unavailable",
-                    "detail": str(exc),
+                    "detail": safe_message(exc),
                 }
                 continue
             except Exception as exc:  # noqa: BLE001 - isolate preflight failures
-                logger.error("Scheduler preflight for %s failed: %s", name, exc)
+                message = safe_message(exc)
+                logger.error("Scheduler preflight for %s failed: %s", name, message)
                 results[name] = {
                     "status": "error",
                     "reason": "preflight_error",
-                    "error": str(exc),
+                    "error": message,
                 }
-                self._mark_scheduler_stale(name, str(exc))
+                self._mark_scheduler_stale(name, message)
                 continue
             if not policy_enabled:
                 results[name] = {"status": "skipped", "reason": "policy_disabled"}
@@ -599,13 +772,14 @@ class UnifiedScheduler:
                         }
                         continue
                 except Exception as exc:  # noqa: BLE001 - isolate preflight failures
-                    logger.error("Freshness preflight for %s failed: %s", name, exc)
+                    message = safe_message(exc)
+                    logger.error("Freshness preflight for %s failed: %s", name, message)
                     results[name] = {
                         "status": "error",
                         "reason": "preflight_error",
-                        "error": str(exc),
+                        "error": message,
                     }
-                    self._mark_scheduler_stale(name, str(exc))
+                    self._mark_scheduler_stale(name, message)
                     continue
 
             try:
@@ -615,13 +789,14 @@ class UnifiedScheduler:
                     if not self.registry.get(dependency).is_available
                 ]
             except Exception as exc:  # noqa: BLE001 - isolate preflight failures
-                logger.error("Dependency preflight for %s failed: %s", name, exc)
+                message = safe_message(exc)
+                logger.error("Dependency preflight for %s failed: %s", name, message)
                 results[name] = {
                     "status": "error",
                     "reason": "preflight_error",
-                    "error": str(exc),
+                    "error": message,
                 }
-                self._mark_scheduler_stale(name, str(exc))
+                self._mark_scheduler_stale(name, message)
                 continue
             if unavailable_dependencies:
                 results[name] = {
@@ -634,6 +809,7 @@ class UnifiedScheduler:
             try:
                 budget = self._new_budget(spec)
                 self._active_budgets[name] = budget
+                self._provider_policies.pop(name, None)
                 if name == "finnhub":
                     partitions = self.cursors.order_partitions(
                         "finnhub_news",
@@ -655,19 +831,24 @@ class UnifiedScheduler:
                         force=force,
                     )
             except Exception as exc:  # noqa: BLE001 - isolate preflight failures
-                logger.error("Budget preflight for %s failed: %s", name, exc)
+                message = safe_message(exc)
+                logger.error("Budget preflight for %s failed: %s", name, message)
                 results[name] = {
                     "status": "error",
                     "reason": "preflight_error",
-                    "error": str(exc),
+                    "error": message,
                 }
-                self._mark_scheduler_stale(name, str(exc))
+                self._mark_scheduler_stale(name, message)
                 continue
             if not has_capacity:
+                reason = budget.exhausted_reason or "no_work_items"
+                is_cooldown = reason == "provider_cooldown"
                 results[name] = {
                     "status": "skipped",
-                    "reason": "budget_exhausted",
-                    "detail": budget.exhausted_reason or "no_work_items",
+                    "reason": "provider_cooldown" if is_cooldown else "budget_exhausted",
+                    "detail": reason,
+                    "error_class": ErrorClass.QUOTA_EXHAUSTED.value,
+                    "remaining_work_skipped": True,
                     "budget": budget.snapshot(),
                 }
                 self._remember_budget_safely(name, budget)
@@ -693,35 +874,138 @@ class UnifiedScheduler:
                 }
                 if result_reason is not None:
                     results[name]["reason"] = result_reason
+                detail_error_class = normalize_error_class(
+                    self._detail_value(detail, "error_class")
+                )
+                if detail_error_class in {
+                    ErrorClass.AUTHENTICATION.value,
+                    ErrorClass.ENTITLEMENT.value,
+                    ErrorClass.RATE_LIMITED.value,
+                    ErrorClass.QUOTA_EXHAUSTED.value,
+                }:
+                    retry_after = self._detail_value(detail, "retry_after")
+                    reset_at = self._detail_value(detail, "reset_at")
+                    if reset_at is None and retry_after is not None:
+                        reset_at = (
+                            self._now_fn()
+                            + timedelta(
+                                seconds=max(float(retry_after), 0.0)
+                            )
+                        ).isoformat().replace("+00:00", "Z")
+                    budget.open_provider_circuit(
+                        reset_at=str(reset_at) if reset_at else None,
+                        retry_after=float(retry_after) if retry_after is not None else None,
+                    )
+                    results[name]["error_class"] = detail_error_class
+                    results[name]["remaining_work_skipped"] = True
+                    results[name]["reset_at"] = reset_at
+                    provider_error = ProviderError(
+                        self._detail_value(detail, "error")
+                        or self._detail_value(detail, "errors")
+                        or result_reason
+                        or detail_error_class,
+                        error_class=detail_error_class,
+                        retry_after=(
+                            float(retry_after) if retry_after is not None else None
+                        ),
+                        reset_at=str(reset_at) if reset_at else None,
+                        attempts=max(request_count, 1),
+                        circuit_open=True,
+                    )
+                    self._dead_letter_source_failure(name, provider_error)
+                    self._persist_provider_status(
+                        name,
+                        "circuit_open",
+                        error_class=detail_error_class,
+                        message=provider_error.safe_message,
+                        retry_after=provider_error.retry_after,
+                        reset_at=provider_error.reset_at,
+                    )
                 if run_status == "success":
                     self.store.mark_cache_fresh(
                         self.SCHEDULER_TICKER,
                         self._scheduler_cache_source(name),
                         self._ttl_for(name),
                     )
+                    if self.store.get_source_cursor_state(
+                        name, "__provider__"
+                    ) is not None:
+                        self._persist_provider_status(name, "success")
                 else:
                     self._mark_scheduler_stale(name, result_reason or run_status)
+            except ProviderError as e:
+                if e.provider_wide:
+                    budget.open_provider_circuit(
+                        reset_at=e.reset_at,
+                        retry_after=e.retry_after,
+                    )
+                status = "skipped" if e.provider_wide else "error"
+                logger.error(
+                    "Scheduler source %s failed [%s]: %s",
+                    name,
+                    e.error_class.value,
+                    e.safe_message,
+                )
+                results[name] = {
+                    "status": status,
+                    "reason": e.error_class.value,
+                    "duration_s": round(time.monotonic() - start, 2),
+                    "error": e.safe_message,
+                    "error_class": e.error_class.value,
+                    "attempts": e.attempts,
+                    "requests": max(e.attempts, budget.attempted_requests),
+                    "retry_timestamps": list(e.retry_timestamps),
+                    "reset_at": e.reset_at,
+                    "circuit_opened_at": (
+                        self._now_fn().isoformat().replace("+00:00", "Z")
+                        if e.circuit_open
+                        else None
+                    ),
+                    "remaining_work_skipped": e.provider_wide,
+                    "budget": budget.snapshot(),
+                }
+                self._mark_scheduler_stale(name, e.safe_message)
+                self._dead_letter_source_failure(name, e)
+                self._persist_provider_status(
+                    name,
+                    "circuit_open" if e.provider_wide else "error",
+                    error_class=e.error_class.value,
+                    message=e.safe_message,
+                    retry_after=e.retry_after,
+                    reset_at=e.reset_at,
+                )
             except BudgetExhaustedError as e:
                 results[name] = {
                     "status": "skipped",
                     "reason": "budget_exhausted",
                     "duration_s": round(time.monotonic() - start, 2),
-                    "error": str(e),
+                    "error": safe_message(e),
+                    "error_class": ErrorClass.QUOTA_EXHAUSTED.value,
+                    "remaining_work_skipped": True,
                     "budget": budget.snapshot(),
                 }
-                self._mark_scheduler_stale(name, str(e))
+                self._mark_scheduler_stale(name, safe_message(e))
             except Exception as e:  # noqa: BLE001 - isolate per-source failures
-                logger.error("Scheduler source %s failed: %s", name, e)
+                message = safe_message(e)
+                logger.error("Scheduler source %s failed: %s", name, message)
                 results[name] = {
                     "status": "error",
                     "duration_s": round(time.monotonic() - start, 2),
-                    "error": str(e),
+                    "error": message,
+                    "error_class": ErrorClass.PERMANENT.value,
                     "budget": budget.snapshot(),
                 }
-                self._mark_scheduler_stale(name, str(e))
+                self._mark_scheduler_stale(name, message)
                 if self.dlq is not None:
                     try:
-                        self.dlq.add(name, "scheduler", str(e))
+                        self.dlq.add_failure(
+                            source=name,
+                            partition="scheduler",
+                            provider_record_id=None,
+                            cursor=None,
+                            error_class=ErrorClass.PERMANENT.value,
+                            message=message,
+                        )
                     except Exception:  # noqa: BLE001
                         pass
 
@@ -731,6 +1015,12 @@ class UnifiedScheduler:
             if i < len(ordered) - 1 and self.inter_source_delay > 0:
                 time.sleep(self.inter_source_delay)
 
+        for source_name, source_result in results.items():
+            self._add_observability(
+                source_name,
+                source_result,
+                self._active_budgets.get(source_name),
+            )
         return results
 
     # ── Run modes ──────────────────────────────────────
@@ -873,6 +1163,61 @@ class UnifiedScheduler:
                 "error": status.get("error_message"),
                 "coverage": coverage,
                 **registry_status,
+            }
+
+        now = self._now_fn()
+        if now.tzinfo is None:
+            now = now.replace(tzinfo=timezone.utc)
+        day_start = now.date().isoformat()
+        minute_start = now.strftime("%Y-%m-%dT%H:%MZ")
+        for name, source_status in sources.items():
+            provider_state = self.store.get_source_cursor_state(
+                name, "__provider__"
+            ) or {}
+            usage = self.store.get_source_budget_usage(
+                name,
+                day_start=day_start,
+                minute_start=minute_start,
+            )
+            reset_value = usage.get("provider_reset")
+            if reset_value is None and provider_state.get("status") == "circuit_open":
+                reset_value = provider_state.get("cursor_value")
+            reset_at = None
+            if reset_value is not None:
+                try:
+                    reset_at = datetime.fromtimestamp(
+                        float(reset_value), tz=timezone.utc
+                    )
+                except (TypeError, ValueError, OSError, OverflowError):
+                    try:
+                        reset_at = datetime.fromisoformat(
+                            str(reset_value).replace("Z", "+00:00")
+                        )
+                    except ValueError:
+                        reset_at = None
+            cooldown = bool(
+                usage.get("provider_remaining") == 0
+                and reset_at is not None
+                and reset_at > now.astimezone(timezone.utc)
+            )
+            source_status["provider"] = {
+                "status": provider_state.get("status"),
+                "error_class": normalize_error_class(
+                    provider_state.get("error_class")
+                ),
+                "message": (
+                    safe_message(provider_state.get("error_message"))
+                    if provider_state.get("error_message")
+                    else None
+                ),
+                "retry_after": provider_state.get("retry_after"),
+                "reset_at": str(reset_value) if reset_value is not None else None,
+                "circuit_opened_at": (
+                    provider_state.get("updated_at")
+                    if provider_state.get("status") == "circuit_open"
+                    else None
+                ),
+                "cooldown_active": cooldown,
             }
 
         # Persisted counters only: status must never invoke an embedding call.

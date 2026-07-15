@@ -7,6 +7,7 @@ from __future__ import annotations
 import logging
 import time
 from collections.abc import Callable, Mapping
+from datetime import datetime, timezone
 from typing import Optional
 
 logger = logging.getLogger(__name__)
@@ -32,6 +33,7 @@ class RunBudget:
         provider_remaining: Optional[int] = None,
         provider_reset: Optional[str] = None,
         now_fn: Callable[[], float] = time.monotonic,
+        wall_now_fn: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
     ) -> None:
         limits = {
             "requests_per_minute": requests_per_minute,
@@ -51,6 +53,7 @@ class RunBudget:
         self.max_work_items = int(max_work_items)
         self.day_requests = int(day_requests)
         self._now_fn = now_fn
+        self._wall_now_fn = wall_now_fn
         self._minute_started = (
             float(now_fn()) if minute_started is None else float(minute_started)
         )
@@ -75,6 +78,8 @@ class RunBudget:
 
     def _capacity_reason(self, requests: int, work_items: int) -> Optional[str]:
         self._refresh_minute_window()
+        if self.in_provider_cooldown:
+            return "provider_cooldown"
         if self._minute_requests + requests > self.requests_per_minute:
             return "requests_per_minute"
         if self.day_requests + self.attempted_requests + requests > self.requests_per_day:
@@ -163,6 +168,45 @@ class RunBudget:
         if retry_after is not None:
             self.retry_after = str(retry_after)
 
+    @property
+    def provider_reset_at(self) -> Optional[datetime]:
+        """Return the persisted provider reset as an aware timestamp when valid."""
+        if self.provider_reset is None:
+            return None
+        try:
+            reset = datetime.fromtimestamp(float(self.provider_reset), tz=timezone.utc)
+        except (TypeError, ValueError, OSError, OverflowError):
+            try:
+                reset = datetime.fromisoformat(
+                    str(self.provider_reset).replace("Z", "+00:00")
+                )
+            except ValueError:
+                return None
+        return reset if reset.tzinfo else reset.replace(tzinfo=timezone.utc)
+
+    @property
+    def in_provider_cooldown(self) -> bool:
+        """Return whether provider work must be skipped until a future reset."""
+        reset = self.provider_reset_at
+        if self.provider_remaining != 0 or reset is None:
+            return False
+        now = self._wall_now_fn()
+        now = now if now.tzinfo else now.replace(tzinfo=timezone.utc)
+        return reset > now.astimezone(timezone.utc)
+
+    def open_provider_circuit(
+        self,
+        *,
+        reset_at: Optional[str],
+        retry_after: Optional[float] = None,
+    ) -> None:
+        """Persist zero provider capacity and its bounded recovery hint."""
+        self.provider_remaining = 0
+        if reset_at is not None:
+            self.provider_reset = str(reset_at)
+        if retry_after is not None:
+            self.retry_after = str(retry_after)
+
     def wrap_http_get(self, request: Callable[..., object]) -> Callable[..., object]:
         """Wrap an adapter HTTP callable with per-attempt quota reservations."""
 
@@ -202,6 +246,7 @@ class RunBudget:
             "work_items_started": self.work_items_started,
             "provider_remaining": self.provider_remaining,
             "provider_reset": self.provider_reset,
+            "provider_cooldown": self.in_provider_cooldown,
             "retry_after": self.retry_after,
             "exhausted_reason": self.exhausted_reason,
             "remaining": {

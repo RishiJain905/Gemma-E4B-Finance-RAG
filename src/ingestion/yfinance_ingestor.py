@@ -18,6 +18,7 @@ from typing import Optional, Any
 import yfinance as yf
 import yaml
 
+from src.ingestion.errors import safe_message
 from src.storage.store import Store
 from src.universe.coverage import CoverageResolver
 
@@ -104,7 +105,7 @@ class YFinanceIngestor:
                 return None
             return t
         except Exception as e:
-            logger.error("Failed to fetch ticker %s: %s", ticker, e)
+            logger.error("Failed to fetch ticker %s: %s", ticker, safe_message(e))
             return None
 
     # ── Fundamentals Ingestion ────────────────────────
@@ -594,7 +595,7 @@ class YFinanceIngestor:
         try:
             news_raw = t.news
         except Exception as e:
-            logger.warning("Ticker %s news fetch failed: %s", ticker, e)
+            logger.warning("Ticker %s news fetch failed: %s", ticker, safe_message(e))
             return
 
         if not news_raw:
