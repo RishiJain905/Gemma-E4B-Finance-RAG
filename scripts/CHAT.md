@@ -277,3 +277,62 @@ evidence with source links, and the final answer, citations, and validation.
 middleware with `ENABLE_GRAPH_OBSERVER=1`. If the browser doesn't open
 automatically, the command prints the URL to open manually. The page is only
 reachable from `127.0.0.1`; a remote browser gets a 404 by design.
+
+## Runbook: first run after Phase 2.3 (one-time)
+
+All Phase 2.3 capabilities ship **off**, so nothing new is ingested until you
+run this once. The model server must be up first — embeddings happen at ingest
+time.
+
+```powershell
+# 1. Model server (chat + embeddings on :8087)
+scripts\serve_model.ps1 start
+
+# 2. Environment sanity — reports configured true/false per key, no values
+python scripts/validate_setup.py
+
+# 3. Additive schema migration + legacy backfill (idempotent, resumable —
+#    rerun the same command to continue after an interruption)
+python scripts/migrate_phase2_3.py --batch-size 100
+
+# 4. Enable the capabilities you want (each defaults to false):
+#    configs/universe.yaml    -> feature_flags.universe_refresh
+#    configs/sources.yaml     -> feature_flags.{sec_broad_events, company_news,
+#                                grouped_market_data, official_feeds, sector_feeds}
+#    configs/middleware.yaml  -> enable_phase2_3_retrieval,
+#                                enable_phase2_3_corpus_projection
+
+# 5. Initial population of the enabled sources (explicit, bounded, resumable)
+python -m src.scheduler bootstrap
+#    interrupted? continue where it stopped:
+python -m src.scheduler bootstrap --resume
+
+# 6. Confirm truthful per-source status + coverage before first queries
+python -m src.scheduler status
+```
+
+Bootstrap history windows (SEC lookback, news/market days) come from the
+`bootstrap:` block in `configs/sources.yaml`; `--since YYYY-MM-DD` overrides
+the SEC start date for one run.
+
+## Runbook: daily, before querying
+
+```powershell
+scripts\serve_model.ps1 start          # if not already running
+python -m src.scheduler daily          # incremental refresh (TTL + cursor driven)
+python -m src.scheduler status         # optional: freshness, budgets, circuits
+python scripts/chat.py                 # auto-starts the middleware and chats
+```
+
+Notes:
+
+- `daily` only refetches what its TTLs/cursors say is due — running it twice
+  is cheap and duplicate-safe. Add `--force` to bypass freshness (it still
+  honors provider quotas and circuit cooldowns), or `--source NAME` /
+  `--scope SCOPE` to target one slice.
+- Intraday, `python -m src.scheduler hourly` refreshes the fast-moving
+  sources; `/refresh daily|hourly|status` works from inside the chat client
+  too.
+- If `status` shows an indexing backlog or error partitions, run
+  `python -m src.scheduler repair [--source NAME]` — it re-indexes stored
+  records without re-downloading from providers.

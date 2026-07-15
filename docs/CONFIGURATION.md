@@ -12,17 +12,23 @@ defaults.
 
 ## Environment Variables (`.env`)
 
-| Variable | Required for | Used by | Notes |
-|----------|--------------|---------|-------|
-| `FRED_API_KEY` | FRED macro ingestion | `src/macros/fred_ingestor.py` | Resolution order: constructor arg → value of the `${FRED_API_KEY}` placeholder in `configs/fred.yaml` → `FRED_API_KEY` env var. Get a free key at <https://fred.stlouisfed.org/docs/api/api_key.html>. |
-| `SEC_EDGAR_USER_AGENT` | SEC EDGAR access | `src/sec/edgar_fetcher.py` | SEC requires a descriptive User-Agent (name + contact email). Resolution order: constructor arg → `SEC_EDGAR_USER_AGENT` env var → `sec.user_agent` in `configs/storage.yaml` → built-in default. |
-| `FINNHUB_API_KEY` | Finnhub company news | `src/ingestion/finnhub_ingestor.py` | Missing or invalid credentials disable only the Finnhub news capability; the adapter never crawls publisher URLs. |
-| `MASSIVE_API_KEY` | Massive grouped market data/actions | `src/ingestion/massive_ingestor.py` | Missing or limited entitlements disable only the affected Massive capability. Grouped US market data remains one request per market date. |
-| `BLS_API_KEY` | Optional BLS extended API access | `src/ingestion/official/bls.py` | Missing credentials set only the BLS source to `disabled_missing_key`; other official feeds continue. |
-| `BEA_API_KEY` | BEA national-accounts API | `src/ingestion/official/bea.py` | Missing credentials set only the BEA source to `disabled_missing_key`. |
-| `EIA_API_KEY` | EIA energy API | `src/ingestion/official/eia.py` | Missing credentials set only the EIA source to `disabled_missing_key`. |
-| `OPENFDA_API_KEY` | Optional openFDA event queries | `src/ingestion/official/openfda.py` | Missing credentials disable only openFDA sector events. |
-| `TWELVE_DATA_API_KEY` | Optional Twelve Data fallback | Future optional adapter | Disabled unless explicitly configured; it is not used as a required Massive fallback. |
+| Variable | Required for | Used by | Verified | Notes |
+|----------|--------------|---------|----------|-------|
+| `FRED_API_KEY` | FRED macro ingestion | `src/macros/fred_ingestor.py` | ✅ 2026-07-15 | Resolution order: constructor arg → value of the `${FRED_API_KEY}` placeholder in `configs/fred.yaml` → `FRED_API_KEY` env var. Get a free key at <https://fred.stlouisfed.org/docs/api/api_key.html>. |
+| `SEC_EDGAR_USER_AGENT` | SEC EDGAR access | `src/sec/edgar_fetcher.py` | ✅ 2026-07-15 | SEC requires a descriptive User-Agent (name + contact email). Resolution order: constructor arg → `SEC_EDGAR_USER_AGENT` env var → `sec.user_agent` in `configs/storage.yaml` → built-in default. |
+| `FINNHUB_API_KEY` | Finnhub company news | `src/ingestion/finnhub_ingestor.py` | ✅ 2026-07-15 | Missing or invalid credentials disable only the Finnhub news capability; the adapter never crawls publisher URLs. |
+| `MASSIVE_API_KEY` | Massive grouped market data/actions | `src/ingestion/massive_ingestor.py` | ✅ 2026-07-15 | Missing or limited entitlements disable only the affected Massive capability. Grouped US market data remains one request per market date. |
+| `BLS_API_KEY` | Optional BLS extended API access | `src/ingestion/official/bls.py` | ✅ 2026-07-15 | Missing credentials set only the BLS source to `disabled_missing_key`; other official feeds continue. |
+| `BEA_API_KEY` | BEA national-accounts API | `src/ingestion/official/bea.py` | ✅ 2026-07-15 | Missing credentials set only the BEA source to `disabled_missing_key`. BEA keys need activation via the emailed link before first use; a not-yet-activated key returns an API error body with HTTP 200. |
+| `EIA_API_KEY` | EIA energy API | `src/ingestion/official/eia.py` | ✅ 2026-07-15 | Missing credentials set only the EIA source to `disabled_missing_key`. |
+| `OPENFDA_API_KEY` | Optional openFDA event queries | `src/ingestion/official/openfda.py` | ✅ 2026-07-15 | Missing credentials disable only openFDA sector events. |
+| `TWELVE_DATA_API_KEY` | Optional Twelve Data fallback | Future optional adapter | ✅ 2026-07-15 | Disabled unless explicitly configured; it is not used as a required Massive fallback. |
+
+**Verified** = one cheap authenticated call per provider succeeded from this
+machine on that date (status/HTTP checks only — no key values are ever logged).
+Verification is point-in-time, not continuous; re-check a provider with a
+single authenticated request if it later reports `disabled_missing_key` or
+`disabled_authentication` in `python -m src.scheduler status`.
 
 Example `.env`:
 
