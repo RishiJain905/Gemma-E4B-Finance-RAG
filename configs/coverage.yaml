@@ -9,7 +9,12 @@ fallback_when_registry_empty: deep
 
 deep:
   tickers: [NVDA, AMD, AAPL, MSFT, META, CRWD]
-  allow_outside_indexes: []
+  # Transitional opt-in: after the Phase 2.3 backfill populates the registry
+  # but before the first universe snapshot lands, the active index union is
+  # empty and these members would otherwise fail off-index validation. All
+  # six are S&P 500/Nasdaq-100 members, so this becomes inert once
+  # universe bootstrap records memberships.
+  allow_outside_indexes: [NVDA, AMD, AAPL, MSFT, META, CRWD]
 
 broad:
   additions: [GOOGL, AMZN, TSLA, AVGO, ORCL, INTC, QCOM, PANW, PLTR, SNOW]
