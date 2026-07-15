@@ -291,18 +291,31 @@ scripts\serve_model.ps1 start
 # 2. Environment sanity — reports configured true/false per key, no values
 python scripts/validate_setup.py
 
-# 3. Additive schema migration + legacy backfill (idempotent, resumable —
-#    rerun the same command to continue after an interruption)
+# 3. Migrate EXISTING data into the new Phase 2.3 tables: applies the new
+#    schema, then creates canonical securities from your current tickers and
+#    corpus_items metadata for existing Chroma families/SEC filings. Local
+#    only — no network, no re-embedding, nothing deleted. It processes
+#    EVERYTHING; --batch-size is rows per commit checkpoint (not a total),
+#    which is what makes an interrupted run resumable — just rerun the same
+#    command. (--max-batches N is the flag that actually limits a run.)
 python scripts/migrate_phase2_3.py --batch-size 100
 
-# 4. Enable the capabilities you want (each defaults to false):
-#    configs/universe.yaml    -> feature_flags.universe_refresh
-#    configs/sources.yaml     -> feature_flags.{sec_broad_events, company_news,
-#                                grouped_market_data, official_feeds, sector_feeds}
-#    configs/middleware.yaml  -> enable_phase2_3_retrieval,
-#                                enable_phase2_3_corpus_projection
+# 4. Enable capabilities by HAND-EDITING the YAML files — change false to
+#    true for each capability you want (all eight default to false, so
+#    bootstrap fetches nothing new until you do this):
+#    configs/universe.yaml    -> feature_flags.universe_refresh: true
+#                                (expands ~6 deep tickers to the ~550-name
+#                                S&P 500/Nasdaq-100 union)
+#    configs/sources.yaml     -> feature_flags: set sec_broad_events,
+#                                company_news, grouped_market_data,
+#                                official_feeds (and optionally sector_feeds)
+#                                to true
+#    configs/middleware.yaml  -> enable_phase2_3_retrieval: true
+#                                enable_phase2_3_corpus_projection: true
 
-# 5. Initial population of the enabled sources (explicit, bounded, resumable)
+# 5. AFTER steps 3 and 4, in that order: initial population of the sources
+#    you just enabled (bootstrap reads the step-4 flags and writes into the
+#    step-3 tables; run earlier it does almost nothing).
 python -m src.scheduler bootstrap
 #    interrupted? continue where it stopped:
 python -m src.scheduler bootstrap --resume
