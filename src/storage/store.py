@@ -922,7 +922,12 @@ class Store:
         source_category: Optional[str] = None,
         source: Optional[str] = None,
         item_type: Optional[str] = None,
+        event_type: Optional[str] = None,
         security: Optional[str] = None,
+        sector: Optional[str] = None,
+        industry: Optional[str] = None,
+        index: Optional[str] = None,
+        coverage_tier: Optional[str] = None,
         year: Optional[str] = None,
         month: Optional[str] = None,
         indexing_state: Optional[str] = None,
@@ -935,13 +940,102 @@ class Store:
             source_category=source_category,
             source=source,
             item_type=item_type,
+            event_type=event_type,
             security=security,
+            sector=sector,
+            industry=industry,
+            index=index,
+            coverage_tier=coverage_tier,
             year=year,
             month=month,
             indexing_state=indexing_state,
             limit=limit,
             offset=offset,
         )
+
+    def count_corpus_accounting(
+        self,
+        group_by: str,
+        *,
+        source_category: Optional[str] = None,
+        source: Optional[str] = None,
+        item_type: Optional[str] = None,
+        event_type: Optional[str] = None,
+        security: Optional[str] = None,
+        sector: Optional[str] = None,
+        industry: Optional[str] = None,
+        index: Optional[str] = None,
+        coverage_tier: Optional[str] = None,
+        year: Optional[str] = None,
+        month: Optional[str] = None,
+        indexing_state: Optional[str] = None,
+    ) -> dict:
+        """Expose total/distinct corpus accounting counts for one dimension."""
+        return self.sqlite.count_corpus_accounting(
+            group_by,
+            source_category=source_category,
+            source=source,
+            item_type=item_type,
+            event_type=event_type,
+            security=security,
+            sector=sector,
+            industry=industry,
+            index=index,
+            coverage_tier=coverage_tier,
+            year=year,
+            month=month,
+            indexing_state=indexing_state,
+        )
+
+    def list_corpus_items(
+        self,
+        *,
+        source_category: Optional[str] = None,
+        source: Optional[str] = None,
+        item_type: Optional[str] = None,
+        event_type: Optional[str] = None,
+        security: Optional[str] = None,
+        sector: Optional[str] = None,
+        industry: Optional[str] = None,
+        index: Optional[str] = None,
+        year: Optional[str] = None,
+        month: Optional[str] = None,
+        indexing_state: Optional[str] = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> list[dict]:
+        """Expose one bounded page of corpus-item leaf metadata (no bodies)."""
+        return self.sqlite.list_corpus_items(
+            source_category=source_category,
+            source=source,
+            item_type=item_type,
+            event_type=event_type,
+            security=security,
+            sector=sector,
+            industry=industry,
+            index=index,
+            year=year,
+            month=month,
+            indexing_state=indexing_state,
+            limit=limit,
+            offset=offset,
+        )
+
+    def get_corpus_event(self, event_id: str) -> Optional[dict]:
+        """Return one structured corpus event with linked securities."""
+        return self.sqlite.get_corpus_event(event_id)
+
+    def list_corpus_item_sources(self, corpus_item_id: str) -> list[dict]:
+        """Return provenance source rows for one corpus item."""
+        return self.sqlite.list_corpus_item_sources(corpus_item_id)
+
+    def list_corpus_item_securities(self, corpus_item_id: str) -> list[dict]:
+        """Return the securities a corpus item links to."""
+        return self.sqlite.list_corpus_item_securities(corpus_item_id)
+
+    def get_corpus_item(self, corpus_item_id: str) -> Optional[dict]:
+        """Return one corpus-item metadata row (no narrative body)."""
+        return self.sqlite.get_corpus_item(corpus_item_id)
 
     # -- Incremental source cursors -----------------------------------------
 

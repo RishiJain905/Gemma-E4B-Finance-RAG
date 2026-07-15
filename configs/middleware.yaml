@@ -52,14 +52,21 @@ graph_trace_ttl_s: 3600
 graph_excerpt_chars: 1000
 graph_question_preview_chars: 200
 
-# Phase 2.2.7.2 — read-only Store-backed corpus explorer. The graph observer
-# flag gates the routes. Pages and expansion responses are hard-bounded; the
-# overview cache is keyed by Store.retrieval_revision(). Env overrides:
-# CORPUS_PAGE_LIMIT, CORPUS_ELEMENT_LIMIT, CORPUS_VISIBLE_NODE_TARGET,
+# Phase 2.2.7.2 / 2.3.5.3 — read-only Store-backed corpus explorer. The graph
+# observer flag gates the routes. Pages and expansion responses are
+# hard-bounded; aggregate/facet reads are cached by Store.retrieval_revision()
+# plus canonical filters. corpus_page_limit is the hard per-page maximum and
+# corpus_default_page_limit is the page size used when a request omits `limit`.
+# Env overrides: CORPUS_PAGE_LIMIT, CORPUS_DEFAULT_PAGE_LIMIT,
+# CORPUS_ELEMENT_LIMIT, CORPUS_VISIBLE_NODE_TARGET,
+# CORPUS_INSPECTOR_EXCERPT_BYTES, CORPUS_INSPECTOR_METADATA_BYTES,
 # CORPUS_OVERVIEW_CACHE_TTL_S, CORPUS_OPAQUE_ID_TTL_S.
 corpus_page_limit: 100
+corpus_default_page_limit: 50
 corpus_element_limit: 2000
 corpus_visible_node_target: 450
+corpus_inspector_excerpt_bytes: 1000
+corpus_inspector_metadata_bytes: 4000
 corpus_overview_cache_ttl_s: 2.0
 corpus_opaque_id_ttl_s: 300.0
 

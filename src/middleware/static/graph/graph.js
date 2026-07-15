@@ -709,7 +709,10 @@ if (typeof document !== "undefined" && document.getElementById("graph-canvas")) 
       });
     }
     function tickDash() {
-      if (cy && !reduceMotion) {
+      // Reduced-motion stops the looping edge-flow animation entirely rather
+      // than spinning an idle rAF loop (2.3.5.3 Step 6).
+      if (reduceMotion) return;
+      if (cy) {
         dashOffset = (dashOffset - 0.8) % 24;
         cy.edges(".inflight").style("line-dash-offset", dashOffset);
       }
@@ -838,7 +841,7 @@ if (typeof document !== "undefined" && document.getElementById("graph-canvas")) 
 
     async function corpusOverview() {
       try {
-        const data = await getJSON(`${API}/corpus/overview`);
+        const data = await getJSON(`${API}/corpus/overview`, corpusSignal());
         loadCorpusPage(data, true);
       } catch (err) { showError("Corpus overview failed", err); }
     }
@@ -919,6 +922,9 @@ if (typeof document !== "undefined" && document.getElementById("graph-canvas")) 
     }
 
     async function applyCorpusState(state) {
+      // A filter/preset/search/drill change starts a new view: cancel the prior
+      // one so an out-of-order response never clobbers the current facets.
+      abortObsoleteCorpusRequests();
       $("corpus-presets").value = state.preset || "";
       $("corpus-search").value = state.q || "";
       updateFacetToggleBadge(state);
@@ -945,14 +951,14 @@ if (typeof document !== "undefined" && document.getElementById("graph-canvas")) 
         // A dimension never narrows by its own facet (that would zero its siblings).
         params.delete(dim);
         try {
-          const data = await getJSON(`${API}/corpus/aggregates?${params.toString()}`);
+          const data = await getJSON(`${API}/corpus/aggregates?${params.toString()}`, corpusSignal());
           const agg = (data && data.aggregates) || { buckets: [] };
           app.corpus.aggregates.set(dim, agg.buckets || []);
           if (data && data.corpus_revision != null) {
             setCorpusRevision(data.corpus_revision, app.corpus.revision != null && app.corpus.revision !== data.corpus_revision);
             app.corpus.revision = data.corpus_revision;
           }
-        } catch (err) { app.corpus.aggregates.set(dim, []); }
+        } catch (err) { if (isAbortError(err)) return; app.corpus.aggregates.set(dim, []); }
       }));
     }
 
@@ -1323,7 +1329,7 @@ if (typeof document !== "undefined" && document.getElementById("graph-canvas")) 
       if (kinds.length) url += `&kinds=${encodeURIComponent(kinds.join(","))}`;
       app.corpus.lastResultsUrl = url;
       try {
-        const data = await getJSON(url);
+        const data = await getJSON(url, corpusSignal());
         loadCorpusPage(data, true);
         app.corpus.resultsCursor = data.next_cursor || null;
         const rows = resultRows(data.nodes || [], state);
@@ -1338,7 +1344,7 @@ if (typeof document !== "undefined" && document.getElementById("graph-canvas")) 
       if (!app.corpus.resultsCursor || !app.corpus.lastResultsUrl) return;
       const url = `${app.corpus.lastResultsUrl}&cursor=${encodeURIComponent(app.corpus.resultsCursor)}`;
       try {
-        const data = await getJSON(url);
+        const data = await getJSON(url, corpusSignal());
         loadCorpusPage(data, false);
         app.corpus.resultsCursor = data.next_cursor || null;
         app.corpus.rows = app.corpus.rows.concat(resultRows(data.nodes || [], corpusState()));
@@ -1762,14 +1768,29 @@ if (typeof document !== "undefined" && document.getElementById("graph-canvas")) 
     }
 
     /* ══ HTTP helper ══════════════════════════════════════════════════════ */
-    async function getJSON(url) {
-      const resp = await fetch(url, { headers: { Accept: "application/json" } });
+    async function getJSON(url, signal) {
+      const resp = await fetch(url, { headers: { Accept: "application/json" }, signal });
       if (!resp.ok) { const err = new Error(`HTTP ${resp.status}`); err.status = resp.status; throw err; }
       return resp.json();
     }
 
+    // Cancel in-flight corpus view requests when the filter set changes so a
+    // slow older page can never overwrite the current one (2.3.5.3 Step 4).
+    function abortObsoleteCorpusRequests() {
+      if (app.corpusAbort) app.corpusAbort.abort();
+      app.corpusAbort = new AbortController();
+      return app.corpusAbort.signal;
+    }
+    function corpusSignal() {
+      return app.corpusAbort ? app.corpusAbort.signal : undefined;
+    }
+    function isAbortError(err) {
+      return err && (err.name === "AbortError" || err.code === 20);
+    }
+
     /* ══ error panel + read-only fallback ═════════════════════════════════ */
     function showError(title, err) {
+      if (isAbortError(err)) return;   // superseded by a newer request; not an error
       $("error-panel").hidden = false;
       $("error-title").textContent = title;
       $("error-detail").textContent = err && err.message ? err.message : String(err);
@@ -1964,6 +1985,14 @@ if (typeof document !== "undefined" && document.getElementById("graph-canvas")) 
 
       $("btn-retry").addEventListener("click", () => { hideError(); if (!cy) initCytoscape(); reloadSnapshot(); });
       $("inspector-close").addEventListener("click", clearInspector);
+      // Escape closes the inspector from anywhere except a text field, keeping
+      // the panel fully keyboard-operable (2.3.5.3 Step 6).
+      document.addEventListener("keydown", (e) => {
+        if (e.key !== "Escape") return;
+        const tag = (document.activeElement && document.activeElement.tagName) || "";
+        if (tag === "INPUT" || tag === "TEXTAREA") return;
+        if (!$("inspector-body").hidden) { clearInspector(); e.preventDefault(); }
+      });
 
       $("corpus-search").addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); submitCorpusSearch(); } });
       $("btn-corpus-search").addEventListener("click", submitCorpusSearch);

@@ -532,7 +532,8 @@ def test_corpus_accounting_delegates_to_sqlite_only(fully_mocked_store):
     assert result == [{"key": "news_vendor", "count": 2, "approximate_bytes": 512}]
     sqlite.get_corpus_accounting.assert_called_once_with(
         "source_category", source_category=None, source=None, item_type=None,
-        security=None, year=None, month=None, indexing_state="indexed",
+        event_type=None, security=None, sector=None, industry=None, index=None,
+        coverage_tier=None, year=None, month=None, indexing_state="indexed",
         limit=10, offset=2,
     )
     chroma.iter_documents.assert_not_called()

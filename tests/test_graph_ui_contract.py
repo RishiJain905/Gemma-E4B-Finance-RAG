@@ -469,3 +469,34 @@ def test_corpus_narrow_layout_uses_drawers_at_1280():
     assert '[data-facets="open"]' in css
     # Work area reflows to a column so the inventory pane stays full-width.
     assert '[data-mode="corpus"] .work-area' in css
+
+
+# ── 2.3.5.3: bounded projection, UI performance, and accessibility ───────────
+
+
+def test_corpus_view_requests_abort_when_filters_change():
+    """Obsolete corpus fetches are cancelled on a filter change so a slow older
+    page can never overwrite the current facets (spec Step 4)."""
+    js = JS.read_text(encoding="utf-8")
+    assert "AbortController" in js
+    assert "abortObsoleteCorpusRequests" in js
+    # The choke point aborts before issuing the new view's requests.
+    assert "corpusSignal" in js
+    assert "isAbortError" in js
+
+
+def test_inspector_is_closable_by_keyboard():
+    """The inspector closes with Escape from anywhere outside a text field
+    (spec Step 6 keyboard operation)."""
+    js = JS.read_text(encoding="utf-8")
+    assert 'e.key !== "Escape"' in js or 'e.key === "Escape"' in js
+    assert "clearInspector" in js
+
+
+def test_reduced_motion_disables_looping_graph_effects():
+    """Reduced-motion stops the looping edge-flow animation entirely rather than
+    spinning an idle rAF loop (spec Step 6)."""
+    js = JS.read_text(encoding="utf-8")
+    css = CSS.read_text(encoding="utf-8")
+    assert "if (reduceMotion) return;" in js
+    assert "@media (prefers-reduced-motion: reduce)" in css

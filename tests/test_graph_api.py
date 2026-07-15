@@ -240,6 +240,103 @@ def test_corpus_aggregates_404_when_graph_is_disabled():
     assert resp.status_code == 404
 
 
+# ── 2.3.5.3: groups / facets / items endpoints on a seeded scale slice ────────
+
+@pytest.fixture
+def scale_corpus_client(offline_store):
+    from tests.fixtures.graph.phase2_3_corpus_scale import build_corpus_scale
+
+    summary = build_corpus_scale(
+        offline_store, securities=100, items=1_500, observations=80,
+        events=80, seed=11,
+    )
+    return _corpus_client(offline_store), summary
+
+
+def test_corpus_groups_endpoint_returns_bounded_revision_aware_nodes(scale_corpus_client):
+    client, summary = scale_corpus_client
+    resp = client.get("/graph/api/corpus/groups?group_by=index&limit=2")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["group_by"] == "index"
+    assert {n["kind"] for n in body["nodes"]} == {"index"}
+    assert body["total_count"] == len(summary.by_index)
+    assert body["corpus_revision"] == offline_revision(client)
+    # Paged: page limit of 2 leaves a cursor when more buckets exist.
+    if len(summary.by_index) > 2:
+        assert body["next_cursor"]
+
+
+def test_corpus_groups_rejects_bad_dimension_and_excessive_limit(scale_corpus_client):
+    client, _ = scale_corpus_client
+    assert client.get(
+        "/graph/api/corpus/groups?group_by=not_a_dim").status_code == 422
+    assert client.get(
+        "/graph/api/corpus/groups?group_by=index&limit=100000").status_code == 422
+
+
+def test_corpus_facets_endpoint_counts_current_filter_set(scale_corpus_client):
+    client, _ = scale_corpus_client
+    resp = client.get("/graph/api/corpus/facets?index=sp500")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["applied_filters"] == {"index": "sp500"}
+    assert "source_category" in body["facets"]
+    assert all("count" in b for b in body["facets"]["source_category"]["buckets"])
+
+
+def test_corpus_search_applies_facets_server_side(scale_corpus_client):
+    client, _ = scale_corpus_client
+    resp = client.get(
+        "/graph/api/corpus/search?kinds=corpus_item&item_type=news&limit=2")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["applied_filters"] == {"item_type": "news"}
+    assert all(n["metadata"]["item_type"] == "news" for n in body["nodes"])
+
+
+def test_corpus_item_detail_endpoint_is_bounded_and_404s_forged_ids(scale_corpus_client):
+    client, _ = scale_corpus_client
+    listing = client.get(
+        "/graph/api/corpus/search?kinds=corpus_item&limit=1").json()
+    node_id = listing["nodes"][0]["id"]
+    detail = client.get(f"/graph/api/corpus/items/{node_id}")
+    assert detail.status_code == 200
+    assert detail.json()["nodes"][0]["kind"] == "corpus_item"
+    # A forged / non-existent opaque id is rejected, never resolved.
+    assert client.get("/graph/api/corpus/items/cg1_deadbeefdeadbeef00").status_code == 404
+
+
+def test_corpus_new_endpoints_404_when_disabled(scale_corpus_client):
+    from tests.fixtures.graph.phase2_3_corpus_scale import build_corpus_scale  # noqa
+
+    client = _corpus_client_disabled()
+    for path in (
+        "/graph/api/corpus/groups?group_by=index",
+        "/graph/api/corpus/facets",
+        "/graph/api/corpus/items/cg1_deadbeefdeadbeef00",
+    ):
+        assert client.get(path).status_code == 404, path
+
+
+def offline_revision(client):
+    """Read the corpus revision the seeded store reports through any endpoint."""
+    return client.get(
+        "/graph/api/corpus/groups?group_by=index&limit=1").json()["corpus_revision"]
+
+
+def _corpus_client_disabled():
+    from src.middleware.config import MiddlewareConfig
+    from src.middleware.graph_api import create_graph_router
+
+    app = FastAPI()
+    config = MiddlewareConfig(config_path=None)
+    app.include_router(create_graph_router(
+        lambda: None, lambda: False, lambda: object(), lambda: config,
+    ))
+    return TestClient(app, client=("127.0.0.1", 50000))
+
+
 # ── 2.2.7.4: app-level loopback + CSP + no-store security posture ────────────
 
 @pytest.fixture
