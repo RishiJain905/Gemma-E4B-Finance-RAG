@@ -108,3 +108,15 @@ selection), visible `:focus-visible` rings in `--flow`, WCAG 2.1 AA contrast
 (ivory on graphite passes; check `--ink-dim` ≥ 4.5:1 on `--surface`, adjust up if
 needed), 24px min targets, `aria-live="polite"` for connection/query status,
 responsive down to a 1280px laptop (inspector collapses to a bottom sheet).
+
+## Phase 2.3 addendum — Corpus Explorer at scale (2.3.5.2)
+
+The Corpus Explorer mode is reorganized into an aggregation-first, faceted
+information architecture for a ≥600-security, ≥100k-item corpus. That work
+**extends this direction without altering it**: every token, typeface, motion
+rule, status-is-colour-plus-shape rule, provenance beam, table fallback, strict
+same-origin CSP, and loopback-only posture above still governs. The corpus mode
+adds a persistent facet rail, a keyboard-navigable inventory/results pane, and a
+canvas that shows only selected aggregates/results — with all filter state in the
+URL hash (no browser storage). The full corpus design record lives in
+[`../../../phase2.3/2.3.5-graph-and-corpus-explorer-scale/assets/design-direction-2.3.5.md`](../../../phase2.3/2.3.5-graph-and-corpus-explorer-scale/assets/design-direction-2.3.5.md).

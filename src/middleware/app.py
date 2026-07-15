@@ -392,7 +392,7 @@ def _emit_graph_evidence(
             "section": item.section,
             "parent_id": item.parent_id,
         }
-        metadata.update(item.taxonomy_metadata())
+        metadata.update(item.graph_evidence_metadata())
         retrieved_from = None
         if item.subquery_ids:
             from .graph_observer import _node_id
@@ -407,6 +407,7 @@ def _emit_graph_evidence(
             rank=rank,
             retrieved_from=retrieved_from,
             status=status,
+            source_metadata=item.source_node_metadata(),
         )
         parent_reference = reference_by_store_id.get(str(item.parent_id))
         if parent_reference:
@@ -515,6 +516,9 @@ def _emit_graph_terminal(
                 "date_semantics": data.get("date_semantics"),
                 "canonical_security": data.get("canonical_security"),
                 "coverage_tier": data.get("coverage_tier"),
+                "source_category": data.get("source_category"),
+                "provider": data.get("provider"),
+                "publisher": data.get("publisher"),
             },
         })
         if data.get("evidence_id"):

@@ -615,4 +615,14 @@ def pack_event_coverage(
         packed.append(row)
         if len(packed) >= limit:
             break
+    # 2.3.5.1: tag each packed row so the graph can show primary vs
+    # corroborating evidence truthfully. The primary is the authoritative record
+    # for an event; additional retained records for the same event corroborate
+    # it. This is additive metadata and does not change packing order/selection.
+    for row in packed:
+        metadata = row.get("metadata")
+        if not isinstance(metadata, dict):
+            continue
+        primary = primary_by_event[_coverage_key(row)][1]
+        metadata["evidence_role"] = "primary" if row is primary else "corroborating"
     return packed

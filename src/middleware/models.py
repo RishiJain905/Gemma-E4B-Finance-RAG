@@ -135,6 +135,9 @@ class EvidenceCitation(BaseModel):
     date_semantics: Optional[dict] = None
     canonical_security: Optional[str] = None
     coverage_tier: Optional[str] = None
+    source_category: Optional[str] = None
+    provider: Optional[str] = None
+    publisher: Optional[str] = None
 
 
 class QueryResponse(BaseModel):
@@ -334,6 +337,15 @@ class CorpusGraphResponse(BaseModel):
     truncated: bool = False
     corpus_revision: int = 0
     refresh: Optional[dict] = None
+    aggregates: Optional[dict] = None
+    # 2.3.5.3 aggregation-first surfaces: applied filter set, paged group level,
+    # facet counts, and visible/total counts for a bounded projection.
+    applied_filters: Optional[dict] = None
+    group_by: Optional[str] = None
+    facets: Optional[dict] = None
+    visible_count: Optional[int] = None
+    total_count: Optional[int] = None
+    total_items: Optional[int] = None
 
 
 class SearchRequest(BaseModel):

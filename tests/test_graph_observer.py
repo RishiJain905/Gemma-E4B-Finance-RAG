@@ -743,6 +743,221 @@ def test_stress_limits_hold_under_many_traces_and_elements():
     assert health["element_count"] <= 20
 
 
+# ── 2.3.5.1: source-aware live trace contract ───────────────────────────────
+
+def _emit_ledger(hub, query_id, facts, documents):
+    """Emit an evidence ledger the way the app does: node kinds stay source-
+    independent, each evidence links its actual source, metadata flows through
+    ``graph_evidence_metadata``/``source_node_metadata``."""
+    from src.middleware.evidence import assign_evidence_ids, build_evidence_items
+    from src.middleware.graph_observer import _node_id, make_event_observer
+
+    emitter = QueryEventEmitter(query_id=query_id, observers=[make_event_observer(hub)])
+    emitter.query_started(question="How did Oracle finance 2026 debt?")
+    emitter.stage("retrieve", "completed", elapsed_ms=1.0)  # the retrieval stage node
+    ledger = assign_evidence_ids(build_evidence_items(facts, documents))
+    for rank, item in enumerate(ledger, 1):
+        excerpt = item.document if item.kind == "document" else str(item.value)
+        emitter.graph_evidence(
+            evidence_id=item.evidence_id, kind=item.kind, excerpt=excerpt,
+            metadata=item.graph_evidence_metadata(), source_type=item.source_type,
+            rank=rank, retrieved_from=_node_id(query_id, "stage", "retrieve"),
+            source_metadata=item.source_node_metadata(),
+        )
+    return emitter, ledger
+
+
+_MIXED_DOCS = [
+    {
+        "id": "sec:acc-1", "document": "Oracle priced $8.0B of senior notes.",
+        "ticker": "ORCL", "source_type": "sec_8k", "source": "sec",
+        "metadata": {
+            "source_category": "sec", "item_type": "filing", "event_type": "debt_raise",
+            "authority_tier": "direct_sec", "canonical_security": "ORCL",
+            "security_id": "ORCL-US", "index_codes": ["SP500"], "form": "8-K",
+            "filing_item": "1.01", "exhibit": "4.1", "corpus_item_id": "sec-orcl-notes",
+            "document_family": "sec:acc-1:item_1_01", "normalization_version": "records-v1",
+            "event_id": "orcl-debt-2026", "published_at": "2026-05-13T21:05:00Z",
+        },
+    },
+    {
+        "id": "finnhub:reuters-1", "document": "Oracle sells $8B in bonds, Reuters reports.",
+        "ticker": "ORCL", "source_type": "finnhub", "source": "finnhub",
+        "metadata": {
+            "source_category": "company_news", "item_type": "news",
+            "authority_tier": "licensed", "canonical_security": "ORCL",
+            "original_publisher": "Reuters", "corpus_item_id": "finnhub-reuters-1",
+            "event_id": "orcl-debt-2026", "published_at": "2026-05-13T21:40:00Z",
+        },
+    },
+]
+_MIXED_FACTS = [
+    {
+        "id": "massive:ORCL:close", "ticker": "ORCL", "metric": "close", "value": 178.4,
+        "unit": "USD", "period": "2026-05-14", "source_type": "massive", "source": "massive",
+        "metadata": {
+            "source_category": "market_data", "item_type": "market_observation",
+            "authority_tier": "structured", "canonical_security": "ORCL",
+            "as_of_at": "2026-05-14T20:00:00Z",
+        },
+    },
+    {
+        "id": "fred:DFF", "metric": "federal_funds_rate", "value": 4.33, "unit": "percent",
+        "period": "2026-05-01", "source_type": "federal_reserve", "source": "federal_reserve",
+        "metadata": {
+            "source_category": "central_bank", "item_type": "policy_release",
+            "authority_tier": "primary", "coverage_tier": "global",
+            "event_type": "monetary_policy_decision", "published_at": "2026-05-01T18:00:00Z",
+        },
+    },
+]
+
+
+def test_mixed_source_trace_resolves_sources_and_distinguishes_provenance():
+    from src.middleware.graph_observer import TraceHub
+
+    hub = TraceHub()
+    emitter, ledger = _emit_ledger(hub, "qmix", _MIXED_FACTS, _MIXED_DOCS)
+    snapshot = hub.snapshot(emitter.query_id)
+    _assert_graph_integrity(snapshot)
+
+    evidence = [n for n in snapshot["nodes"] if n["kind"] == "evidence"]
+    sources = [n for n in snapshot["nodes"] if n["kind"] == "source"]
+    ledger_ids = {item.evidence_id for item in ledger}
+
+    # All four source categories present; node kinds stay source-independent.
+    categories = {n["metadata"].get("source_category") for n in evidence}
+    assert categories == {"sec", "company_news", "market_data", "central_bank"}
+    assert {n["kind"] for n in snapshot["nodes"]} <= {
+        "query", "plan", "subquery", "stage", "tool", "evidence", "source",
+        "answer", "citation",
+    }
+
+    # Every displayed evidence resolves to the ledger and links its actual source.
+    for node in evidence:
+        assert node["metadata"]["evidence_id"] in ledger_ids
+    from_source = [e for e in snapshot["edges"] if e["relation"] == "from_source"]
+    assert len(from_source) == len(evidence)
+    source_ids = {n["id"] for n in sources}
+    assert all(e["target"] in source_ids for e in from_source)
+
+    # provider/publisher distinct: the news item carries both; the filing only a provider.
+    news = next(n for n in evidence if n["metadata"]["source_category"] == "company_news")
+    assert news["metadata"]["provider"] == "finnhub"
+    assert news["metadata"]["publisher"] == "Reuters"
+    filing = next(n for n in evidence if n["metadata"]["source_category"] == "sec")
+    assert filing["metadata"]["provider"] == "sec"
+    assert filing["metadata"].get("publisher") is None  # a filing has no separate publisher
+    assert filing["metadata"]["form"] == "8-K" and filing["metadata"]["exhibit"] == "4.1"
+
+    # Source nodes are source-aware: category, authority, and provider identity.
+    sec_source = next(n for n in sources if n["metadata"].get("source_category") == "sec")
+    assert sec_source["metadata"]["authority_tier"] == "direct_sec"
+    assert sec_source["metadata"]["provider"] == "sec"
+
+
+def test_primary_and_corroborating_roles_are_distinguishable():
+    from src.middleware.evidence_taxonomy import normalize_evidence, pack_event_coverage
+    from src.middleware.graph_observer import TraceHub
+
+    packed = pack_event_coverage(
+        [normalize_evidence(row) for row in _MIXED_DOCS], limit=5, max_secondary_per_event=2,
+    )
+    hub = TraceHub()
+    emitter, _ledger = _emit_ledger(hub, "qrole", [], packed)
+    evidence = [n for n in hub.snapshot(emitter.query_id)["nodes"] if n["kind"] == "evidence"]
+    roles = {n["metadata"].get("provider"): n["metadata"].get("evidence_role") for n in evidence}
+    # Same event, two sources: SEC filing is primary, the news story corroborates.
+    assert roles["sec"] == "primary"
+    assert roles["finnhub"] == "corroborating"
+
+
+def test_deduped_context_creates_no_duplicate_evidence_nodes():
+    from src.middleware.evidence_taxonomy import normalize_evidence, pack_event_coverage
+    from src.middleware.graph_observer import TraceHub
+
+    # Two syndicated copies of one story dedupe to a single retained record.
+    syndicated = [
+        {"id": "wire-a", "document": "Oracle sells $8B in notes.", "ticker": "ORCL",
+         "source_type": "finnhub", "source": "finnhub",
+         "metadata": {"source_category": "company_news", "item_type": "news",
+                      "syndicated_key": "orcl-notes", "event_id": "orcl-debt"}},
+        {"id": "wire-b", "document": "Oracle sells $8B in notes.", "ticker": "ORCL",
+         "source_type": "massive", "source": "massive",
+         "metadata": {"source_category": "company_news", "item_type": "news",
+                      "syndicated_key": "orcl-notes", "event_id": "orcl-debt"}},
+    ]
+    packed = pack_event_coverage(
+        [normalize_evidence(row) for row in syndicated], limit=5, max_secondary_per_event=2,
+    )
+    assert len(packed) == 1  # dedupe collapsed the duplicate before packing
+    hub = TraceHub()
+    emitter, ledger = _emit_ledger(hub, "qdedup", [], packed + packed)  # re-emit same ids
+    evidence = [n for n in hub.snapshot(emitter.query_id)["nodes"] if n["kind"] == "evidence"]
+    node_ids = [n["id"] for n in evidence]
+    assert len(node_ids) == len(set(node_ids))  # no fabricated duplicate nodes
+
+
+def test_adaptive_to_legacy_fallback_preserves_route_identity_and_reason(monkeypatch):
+    """When the adaptive layer demotes to legacy it re-uses the shared
+    ``stage:route`` node id, so the fallback marks that one node (no duplicate
+    routing node) and records a bounded fallback reason."""
+    from src.middleware import app as middleware_app
+    from src.middleware.config import MiddlewareConfig
+    from src.middleware.graph_observer import TraceHub, _node_id
+    from src.middleware.models import QueryRequest
+
+    config = MiddlewareConfig(config_path=None)
+    config.enable_graph_observer = True
+    monkeypatch.setattr(middleware_app, "config", config)
+    monkeypatch.setattr(middleware_app, "graph_hub", TraceHub())
+    request = QueryRequest(question="Compare AAPL revenue", refresh=False)
+    emitter = middleware_app._install_query_emitter(request, chat_events=False)
+
+    # The adaptive path emitted stage:route before failing; then the legacy
+    # fallback re-emits the same node id with the fallback reason.
+    intent = {"ticker": "AAPL", "metrics": ["revenue"], "question_type": "comparison"}
+    middleware_app._emit_graph_adaptive_result(SimpleNamespace(
+        fallback_reason=None, sufficiency=None, retry_performed=False,
+        graph_trace_metadata=lambda: {"lane": "standard"},
+    ))
+    middleware_app._emit_graph_legacy_intent(intent, fallback_reason="adaptive_fallback")
+
+    snapshot = middleware_app.graph_hub.snapshot(emitter.query_id)
+    route_id = _node_id(emitter.query_id, "stage", "route")
+    route_nodes = [n for n in snapshot["nodes"] if n["id"] == route_id]
+    assert len(route_nodes) == 1, "the shared route node must not be duplicated"
+    assert route_nodes[0]["status"] == "fallback"
+    assert route_nodes[0]["metadata"].get("reason") == "adaptive_fallback"
+    # No separate stage:intent identity is reintroduced.
+    assert not any(n["id"].endswith(":stage:intent") for n in snapshot["nodes"])
+
+
+def test_source_aware_metadata_is_bounded_and_redacts_denied_keys():
+    from src.middleware.evidence import EvidenceItem, assign_evidence_ids
+    from src.middleware.graph_observer import TraceHub
+
+    row = {
+        "id": "sec:acc-canary", "document": "safe body", "ticker": "ORCL",
+        "source_type": "sec_8k", "source": "sec",
+        "metadata": {
+            "source_category": "sec", "item_type": "filing", "authority_tier": "direct_sec",
+            "form": "8-K", "corpus_item_id": "sec-orcl-canary",
+            "api_key": "CANARY_SECRET", "local_path": r"C:\Users\alice\secret.txt",
+            "published_at": "2026-05-13T21:05:00Z",
+        },
+    }
+    item = assign_evidence_ids([EvidenceItem.from_row(row, kind="document")])[0]
+    hub = TraceHub()
+    _emit_ledger(hub, "qcanary", [], [row])
+    blob = json.dumps(hub.snapshot("qcanary"))
+    # New source-aware fields survive; denied keys and local paths never do.
+    assert '"form": "8-K"' in blob and '"corpus_item_id": "sec-orcl-canary"' in blob
+    assert "CANARY_SECRET" not in blob
+    assert "alice" not in blob and "secret.txt" not in blob
+    assert item.form == "8-K"  # the ledger carries the same allowlisted field
+
+
 @pytest.mark.asyncio
 async def test_observer_disabled_yields_no_deltas_and_byte_compatible_response(monkeypatch):
     from src.middleware import app as middleware_app

@@ -40,10 +40,13 @@ _GRAPH_QUESTION_PREVIEW_CHARS_RANGE = (0, 2000)
 # Safe corpus explorer budgets (2.2.7.2). These caps are also enforced by the
 # API/projector so a bad configuration cannot overload a local graph client.
 _CORPUS_PAGE_LIMIT_RANGE = (1, 200)
+_CORPUS_DEFAULT_PAGE_LIMIT_RANGE = (1, 100)
 _CORPUS_ELEMENT_LIMIT_RANGE = (1, 2000)
 _CORPUS_VISIBLE_NODE_TARGET_RANGE = (1, 499)
 _CORPUS_OVERVIEW_TTL_RANGE = (0.1, 60.0)
 _CORPUS_OPAQUE_ID_TTL_RANGE = (1.0, 3600.0)
+_CORPUS_INSPECTOR_EXCERPT_BYTES_RANGE = (0, 4000)
+_CORPUS_INSPECTOR_METADATA_BYTES_RANGE = (0, 16000)
 
 
 class MiddlewareConfig:
@@ -100,10 +103,14 @@ class MiddlewareConfig:
 
         # Phase 2.2.7.2 — Store-backed, read-only corpus explorer budgets.
         self.corpus_page_limit: int = 100
+        self.corpus_default_page_limit: int = 50
         self.corpus_element_limit: int = 2000
         self.corpus_visible_node_target: int = 450
         self.corpus_overview_cache_ttl_s: float = 2.0
         self.corpus_opaque_id_ttl_s: float = 300.0
+        # Phase 2.3.5.3 — inspector detail byte caps enforced server-side.
+        self.corpus_inspector_excerpt_bytes: int = 1000
+        self.corpus_inspector_metadata_bytes: int = 4000
 
         # Phase 2.1.4 — analytical tool-calling controls.
         self.enable_tools: bool = False
@@ -346,8 +353,11 @@ class MiddlewareConfig:
         _int("GRAPH_EXCERPT_CHARS", "graph_excerpt_chars")
         _int("GRAPH_QUESTION_PREVIEW_CHARS", "graph_question_preview_chars")
         _int("CORPUS_PAGE_LIMIT", "corpus_page_limit")
+        _int("CORPUS_DEFAULT_PAGE_LIMIT", "corpus_default_page_limit")
         _int("CORPUS_ELEMENT_LIMIT", "corpus_element_limit")
         _int("CORPUS_VISIBLE_NODE_TARGET", "corpus_visible_node_target")
+        _int("CORPUS_INSPECTOR_EXCERPT_BYTES", "corpus_inspector_excerpt_bytes")
+        _int("CORPUS_INSPECTOR_METADATA_BYTES", "corpus_inspector_metadata_bytes")
         _float("CORPUS_OVERVIEW_CACHE_TTL_S", "corpus_overview_cache_ttl_s")
         _float("CORPUS_OPAQUE_ID_TTL_S", "corpus_opaque_id_ttl_s")
         _int("EMBEDDING_CACHE_SIZE", "embedding_cache_size")
@@ -528,10 +538,18 @@ class MiddlewareConfig:
             setattr(self, attr, bounded)
 
         _clamp_int("corpus_page_limit", _CORPUS_PAGE_LIMIT_RANGE)
+        _clamp_int("corpus_default_page_limit", _CORPUS_DEFAULT_PAGE_LIMIT_RANGE)
         _clamp_int("corpus_element_limit", _CORPUS_ELEMENT_LIMIT_RANGE)
         _clamp_int("corpus_visible_node_target", _CORPUS_VISIBLE_NODE_TARGET_RANGE)
+        _clamp_int(
+            "corpus_inspector_excerpt_bytes", _CORPUS_INSPECTOR_EXCERPT_BYTES_RANGE)
+        _clamp_int(
+            "corpus_inspector_metadata_bytes", _CORPUS_INSPECTOR_METADATA_BYTES_RANGE)
         _clamp_float("corpus_overview_cache_ttl_s", _CORPUS_OVERVIEW_TTL_RANGE)
         _clamp_float("corpus_opaque_id_ttl_s", _CORPUS_OPAQUE_ID_TTL_RANGE)
+        # The default page cannot exceed the hard maximum page size.
+        if self.corpus_default_page_limit > self.corpus_page_limit:
+            self.corpus_default_page_limit = self.corpus_page_limit
         if clamped:
             logger.warning(
                 "Clamped corpus explorer limits to safe ranges: %s", ", ".join(clamped))

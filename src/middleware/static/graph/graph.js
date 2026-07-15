@@ -217,6 +217,173 @@
   };
 })(typeof window !== "undefined" ? window : globalThis);
 
+/* ══ 1b. Corpus Explorer IA — pure, DOM-free, testable (2.3.5.2) ═══════════ */
+/* Aggregation-first navigation: all filter state lives in the URL hash and
+   nowhere else (no cookies, no analytics, no browser storage), so a
+   reload/back/forward/deep-link is a pure function of the hash. Facets are
+   combinable; provider names are present but never the first navigation level. */
+(function (root) {
+  // Combinable facet dimensions. Those with a truthy `dim` get authoritative
+  // "counts before expansion" from GET /corpus/aggregates (group_by=dim); the
+  // rest are combinable controls whose universe-wide counts are the deeper
+  // index work deferred to 2.3.5.3 (see design-direction-2.3.5.md).
+  const CORPUS_FACET_GROUPS = [
+    { key: "coverage_tier", label: "Coverage tier", dim: null,
+      options: ["broad", "deep", "sector", "global"] },
+    { key: "index", label: "Index", dim: null,
+      options: ["sp500", "nasdaq100", "overlap", "off_index"] },
+    { key: "sector", label: "Sector / industry", dim: null, options: [] },
+    { key: "ticker", label: "Ticker", dim: null, options: [] },
+    { key: "source_category", label: "Source category", dim: "source_category" },
+    { key: "source", label: "Source", dim: "source" },
+    { key: "item_type", label: "Item type", dim: "item_type" },
+    { key: "event_type", label: "Event type", dim: null, options: [] },
+    { key: "form", label: "Form / exhibit", dim: null, options: [] },
+    { key: "indexing_state", label: "Indexing state", dim: "indexing_state",
+      options: ["indexed", "pending", "failed", "not_applicable"] },
+    { key: "freshness", label: "Freshness", dim: null,
+      options: ["fresh", "stale", "error", "never"] },
+    { key: "authority", label: "Authority tier", dim: null,
+      options: ["primary", "structured", "licensed", "analysis", "discovery"] },
+    { key: "date", label: "Date range", dim: "year", type: "date" },
+  ];
+  const CORPUS_FACET_KEYS = CORPUS_FACET_GROUPS
+    .filter((group) => group.key !== "date")
+    .map((group) => group.key);
+
+  // Drill order for the aggregation-first hierarchy (spec Step-0 diagram):
+  // selecting an aggregate group descends one authoritative level at a time.
+  // Every level here is backed by real data now (index options + the
+  // accounting-backed source_category/item_type/year counts); sector stays a
+  // combinable rail facet whose universe-wide counts are 2.3.5.3 index work.
+  const CORPUS_DRILL_ORDER = ["index", "source_category", "item_type", "year"];
+
+  // Deterministic presets are URL shortcuts over normal facets, not separate API
+  // behavior. Each returns the facet/view changes it layers onto current state.
+  const CORPUS_PRESETS = {
+    "index-coverage": { groupBy: "index", view: "aggregates" },
+    "financing-events": {
+      facets: {
+        item_type: ["filing", "filing_exhibit"],
+        event_type: ["debt_raise", "equity_raise", "convertible_offering", "shelf_registration"],
+      }, view: "results",
+    },
+    "latest-news": { facets: { source_category: ["company_news"] }, view: "results" },
+    "macro-policy": {
+      facets: { source_category: ["central_bank", "treasury", "economic_agency"] },
+      view: "results",
+    },
+    "stale-sources": { facets: { freshness: ["stale", "error"] }, view: "results" },
+    "indexing-backlog": { facets: { indexing_state: ["pending", "failed"] }, view: "results" },
+    "ticker-research": { view: "results", groupBy: "source_category" },
+  };
+
+  function emptyCorpusState() {
+    const facets = {};
+    for (const key of CORPUS_FACET_KEYS) facets[key] = [];
+    return {
+      facets, q: "", preset: "", view: "aggregates",
+      groupBy: "source_category", published_from: "", published_to: "",
+    };
+  }
+
+  // Parse the corpus hash into state. Unknown keys are ignored; combined facets
+  // round-trip exactly, which is what makes a reload preserve every filter.
+  function parseCorpusHash(hash) {
+    const state = emptyCorpusState();
+    const raw = String(hash || "").replace(/^#/, "");
+    const params = new URLSearchParams(raw);
+    for (const key of CORPUS_FACET_KEYS) {
+      const value = params.get(key);
+      state.facets[key] = value ? value.split(",").map((v) => v.trim()).filter(Boolean) : [];
+    }
+    state.q = params.get("q") || "";
+    state.preset = params.get("preset") || "";
+    state.view = params.get("view") === "results" ? "results" : "aggregates";
+    state.groupBy = params.get("groupby") || "source_category";
+    state.published_from = params.get("published_from") || "";
+    state.published_to = params.get("published_to") || "";
+    return state;
+  }
+
+  // Serialize state back to a stable hash string. Only non-empty values appear,
+  // so equivalent states produce identical hashes (clean back/forward history).
+  function corpusHash(state) {
+    const params = new URLSearchParams();
+    params.set("mode", "corpus");
+    for (const key of CORPUS_FACET_KEYS) {
+      const vals = (state.facets && state.facets[key]) || [];
+      if (vals.length) params.set(key, vals.join(","));
+    }
+    if (state.q) params.set("q", state.q);
+    if (state.preset) params.set("preset", state.preset);
+    if (state.view === "results") params.set("view", "results");
+    if (state.groupBy && state.groupBy !== "source_category") params.set("groupby", state.groupBy);
+    if (state.published_from) params.set("published_from", state.published_from);
+    if (state.published_to) params.set("published_to", state.published_to);
+    return "#" + params.toString();
+  }
+
+  function toggleFacetValue(state, key, value) {
+    const next = emptyCorpusState();
+    Object.assign(next, JSON.parse(JSON.stringify(state)));
+    if (!CORPUS_FACET_KEYS.includes(key)) return next;
+    const set = new Set(next.facets[key] || []);
+    if (set.has(value)) set.delete(value); else set.add(value);
+    next.facets[key] = Array.from(set);
+    next.preset = "";  // a manual facet edit leaves preset mode
+    return next;
+  }
+
+  // Apply a preset over the current state. Presets replace only the dimensions
+  // they name, so a chosen ticker survives ticker-research and users can layer.
+  function applyPreset(state, presetId) {
+    const preset = CORPUS_PRESETS[presetId];
+    const next = emptyCorpusState();
+    Object.assign(next, JSON.parse(JSON.stringify(state)));
+    next.preset = presetId;
+    if (!preset) return next;
+    if (preset.facets) {
+      for (const key of Object.keys(preset.facets)) next.facets[key] = preset.facets[key].slice();
+    }
+    if (preset.view) next.view = preset.view;
+    if (preset.groupBy) next.groupBy = preset.groupBy;
+    return next;
+  }
+
+  function activeFacetCount(state) {
+    let total = 0;
+    for (const key of CORPUS_FACET_KEYS) total += (state.facets[key] || []).length;
+    if (state.published_from || state.published_to) total += 1;
+    return total;
+  }
+
+  // The subset of active facets the aggregates/accounting endpoint understands
+  // as single-value narrowing filters (2.3.5.2 authoritative dimensions).
+  function accountingFilters(state) {
+    const filters = {};
+    for (const key of ["source_category", "source", "item_type", "indexing_state"]) {
+      const vals = state.facets[key] || [];
+      if (vals.length === 1) filters[key] = vals[0];
+    }
+    return filters;
+  }
+
+  root.CorpusIA = {
+    CORPUS_FACET_GROUPS,
+    CORPUS_FACET_KEYS,
+    CORPUS_DRILL_ORDER,
+    CORPUS_PRESETS,
+    emptyCorpusState,
+    parseCorpusHash,
+    corpusHash,
+    toggleFacetValue,
+    applyPreset,
+    activeFacetCount,
+    accountingFilters,
+  };
+})(typeof window !== "undefined" ? window : globalThis);
+
 /* ══ Everything below needs the DOM; skip under a bare test harness. ═══════ */
 if (typeof document !== "undefined" && document.getElementById("graph-canvas")) {
   (function () {
@@ -250,7 +417,11 @@ if (typeof document !== "undefined" && document.getElementById("graph-canvas")) 
       pinnedNode: null,
       scrubberMax: 0,
       cap: 5000,
-      corpus: { revision: null, cursor: null, lastQuery: null, nodes: new Map(), edges: new Map(), freshAgg: new Map() },
+      corpus: {
+        revision: null, cursor: null, lastQuery: null,
+        nodes: new Map(), edges: new Map(), freshAgg: new Map(),
+        state: null, aggregates: new Map(), rows: [], selectedRowId: null,
+      },
       dragging: false,
       scrubbing: false,           // slider drag in progress -> instant, no fit
       scrubRaf: 0,                // coalesces scrub-driven re-renders
@@ -303,6 +474,11 @@ if (typeof document !== "undefined" && document.getElementById("graph-canvas")) 
         { selector: 'node[kind="tool"]', style: { shape: "hexagon", width: 40, height: 38 } },
         { selector: 'node[kind="evidence"]', style: { shape: "diamond", width: 34, height: 34 } },
         { selector: 'node[kind="evidence"][emd="document"]', style: { shape: "cut-rectangle", width: 34, height: 40 } },
+        // Source-aware subtypes (2.3.5.1): drawn from metadata, never a new node
+        // kind. Primary/authoritative evidence reads bolder; corroborating (a
+        // secondary source on the same event) is lighter and dashed.
+        { selector: 'node[kind="evidence"][atier="primary"], node[kind="evidence"][atier="direct_sec"]', style: { "border-width": 3, "background-color": COL.surface } },
+        { selector: 'node[kind="evidence"][erole="corroborating"]', style: { "border-style": "dashed", "background-opacity": 0.55 } },
         { selector: 'node[kind="source"]', style: { shape: "ellipse", "background-opacity": 0, "border-width": 2.4, width: 30, height: 30 } },
         { selector: 'node[kind="answer"]', style: { shape: "round-rectangle", "border-style": "double", "border-width": 4, width: 96, height: 34, "text-valign": "center", "text-margin-y": 0 } },
         { selector: 'node[kind="citation"]', style: { shape: "tag", width: 40, height: 30 } },
@@ -346,12 +522,17 @@ if (typeof document !== "undefined" && document.getElementById("graph-canvas")) 
 
     /* ══ 3./4. Rendering ══════════════════════════════════════════════════ */
     function nodeToEle(n) {
-      const emd = (n.metadata && n.metadata.kind) || "";
+      const m = n.metadata || {};
+      const emd = m.kind || "";
+      // Source-aware subtypes ride on data attributes (never new node kinds), so
+      // authority tier and primary/corroborating role can drive style/legend.
       return {
         group: "nodes",
         data: {
           id: n.id, label: displayLabel(n), kind: n.kind,
           status: n.status, emd, raw: n,
+          atier: m.authority_tier || "", erole: m.evidence_role || "",
+          scat: m.source_category || "",
         },
       };
     }
@@ -364,6 +545,21 @@ if (typeof document !== "undefined" && document.getElementById("graph-canvas")) 
         return m.evidence_id || m.ticker || n.label || "evidence";
       }
       return n.label || n.kind;
+    }
+    function isPlainObject(v) {
+      return v != null && typeof v === "object" && !Array.isArray(v);
+    }
+    // Render allowlisted metadata values without innerHTML. Nested date-semantics
+    // maps flatten to "key: value · …" so timestamps stay legible in the inspector.
+    function formatMetaValue(val) {
+      if (Array.isArray(val)) return val.join(", ");
+      if (isPlainObject(val)) {
+        return Object.keys(val)
+          .filter((k) => val[k] != null && val[k] !== "")
+          .map((k) => `${k.replace(/_/g, " ")}: ${val[k]}`)
+          .join(" · ");
+      }
+      return String(val);
     }
 
     function activeTrace() {
@@ -513,7 +709,10 @@ if (typeof document !== "undefined" && document.getElementById("graph-canvas")) 
       });
     }
     function tickDash() {
-      if (cy && !reduceMotion) {
+      // Reduced-motion stops the looping edge-flow animation entirely rather
+      // than spinning an idle rAF loop (2.3.5.3 Step 6).
+      if (reduceMotion) return;
+      if (cy) {
         dashOffset = (dashOffset - 0.8) % 24;
         cy.edges(".inflight").style("line-dash-offset", dashOffset);
       }
@@ -642,7 +841,7 @@ if (typeof document !== "undefined" && document.getElementById("graph-canvas")) 
 
     async function corpusOverview() {
       try {
-        const data = await getJSON(`${API}/corpus/overview`);
+        const data = await getJSON(`${API}/corpus/overview`, corpusSignal());
         loadCorpusPage(data, true);
       } catch (err) { showError("Corpus overview failed", err); }
     }
@@ -686,6 +885,549 @@ if (typeof document !== "undefined" && document.getElementById("graph-canvas")) 
     function setCorpusRevision(rev, changed) {
       $("corpus-revision").textContent = rev == null ? "—" : String(rev);
       if (changed) announce(`Corpus revision changed to ${rev}. Reload to refresh.`);
+    }
+
+    /* ══ 4b. Aggregation-first IA: facets, inventory, URL state (2.3.5.2) ══ */
+    const CI = window.CorpusIA;
+    // Authoritative aggregate dimensions we fetch for facet counts (bounded).
+    const AGG_DIMS = ["source_category", "source", "item_type", "indexing_state", "year"];
+    const FRESH_LABELS = { fresh: "fresh ●", stale: "stale ⌛", error: "error ✕", never: "never ◌" };
+    const INDEXING_LABELS = {
+      indexed: "indexed ●", pending: "pending ⟳", failed: "failed ✕",
+      not_applicable: "n/a",
+    };
+    const STATUS_GLYPH = {
+      fresh: "●", stale: "⌛", error: "✕", indexing: "⟳", backlog: "⏳",
+      complete: "●", pending: "◌", dropped: "⌀",
+    };
+
+    function corpusState() {
+      if (!app.corpus.state) app.corpus.state = CI.emptyCorpusState();
+      return app.corpus.state;
+    }
+
+    // Every corpus state change routes through the hash so refresh/back/forward
+    // and deep links stay a pure function of the URL (no cookies, no storage).
+    function navigateCorpus(next) {
+      app.corpus.state = next;
+      const hash = CI.corpusHash(next);
+      if (window.location.hash === hash) applyCorpusState(next);
+      else window.location.hash = hash;   // hashchange handler re-applies
+    }
+    function onCorpusHashChange() {
+      if (app.mode !== "corpus") return;
+      const state = CI.parseCorpusHash(window.location.hash);
+      app.corpus.state = state;
+      applyCorpusState(state);
+    }
+
+    async function applyCorpusState(state) {
+      // A filter/preset/search/drill change starts a new view: cancel the prior
+      // one so an out-of-order response never clobbers the current facets.
+      abortObsoleteCorpusRequests();
+      $("corpus-presets").value = state.preset || "";
+      $("corpus-search").value = state.q || "";
+      updateFacetToggleBadge(state);
+      await refreshAggregates(state);
+      renderFacetRail(state);
+      if (state.view === "results") renderResults(state);
+      else renderAggregatesInventory(state);
+    }
+
+    function updateFacetToggleBadge(state) {
+      const count = CI.activeFacetCount(state);
+      const btn = $("btn-facets-toggle");
+      btn.textContent = count ? `Facets (${count})` : "Facets";
+    }
+
+    // Fetch one bounded aggregate page per dimension, narrowed by the single-value
+    // facets the accounting endpoint understands. Revision-cached; fully fail-soft.
+    async function refreshAggregates(state) {
+      const filters = CI.accountingFilters(state);
+      const query = new URLSearchParams(filters);
+      await Promise.all(AGG_DIMS.map(async (dim) => {
+        const params = new URLSearchParams(query);
+        params.set("group_by", dim);
+        // A dimension never narrows by its own facet (that would zero its siblings).
+        params.delete(dim);
+        try {
+          const data = await getJSON(`${API}/corpus/aggregates?${params.toString()}`, corpusSignal());
+          const agg = (data && data.aggregates) || { buckets: [] };
+          app.corpus.aggregates.set(dim, agg.buckets || []);
+          if (data && data.corpus_revision != null) {
+            setCorpusRevision(data.corpus_revision, app.corpus.revision != null && app.corpus.revision !== data.corpus_revision);
+            app.corpus.revision = data.corpus_revision;
+          }
+        } catch (err) { if (isAbortError(err)) return; app.corpus.aggregates.set(dim, []); }
+      }));
+    }
+
+    function authorityCounts() {
+      const totals = {};
+      for (const bucket of app.corpus.aggregates.get("source_category") || []) {
+        const tier = bucket.authority_tier || "discovery";
+        totals[tier] = (totals[tier] || 0) + (bucket.count || 0);
+      }
+      return totals;
+    }
+    function overviewNodeValues() {
+      return (app.corpus.overviewNodes || app.corpus.nodes).values();
+    }
+    function overviewFreshMap() {
+      return app.corpus.overviewFresh || app.corpus.freshAgg;
+    }
+    function freshnessCounts() {
+      const totals = {};
+      for (const entry of overviewFreshMap().values()) {
+        for (const status of Object.keys(entry.counts || {})) {
+          const key = status === "complete" ? "fresh" : status === "dropped" ? "never" : status;
+          totals[key] = (totals[key] || 0) + entry.counts[status];
+        }
+      }
+      return totals;
+    }
+
+    // Build the persistent facet rail. Dimension-backed groups show authoritative
+    // counts before expansion; fixed-vocabulary groups render as combinable
+    // toggles even where universe-wide counts are 2.3.5.3 work.
+    function renderFacetRail(state) {
+      const host = $("facet-groups");
+      host.replaceChildren();
+      const authority = authorityCounts();
+      const freshness = freshnessCounts();
+      for (const group of CI.CORPUS_FACET_GROUPS) {
+        const section = document.createElement("section");
+        section.className = "facet-group";
+        const open = group.key === "source_category" || group.key === "item_type"
+          || (state.facets[group.key] && state.facets[group.key].length);
+        section.dataset.open = String(!!open);
+
+        const head = document.createElement("button");
+        head.type = "button";
+        head.className = "facet-group-head";
+        const label = document.createElement("span");
+        label.className = "field-label";
+        label.textContent = group.label;
+        const active = document.createElement("span");
+        active.className = "fg-active mono";
+        const activeVals = group.key === "date"
+          ? ((state.published_from || state.published_to) ? 1 : 0)
+          : (state.facets[group.key] || []).length;
+        active.textContent = activeVals ? String(activeVals) : "";
+        const chev = document.createElement("span");
+        chev.className = "chev"; chev.textContent = "▾"; chev.setAttribute("aria-hidden", "true");
+        head.append(label, active, chev);
+        head.setAttribute("aria-expanded", String(!!open));
+        head.addEventListener("click", () => {
+          const nowOpen = section.dataset.open !== "true";
+          section.dataset.open = String(nowOpen);
+          head.setAttribute("aria-expanded", String(nowOpen));
+        });
+        section.appendChild(head);
+
+        if (group.key === "date") {
+          section.appendChild(renderDateFacet(state));
+          host.appendChild(section);
+          continue;
+        }
+
+        let options = [];
+        if (group.key === "authority") {
+          options = group.options.map((v) => ({ key: v, label: v, count: authority[v] }));
+        } else if (group.key === "freshness") {
+          options = group.options.map((v) => ({ key: v, label: FRESH_LABELS[v] || v, count: freshness[v] }));
+        } else if (group.key === "indexing_state") {
+          const counts = mapBuckets("indexing_state");
+          options = group.options.map((v) => ({ key: v, label: INDEXING_LABELS[v] || v, count: counts[v] }));
+        } else if (group.dim) {
+          options = (app.corpus.aggregates.get(group.dim) || []).map((b) => ({
+            key: b.key, label: b.label || b.key, count: b.count,
+            authority: b.authority_tier, global: b.global_source,
+          }));
+        } else if (group.key === "ticker") {
+          options = tickerOptions();
+        } else {
+          options = (group.options || []).map((v) => ({ key: v, label: v }));
+        }
+
+        const list = document.createElement("ul");
+        list.className = "facet-options";
+        if (!options.length) {
+          const note = document.createElement("li");
+          note.className = "facet-empty";
+          note.textContent = group.dim
+            ? "No values yet."
+            : "Combinable filter — counts arrive with 2.3.5.3 index work.";
+          list.appendChild(note);
+        }
+        const selected = new Set(state.facets[group.key] || []);
+        for (const opt of options) {
+          list.appendChild(renderFacetOption(group.key, opt, selected.has(String(opt.key))));
+        }
+        section.appendChild(list);
+        host.appendChild(section);
+      }
+    }
+
+    function mapBuckets(dim) {
+      const out = {};
+      for (const b of app.corpus.aggregates.get(dim) || []) out[b.key] = b.count;
+      return out;
+    }
+    function tickerOptions() {
+      const out = [];
+      for (const n of overviewNodeValues()) {
+        if (n.kind === "ticker") out.push({ key: n.label, label: n.label });
+      }
+      return out.sort((a, b) => a.label.localeCompare(b.label)).slice(0, 100);
+    }
+
+    function renderFacetOption(groupKey, opt, isSelected) {
+      const li = document.createElement("li");
+      const btn = document.createElement("button");
+      btn.type = "button";
+      btn.className = "facet-option";
+      btn.setAttribute("aria-pressed", String(!!isSelected));
+      const mark = document.createElement("span");
+      mark.className = "fo-mark"; mark.textContent = "✓"; mark.setAttribute("aria-hidden", "true");
+      const label = document.createElement("span");
+      label.className = "fo-label"; label.textContent = opt.label;
+      btn.append(mark, label);
+      if (opt.authority) {
+        const pip = document.createElement("span");
+        pip.className = "auth-pip auth-" + opt.authority;
+        pip.textContent = opt.global ? opt.authority + " ·global" : opt.authority;
+        btn.appendChild(pip);
+      }
+      if (opt.count != null) {
+        const count = document.createElement("span");
+        count.className = "fo-count"; count.textContent = fmtCount(opt.count);
+        btn.appendChild(count);
+      }
+      btn.addEventListener("click", () => navigateCorpus(CI.toggleFacetValue(corpusState(), groupKey, String(opt.key))));
+      li.appendChild(btn);
+      return li;
+    }
+
+    function renderDateFacet(state) {
+      const wrap = document.createElement("div");
+      wrap.className = "facet-date";
+      for (const [key, text] of [["published_from", "From"], ["published_to", "To"]]) {
+        const row = document.createElement("label");
+        const span = document.createElement("span");
+        span.className = "field-label"; span.textContent = text;
+        const input = document.createElement("input");
+        input.type = "date"; input.value = state[key] || "";
+        input.setAttribute("aria-label", `Published ${text.toLowerCase()}`);
+        input.addEventListener("change", () => {
+          const next = CI.emptyCorpusState();
+          Object.assign(next, JSON.parse(JSON.stringify(corpusState())));
+          next[key] = input.value; next.preset = "";
+          navigateCorpus(next);
+        });
+        row.append(span, input);
+        wrap.appendChild(row);
+      }
+      // Authoritative year buckets shown as read-only counts beside the range.
+      const years = app.corpus.aggregates.get("year") || [];
+      if (years.length) {
+        const list = document.createElement("ul");
+        list.className = "facet-options";
+        for (const b of years.slice(0, 12)) {
+          const li = document.createElement("li");
+          const item = document.createElement("span");
+          item.className = "facet-option";
+          const label = document.createElement("span");
+          label.className = "fo-label"; label.textContent = b.key;
+          const count = document.createElement("span");
+          count.className = "fo-count"; count.textContent = fmtCount(b.count);
+          item.append(label, count);
+          li.appendChild(item);
+          list.appendChild(li);
+        }
+        wrap.appendChild(list);
+      }
+      return wrap;
+    }
+
+    function fmtCount(n) {
+      const v = Number(n) || 0;
+      return v >= 1000 ? v.toLocaleString("en-US") : String(v);
+    }
+
+    /* ── Inventory / results pane (the complete accessible surface) ──────── */
+    function setInventory(rows, opts) {
+      app.corpus.rows = rows;
+      const list = $("inventory-list");
+      list.replaceChildren();
+      const empty = $("inventory-empty");
+      empty.hidden = rows.length > 0;
+      if (!rows.length) empty.textContent = (opts && opts.emptyText) || "No items match these facets. Clear a filter or pick a preset.";
+      rows.forEach((row, i) => list.appendChild(renderInvRow(row, i)));
+      $("inventory-count").textContent = (opts && opts.countText) || `${rows.length} shown`;
+      $("btn-inventory-more").hidden = !(opts && opts.more);
+      // First row is the roving-focus entry point for keyboard users.
+      const first = list.querySelector(".inv-row");
+      if (first) first.tabIndex = 0;
+    }
+
+    function renderInvRow(row, index) {
+      const li = document.createElement("li");
+      li.className = "inv-row" + (row.aggregate ? " is-aggregate" : "");
+      li.setAttribute("role", "option");
+      li.dataset.rowId = String(row.id != null ? row.id : index);
+      li.tabIndex = -1;
+      li.setAttribute("aria-selected", row.id === app.corpus.selectedRowId ? "true" : "false");
+      const glyph = document.createElement("span");
+      glyph.className = "inv-glyph"; glyph.setAttribute("aria-hidden", "true");
+      glyph.textContent = KIND_GLYPH[row.kind] || (row.aggregate ? "▦" : "•");
+      const title = document.createElement("span");
+      title.className = "inv-title"; title.textContent = row.title;
+      const meta = document.createElement("span");
+      meta.className = "inv-meta"; meta.textContent = row.meta || "";
+      const sub = document.createElement("span");
+      sub.className = "inv-sub"; sub.textContent = row.sub || "";
+      const badges = document.createElement("span");
+      badges.className = "inv-badges";
+      for (const b of row.badges || []) {
+        const el = document.createElement("span");
+        el.className = "inv-badge" + (b.status ? " st-badge st-" + b.status : "");
+        el.textContent = b.text;
+        badges.appendChild(el);
+      }
+      li.append(glyph, title, meta, sub, badges);
+      li.addEventListener("click", () => activateInvRow(row));
+      return li;
+    }
+
+    function activateInvRow(row) {
+      app.corpus.selectedRowId = row.id;
+      highlightInvRows(row.id);
+      if (row.aggregate) { drillAggregate(row); return; }
+      if (row.node) { selectCorpusItem(row.node); }
+    }
+    function highlightInvRows(id) {
+      document.querySelectorAll(".inv-row").forEach((r) =>
+        r.setAttribute("aria-selected", r.dataset.rowId === String(id) ? "true" : "false"));
+    }
+
+    // Aggregation-first landing: render the current drill dimension's buckets as
+    // aggregate group rows. Never renders the corpus — one bounded page of counts.
+    function renderAggregatesInventory(state) {
+      const dim = state.groupBy || "source_category";
+      let rows;
+      if (dim === "ticker") rows = tickerInventoryRows();
+      else if (dim === "index" || dim === "sector") rows = optionAggRows(dim);
+      else rows = aggregateRows(dim, app.corpus.aggregates.get(dim) || []);
+      setInventory(rows, {
+        countText: `${rows.length} groups · ${dim.replace(/_/g, " ")}`,
+        emptyText: "No aggregates yet. Corpus may be empty or still indexing.",
+      });
+    }
+
+    // Fixed-vocabulary drill levels (index/sector) render as aggregate group rows
+    // without universe-wide counts (2.3.5.3 index work); they still drill and set
+    // the matching combinable facet.
+    function optionAggRows(dim) {
+      const group = CI.CORPUS_FACET_GROUPS.find((g) => g.key === dim);
+      const labels = {
+        sp500: "S&P 500", nasdaq100: "Nasdaq-100",
+        overlap: "Index overlap", off_index: "Off-index (deep)",
+      };
+      return ((group && group.options) || []).map((key) => ({
+        id: `agg:${dim}:${key}`, aggregate: true, dim, key, kind: "source",
+        title: labels[key] || key, meta: "group",
+        sub: dim.replace(/_/g, " "), badges: [],
+      }));
+    }
+
+    function aggregateRows(dim, buckets) {
+      return buckets.map((b) => {
+        const badges = [];
+        if (b.authority_tier) badges.push({ text: b.authority_tier });
+        if (b.global_source) badges.push({ text: "global" });
+        return {
+          id: `agg:${dim}:${b.key}`, aggregate: true, dim, key: b.key, kind: "source",
+          title: b.label || b.key,
+          meta: `${fmtCount(b.count)} items`,
+          sub: dim === "source_category" ? "source category" : dim.replace(/_/g, " "),
+          badges,
+        };
+      });
+    }
+
+    // Per-security badges (SEC 14 · news 86 · market 252 · official 3) derive from
+    // the bounded overview ticker projection, not hidden per-item DOM nodes.
+    function tickerInventoryRows() {
+      const OFFICIAL = new Set(["fred", "federal_reserve", "treasury", "bls", "bea", "eia"]);
+      const rows = [];
+      const fresh_map = overviewFreshMap();
+      for (const n of overviewNodeValues()) {
+        if (n.kind !== "ticker") continue;
+        const m = n.metadata || {};
+        const counts = m.source_counts || {};
+        const badges = [];
+        let sec = 0, news = 0, market = 0, official = 0;
+        for (const s of Object.keys(counts)) {
+          const key = s.toLowerCase();
+          if (key.includes("sec")) sec += counts[s];
+          else if (key.includes("news") || key.includes("finnhub") || key.includes("gdelt")) news += counts[s];
+          else if (OFFICIAL.has(key)) official += counts[s];
+          else market += counts[s];
+        }
+        if (sec) badges.push({ text: `SEC ${sec}` });
+        if (news) badges.push({ text: `news ${news}` });
+        if (market) badges.push({ text: `market ${market}` });
+        if (official) badges.push({ text: `official ${official}` });
+        const fresh = fresh_map.get(n.id);
+        if (fresh && fresh.worst && fresh.worst !== "complete") {
+          const map = { pending: "stale", dropped: "backlog", error: "error" };
+          badges.push({ text: (map[fresh.worst] || fresh.worst), status: map[fresh.worst] || "stale" });
+        }
+        rows.push({
+          id: `tick:${n.id}`, node: n, kind: "ticker", title: n.label,
+          meta: `${fmtCount(m.record_count || 0)} items`,
+          sub: (m.company_name || "").slice(0, 40),
+          badges,
+        });
+      }
+      return rows.sort((a, b) => a.title.localeCompare(b.title));
+    }
+
+    // Drill one authoritative level: fix the chosen aggregate as a facet and
+    // advance groupBy to the next level. Leaf level switches to item results.
+    function drillAggregate(row) {
+      const next = CI.emptyCorpusState();
+      Object.assign(next, JSON.parse(JSON.stringify(corpusState())));
+      const facetKey = row.dim;
+      if (CI.CORPUS_FACET_KEYS.includes(facetKey)) {
+        next.facets[facetKey] = [String(row.key)];
+      } else if (row.dim === "year" && /^\d{4}$/.test(String(row.key))) {
+        next.published_from = `${row.key}-01-01`;
+        next.published_to = `${row.key}-12-31`;
+      }
+      const order = CI.CORPUS_DRILL_ORDER;
+      const idx = order.indexOf(row.dim);
+      const nextDim = idx >= 0 && idx < order.length - 1 ? order[idx + 1] : null;
+      if (nextDim) { next.groupBy = nextDim; next.view = "aggregates"; }
+      else next.view = "results";
+      next.preset = "";
+      navigateCorpus(next);
+      announce(`Expanded ${row.title}.`);
+    }
+
+    // Results view: item rows from the bounded search projection. The same nodes
+    // populate the canvas (selected/searched only, folded/LOD preserved).
+    async function renderResults(state) {
+      const q = state.q || "";
+      const ticker = (state.facets.ticker || [])[0] || "";
+      let url = `${API}/corpus/search?q=${encodeURIComponent(q)}`;
+      if (ticker) url += `&ticker=${encodeURIComponent(ticker)}`;
+      const cats = state.facets.source_category || [];
+      // Category facet maps to concrete node kinds so the item list narrows.
+      const kinds = catKinds(cats);
+      if (kinds.length) url += `&kinds=${encodeURIComponent(kinds.join(","))}`;
+      app.corpus.lastResultsUrl = url;
+      try {
+        const data = await getJSON(url, corpusSignal());
+        loadCorpusPage(data, true);
+        app.corpus.resultsCursor = data.next_cursor || null;
+        const rows = resultRows(data.nodes || [], state);
+        setInventory(rows, {
+          countText: `${rows.length} items` + (data.truncated ? " · truncated to cap" : ""),
+          more: !!data.next_cursor,
+          emptyText: "No items match these facets. Clear a filter or pick a preset.",
+        });
+      } catch (err) { showError("Corpus search failed", err); }
+    }
+    async function loadMoreResults() {
+      if (!app.corpus.resultsCursor || !app.corpus.lastResultsUrl) return;
+      const url = `${app.corpus.lastResultsUrl}&cursor=${encodeURIComponent(app.corpus.resultsCursor)}`;
+      try {
+        const data = await getJSON(url, corpusSignal());
+        loadCorpusPage(data, false);
+        app.corpus.resultsCursor = data.next_cursor || null;
+        app.corpus.rows = app.corpus.rows.concat(resultRows(data.nodes || [], corpusState()));
+        setInventory(app.corpus.rows, {
+          countText: `${app.corpus.rows.length} items`, more: !!data.next_cursor,
+        });
+      } catch (err) { showError("Load next page failed", err); }
+    }
+    function submitCorpusSearch() {
+      const next = CI.emptyCorpusState();
+      Object.assign(next, JSON.parse(JSON.stringify(corpusState())));
+      next.q = $("corpus-search").value.trim();
+      next.view = "results"; next.preset = "";
+      navigateCorpus(next);
+    }
+    function findInvRow(rowId) {
+      return app.corpus.rows.find((r, i) => String(r.id != null ? r.id : i) === rowId) || null;
+    }
+    function wireInventoryKeyboard() {
+      const list = $("inventory-list");
+      list.addEventListener("keydown", (e) => {
+        const rows = Array.from(list.querySelectorAll(".inv-row"));
+        if (!rows.length) return;
+        let idx = rows.findIndex((r) => r === document.activeElement);
+        if (idx < 0) idx = rows.findIndex((r) => r.getAttribute("aria-selected") === "true");
+        if (e.key === "ArrowDown") { e.preventDefault(); idx = Math.min(rows.length - 1, idx + 1); }
+        else if (e.key === "ArrowUp") { e.preventDefault(); idx = Math.max(0, Math.max(idx, 0) - 1); }
+        else if (e.key === "Home") { e.preventDefault(); idx = 0; }
+        else if (e.key === "End") { e.preventDefault(); idx = rows.length - 1; }
+        else if (e.key === "Enter" || e.key === " ") {
+          e.preventDefault();
+          const cur = rows[Math.max(0, idx)];
+          if (cur) { const row = findInvRow(cur.dataset.rowId); if (row) activateInvRow(row); }
+          return;
+        } else return;
+        const row = rows[idx];
+        if (row) {
+          rows.forEach((r) => { r.tabIndex = -1; });
+          row.tabIndex = 0; row.focus();
+        }
+      });
+    }
+    function catKinds(cats) {
+      const map = {
+        sec: ["filing", "section"], company_news: ["document_family"],
+        market_data: ["metric", "fact"], issuer: ["document_family"],
+      };
+      const out = new Set();
+      for (const c of cats) for (const k of map[c] || []) out.add(k);
+      return Array.from(out);
+    }
+    function resultRows(nodes, state) {
+      const rows = [];
+      for (const n of nodes) {
+        const m = n.metadata || {};
+        const status = m.status || m.indexing_status || "";
+        const badges = [];
+        if (m.authority_tier) badges.push({ text: m.authority_tier });
+        const st = corpusRowStatus(m);
+        if (st) badges.push({ text: STATUS_GLYPH[st.key] + " " + st.key, status: st.key });
+        rows.push({
+          id: `item:${n.id}`, node: n, kind: n.kind, title: displayLabel(n),
+          meta: [m.form || m.item_type || n.kind, dateOf(m)].filter(Boolean).join(" · "),
+          sub: [m.ticker, m.source_category || m.source].filter(Boolean).join(" · "),
+          badges,
+        });
+      }
+      return rows;
+    }
+    function corpusRowStatus(m) {
+      const s = String(m.status || m.indexing_status || "").toLowerCase();
+      if (s.includes("error") || s.includes("fail")) return { key: "error" };
+      if (s.includes("pending") || s.includes("index")) return { key: "indexing" };
+      if (s.includes("stale")) return { key: "stale" };
+      return null;
+    }
+    function dateOf(m) {
+      return m.filing_date || m.date || m.published_at || m.as_of || m.last_updated || "";
+    }
+
+    function selectCorpusItem(node) {
+      if (!app.corpus.nodes.has(node.id)) { app.corpus.nodes.set(node.id, node); renderCorpus(); }
+      selectNode(node.id, false);
     }
 
     /* ══ 5. Resilient SSE client ══════════════════════════════════════════ */
@@ -853,6 +1595,7 @@ if (typeof document !== "undefined" && document.getElementById("graph-canvas")) 
       for (const key of Object.keys(meta)) {
         const val = meta[key];
         if (val == null || val === "" || (Array.isArray(val) && !val.length)) continue;
+        if (isPlainObject(val) && !Object.keys(val).length) continue;
         const dt = document.createElement("dt");
         dt.textContent = key.replace(/_/g, " ");
         const dd = document.createElement("dd");
@@ -861,7 +1604,7 @@ if (typeof document !== "undefined" && document.getElementById("graph-canvas")) 
           a.href = val; a.textContent = val; a.rel = "noreferrer noopener"; a.target = "_blank";
           dd.appendChild(a);
         } else {
-          dd.textContent = Array.isArray(val) ? val.join(", ") : String(val);
+          dd.textContent = formatMetaValue(val);
         }
         dl.appendChild(dt); dl.appendChild(dd);
       }
@@ -973,7 +1716,13 @@ if (typeof document !== "undefined" && document.getElementById("graph-canvas")) 
       if (m.score != null) parts.push(`score ${m.score}`);
       if (m.elapsed_ms != null) parts.push(`${m.elapsed_ms}ms`);
       if (m.count != null) parts.push(`${m.count}`);
-      if (m.source_type) parts.push(m.source_type);
+      // Source-aware summary: category + item/event type + role, so the table
+      // reads as "who said it, what kind, primary or corroborating".
+      if (m.source_category) parts.push(m.source_category);
+      else if (m.source_type) parts.push(m.source_type);
+      if (m.item_type) parts.push(m.item_type);
+      if (m.event_type) parts.push(m.event_type);
+      if (m.evidence_role) parts.push(m.evidence_role);
       return parts.join(" · ");
     }
     function highlightRows(id) {
@@ -1019,14 +1768,29 @@ if (typeof document !== "undefined" && document.getElementById("graph-canvas")) 
     }
 
     /* ══ HTTP helper ══════════════════════════════════════════════════════ */
-    async function getJSON(url) {
-      const resp = await fetch(url, { headers: { Accept: "application/json" } });
+    async function getJSON(url, signal) {
+      const resp = await fetch(url, { headers: { Accept: "application/json" }, signal });
       if (!resp.ok) { const err = new Error(`HTTP ${resp.status}`); err.status = resp.status; throw err; }
       return resp.json();
     }
 
+    // Cancel in-flight corpus view requests when the filter set changes so a
+    // slow older page can never overwrite the current one (2.3.5.3 Step 4).
+    function abortObsoleteCorpusRequests() {
+      if (app.corpusAbort) app.corpusAbort.abort();
+      app.corpusAbort = new AbortController();
+      return app.corpusAbort.signal;
+    }
+    function corpusSignal() {
+      return app.corpusAbort ? app.corpusAbort.signal : undefined;
+    }
+    function isAbortError(err) {
+      return err && (err.name === "AbortError" || err.code === 20);
+    }
+
     /* ══ error panel + read-only fallback ═════════════════════════════════ */
     function showError(title, err) {
+      if (isAbortError(err)) return;   // superseded by a newer request; not an error
       $("error-panel").hidden = false;
       $("error-title").textContent = title;
       $("error-detail").textContent = err && err.message ? err.message : String(err);
@@ -1049,15 +1813,33 @@ if (typeof document !== "undefined" && document.getElementById("graph-canvas")) 
       $("corpus-controls").hidden = mode !== "corpus";
       $("query-picker-field").hidden = mode !== "live";
       $("corpus-revision-field").hidden = mode !== "corpus";
-      $("scrubber-bar").querySelectorAll("input,.field-label").forEach(() => {});
+      $("facet-rail").hidden = mode !== "corpus";
+      $("inventory-pane").hidden = mode !== "corpus";
       clearInspector();
       if (mode === "corpus") {
-        if (!app.corpus.nodes.size) corpusOverview();
-        else renderCorpus();
+        enterCorpus();
       } else {
+        document.documentElement.removeAttribute("data-facets");
         renderLive();
         syncStageRail();
       }
+    }
+
+    // Enter Corpus Explorer: the bounded overview seeds the canvas, freshness
+    // fold, and ticker projection; then the URL hash drives the facet rail and
+    // aggregation-first inventory. mode=corpus is stamped without a history entry.
+    async function enterCorpus() {
+      if (!app.corpus.nodes.size) await corpusOverview();
+      else renderCorpus();
+      // Snapshot the bounded overview projection so the facet rail's freshness
+      // and ticker derivations survive a later search replacing the canvas nodes.
+      app.corpus.overviewNodes = new Map(app.corpus.nodes);
+      app.corpus.overviewFresh = new Map(app.corpus.freshAgg);
+      const state = CI.parseCorpusHash(window.location.hash);
+      app.corpus.state = state;
+      const hash = CI.corpusHash(state);
+      if (window.location.hash !== hash) history.replaceState(null, "", hash);
+      applyCorpusState(state);
     }
 
     /* ══ 7. Bootstrap + events ════════════════════════════════════════════ */
@@ -1203,13 +1985,34 @@ if (typeof document !== "undefined" && document.getElementById("graph-canvas")) 
 
       $("btn-retry").addEventListener("click", () => { hideError(); if (!cy) initCytoscape(); reloadSnapshot(); });
       $("inspector-close").addEventListener("click", clearInspector);
+      // Escape closes the inspector from anywhere except a text field, keeping
+      // the panel fully keyboard-operable (2.3.5.3 Step 6).
+      document.addEventListener("keydown", (e) => {
+        if (e.key !== "Escape") return;
+        const tag = (document.activeElement && document.activeElement.tagName) || "";
+        if (tag === "INPUT" || tag === "TEXTAREA") return;
+        if (!$("inspector-body").hidden) { clearInspector(); e.preventDefault(); }
+      });
 
-      $("corpus-search").addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); corpusSearch(true); } });
-      $("btn-corpus-search").addEventListener("click", () => corpusSearch(true));
-      $("btn-corpus-overview").addEventListener("click", () => corpusOverview());
+      $("corpus-search").addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); submitCorpusSearch(); } });
+      $("btn-corpus-search").addEventListener("click", submitCorpusSearch);
+      $("btn-corpus-overview").addEventListener("click", () => navigateCorpus(CI.emptyCorpusState()));
       $("btn-corpus-more").addEventListener("click", () => {
         if (app.corpus.lastQuery != null) corpusSearch(false);
       });
+
+      // Aggregation-first controls (2.3.5.2): presets, facet clear, drawer, paging.
+      $("corpus-presets").addEventListener("change", (e) => {
+        if (e.target.value) navigateCorpus(CI.applyPreset(corpusState(), e.target.value));
+      });
+      $("btn-facets-clear").addEventListener("click", () => navigateCorpus(CI.emptyCorpusState()));
+      $("btn-facets-toggle").addEventListener("click", () => {
+        const open = document.documentElement.getAttribute("data-facets") === "open";
+        document.documentElement.setAttribute("data-facets", open ? "closed" : "open");
+        $("btn-facets-toggle").setAttribute("aria-expanded", String(!open));
+      });
+      $("btn-inventory-more").addEventListener("click", loadMoreResults);
+      wireInventoryKeyboard();
 
       wireKeyboard();
     }
@@ -1293,7 +2096,10 @@ if (typeof document !== "undefined" && document.getElementById("graph-canvas")) 
       await applyTraceHash();
       connect();
       window.addEventListener("resize", () => { if (app.mode === "live") { renderLive(); syncStageRail(); } });
-      window.addEventListener("hashchange", () => { applyTraceHash(); });
+      window.addEventListener("hashchange", () => {
+        if (app.mode === "corpus") onCorpusHashChange();
+        else applyTraceHash();
+      });
     }
 
     // Confirm the observer is on before wiring the live stream. If it is off

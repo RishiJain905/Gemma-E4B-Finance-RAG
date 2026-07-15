@@ -273,3 +273,230 @@ def test_graph_js_folds_corpus_freshness_leaves():
     assert "foldCorpusForCanvas" in js
     assert "updateCorpusLabelLOD" in js
     assert "freshWorst" in js
+
+
+# ── 2.3.5.1: source-aware live trace ─────────────────────────────────────────
+
+MIXED_FIXTURE = Path(__file__).parent / "fixtures" / "graph" / "query_trace_mixed_v1.json"
+
+
+def test_mixed_source_fixture_matches_wire_schema_and_resolves_to_ledger():
+    """The 2.3.5.1 mixed fixture (SEC financing + company news + market
+    observation + macro release) is schema_version 1 — Phase 2.2 readers still
+    parse it — and every source/evidence/citation resolves to the ledger."""
+    import json
+
+    from src.middleware.graph_observer import (
+        EDGE_RELATIONS,
+        NODE_KINDS,
+        NODE_STATUSES,
+        _DENIED_KEY,
+    )
+
+    fixture = json.loads(MIXED_FIXTURE.read_text(encoding="utf-8"))
+    assert fixture["schema_version"] == 1
+    snapshot = fixture["snapshot"]
+    assert snapshot["schema_version"] == 1 and snapshot["complete"] is True
+
+    node_ids = set()
+    evidence_ids = set()
+    categories = set()
+    for node in snapshot["nodes"]:
+        assert node["kind"] in NODE_KINDS, node["kind"]
+        assert node["status"] in NODE_STATUSES, node["status"]
+        node_ids.add(node["id"])
+        metadata = node.get("metadata") or {}
+        for key in metadata:
+            assert not _DENIED_KEY.search(key), f"denied metadata key: {key}"
+        assert not (_LAYOUT_KEYS & set(metadata)), "fixture must not embed layout"
+        if node["kind"] == "evidence":
+            assert len(node.get("summary", "")) <= 1000
+            evidence_ids.add(metadata.get("evidence_id"))
+            categories.add(metadata.get("source_category"))
+
+    # Four distinct source categories, no provider-specific node kinds.
+    assert categories == {"sec", "company_news", "market_data", "central_bank"}
+
+    for edge in snapshot["edges"]:
+        assert edge["relation"] in EDGE_RELATIONS, edge["relation"]
+        assert edge["source"] in node_ids, f"dangling source {edge['source']}"
+        assert edge["target"] in node_ids, f"dangling target {edge['target']}"
+        # Every source/citation link resolves to a real evidence node.
+        if edge["relation"] in ("from_source", "cited_by"):
+            assert edge["source"].rsplit(":", 1)[-1] in evidence_ids
+
+    # provider/publisher distinction is preserved on the wire.
+    news = next(n for n in snapshot["nodes"]
+                if n["kind"] == "evidence" and n["metadata"].get("source_category") == "company_news")
+    assert news["metadata"]["provider"] == "finnhub"
+    assert news["metadata"]["publisher"] == "Reuters"
+
+
+def test_graph_js_renders_source_aware_metadata_and_subtypes():
+    """The inspector flattens nested date-semantics, and evidence subtypes ride
+    on metadata-driven data attributes (never new node kinds)."""
+    js = JS.read_text(encoding="utf-8")
+    assert "formatMetaValue" in js
+    assert "isPlainObject" in js
+    # Authority tier + primary/corroborating role drive style, not node kinds.
+    assert "atier" in js and "erole" in js
+    assert 'atier="primary"' in js or "atier=\"direct_sec\"" in js
+    assert 'erole="corroborating"' in js
+
+
+def test_graph_css_handles_richer_provenance_values():
+    css = CSS.read_text(encoding="utf-8")
+    assert "overflow-wrap: anywhere" in css
+
+
+# ── 2.3.5.2: aggregation-first, faceted Corpus Explorer ──────────────────────
+
+def test_corpus_explorer_has_three_surfaces_and_facet_rail():
+    """Facet rail, inventory/results pane, and canvas are distinct surfaces; the
+    inventory list is a keyboard-navigable listbox usable without Cytoscape."""
+    html = INDEX.read_text(encoding="utf-8")
+    for token in (
+        'id="facet-rail"', 'aria-label="Corpus facets"', 'id="facet-groups"',
+        'id="inventory-pane"', 'id="inventory-list"', 'role="listbox"',
+        'id="inventory-empty"', 'id="inventory-count"', 'id="btn-inventory-more"',
+        'id="corpus-presets"', 'id="btn-facets-clear"', 'id="btn-facets-toggle"',
+        'id="work-area"',
+    ):
+        assert token in html, f"index.html missing {token}"
+
+
+def test_corpus_presets_are_url_shortcuts_in_html_and_js():
+    """All seven deterministic presets exist as saved entry points and expansions."""
+    html = INDEX.read_text(encoding="utf-8")
+    js = JS.read_text(encoding="utf-8")
+    presets = [
+        "index-coverage", "financing-events", "latest-news", "macro-policy",
+        "stale-sources", "indexing-backlog", "ticker-research",
+    ]
+    for preset in presets:
+        assert f'value="{preset}"' in html, f"preset option {preset} missing"
+        assert f'"{preset}"' in js, f"preset {preset} not expanded in CORPUS_PRESETS"
+    assert "CORPUS_PRESETS" in js and "applyPreset" in js
+
+
+def test_corpus_ia_pure_state_helpers_are_defined():
+    """The URL<->facet-state layer is pure and testable, like GraphState."""
+    js = JS.read_text(encoding="utf-8")
+    for fn in (
+        "CorpusIA", "parseCorpusHash", "corpusHash", "toggleFacetValue",
+        "applyPreset", "activeFacetCount", "accountingFilters",
+        "emptyCorpusState",
+    ):
+        assert fn in js, f"CorpusIA helper {fn} missing from graph.js"
+
+
+def test_corpus_filter_state_lives_in_url_not_browser_storage():
+    """Filter state is in the URL hash for refresh/back/forward/deep-link; no
+    cookies, analytics, or localStorage (spec Step 1)."""
+    js = JS.read_text(encoding="utf-8")
+    assert "corpusHash" in js and "parseCorpusHash" in js
+    assert "window.location.hash" in js
+    assert "history.replaceState" in js
+    assert "hashchange" in js
+    for banned in ("localStorage", "sessionStorage", "document.cookie"):
+        assert banned not in js, f"corpus state must not use {banned}"
+
+
+def test_corpus_facet_counts_come_from_bounded_aggregate_endpoint():
+    """Counts are shown before expansion, projected from the authoritative bounded
+    aggregates endpoint — never inferred from a rendered corpus."""
+    js = JS.read_text(encoding="utf-8")
+    assert "corpus/aggregates" in js
+    assert "refreshAggregates" in js and "renderFacetRail" in js
+    assert "authorityCounts" in js  # authority tier derived from source-category buckets
+
+
+def test_corpus_inventory_is_keyboard_navigable():
+    """The inventory list is fully keyboard-navigable (spec testing list)."""
+    js = JS.read_text(encoding="utf-8")
+    assert "wireInventoryKeyboard" in js
+    for key in ("ArrowDown", "ArrowUp", "Home", "End"):
+        assert key in js, f"inventory keyboard missing {key}"
+    assert 'role="option"' in js or 'setAttribute("role", "option")' in js
+
+
+def test_corpus_expansion_is_bounded_and_drills_one_level():
+    """Aggregation-first: the landing renders aggregate groups, and expansion adds
+    one bounded level at a time under the visible-node cap."""
+    js = JS.read_text(encoding="utf-8")
+    assert "renderAggregatesInventory" in js and "drillAggregate" in js
+    assert "CORPUS_DRILL_ORDER" in js
+    assert "app.cap" in js  # per-page loads still respect the visible element cap
+
+
+def test_corpus_preserves_freshness_fold_and_label_lod():
+    """Phase 2.2 folding + label level-of-detail remain intact (spec Step 5)."""
+    js = JS.read_text(encoding="utf-8")
+    assert "foldCorpusForCanvas" in js and "freshWorst" in js
+    assert "updateCorpusLabelLOD" in js
+    # The inspector still surfaces the folded freshness rollup by status counts.
+    assert "freshAgg" in js
+
+
+def test_corpus_status_uses_text_and_glyph_not_colour_alone():
+    """Status is text/icon/shape in addition to colour (2.2.7.3 rule)."""
+    js = JS.read_text(encoding="utf-8")
+    css = CSS.read_text(encoding="utf-8")
+    assert "STATUS_GLYPH" in js
+    for badge in (".st-badge", ".st-stale", ".st-error", ".st-indexing"):
+        assert badge in css, f"status badge style {badge} missing"
+    # Authority tier renders as a labelled pip, colour reinforcing the word.
+    assert ".auth-primary" in css
+
+
+def test_corpus_zero_empty_error_and_indexing_states_direct_action():
+    """Empty/zero/error/stale/indexing states are present and actionable."""
+    js = JS.read_text(encoding="utf-8")
+    html = INDEX.read_text(encoding="utf-8")
+    assert "No items match these facets" in js
+    assert "still indexing" in js
+    assert "INDEXING_LABELS" in js and "FRESH_LABELS" in js
+    assert "Pick a source group or preset to explore the corpus." in html
+
+
+def test_corpus_narrow_layout_uses_drawers_at_1280():
+    """At ≤1280px the facet rail is an independent drawer and the result list
+    stays usable with the canvas collapsed (spec Step 5)."""
+    css = CSS.read_text(encoding="utf-8")
+    assert "@media (max-width: 1280px)" in css
+    assert '[data-mode="corpus"] .facet-rail' in css
+    assert "translateX(-100%)" in css
+    assert '[data-facets="open"]' in css
+    # Work area reflows to a column so the inventory pane stays full-width.
+    assert '[data-mode="corpus"] .work-area' in css
+
+
+# ── 2.3.5.3: bounded projection, UI performance, and accessibility ───────────
+
+
+def test_corpus_view_requests_abort_when_filters_change():
+    """Obsolete corpus fetches are cancelled on a filter change so a slow older
+    page can never overwrite the current facets (spec Step 4)."""
+    js = JS.read_text(encoding="utf-8")
+    assert "AbortController" in js
+    assert "abortObsoleteCorpusRequests" in js
+    # The choke point aborts before issuing the new view's requests.
+    assert "corpusSignal" in js
+    assert "isAbortError" in js
+
+
+def test_inspector_is_closable_by_keyboard():
+    """The inspector closes with Escape from anywhere outside a text field
+    (spec Step 6 keyboard operation)."""
+    js = JS.read_text(encoding="utf-8")
+    assert 'e.key !== "Escape"' in js or 'e.key === "Escape"' in js
+    assert "clearInspector" in js
+
+
+def test_reduced_motion_disables_looping_graph_effects():
+    """Reduced-motion stops the looping edge-flow animation entirely rather than
+    spinning an idle rAF loop (spec Step 6)."""
+    js = JS.read_text(encoding="utf-8")
+    css = CSS.read_text(encoding="utf-8")
+    assert "if (reduceMotion) return;" in js
+    assert "@media (prefers-reduced-motion: reduce)" in css

@@ -762,6 +762,18 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_corpus_events_provider
     WHERE provider_record_id IS NOT NULL AND provider_record_id <> '';
 CREATE INDEX IF NOT EXISTS idx_corpus_events_type_effective
     ON corpus_events(event_type, effective_at);
+-- Corpus accounting facet filters (2.3.5.3): keep filtered aggregate scans on an
+-- index instead of a full corpus_items scan.
+CREATE INDEX IF NOT EXISTS idx_corpus_items_source_category
+    ON corpus_items(source_category);
+CREATE INDEX IF NOT EXISTS idx_corpus_items_source
+    ON corpus_items(source);
+CREATE INDEX IF NOT EXISTS idx_corpus_items_item_type
+    ON corpus_items(item_type);
+CREATE INDEX IF NOT EXISTS idx_corpus_items_event_type
+    ON corpus_items(event_type)
+    WHERE event_type IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_securities_industry ON securities(industry);
 
 
 """
@@ -2036,6 +2048,181 @@ CREATE INDEX IF NOT EXISTS idx_corpus_events_type_effective
             conn.commit()
         return changed
 
+    # Aggregate dimensions the corpus explorer can group and filter over. The
+    # source-independent index/sector/industry/coverage_tier/event_type keys
+    # (2.3.5.3) join the security registry to the corpus ledger; the Phase 2.2
+    # dimensions above them stay compatible.
+    _ACCOUNTING_DIMENSIONS = frozenset({
+        "source_category", "source", "item_type", "event_type",
+        "security", "sector", "industry", "index", "coverage_tier",
+        "year", "month", "indexing_state",
+    })
+    # Filters that require the corpus_item -> security registry link at all.
+    _ACCOUNTING_LINK_KEYS = frozenset({
+        "security", "sector", "industry", "index", "coverage_tier",
+    })
+
+    def _accounting_cte(
+        self, *, need_link: bool, need_reg_narrative: bool,
+        need_reg_structured: bool, need_index: bool,
+    ) -> str:
+        """Build the UNION-ALL accounting CTE with registry joins gated by need.
+
+        Joins are added only for the requested dimension/filter set so that
+        non-registry aggregates never multiply rows across index memberships.
+        """
+        def coverage(sec_id: str) -> str:
+            return (
+                f"CASE WHEN {sec_id} IS NULL THEN 'unlinked' "
+                f"WHEN EXISTS (SELECT 1 FROM security_memberships m "
+                f"WHERE m.security_id={sec_id} AND m.active=1) "
+                f"THEN 'index_covered' ELSE 'non_index' END"
+            )
+
+        # Narrative corpus items carry their ticker on the link row directly.
+        n_link = ("LEFT JOIN corpus_item_securities cl "
+                  "ON cl.corpus_item_id=ci.corpus_item_id") if need_link else ""
+        n_sec = "cl.security_id" if need_link else "NULL"
+        n_tkr = "cl.ticker" if need_link else "NULL"
+        n_reg = ("LEFT JOIN securities cs ON cs.security_id=cl.security_id"
+                 if need_reg_narrative else "")
+        n_sector = "cs.sector" if need_reg_narrative else "NULL"
+        n_industry = "cs.industry" if need_reg_narrative else "NULL"
+        n_mem = ("LEFT JOIN security_memberships cm "
+                 "ON cm.security_id=cl.security_id AND cm.active=1"
+                 if need_index else "")
+        n_index = "cm.index_code" if need_index else "NULL"
+
+        def structured(link_join: str, sec_alias: str, reg_alias: str,
+                       mem_alias: str) -> tuple[str, str, str, str, str, str]:
+            link = link_join if need_link else ""
+            sec = f"{sec_alias}.security_id" if need_link else "NULL"
+            reg = (f"LEFT JOIN securities {reg_alias} "
+                   f"ON {reg_alias}.security_id={sec_alias}.security_id"
+                   if need_reg_structured else "")
+            tkr = f"{reg_alias}.ticker" if need_reg_structured else "NULL"
+            sector = f"{reg_alias}.sector" if need_reg_structured else "NULL"
+            industry = f"{reg_alias}.industry" if need_reg_structured else "NULL"
+            mem = (f"LEFT JOIN security_memberships {mem_alias} "
+                   f"ON {mem_alias}.security_id={sec_alias}.security_id "
+                   f"AND {mem_alias}.active=1" if need_index else "")
+            idx = f"{mem_alias}.index_code" if need_index else "NULL"
+            joins = " ".join(part for part in (link, reg, mem) if part)
+            return joins, sec, tkr, sector, industry, idx
+
+        o_joins, o_sec, o_tkr, o_sector, o_industry, o_idx = structured(
+            "LEFT JOIN observation_securities ol "
+            "ON ol.observation_id=observation.observation_id",
+            "ol", "os", "om",
+        )
+        e_joins, e_sec, e_tkr, e_sector, e_industry, e_idx = structured(
+            "LEFT JOIN event_securities el ON el.event_id=event.event_id",
+            "el", "es", "em",
+        )
+        return f"""
+            WITH accounting AS (
+                SELECT ci.source_category, ci.source, ci.item_type,
+                       ci.event_type AS event_type,
+                       {n_sec} AS security_id, {n_tkr} AS ticker,
+                       {n_sector} AS sector, {n_industry} AS industry,
+                       {n_index} AS index_code,
+                       {coverage(n_sec)} AS coverage_tier,
+                       COALESCE(ci.published_at, ci.effective_at, ci.as_of_at,
+                                ci.ingested_at) AS occurred_at,
+                       ci.indexing_status AS indexing_state,
+                       ci.metadata_bytes + ci.narrative_bytes AS approximate_bytes
+                FROM corpus_items ci {n_link} {n_reg} {n_mem}
+                UNION ALL
+                SELECT observation.source_category, observation.source_name,
+                       'observation', NULL,
+                       {o_sec}, {o_tkr}, {o_sector}, {o_industry}, {o_idx},
+                       {coverage(o_sec)},
+                       COALESCE(observation.published_at, observation.as_of_at,
+                                observation.period_end, observation.ingested_at),
+                       'not_applicable',
+                       length(CAST(COALESCE(observation.metric_id, '') AS BLOB)) +
+                       length(CAST(COALESCE(observation.value_text, '') AS BLOB)) +
+                       length(CAST(COALESCE(observation.unit, '') AS BLOB)) +
+                       length(CAST(COALESCE(observation.metadata_json, '') AS BLOB))
+                FROM corpus_observations observation {o_joins}
+                UNION ALL
+                SELECT event.source_category, event.source_name, 'event',
+                       event.event_type,
+                       {e_sec}, {e_tkr}, {e_sector}, {e_industry}, {e_idx},
+                       {coverage(e_sec)},
+                       COALESCE(event.published_at, event.effective_at,
+                                event.announced_at, event.ingested_at),
+                       'not_applicable',
+                       length(CAST(COALESCE(event.event_type, '') AS BLOB)) +
+                       length(CAST(COALESCE(event.explanation, '') AS BLOB)) +
+                       length(CAST(COALESCE(event.metadata_json, '') AS BLOB))
+                FROM corpus_events event {e_joins}
+            )
+        """
+
+    @classmethod
+    def _accounting_dimension_sql(cls, group_by: str) -> str:
+        dimensions = {
+            "source_category": "a.source_category",
+            "source": "a.source",
+            "item_type": "a.item_type",
+            "event_type": "COALESCE(a.event_type, 'none')",
+            "security": "COALESCE(a.security_id, 'unlinked')",
+            "sector": "COALESCE(a.sector, 'unclassified')",
+            "industry": "COALESCE(a.industry, 'unclassified')",
+            "index": "COALESCE(a.index_code, 'unlinked')",
+            "coverage_tier": "a.coverage_tier",
+            "year": "substr(a.occurred_at, 1, 4)",
+            "month": "substr(a.occurred_at, 1, 7)",
+            "indexing_state": "a.indexing_state",
+        }
+        expression = dimensions.get(group_by)
+        if expression is None:
+            raise ValueError(
+                f"group_by must be one of {sorted(cls._ACCOUNTING_DIMENSIONS)}")
+        return expression
+
+    def _accounting_where(
+        self, *, source_category, source, item_type, event_type, security,
+        sector, industry, index, coverage_tier, year, month, indexing_state,
+    ) -> tuple[str, list[object], bool, bool, bool, bool]:
+        """Return the WHERE clause plus which registry joins the filters need."""
+        predicates: list[str] = []
+        params: list[object] = []
+        equality = (
+            ("a.source_category", source_category),
+            ("a.source", source),
+            ("a.item_type", item_type),
+            ("a.event_type", event_type),
+            ("a.sector", sector),
+            ("a.industry", industry),
+            ("a.index_code", index),
+            ("a.coverage_tier", coverage_tier),
+            ("substr(a.occurred_at, 1, 4)", year),
+            ("substr(a.occurred_at, 1, 7)", month),
+            ("a.indexing_state", indexing_state),
+        )
+        for column, value in equality:
+            if value is not None:
+                predicates.append(f"{column}=?")
+                params.append(value)
+        if security is not None:
+            predicates.append("(a.security_id=? OR a.ticker=?)")
+            params.extend((security, str(security).upper()))
+        where = f"WHERE {' AND '.join(predicates)}" if predicates else ""
+        need_reg = sector is not None or industry is not None
+        need_link_filter = (
+            security is not None or sector is not None or industry is not None
+            or index is not None or coverage_tier is not None
+        )
+        return (
+            where, params,
+            need_link_filter,                    # any filter needs the security link
+            need_reg,                            # narrative registry join
+            security is not None or need_reg,    # structured registry join (ticker)
+            index is not None,                   # membership join
+        )
+
     def get_corpus_accounting(
         self,
         group_by: str,
@@ -2043,7 +2230,12 @@ CREATE INDEX IF NOT EXISTS idx_corpus_events_type_effective
         source_category: Optional[str] = None,
         source: Optional[str] = None,
         item_type: Optional[str] = None,
+        event_type: Optional[str] = None,
         security: Optional[str] = None,
+        sector: Optional[str] = None,
+        industry: Optional[str] = None,
+        index: Optional[str] = None,
+        coverage_tier: Optional[str] = None,
         year: Optional[str] = None,
         month: Optional[str] = None,
         indexing_state: Optional[str] = None,
@@ -2052,92 +2244,25 @@ CREATE INDEX IF NOT EXISTS idx_corpus_events_type_effective
     ) -> list[dict]:
         """Return bounded corpus counts and byte estimates from SQLite metadata."""
         self._validate_inventory_page(limit, offset)
-        include_security = group_by == "security" or security is not None
-        narrative_join = (
-            "LEFT JOIN corpus_item_securities link "
-            "ON link.corpus_item_id=ci.corpus_item_id"
-            if include_security else ""
+        expression = self._accounting_dimension_sql(group_by)
+        where, params, f_link, f_reg_n, f_reg_s, f_idx = self._accounting_where(
+            source_category=source_category, source=source, item_type=item_type,
+            event_type=event_type, security=security, sector=sector,
+            industry=industry, index=index, coverage_tier=coverage_tier,
+            year=year, month=month, indexing_state=indexing_state,
         )
-        observation_join = (
-            "LEFT JOIN observation_securities link "
-            "ON link.observation_id=observation.observation_id "
-            "LEFT JOIN securities security ON security.security_id=link.security_id"
-            if include_security else ""
+        need_reg_narrative = f_reg_n or group_by in {"sector", "industry"}
+        need_reg_structured = (
+            f_reg_s or group_by in {"security", "sector", "industry"})
+        need_index = f_idx or group_by == "index"
+        need_link = (
+            f_link or need_index or need_reg_narrative or need_reg_structured
+            or group_by in self._ACCOUNTING_LINK_KEYS
         )
-        event_join = (
-            "LEFT JOIN event_securities link ON link.event_id=event.event_id "
-            "LEFT JOIN securities security ON security.security_id=link.security_id"
-            if include_security else ""
+        cte = self._accounting_cte(
+            need_link=need_link, need_reg_narrative=need_reg_narrative,
+            need_reg_structured=need_reg_structured, need_index=need_index,
         )
-        narrative_security = "link.security_id" if include_security else "NULL"
-        narrative_ticker = "link.ticker" if include_security else "NULL"
-        structured_security = "link.security_id" if include_security else "NULL"
-        structured_ticker = "security.ticker" if include_security else "NULL"
-        cte = f"""
-            WITH accounting AS (
-                SELECT ci.source_category, ci.source, ci.item_type,
-                       {narrative_security} AS security_id,
-                       {narrative_ticker} AS ticker,
-                       COALESCE(ci.published_at, ci.effective_at, ci.as_of_at,
-                                ci.ingested_at) AS occurred_at,
-                       ci.indexing_status AS indexing_state,
-                       ci.metadata_bytes + ci.narrative_bytes AS approximate_bytes
-                FROM corpus_items ci {narrative_join}
-                UNION ALL
-                SELECT observation.source_category, observation.source_name,
-                       'observation', {structured_security}, {structured_ticker},
-                       COALESCE(observation.published_at, observation.as_of_at,
-                                observation.period_end, observation.ingested_at),
-                       'not_applicable',
-                       length(CAST(COALESCE(observation.metric_id, '') AS BLOB)) +
-                       length(CAST(COALESCE(observation.value_text, '') AS BLOB)) +
-                       length(CAST(COALESCE(observation.unit, '') AS BLOB)) +
-                       length(CAST(COALESCE(observation.metadata_json, '') AS BLOB))
-                FROM corpus_observations observation {observation_join}
-                UNION ALL
-                SELECT event.source_category, event.source_name, 'event',
-                       {structured_security}, {structured_ticker},
-                       COALESCE(event.published_at, event.effective_at,
-                                event.announced_at, event.ingested_at),
-                       'not_applicable',
-                       length(CAST(COALESCE(event.event_type, '') AS BLOB)) +
-                       length(CAST(COALESCE(event.explanation, '') AS BLOB)) +
-                       length(CAST(COALESCE(event.metadata_json, '') AS BLOB))
-                FROM corpus_events event {event_join}
-            )
-        """
-        date_value = "a.occurred_at"
-        dimensions = {
-            "source_category": "a.source_category",
-            "source": "a.source",
-            "item_type": "a.item_type",
-            "security": "COALESCE(a.security_id, 'unlinked')",
-            "year": f"substr({date_value}, 1, 4)",
-            "month": f"substr({date_value}, 1, 7)",
-            "indexing_state": "a.indexing_state",
-        }
-        expression = dimensions.get(group_by)
-        if expression is None:
-            raise ValueError(f"group_by must be one of {sorted(dimensions)}")
-
-        predicates: list[str] = []
-        params: list[object] = []
-        filters = (
-            ("a.source_category", source_category),
-            ("a.source", source),
-            ("a.item_type", item_type),
-            (f"substr({date_value}, 1, 4)", year),
-            (f"substr({date_value}, 1, 7)", month),
-            ("a.indexing_state", indexing_state),
-        )
-        for column, value in filters:
-            if value is not None:
-                predicates.append(f"{column}=?")
-                params.append(value)
-        if security is not None:
-            predicates.append("(a.security_id=? OR a.ticker=?)")
-            params.extend((security, security.upper()))
-        where = f"WHERE {' AND '.join(predicates)}" if predicates else ""
         sql = (
             cte +
             f"SELECT {expression} AS key, COUNT(*) AS count, "
@@ -2145,9 +2270,9 @@ CREATE INDEX IF NOT EXISTS idx_corpus_events_type_effective
             f"FROM accounting a {where} GROUP BY {expression} "
             f"ORDER BY count DESC, key LIMIT ? OFFSET ?"
         )
-        params.extend((limit, offset))
+        query_params = list(params) + [limit, offset]
         with self._connect() as conn:
-            rows = conn.execute(sql, params).fetchall()
+            rows = conn.execute(sql, query_params).fetchall()
         return [
             {
                 "key": row["key"] or "unknown",
@@ -2156,6 +2281,157 @@ CREATE INDEX IF NOT EXISTS idx_corpus_events_type_effective
             }
             for row in rows
         ]
+
+    def count_corpus_accounting(
+        self,
+        group_by: str,
+        *,
+        source_category: Optional[str] = None,
+        source: Optional[str] = None,
+        item_type: Optional[str] = None,
+        event_type: Optional[str] = None,
+        security: Optional[str] = None,
+        sector: Optional[str] = None,
+        industry: Optional[str] = None,
+        index: Optional[str] = None,
+        coverage_tier: Optional[str] = None,
+        year: Optional[str] = None,
+        month: Optional[str] = None,
+        indexing_state: Optional[str] = None,
+    ) -> dict:
+        """Return total accounting rows and distinct bucket count for a dimension."""
+        expression = self._accounting_dimension_sql(group_by)
+        where, params, f_link, f_reg_n, f_reg_s, f_idx = self._accounting_where(
+            source_category=source_category, source=source, item_type=item_type,
+            event_type=event_type, security=security, sector=sector,
+            industry=industry, index=index, coverage_tier=coverage_tier,
+            year=year, month=month, indexing_state=indexing_state,
+        )
+        need_reg_narrative = f_reg_n or group_by in {"sector", "industry"}
+        need_reg_structured = (
+            f_reg_s or group_by in {"security", "sector", "industry"})
+        need_index = f_idx or group_by == "index"
+        need_link = (
+            f_link or need_index or need_reg_narrative or need_reg_structured
+            or group_by in self._ACCOUNTING_LINK_KEYS
+        )
+        cte = self._accounting_cte(
+            need_link=need_link, need_reg_narrative=need_reg_narrative,
+            need_reg_structured=need_reg_structured, need_index=need_index,
+        )
+        sql = (
+            cte +
+            f"SELECT COUNT(*) AS total_rows, "
+            f"COUNT(DISTINCT {expression}) AS distinct_keys, "
+            f"COALESCE(SUM(a.approximate_bytes), 0) AS approximate_bytes "
+            f"FROM accounting a {where}"
+        )
+        with self._connect() as conn:
+            row = conn.execute(sql, list(params)).fetchone()
+        return {
+            "total_rows": int(row["total_rows"] or 0),
+            "distinct_keys": int(row["distinct_keys"] or 0),
+            "approximate_bytes": int(row["approximate_bytes"] or 0),
+        }
+
+    # Safe, bounded fields returned for a corpus-item leaf node. Bodies live in
+    # Chroma and are never selected here.
+    _CORPUS_ITEM_FIELDS = (
+        "corpus_item_id", "source", "source_category", "item_type",
+        "event_type", "title", "normalized_headline", "published_at",
+        "effective_at", "as_of_at", "indexing_status", "document_family_id",
+        "source_url", "license_label", "evidence_authority", "narrative_bytes",
+        "metadata_bytes", "is_tombstone",
+    )
+
+    def list_corpus_items(
+        self,
+        *,
+        source_category: Optional[str] = None,
+        source: Optional[str] = None,
+        item_type: Optional[str] = None,
+        event_type: Optional[str] = None,
+        security: Optional[str] = None,
+        sector: Optional[str] = None,
+        industry: Optional[str] = None,
+        index: Optional[str] = None,
+        year: Optional[str] = None,
+        month: Optional[str] = None,
+        indexing_state: Optional[str] = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> list[dict]:
+        """Return one bounded page of corpus-item leaf metadata for a filter set.
+
+        Registry-scoped filters (security/sector/industry/index) resolve through
+        ``EXISTS`` subqueries so each item is returned at most once regardless of
+        how many securities or index memberships it links to.
+        """
+        self._validate_inventory_page(limit, offset)
+        occurred = ("COALESCE(ci.published_at, ci.effective_at, ci.as_of_at, "
+                    "ci.ingested_at)")
+        predicates: list[str] = []
+        params: list[object] = []
+        for column, value in (
+            ("ci.source_category", source_category),
+            ("ci.source", source),
+            ("ci.item_type", item_type),
+            ("ci.event_type", event_type),
+            ("ci.indexing_status", indexing_state),
+            (f"substr({occurred}, 1, 4)", year),
+            (f"substr({occurred}, 1, 7)", month),
+        ):
+            if value is not None:
+                predicates.append(f"{column}=?")
+                params.append(value)
+        if security is not None:
+            predicates.append(
+                "EXISTS (SELECT 1 FROM corpus_item_securities l "
+                "WHERE l.corpus_item_id=ci.corpus_item_id "
+                "AND (l.security_id=? OR l.ticker=?))")
+            params.extend((security, str(security).upper()))
+        for column, value in (("s.sector", sector), ("s.industry", industry)):
+            if value is not None:
+                predicates.append(
+                    "EXISTS (SELECT 1 FROM corpus_item_securities l "
+                    "JOIN securities s ON s.security_id=l.security_id "
+                    f"WHERE l.corpus_item_id=ci.corpus_item_id AND {column}=?)")
+                params.append(value)
+        if index is not None:
+            predicates.append(
+                "EXISTS (SELECT 1 FROM corpus_item_securities l "
+                "JOIN security_memberships m ON m.security_id=l.security_id "
+                "WHERE l.corpus_item_id=ci.corpus_item_id "
+                "AND m.index_code=? AND m.active=1)")
+            params.append(index)
+        where = f"WHERE {' AND '.join(predicates)}" if predicates else ""
+        sql = (
+            f"SELECT {', '.join('ci.' + name for name in self._CORPUS_ITEM_FIELDS)} "
+            f"FROM corpus_items ci {where} "
+            f"ORDER BY {occurred} DESC, ci.corpus_item_id LIMIT ? OFFSET ?"
+        )
+        params.extend((limit, offset))
+        with self._connect() as conn:
+            rows = conn.execute(sql, params).fetchall()
+        return [dict(row) for row in rows]
+
+    def get_corpus_event(self, event_id: str) -> Optional[dict]:
+        """Return one structured corpus event with its linked securities."""
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM corpus_events WHERE event_id=?", (event_id,),
+            ).fetchone()
+            if row is None:
+                return None
+            result = dict(row)
+            result["metadata"] = json.loads(result.pop("metadata_json", "{}") or "{}")
+            result["security_ids"] = [
+                r["security_id"] for r in conn.execute(
+                    "SELECT security_id FROM event_securities WHERE event_id=? "
+                    "ORDER BY security_id", (event_id,),
+                ).fetchall()
+            ]
+        return result
 
     def upsert_observation_record(self, record: ObservationRecord) -> dict:
         """Atomically upsert one structured observation and its security links."""
