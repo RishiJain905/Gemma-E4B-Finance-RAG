@@ -1,7 +1,7 @@
 # configs/sec_companyfacts.yaml
 # SEC CompanyFacts ingestion and canonical metric projection.
 
-enabled: false
+enabled: true
 user_agent: "TraceAlchemy Research contact@tracealchemy.example.com"
 allowed_taxonomies:
   - us-gaap

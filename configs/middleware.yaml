@@ -18,8 +18,8 @@ embedding_cache_size: 256
 # Phase 2.3 additive query/UI rollout. Off preserves Phase 2.2 retrieval and
 # graph behavior while migrated evidence remains queryable through existing APIs.
 # Env: ENABLE_PHASE2_3_RETRIEVAL, ENABLE_PHASE2_3_CORPUS_PROJECTION.
-enable_phase2_3_retrieval: false
-enable_phase2_3_corpus_projection: false
+enable_phase2_3_retrieval: true
+enable_phase2_3_corpus_projection: true
 
 # Phase 2.2.6.1 — tool-aware streaming & progress events.
 # Both feature flags default off so the streaming/tool behavior is byte-identical
@@ -35,8 +35,8 @@ enable_phase2_3_corpus_projection: false
 #       tool_completed progress events (default on).
 # Env: ENABLE_TOOL_FINAL_STREAMING, ENABLE_STREAM_PROGRESS_EVENTS,
 # STREAM_PROGRESS_INCLUDE_COUNTS.
-enable_tool_final_streaming: false
-enable_stream_progress_events: false
+enable_tool_final_streaming: true
+enable_stream_progress_events: true
 stream_progress_include_counts: true
 
 # Phase 2.2.7 — bounded in-memory query trace graph + localhost read-only UI/API.
@@ -51,7 +51,7 @@ stream_progress_include_counts: true
 # MiddlewareConfig. Env: ENABLE_GRAPH_OBSERVER, GRAPH_TRACE_LIMIT,
 # GRAPH_ELEMENT_LIMIT, GRAPH_TRACE_TTL_S, GRAPH_EXCERPT_CHARS,
 # GRAPH_QUESTION_PREVIEW_CHARS.
-enable_graph_observer: false
+enable_graph_observer: true
 graph_trace_limit: 100
 graph_element_limit: 5000
 graph_trace_ttl_s: 3600

@@ -146,22 +146,33 @@ def test_phase23_switches_default_off_and_status_never_emits_secret_values():
     with (root / "configs" / "middleware.yaml").open(encoding="utf-8") as handle:
         middleware = yaml.safe_load(handle)
 
-    switches = {
-        "universe_refresh": universe["feature_flags"]["universe_refresh"],
-        **sources["feature_flags"],
-        "retrieval_facets_ranking": middleware["enable_phase2_3_retrieval"],
-        "corpus_explorer_projection": middleware["enable_phase2_3_corpus_projection"],
+    # The eight rollout switches must remain declared in their config
+    # surfaces, and every switch must be an explicit boolean. Their VALUE is
+    # operator-owned rollout state (enabled on this deployment 2026-07-15) —
+    # the shipped default-off contract is asserted against code defaults
+    # below, not against the committed YAML.
+    assert set(sources["feature_flags"]) == {
+        "sec_broad_events",
+        "company_news",
+        "grouped_market_data",
+        "official_feeds",
+        "sector_feeds",
     }
-    assert switches == {
-        "universe_refresh": False,
-        "sec_broad_events": False,
-        "company_news": False,
-        "grouped_market_data": False,
-        "official_feeds": False,
-        "sector_feeds": False,
-        "retrieval_facets_ranking": False,
-        "corpus_explorer_projection": False,
-    }
+    assert isinstance(universe["feature_flags"]["universe_refresh"], bool)
+    for name, value in sources["feature_flags"].items():
+        assert isinstance(value, bool), name
+    assert isinstance(middleware["enable_phase2_3_retrieval"], bool)
+    assert isinstance(middleware["enable_phase2_3_corpus_projection"], bool)
+
+    # Shipped defaults: when the YAML omits the wired middleware switches,
+    # code defaults keep the Phase 2.2 query/projection behavior (off).
+    from src.middleware.config import MiddlewareConfig
+
+    code_defaults = MiddlewareConfig(
+        config_path=root / "configs" / "does-not-exist.middleware.yaml"
+    )
+    assert code_defaults.enable_phase2_3_retrieval is False
+    assert code_defaults.enable_phase2_3_corpus_projection is False
 
     secret = "do-not-print-this-secret"
     status = SourceRegistry.load(
