@@ -15,6 +15,12 @@ return_timings: true
 enable_streaming: true
 embedding_cache_size: 256
 
+# Phase 2.3 additive query/UI rollout. Off preserves Phase 2.2 retrieval and
+# graph behavior while migrated evidence remains queryable through existing APIs.
+# Env: ENABLE_PHASE2_3_RETRIEVAL, ENABLE_PHASE2_3_CORPUS_PROJECTION.
+enable_phase2_3_retrieval: false
+enable_phase2_3_corpus_projection: false
+
 # Phase 2.2.6.1 — tool-aware streaming & progress events.
 # Both feature flags default off so the streaming/tool behavior is byte-identical
 # to the pre-2.2.6 path until promotion:

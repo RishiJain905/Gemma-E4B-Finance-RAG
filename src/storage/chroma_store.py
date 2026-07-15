@@ -535,6 +535,25 @@ class ChromaStore:
             metas += [{}] * (n - len(metas))
         return ids, texts, metas
 
+    def iter_document_metadata(self, *, limit: int, offset: int = 0) -> list[dict]:
+        """Return one bounded metadata-only page for migration/accounting work."""
+        if not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= 1000:
+            raise ValueError("limit must be between 1 and 1000")
+        if not isinstance(offset, int) or isinstance(offset, bool) or offset < 0:
+            raise ValueError("offset must be a non-negative integer")
+        results = self.collection.get(
+            include=["metadatas"], limit=limit, offset=offset
+        )
+        ids = list(results.get("ids") or [])
+        metadatas = list(results.get("metadatas") or [])
+        return [
+            {
+                "id": document_id,
+                "metadata": metadatas[index] if index < len(metadatas) else {},
+            }
+            for index, document_id in enumerate(ids)
+        ]
+
     # ── Ticker-Specific Operations ────────────────────
 
     def search_by_ticker(self, query: str, ticker: str,

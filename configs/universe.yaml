@@ -1,4 +1,8 @@
 # Security universe provider configuration (Phase 2.3.1.1).
+# Additive rollout gate. Stored identities remain queryable while disabled.
+feature_flags:
+  universe_refresh: false
+
 providers:
   nasdaq100:
     enabled: true

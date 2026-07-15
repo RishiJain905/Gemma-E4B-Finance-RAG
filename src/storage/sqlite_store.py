@@ -18,6 +18,7 @@ from src.ingestion.normalization import (
     syndicated_news_key,
 )
 from src.ingestion.records import EventRecord, NarrativeRecord, ObservationRecord
+from src.storage.migrations import apply_migrations
 
 logger = logging.getLogger(__name__)
 
@@ -48,229 +49,20 @@ class SQLiteStore:
         return conn
 
     def _init_schema(self):
-        """Create all tables and indexes if they don't exist."""
-        if self.SCHEMA_SQL.exists():
-            with open(self.SCHEMA_SQL, encoding="utf-8") as f:
-                sql = f.read()
-        else:
-            sql = self._inline_schema()
-
+        """Bootstrap a new database or migrate an existing database in place."""
         with self._connect() as conn:
-            conn.executescript(sql)
-            conn.execute(
-                """CREATE TABLE IF NOT EXISTS sec_daily_indexes (
-                    index_date TEXT PRIMARY KEY,
-                    source_url TEXT NOT NULL,
-                    status TEXT NOT NULL CHECK (status IN ('processed')),
-                    registered_count INTEGER NOT NULL DEFAULT 0,
-                    processed_at TEXT NOT NULL DEFAULT (datetime('now'))
-                )"""
-            )
-            existing = {
-                row[1] for row in conn.execute("PRAGMA table_info(filings)").fetchall()
-            }
-            migrations = {
-                "index_error": "ALTER TABLE filings ADD COLUMN index_error TEXT",
-                "index_section_count": (
-                    "ALTER TABLE filings ADD COLUMN index_section_count INTEGER DEFAULT 0"
-                ),
-                "index_chunk_count": (
-                    "ALTER TABLE filings ADD COLUMN index_chunk_count INTEGER DEFAULT 0"
-                ),
-                "cik": "ALTER TABLE filings ADD COLUMN cik TEXT",
-                "primary_document": "ALTER TABLE filings ADD COLUMN primary_document TEXT",
-                "discovery_scope": (
-                    "ALTER TABLE filings ADD COLUMN discovery_scope TEXT DEFAULT 'deep'"
-                ),
-                "items_json": "ALTER TABLE filings ADD COLUMN items_json TEXT DEFAULT '[]'",
-                "exhibits_json": "ALTER TABLE filings ADD COLUMN exhibits_json TEXT DEFAULT '[]'",
-            }
-            for column, statement in migrations.items():
-                if column not in existing:
-                    conn.execute(statement)
-            conn.execute(
-                """CREATE TABLE IF NOT EXISTS source_cursors (
-                    source TEXT NOT NULL,
-                    partition_key TEXT NOT NULL,
-                    cursor_value TEXT,
-                    cursor_type TEXT NOT NULL DEFAULT 'none',
-                    overlap_value TEXT,
-                    last_successful_run_id TEXT,
-                    last_successful_at TEXT,
-                    version TEXT NOT NULL DEFAULT '1',
-                    status TEXT NOT NULL DEFAULT 'unknown',
-                    error_class TEXT,
-                    error_message TEXT,
-                    retry_after REAL,
-                    updated_at TEXT NOT NULL,
-                    PRIMARY KEY (source, partition_key)
-                )"""
-            )
-            conn.execute(
-                "CREATE INDEX IF NOT EXISTS idx_source_cursors_status "
-                "ON source_cursors(source, status, updated_at)"
-            )
-            cursor_columns = {
-                row[1]
-                for row in conn.execute("PRAGMA table_info(source_cursors)").fetchall()
-            }
-            if "last_successful_at" not in cursor_columns:
-                conn.execute(
-                    "ALTER TABLE source_cursors ADD COLUMN last_successful_at TEXT"
-                )
-            conn.execute(
-                """CREATE TABLE IF NOT EXISTS source_budget_usage (
-                    source TEXT NOT NULL,
-                    window_kind TEXT NOT NULL CHECK (window_kind IN ('minute', 'day')),
-                    window_start TEXT NOT NULL,
-                    attempted_requests INTEGER NOT NULL DEFAULT 0,
-                    successful_requests INTEGER NOT NULL DEFAULT 0,
-                    provider_remaining INTEGER,
-                    provider_reset TEXT,
-                    updated_at TEXT NOT NULL,
-                    PRIMARY KEY (source, window_kind, window_start)
-                )"""
-            )
-            conn.execute(
-                """CREATE TABLE IF NOT EXISTS scheduler_runs (
-                    run_id TEXT PRIMARY KEY,
-                    mode TEXT NOT NULL,
-                    policy_revision TEXT NOT NULL,
-                    config_revision TEXT NOT NULL,
-                    started_at TEXT NOT NULL,
-                    ended_at TEXT,
-                    duration_seconds REAL,
-                    status TEXT NOT NULL DEFAULT 'running',
-                    requested_sources_json TEXT NOT NULL DEFAULT '[]',
-                    completed_sources_json TEXT NOT NULL DEFAULT '[]',
-                    skipped_sources_json TEXT NOT NULL DEFAULT '[]',
-                    failed_sources_json TEXT NOT NULL DEFAULT '[]',
-                    terminal_error_class TEXT,
-                    terminal_error_message TEXT
-                )"""
-            )
-            conn.execute(
-                """CREATE TABLE IF NOT EXISTS scheduler_run_sources (
-                    run_id TEXT NOT NULL REFERENCES scheduler_runs(run_id) ON DELETE CASCADE,
-                    source TEXT NOT NULL,
-                    mode TEXT NOT NULL,
-                    policy_revision TEXT NOT NULL,
-                    config_revision TEXT NOT NULL,
-                    started_at TEXT,
-                    ended_at TEXT,
-                    duration_seconds REAL,
-                    status TEXT NOT NULL,
-                    requested INTEGER NOT NULL DEFAULT 1,
-                    completed INTEGER NOT NULL DEFAULT 0,
-                    skipped INTEGER NOT NULL DEFAULT 0,
-                    failed INTEGER NOT NULL DEFAULT 0,
-                    partitions INTEGER NOT NULL DEFAULT 0,
-                    items INTEGER NOT NULL DEFAULT 0,
-                    requests INTEGER NOT NULL DEFAULT 0,
-                    new_items INTEGER NOT NULL DEFAULT 0,
-                    updated_items INTEGER NOT NULL DEFAULT 0,
-                    duplicates INTEGER NOT NULL DEFAULT 0,
-                    cursor_before_json TEXT,
-                    cursor_after_json TEXT,
-                    quota_remaining INTEGER,
-                    freshness TEXT,
-                    last_success TEXT,
-                    next_due TEXT,
-                    cooldown_reset TEXT,
-                    error_class TEXT,
-                    error_message TEXT,
-                    details_json TEXT NOT NULL DEFAULT '{}',
-                    PRIMARY KEY (run_id, source)
-                )"""
-            )
-            conn.execute(
-                """CREATE TABLE IF NOT EXISTS bootstrap_partitions (
-                    run_id TEXT NOT NULL REFERENCES scheduler_runs(run_id) ON DELETE CASCADE,
-                    source TEXT NOT NULL,
-                    partition_key TEXT NOT NULL,
-                    status TEXT NOT NULL,
-                    started_at TEXT,
-                    ended_at TEXT,
-                    attempts INTEGER NOT NULL DEFAULT 0,
-                    items INTEGER NOT NULL DEFAULT 0,
-                    new_items INTEGER NOT NULL DEFAULT 0,
-                    updated_items INTEGER NOT NULL DEFAULT 0,
-                    duplicates INTEGER NOT NULL DEFAULT 0,
-                    error_class TEXT,
-                    error_message TEXT,
-                    PRIMARY KEY (run_id, source, partition_key)
-                )"""
-            )
-            bootstrap_columns = {
-                row[1]
-                for row in conn.execute(
-                    "PRAGMA table_info(bootstrap_partitions)"
-                ).fetchall()
-            }
-            for column in ("new_items", "updated_items", "duplicates"):
-                if column not in bootstrap_columns:
-                    conn.execute(
-                        f"ALTER TABLE bootstrap_partitions ADD COLUMN {column} "
-                        "INTEGER NOT NULL DEFAULT 0"
-                    )
-            conn.execute(
-                "CREATE INDEX IF NOT EXISTS idx_scheduler_runs_started "
-                "ON scheduler_runs(started_at DESC)"
-            )
-            conn.execute(
-                "CREATE INDEX IF NOT EXISTS idx_scheduler_run_sources_source "
-                "ON scheduler_run_sources(source, ended_at DESC)"
-            )
-            conn.execute(
-                "CREATE INDEX IF NOT EXISTS idx_bootstrap_partitions_status "
-                "ON bootstrap_partitions(source, status, run_id)"
-            )
-            corpus_columns = {
-                row[1] for row in conn.execute("PRAGMA table_info(corpus_items)").fetchall()
-            }
-            corpus_migrations = {
-                "document_family_id": "ALTER TABLE corpus_items ADD COLUMN document_family_id TEXT",
-                "narrative_bytes": (
-                    "ALTER TABLE corpus_items ADD COLUMN narrative_bytes INTEGER NOT NULL DEFAULT 0"
-                ),
-                "metadata_bytes": (
-                    "ALTER TABLE corpus_items ADD COLUMN metadata_bytes INTEGER NOT NULL DEFAULT 0"
-                ),
-                "is_tombstone": (
-                    "ALTER TABLE corpus_items ADD COLUMN is_tombstone INTEGER NOT NULL DEFAULT 0"
-                ),
-                "retired_at": "ALTER TABLE corpus_items ADD COLUMN retired_at TEXT",
-                "retention_reason": "ALTER TABLE corpus_items ADD COLUMN retention_reason TEXT",
-            }
-            for column, statement in corpus_migrations.items():
-                if column not in corpus_columns:
-                    conn.execute(statement)
-            conn.execute(
-                "UPDATE corpus_items SET document_family_id=corpus_item_id "
-                "WHERE document_family_id IS NULL OR document_family_id=''"
-            )
-            conn.execute(
-                "CREATE UNIQUE INDEX IF NOT EXISTS idx_corpus_items_document_family "
-                "ON corpus_items(document_family_id)"
-            )
-            conn.execute(
-                "CREATE INDEX IF NOT EXISTS idx_corpus_items_retention "
-                "ON corpus_items(item_type, is_tombstone, indexing_status, published_at)"
-            )
-            conn.execute(
-                "CREATE INDEX IF NOT EXISTS idx_corpus_observations_market_key "
-                "ON corpus_observations(source_name, metric_id, period_end, tickers_json)"
-            )
-            # Official revisions share an agency record id across vintages.  The
-            # migration is intentionally additive: existing rows remain intact,
-            # while metric + provider id + vintage becomes the observation key.
-            conn.execute("DROP INDEX IF EXISTS idx_corpus_observations_provider")
-            conn.execute(
-                "CREATE UNIQUE INDEX IF NOT EXISTS idx_corpus_observations_provider "
-                "ON corpus_observations(source_name, metric_id, provider_record_id, vintage_at) "
-                "WHERE provider_record_id IS NOT NULL AND provider_record_id <> ''"
-            )
-            conn.commit()
+            application_tables = conn.execute(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' "
+                "AND name NOT LIKE 'sqlite_%'"
+            ).fetchone()[0]
+            if application_tables == 0:
+                if self.SCHEMA_SQL.exists():
+                    sql = self.SCHEMA_SQL.read_text(encoding="utf-8")
+                else:
+                    sql = self._inline_schema()
+                conn.executescript(sql)
+                conn.commit()
+            apply_migrations(conn)
 
     @staticmethod
     def _inline_schema() -> str:

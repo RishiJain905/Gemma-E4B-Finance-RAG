@@ -938,6 +938,85 @@ def load_cases(path: Path = GOLDEN) -> list[dict]:
     return cases
 
 
+# ── Phase 2.3 golden evaluation set + evidence ledger (2.3.6.2) ─────────
+#
+# The Phase 2.3 golden set (tests/fixtures/evaluation/phase2_3_golden.json)
+# extends the evaluation corpus with the broad-universe question classes the
+# 2.3.6.2 spec (Step 3) lists. It is one JSON document (not JSONL) with two
+# top-level groups:
+#   - "answerable": classes current-phase behavior can answer, each carrying the
+#     labeled evidence ledger (durable store ids) that MUST be delivered to
+#     generation and, where relevant, the primary/secondary authority ordering;
+#   - "deferred": the 2.3.7-dependent classes, each naming under "requires" the
+#     separate Phase 2.3.7 gate that will measure it rather than being silently
+#     omitted (2.3.6.2's final sign-off depends on those gates, not on this file).
+#
+# ``capture_evidence_ledger`` records the EXACT evidence ledger delivered to
+# generation for a retrieval result — the packed EvidenceItem list with its
+# request-local ``E1..En`` ids — using the same evidence helpers the middleware
+# prompt builder uses (src/middleware/evidence.py), so the offline evaluator
+# measures what the model would actually see, not a re-derived approximation.
+
+PHASE2_3_GOLDEN = EVAL_DIR.parent / "tests" / "fixtures" / "evaluation" / "phase2_3_golden.json"
+
+
+def load_phase2_3_golden(path: Path = PHASE2_3_GOLDEN) -> dict:
+    """Load the Phase 2.3 golden evaluation set (answerable + deferred classes)."""
+    data = json.loads(Path(path).read_text(encoding="utf-8"))
+    if not isinstance(data, dict):
+        raise ValueError("phase 2.3 golden set must be a JSON object")
+    return data
+
+
+def phase2_3_answerable_cases(golden: Optional[dict] = None) -> list[dict]:
+    """Return every answerable Phase 2.3 golden case, tagged with its class.
+
+    Each returned case carries a ``question_class`` copied from its group so a
+    flat run can still attribute a row to the class it exercises.
+    """
+    golden = golden if golden is not None else load_phase2_3_golden()
+    cases: list[dict] = []
+    for group in golden.get("answerable") or []:
+        question_class = group.get("question_class")
+        for case in group.get("cases") or []:
+            cases.append({**case, "question_class": question_class})
+    return cases
+
+
+def phase2_3_deferred_cases(golden: Optional[dict] = None) -> list[dict]:
+    """Return every deferred (2.3.7-dependent) Phase 2.3 golden entry."""
+    golden = golden if golden is not None else load_phase2_3_golden()
+    return list(golden.get("deferred") or [])
+
+
+def capture_evidence_ledger(retrieval: Optional[dict]) -> list[dict]:
+    """Return the exact evidence ledger a retrieval would deliver to generation.
+
+    Packs usable facts then usable documents into request-local ``E1..En``
+    evidence items via the same helpers the middleware prompt builder uses
+    (``src/middleware/evidence.py``), so the recorded ledger is precisely what
+    the model would see. Never raises; returns ``[]`` for an empty/None
+    retrieval. Each entry is an ``EvidenceItem.to_dict()`` carrying both the
+    request-local ``evidence_id`` and the durable ``store_id``.
+    """
+    from src.middleware.evidence import (
+        assign_evidence_ids,
+        build_evidence_items,
+        usable_documents,
+        usable_facts,
+    )
+
+    items = assign_evidence_ids(
+        build_evidence_items(usable_facts(retrieval), usable_documents(retrieval))
+    )
+    return [item.to_dict() for item in items]
+
+
+def ledger_store_ids(ledger: list[dict]) -> list[str]:
+    """Return the durable store ids from a captured ledger, in packed order."""
+    return [str(entry.get("store_id")) for entry in ledger if entry.get("store_id")]
+
+
 def load_conversations(path: Path = CONVERSATIONS) -> list[dict]:
     """Load the conversation golden set (one conversation per line).
 

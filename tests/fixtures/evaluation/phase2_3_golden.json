@@ -1,0 +1,257 @@
+{
+  "version": "phase2_3-golden-v1",
+  "description": "Phase 2.3.6.2 golden evaluation set. Extends the Phase 2.1/2.2 golden corpus with the broad-universe question classes the 2.3.6.2 spec (Step 3) lists. 'answerable' classes are answerable by current-phase behavior and carry the labeled evidence ledger (store ids) that MUST be delivered to generation plus, where relevant, the primary/secondary authority ordering the answer must preserve. 'deferred' classes depend on the separate Phase 2.3.7 gates and name the gate that will measure them under 'requires' rather than being silently omitted. The store ids below are the pilot corpus seeded by tests/test_phase2_3_end_to_end.py::seed_pilot_corpus; both files are kept in sync.",
+  "pilot_securities": ["ORCL", "NVDA", "AAPL", "JNJ", "F", "LMT"],
+  "answerable": [
+    {
+      "question_class": "financing_primary_filing",
+      "description": "Latest debt/equity raise and the supporting primary SEC filing; the direct SEC filing must be delivered and must outrank duplicate secondary reporting.",
+      "cases": [
+        {
+          "id": "p23-financing-orcl-001",
+          "question": "What was Oracle's most recent debt raise and which SEC filing evidences it?",
+          "expected_ticker": "ORCL",
+          "expected_intent": "news",
+          "must_mention": ["notes", "financing"],
+          "expected_sources": ["sec"],
+          "retrieval": {"ticker": "ORCL"},
+          "expected_evidence_ids": ["sec-orcl-notes-2026", "issuer-orcl-notes-2026"],
+          "primary_evidence_id": "sec-orcl-notes-2026",
+          "secondary_evidence_ids": ["finnhub-orcl-notes-2026"],
+          "answerability": "answerable"
+        }
+      ]
+    },
+    {
+      "question_class": "citations_multi_source",
+      "description": "Citations spanning primary and corroborating sources for one event; primary SEC evidence and at least one corroborating source both appear in the ledger.",
+      "cases": [
+        {
+          "id": "p23-citations-orcl-001",
+          "question": "Summarize Oracle's senior notes offering and cite the filing plus corroborating coverage.",
+          "expected_ticker": "ORCL",
+          "expected_intent": "explanation",
+          "must_mention": ["Oracle", "notes"],
+          "expected_sources": ["sec"],
+          "retrieval": {"ticker": "ORCL"},
+          "expected_evidence_ids": ["sec-orcl-notes-2026", "finnhub-orcl-notes-2026"],
+          "primary_evidence_id": "sec-orcl-notes-2026",
+          "secondary_evidence_ids": ["finnhub-orcl-notes-2026"],
+          "answerability": "answerable"
+        }
+      ]
+    },
+    {
+      "question_class": "corporate_action_market_date",
+      "description": "Recent corporate action and its market date, evidenced by an issuer filing and a linked structured event.",
+      "cases": [
+        {
+          "id": "p23-action-aapl-001",
+          "question": "What is Apple's latest corporate action and its effective market date?",
+          "expected_ticker": "AAPL",
+          "expected_intent": "news",
+          "must_mention": ["buyback"],
+          "expected_sources": ["sec"],
+          "retrieval": {"ticker": "AAPL"},
+          "expected_evidence_ids": ["sec-aapl-8k-2026"],
+          "expected_event_id": "aapl-buyback-2026",
+          "answerability": "answerable"
+        }
+      ]
+    },
+    {
+      "question_class": "company_news_broad",
+      "description": "Company news across several broad-universe tickers; the licensed news item is delivered.",
+      "cases": [
+        {
+          "id": "p23-news-nvda-001",
+          "question": "What is the latest NVIDIA data-center news?",
+          "expected_ticker": "NVDA",
+          "expected_intent": "news",
+          "must_mention": ["data-center"],
+          "expected_sources": ["gdelt"],
+          "retrieval": {"ticker": "NVDA"},
+          "expected_evidence_ids": ["finnhub-nvda-datacenter-2026"],
+          "answerability": "answerable"
+        },
+        {
+          "id": "p23-news-aapl-001",
+          "question": "What is the latest Apple buyback news?",
+          "expected_ticker": "AAPL",
+          "expected_intent": "news",
+          "must_mention": ["buyback"],
+          "expected_sources": ["yfinance"],
+          "retrieval": {"ticker": "AAPL"},
+          "expected_evidence_ids": ["finnhub-aapl-buyback-2026"],
+          "answerability": "answerable"
+        }
+      ]
+    },
+    {
+      "question_class": "sector_regulatory",
+      "description": "Sector/regulatory events mapped to the correct issuer (openFDA, NHTSA, USAspending).",
+      "cases": [
+        {
+          "id": "p23-sector-jnj-001",
+          "question": "Are there any recent openFDA regulatory actions affecting Johnson & Johnson?",
+          "expected_ticker": "JNJ",
+          "expected_intent": "news",
+          "must_mention": ["openFDA"],
+          "expected_sources": ["sec"],
+          "retrieval": {"ticker": "JNJ"},
+          "expected_evidence_ids": ["openfda-jnj-recall-2026"],
+          "answerability": "answerable"
+        },
+        {
+          "id": "p23-sector-f-001",
+          "question": "Has Ford had any recent NHTSA safety recalls?",
+          "expected_ticker": "F",
+          "expected_intent": "news",
+          "must_mention": ["recall"],
+          "expected_sources": ["sec"],
+          "retrieval": {"ticker": "F"},
+          "expected_evidence_ids": ["nhtsa-f-recall-2026"],
+          "answerability": "answerable"
+        },
+        {
+          "id": "p23-sector-lmt-001",
+          "question": "What recent federal contract awards has Lockheed Martin received?",
+          "expected_ticker": "LMT",
+          "expected_intent": "news",
+          "must_mention": ["contract"],
+          "expected_sources": ["sec"],
+          "retrieval": {"ticker": "LMT"},
+          "expected_evidence_ids": ["usaspending-lmt-award-2026"],
+          "answerability": "answerable"
+        }
+      ]
+    },
+    {
+      "question_class": "official_macro_release",
+      "description": "Fed/Treasury/BLS/BEA/EIA release questions answered from the official macro catalog (no ticker).",
+      "cases": [
+        {
+          "id": "p23-macro-bls-001",
+          "question": "What did the latest BLS consumer price index release show?",
+          "expected_ticker": null,
+          "expected_intent": "macro",
+          "must_mention": ["consumer price index"],
+          "expected_sources": ["fred"],
+          "retrieval": {"source": "bls"},
+          "expected_evidence_ids": ["bls-cpi-2026-06"],
+          "answerability": "answerable"
+        },
+        {
+          "id": "p23-macro-fed-001",
+          "question": "What was the most recent Federal Reserve monetary policy decision?",
+          "expected_ticker": null,
+          "expected_intent": "macro",
+          "must_mention": ["Federal Reserve"],
+          "expected_sources": ["fred"],
+          "retrieval": {"source": "fed"},
+          "expected_evidence_ids": ["fed-decision-2026-06"],
+          "answerability": "answerable"
+        }
+      ]
+    },
+    {
+      "question_class": "historical_as_of",
+      "description": "Historical-as-of question resolved through a former ticker; the vintage filing is delivered under the former symbol.",
+      "cases": [
+        {
+          "id": "p23-historical-meta-001",
+          "question": "What did FB report in its Q3 2021 filing?",
+          "expected_ticker": "META",
+          "expected_intent": "fact_lookup",
+          "must_mention": ["results"],
+          "expected_sources": ["sec"],
+          "retrieval": {"security": "FB", "as_of": "2021-10-01", "item_type": "filing", "published_to": "2021-12-31T23:59:59Z"},
+          "expected_evidence_ids": ["meta-historical-2021"],
+          "answerability": "answerable"
+        }
+      ]
+    },
+    {
+      "question_class": "structured_fact",
+      "description": "A structured metric answered from a structured fact source, never from an embedded numeric-row surrogate.",
+      "cases": [
+        {
+          "id": "p23-fact-nvda-001",
+          "question": "What was NVIDIA's latest total revenue?",
+          "expected_ticker": "NVDA",
+          "expected_intent": "fact_lookup",
+          "must_mention": ["revenue"],
+          "expected_sources": ["yfinance"],
+          "retrieval": {"ticker": "NVDA"},
+          "expected_fact": {"metric": "total_revenue", "source_type": "yfinance"},
+          "answerability": "answerable"
+        }
+      ]
+    },
+    {
+      "question_class": "unavailable_abstain",
+      "description": "A ticker with no seeded evidence yields an empty ledger, so generation must abstain rather than invent evidence.",
+      "cases": [
+        {
+          "id": "p23-unavailable-001",
+          "question": "What was the latest financing event for ticker ZZZZ?",
+          "expected_ticker": "ZZZZ",
+          "expected_intent": "news",
+          "must_mention": [],
+          "expected_sources": [],
+          "retrieval": {"ticker": "ZZZZ"},
+          "expected_evidence_ids": [],
+          "answerability": "unavailable"
+        }
+      ]
+    },
+    {
+      "question_class": "stale_source_conflict",
+      "description": "Stale evidence is delivered with a truthful freshness marker so the answer can disclose it (generation-time disclosure itself is a model behavior).",
+      "cases": [
+        {
+          "id": "p23-stale-nvda-001",
+          "question": "What did NVIDIA report about its data-center segment last year?",
+          "expected_ticker": "NVDA",
+          "expected_intent": "news",
+          "must_mention": ["data-center"],
+          "expected_sources": ["yfinance"],
+          "retrieval": {"ticker": "NVDA"},
+          "expected_evidence_ids": ["finnhub-nvda-stale-2025"],
+          "expected_freshness": {"finnhub-nvda-stale-2025": "stale"},
+          "answerability": "stale"
+        }
+      ]
+    }
+  ],
+  "deferred": [
+    {
+      "question_class": "all_ticker_inventory",
+      "requires": "2.3.7.1 authoritative capability inventory",
+      "gate": "explicit all-ticker inventory has set precision/recall 1.0, exact count, and zero invented tickers against the active canonical registry",
+      "description": "Direct and indirect corpus-capability questions, including the exact complete active ticker set and count, answered from authoritative Store metadata rather than a top-k retrieval sample.",
+      "example_question": "List every ticker currently in the active corpus and its exact count."
+    },
+    {
+      "question_class": "deterministic_bypass",
+      "requires": "2.3.7.3 deterministic answers",
+      "gate": "eligible deterministic answers make zero model calls and reduce end-to-end latency by at least 90%",
+      "description": "Deterministic fact/inventory questions that must bypass model generation while incomplete, conflicting, or qualitative requests never skip generation solely for speed.",
+      "example_question": "How many corpus items are indexed for AAPL?"
+    },
+    {
+      "question_class": "indirect_plan_accuracy",
+      "requires": "2.3.7.2 indirect-query completeness",
+      "gate": "indirect-query exact-plan accuracy improves by at least 15 percentage points over the measured baseline without materially regressing direct questions",
+      "description": "Indirect corpus-capability questions whose retrieval plan must track answer obligations and set completeness explicitly.",
+      "example_question": "Which technology companies in the corpus have filed a financing event this quarter?"
+    },
+    {
+      "question_class": "seeded_scale_lexical_hybrid",
+      "requires": "2.3.7.5 persistent lexical index and hybrid retrieval",
+      "gate": "persistent lexical and hybrid retrieval meet the 2.3.7.5 latency, quality, revision, and fail-soft gates at 100,000 seeded items",
+      "description": "Lexical exact-match and semantic hybrid queries evaluated at the 100,000-item seeded scale, which the current in-memory BM25 path does not satisfy.",
+      "example_question": "Find every filing mentioning 'senior notes due 2036' across the seeded corpus."
+    }
+  ]
+}

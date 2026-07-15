@@ -315,6 +315,19 @@ class Store:
             "chroma_doc_count": self.chroma.count(),
         }
 
+    def migrate_phase2_3(
+        self,
+        *,
+        batch_size: int = 100,
+        max_batches: Optional[int] = None,
+    ) -> dict[str, object]:
+        """Run the resumable Phase 2.3 metadata backfill through the facade."""
+        from src.storage.phase2_3_backfill import Phase23Backfill
+
+        return Phase23Backfill(self, batch_size=batch_size).run(
+            max_batches=max_batches
+        )
+
     def _check_sqlite(self) -> bool:
         try:
             with self.sqlite._connect() as conn:
@@ -2061,6 +2074,12 @@ class Store:
         # For SQLite, just drop and recreate tables
         with self.sqlite._connect() as conn:
             conn.executescript("""
+                DROP TABLE IF EXISTS bootstrap_partitions;
+                DROP TABLE IF EXISTS scheduler_run_sources;
+                DROP TABLE IF EXISTS scheduler_runs;
+                DROP TABLE IF EXISTS source_budget_usage;
+                DROP TABLE IF EXISTS source_cursors;
+                DROP TABLE IF EXISTS sec_daily_indexes;
                 DROP TABLE IF EXISTS event_corpus_items;
                 DROP TABLE IF EXISTS event_securities;
                 DROP TABLE IF EXISTS corpus_events;
@@ -2073,11 +2092,17 @@ class Store:
                 DROP TABLE IF EXISTS security_memberships;
                 DROP TABLE IF EXISTS security_aliases;
                 DROP TABLE IF EXISTS securities;
+                DROP TABLE IF EXISTS identity_reconciliation_errors;
+                DROP TABLE IF EXISTS phase2_3_backfill_progress;
+                DROP TABLE IF EXISTS source_circuit_state;
                 DROP TABLE IF EXISTS fundamentals;
-                DROP TABLE IF EXISTS sec_daily_indexes;
+                DROP TABLE IF EXISTS sec_companyfacts;
                 DROP TABLE IF EXISTS filings;
                 DROP TABLE IF EXISTS cache_meta;
                 DROP TABLE IF EXISTS ingestion_log;
+                DROP TABLE IF EXISTS store_revision;
+                DROP TABLE IF EXISTS dead_letter;
+                DROP TABLE IF EXISTS schema_migrations;
             """)
             conn.commit()
         self.sqlite._init_schema()

@@ -71,6 +71,11 @@ class MiddlewareConfig:
         self.enable_streaming: bool = True
         self.embedding_cache_size: int = 256
 
+        # Phase 2.3 additive rollout gates. Off preserves the Phase 2.2 query
+        # and Corpus Explorer paths; stored evidence and schema remain intact.
+        self.enable_phase2_3_retrieval: bool = False
+        self.enable_phase2_3_corpus_projection: bool = False
+
         # Phase 2.2.6.1 — tool-aware streaming & progress events. Both feature
         # flags default off so behavior is byte-identical to the pre-2.2.6
         # streaming path until promotion:
@@ -347,6 +352,11 @@ class MiddlewareConfig:
         _bool("ENABLE_STREAM_PROGRESS_EVENTS", "enable_stream_progress_events")
         _bool("STREAM_PROGRESS_INCLUDE_COUNTS", "stream_progress_include_counts")
         _bool("ENABLE_GRAPH_OBSERVER", "enable_graph_observer")
+        _bool("ENABLE_PHASE2_3_RETRIEVAL", "enable_phase2_3_retrieval")
+        _bool(
+            "ENABLE_PHASE2_3_CORPUS_PROJECTION",
+            "enable_phase2_3_corpus_projection",
+        )
         _int("GRAPH_TRACE_LIMIT", "graph_trace_limit")
         _int("GRAPH_ELEMENT_LIMIT", "graph_element_limit")
         _int("GRAPH_TRACE_TTL_S", "graph_trace_ttl_s")

@@ -55,6 +55,35 @@ server doesn't report a `capabilities` block.
 | `/help` | Show the full command list. |
 | `/quit` or `/exit` | Leave (stops the middleware if this script started it). |
 
+## Scheduler operational modes (Phase 2.3.4.3)
+
+`/refresh` in this client only drives `daily|hourly|weekly|all|status`
+(`SCHEDULER_MODES` in `scripts/chat.py`). Three additional operational modes
+exist but are **not** wired into `/refresh` — run them directly outside the
+chat session:
+
+```bash
+python -m src.scheduler bootstrap [--source NAME] [--since YYYY-MM-DD] [--resume]
+python -m src.scheduler repair [--source NAME] [--limit N]
+python -m src.scheduler retention --preview | --apply --confirm
+python -m src.scheduler status [--source NAME] [--scope SCOPE] [--json]
+```
+
+- `bootstrap` — explicit, resumable initial population of an empty/new
+  broad-universe source; never runs implicitly from `/refresh`.
+- `repair` — re-indexes stored pending/error narratives and SEC artifacts;
+  makes no provider download.
+- `retention` — previews, then explicitly applies, configured narrative
+  expiry; `/refresh` and the other modes never invoke it.
+- `status` — the mode behind `/refresh status` and the `/health` response's
+  `scheduler` block. It performs no network, provider, or embedding calls and
+  reports a **truthful** per-source terminal status (a disabled, rate-limited,
+  or circuit-open source is never reported as `fresh`) plus
+  denominator-explicit coverage health by index/scope/sector.
+
+See `docs/CONFIGURATION.md` for the full flag reference and
+`docs/ARCHITECTURE.md` for the source registry these modes operate on.
+
 ## Answer metadata
 
 After every answer, the renderer prints whatever the server response

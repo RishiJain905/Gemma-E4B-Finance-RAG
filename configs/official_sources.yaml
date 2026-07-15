@@ -2,6 +2,11 @@
 # Only entries in this file may be requested by the official adapters.
 version: "2.3.2.3-r1"
 
+# Catalog entries remain documented/queryable while rollout is disabled.
+feature_flags:
+  official_feeds: false
+  sector_feeds: false
+
 entries:
   - name: federal_reserve_policy_statements
     agency: federal_reserve

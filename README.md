@@ -209,6 +209,39 @@ opens it at startup). It is an *observability* view and never changes retrieval
 or answers. Remote exposure is intentionally unsupported. See
 [`docs/CONFIGURATION.md`](docs/CONFIGURATION.md) and [`docs/API.md`](docs/API.md).
 
+### Broad-universe ingestion (optional, Phase 2.3.4–2.3.6)
+
+Beyond the six deep-coverage sources above, ingestion can also run through a
+validated **source registry** (`configs/sources.yaml`) that adds per-source
+cadence, request/day budgets, incremental cursors, and provider circuit
+breakers on top of the same failure-isolation guarantee — one exhausted,
+rate-limited, or failing source never blocks another. It optionally extends
+coverage to broad company events, company news, market data, and official
+macro/regulatory/sector feeds across the wider S&P 500 / Nasdaq-100 universe.
+Every broad-universe capability and the additive schema migration that backs
+it are **disabled by default**; enabling a capability only adds new evidence,
+it never changes the existing schema or query path.
+
+The scheduler adds explicit `bootstrap` / `repair` / `retention` operational
+modes alongside `daily`/`hourly`/`weekly`/`all`, plus a truthful `status`
+report that never claims a disabled or rate-limited source is fresh:
+
+```bash
+python -m src.scheduler bootstrap --source sec_filings --since 2026-06-01
+python -m src.scheduler status --json
+python -m src.scheduler repair --source ir_pages --limit 50
+python -m src.scheduler retention --preview
+```
+
+The optional live graph above also gains an **aggregation-first Corpus
+Explorer** (market universe → index/sector/source groups → bounded on-demand
+expansion, never a full-corpus render) and a **source-aware Live Trace** that
+attributes each piece of evidence to its security identity, index membership,
+authority tier, and provider-vs-publisher role. See
+[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) and
+[`docs/CONFIGURATION.md`](docs/CONFIGURATION.md) for the registry schema,
+capability flags, and migration.
+
 ---
 
 ## Architecture
@@ -342,6 +375,15 @@ With coverage:
 ```bash
 pytest tests/ -v --cov=src --cov-report=term-missing
 ```
+
+`tests/test_phase2_3_end_to_end.py` is an offline harness that drives a seeded
+pilot slice (ORCL, NVDA, AAPL, plus one healthcare/automotive/government-
+contractor security and a small macro catalog) through bootstrap, repeated
+refresh, and simulated failure modes with no network or model, scored against
+the Phase 2.3 golden set (`tests/fixtures/evaluation/phase2_3_golden.json`).
+The golden set's `answerable` classes are asserted against the labeled
+evidence ledger; its Phase 2.3.7-dependent classes are explicitly marked
+`deferred` rather than silently omitted.
 
 Tests that hit the live SEC EDGAR network and a running `llama-server` on
 `:8087` are marked `live` (see `pytest.ini`). Skip them with:
