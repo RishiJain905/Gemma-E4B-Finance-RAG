@@ -2,6 +2,16 @@
 # Scheduler-owned source cadence, cursor, quota, and bounded-work registry.
 version: "2.3.4.1-r1"
 
+# Explicit bootstrap windows. These values are never consulted by daily or
+# hourly incremental runs.
+bootstrap:
+  sec_lookback_days: 30
+  company_news_days: 30
+  market_history_days: 30
+  macro_history_observations: 5
+  max_sec_partitions: 90
+  max_run_summaries: 100
+
 sources:
   universe_nasdaq100:
     capability_group: universe

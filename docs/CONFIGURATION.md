@@ -531,6 +531,54 @@ can be supplied as the resolver config. It logs a deprecation warning, maps
 
 ---
 
+## `configs/sources.yaml` and operational windows (Phase 2.3.4.3)
+
+`sources.yaml` is the scheduler-owned registry for cadence, cursor overlap,
+request limits, work limits, retry policy, and optional environment-key
+availability. Its `version` is persisted in every scheduler run summary.
+
+The top-level `bootstrap` block is used only by the explicit bootstrap command:
+
+```yaml
+bootstrap:
+  sec_lookback_days: 30
+  company_news_days: 30
+  market_history_days: 30
+  macro_history_observations: 5
+  max_sec_partitions: 90
+  max_run_summaries: 100
+```
+
+`--since YYYY-MM-DD` overrides the SEC bootstrap start date for that run. The
+complete partition manifest is stored atomically with the run header; each
+invocation processes at most `max_sec_partitions` and `--resume` continues the
+same immutable manifest with cumulative counts. Daily/hourly/all modes never
+read these history windows. Current
+universe memberships and their observation timestamps are populated by the
+three `universe_*` sources. SEC bootstrap is bounded to recent index/event
+partitions and does not trigger a broad full filing-text backfill.
+
+The operational commands are:
+
+```text
+python -m src.scheduler bootstrap [--source NAME] [--since YYYY-MM-DD] [--resume]
+python -m src.scheduler daily [--source NAME] [--scope SCOPE] [--force]
+python -m src.scheduler repair [--source NAME] [--limit N]
+python -m src.scheduler retention --preview
+python -m src.scheduler status [--source NAME] [--json]
+```
+
+`--force` only bypasses scheduler freshness. It never bypasses registry
+availability, provider circuit cooldowns, quotas, entitlements, or retention
+confirmation. Retention is preview-first; an apply must explicitly select the
+displayed family IDs. Status reads SQLite `cache_meta`, cursor, budget, run,
+and corpus tables only, so it performs no provider or embedding requests.
+Bounded query-tool refreshes execute per security through the scheduler's
+registry, durable request budgets, and provider circuit wrapper; unsupported
+or broad-universe requests are rejected.
+
+---
+
 ## `configs/watchlist.yaml`
 
 Market-proxy tickers and the per-source ingestion schedule. Security selection

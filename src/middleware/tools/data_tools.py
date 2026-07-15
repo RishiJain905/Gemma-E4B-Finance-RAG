@@ -4,11 +4,88 @@ Analytical tools over middleware data sources.
 """
 
 import logging
+import os
+from datetime import datetime, timezone
 
 from . import sanity
 from .base import Tool, register
 
 logger = logging.getLogger(__name__)
+
+_TOOL_REGISTRY_SOURCES = {
+    "yfinance_fundamentals": "yfinance",
+    "yfinance_news": "yfinance",
+    "finnhub_news": "finnhub",
+    "massive_market": "massive",
+    "gdelt_news": "gdelt",
+    "estimates": "estimates",
+    "sec_filings": "sec_filings",
+    "earnings_transcripts": "earnings_transcripts",
+    "ir_pages": "ir_pages",
+}
+
+
+def _provider_reset_at(value: object) -> datetime | None:
+    """Parse persisted provider reset values used by scheduler budgets."""
+    if value is None or str(value).strip() == "":
+        return None
+    try:
+        parsed = datetime.fromtimestamp(float(str(value)), tz=timezone.utc)
+    except (TypeError, ValueError, OSError, OverflowError):
+        try:
+            parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+
+
+def _refresh_tool_preflight(store, logical: str) -> tuple[bool, str | None, str | None]:
+    """Check registry availability, durable budgets, and provider cooldowns."""
+    try:
+        from src.scheduler.source_registry import SourceRegistry
+
+        registry = SourceRegistry.load(environ=os.environ)
+        registry_name = _TOOL_REGISTRY_SOURCES.get(logical)
+        spec = registry.sources.get(registry_name) if registry_name else None
+        if spec is None:
+            return False, "invalid_source", registry_name
+        if not spec.is_available:
+            return False, spec.status, registry_name
+
+        now = datetime.now(timezone.utc)
+        day_start = now.date().isoformat()
+        minute_start = now.strftime("%Y-%m-%dT%H:%MZ")
+        usage = store.get_source_budget_usage(
+            registry_name,
+            day_start=day_start,
+            minute_start=minute_start,
+        )
+        provider_state = store.get_source_cursor_state(
+            registry_name, "__provider__",
+        ) or {}
+        state_reset = _provider_reset_at(provider_state.get("cursor_value"))
+        if (
+            provider_state.get("status") == "circuit_open"
+            and (state_reset is None or state_reset > now)
+        ):
+            return False, "provider_cooldown", registry_name
+        if int(usage.get("day_requests") or 0) >= spec.requests_per_day:
+            return False, "requests_per_day", registry_name
+        if int(usage.get("minute_requests") or 0) >= spec.requests_per_minute:
+            return False, "requests_per_minute", registry_name
+        remaining = usage.get("provider_remaining")
+        usage_reset = _provider_reset_at(usage.get("provider_reset"))
+        if (
+            remaining is not None
+            and int(remaining) <= 0
+            and (usage_reset is None or usage_reset > now)
+        ):
+            return False, "provider_cooldown", registry_name
+        return True, None, registry_name
+    except Exception as exc:  # noqa: BLE001 - a guard failure must fail closed
+        logger.warning("Refresh preflight failed for %s: %s", logical, exc)
+        return False, "preflight_error", None
+
 
 QUARTER_ESTIMATE_METRICS = [
     "estimate_revenue_current_q",
@@ -237,8 +314,15 @@ def refresh_data_handler(store, ticker, sources=None):
     watchlist-wide via the UnifiedScheduler, so the tool skips them and
     reports them instead of triggering a scheduler-scale ingestion.
     """
-    ticker = ticker.upper()
+    ticker = str(ticker or "").strip().upper()
     try:
+        requested = [str(value).strip().lower() for value in (sources or [])]
+        if any(value in {"all", "*", "broad", "universe"} for value in requested):
+            return {
+                "error": "refresh request is unbounded; name bounded per-security sources",
+                "ticker": ticker,
+                "valid_sources": sorted(_TOOL_REGISTRY_SOURCES),
+            }
         from src.middleware import app as middleware_app
         from src.middleware.app import (
             SCHEDULER_SOURCE_MAP,
@@ -249,8 +333,11 @@ def refresh_data_handler(store, ticker, sources=None):
         )
         import time
 
-        if sources:
-            logical = _normalize_sources(sources)
+        if not ticker or len(ticker) > 16:
+            return {"error": "ticker must be a bounded security symbol", "ticker": ticker}
+
+        if requested:
+            logical = _normalize_sources(requested)
             if not logical:
                 return {
                     "error": "no valid sources requested",
@@ -260,6 +347,13 @@ def refresh_data_handler(store, ticker, sources=None):
         else:
             report = middleware_app.store.get_freshness_report(ticker)
             logical = _stale_source_names(report)
+
+        if len(logical) > 8:
+            return {
+                "error": "refresh request is unbounded; request at most 8 sources",
+                "ticker": ticker,
+                "valid_sources": sorted(set(_SOURCE_ALIASES.values())),
+            }
 
         skipped = [s for s in logical if s in SCHEDULER_SOURCE_MAP]
         logical = [s for s in logical if s not in SCHEDULER_SOURCE_MAP]
@@ -275,13 +369,30 @@ def refresh_data_handler(store, ticker, sources=None):
                 "skipped_scheduler_managed": skipped,
                 "note": note,
             }
+        allowed: list[str] = []
+        guard_errors: list[str] = []
+        for logical_name in logical:
+            ok, reason, _registry_name = _refresh_tool_preflight(store, logical_name)
+            if ok:
+                allowed.append(logical_name)
+            else:
+                guard_errors.append(f"{logical_name}: {reason or 'refresh rejected'}")
+        logical = allowed
+        if not logical:
+            return {
+                "ticker": ticker,
+                "refreshed": [],
+                "errors": guard_errors,
+                "skipped_scheduler_managed": skipped,
+                "note": "all requested refreshes were rejected by registry or operational controls",
+            }
         logger.warning("REFRESH tool invoked: %s sources=%s", ticker, logical)
         start = time.time()
         refreshed, errors = _refresh_ticker_sources(ticker, logical)
         return {
             "ticker": ticker,
             "refreshed": refreshed,
-            "errors": errors,
+            "errors": guard_errors + errors,
             "skipped_scheduler_managed": skipped,
             "duration_s": round(time.time() - start, 2),
         }

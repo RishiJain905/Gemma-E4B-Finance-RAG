@@ -671,6 +671,196 @@ class Store:
         """Persist a structured event and its item/security links."""
         return self.sqlite.upsert_event_record(record)
 
+    def repair_corpus_item(self, corpus_item_id: str) -> dict:
+        """Retry one stored narrative index without contacting its provider."""
+        item_id = str(corpus_item_id or "").strip()
+        if not item_id:
+            raise ValueError("corpus_item_id is required")
+        item = self.sqlite.get_corpus_item(item_id)
+        if item is None:
+            return {
+                "corpus_item_id": item_id,
+                "status": "skipped",
+                "reason": "not_found",
+            }
+        if item.get("indexing_status") not in {"pending", "error"}:
+            return {
+                "corpus_item_id": item_id,
+                "status": "skipped",
+                "reason": "not_retryable",
+            }
+        if str(item.get("item_type") or "").lower() != "news":
+            return {
+                "corpus_item_id": item_id,
+                "status": "skipped",
+                "reason": "full_content_not_retained",
+            }
+        title = str(item.get("title") or "").strip()
+        summary = str(item.get("summary") or "").strip()
+        text = "\n\n".join(value for value in (title, summary) if value)
+        if not text:
+            message = "stored narrative has no indexable title or summary"
+            self.sqlite.set_corpus_index_status(item_id, "error", message)
+            return {
+                "corpus_item_id": item_id,
+                "status": "failed",
+                "reason": "content_unavailable",
+                "error": message,
+            }
+
+        security_rows = self.sqlite.list_corpus_item_securities(item_id)
+        tickers = [str(value) for value in (item.get("tickers") or []) if value]
+        if not tickers:
+            tickers = [
+                str(row.get("ticker")) for row in security_rows if row.get("ticker")
+            ]
+        metadata = {
+            "corpus_item_id": item_id,
+            "document_family_id": str(item.get("document_family_id") or item_id),
+            "source_category": item.get("source_category"),
+            "source_name": item.get("source"),
+            "item_type": item.get("item_type"),
+            "document_family": item.get("document_family"),
+            "content_hash": item.get("content_hash"),
+            "license_label": item.get("license_label"),
+            "normalization_version": item.get("normalization_version"),
+            "evidence_authority": item.get("evidence_authority"),
+            "provider_record_id": item.get("provider_record_id"),
+            "original_publisher": item.get("original_publisher"),
+            "canonical_url": item.get("canonical_url"),
+            "event_type": item.get("event_type"),
+            "published_at": item.get("published_at"),
+            "effective_at": item.get("effective_at"),
+            "as_of_at": item.get("as_of_at"),
+            "indexing_status": "indexed",
+        }
+        for key, value in (item.get("metadata") or {}).items():
+            if isinstance(value, (str, int, float, bool)):
+                metadata[str(key)] = value
+        if tickers:
+            metadata["tickers"] = ",".join(sorted(set(tickers)))
+        if security_rows:
+            metadata["security_ids"] = ",".join(
+                sorted({str(row["security_id"]) for row in security_rows})
+            )
+
+        try:
+            self._bump_revision("repair_corpus_item")
+            self.chroma.add_document(
+                document_id=item_id,
+                text=text,
+                ticker=tickers[0] if tickers else None,
+                source=str(item.get("source") or ""),
+                date=item.get("published_at"),
+                metadata=metadata,
+                replace_family=True,
+            )
+        except Exception as exc:  # noqa: BLE001 - repair stays item-isolated
+            message = str(exc)[:2_000]
+            self.sqlite.set_corpus_index_status(item_id, "error", message)
+            logger.warning("Narrative repair failed for %s: %s", item_id, message)
+            return {
+                "corpus_item_id": item_id,
+                "status": "failed",
+                "error": message,
+            }
+
+        self.sqlite.set_corpus_index_status(item_id, "indexed")
+        return {"corpus_item_id": item_id, "status": "completed"}
+
+    def repair_filing_index(self, accession: str) -> dict:
+        """Retry one stored SEC artifact without invoking the SEC fetcher."""
+        item_id = str(accession or "").strip()
+        if not item_id:
+            raise ValueError("accession is required")
+        filing = self.sqlite.get_retryable_filing(item_id)
+        if filing is None:
+            return {"accession": item_id, "status": "skipped", "reason": "not_retryable"}
+        artifact = filing.get("file_path")
+        if not artifact:
+            message = "stored SEC artifact path is unavailable"
+            self.sqlite.mark_filing_index_pending(item_id, file_path="", error=message)
+            return {"accession": item_id, "status": "failed", "error": message}
+
+        try:
+            from src.sec.filing_sections import split_filing_sections
+
+            path = Path(str(artifact))
+            text = path.read_text(encoding="utf-8", errors="replace")
+            sections = split_filing_sections(text, {
+                **filing,
+                "accession": item_id,
+                "filing_type": filing.get("filing_type"),
+                "file_path": str(path),
+            })[:500]
+            if not sections:
+                raise ValueError("stored SEC artifact contains no indexable sections")
+            counts = self.add_filing_sections(sections)
+            if int(counts.get("sections_written") or 0) != len(sections):
+                raise RuntimeError("SEC repair did not index every stored section")
+            self.sqlite.mark_filing_parsed(
+                item_id,
+                embedding_id=f"sec:{item_id}",
+                file_path=str(path),
+                section_count=int(counts.get("sections_written") or 0),
+                chunk_count=int(counts.get("chunks_written") or 0),
+            )
+            return {
+                "accession": item_id,
+                "status": "completed",
+                "sections": int(counts.get("sections_written") or 0),
+                "chunks": int(counts.get("chunks_written") or 0),
+            }
+        except Exception as exc:  # noqa: BLE001 - one artifact stays isolated
+            message = str(exc)[:2_000]
+            self.sqlite.mark_filing_index_pending(
+                item_id, file_path=str(artifact), error=message,
+            )
+            logger.warning("SEC filing repair failed for %s: %s", item_id, message)
+            return {"accession": item_id, "status": "failed", "error": message}
+
+    def list_retryable_corpus_items(
+        self,
+        limit: int = 100,
+        *,
+        source: Optional[str] = None,
+        security: Optional[str] = None,
+        item_id: Optional[str] = None,
+        date_from: Optional[str] = None,
+        date_to: Optional[str] = None,
+        run_id: Optional[str] = None,
+    ) -> list[dict]:
+        """List stored narrative indexing failures for repair selection."""
+        return self.sqlite.list_retryable_corpus_items(
+            limit,
+            source=source,
+            security=security,
+            item_id=item_id,
+            date_from=date_from,
+            date_to=date_to,
+            run_id=run_id,
+        )
+
+    def list_retryable_filings(
+        self,
+        limit: int = 100,
+        *,
+        security: Optional[str] = None,
+        item_id: Optional[str] = None,
+        date_from: Optional[str] = None,
+        date_to: Optional[str] = None,
+        run_id: Optional[str] = None,
+    ) -> list[dict]:
+        """List stored SEC indexing artifacts through the repair facade."""
+        return self.sqlite.list_retryable_filings(
+            limit,
+            security=security,
+            item_id=item_id,
+            date_from=date_from,
+            date_to=date_to,
+            run_id=run_id,
+        )
+
     def run_retention(
         self,
         *,
@@ -678,12 +868,17 @@ class Store:
         apply: bool = False,
         policy: Optional[RetentionPolicy] = None,
         limit: Optional[int] = None,
+        eligible_ids: Optional[list[str]] = None,
     ) -> dict:
         """Preview or explicitly apply configured narrative retention."""
         active_policy = policy or load_retention_policy()
         cutoff = active_policy.company_news_cutoff(as_of)
         run_limit = active_policy.max_items_per_run if limit is None else limit
-        candidates = self.sqlite.list_news_retention_candidates(cutoff, limit=run_limit)
+        candidates = self.sqlite.list_news_retention_candidates(
+            cutoff,
+            limit=run_limit,
+            document_family_ids=eligible_ids,
+        )
         family_ids = [str(row["document_family_id"]) for row in candidates]
         result = {
             "apply": apply,
@@ -831,6 +1026,62 @@ class Store:
             provider_remaining=provider_remaining,
             provider_reset=provider_reset,
         )
+
+    # -- Scheduler run status (2.3.4.3) -------------------------------------
+
+    def start_scheduler_run(
+        self,
+        mode: str,
+        *,
+        policy_revision: str,
+        config_revision: str,
+        requested_sources: list[str],
+        run_id: Optional[str] = None,
+        started_at: Optional[str] = None,
+        bootstrap_manifest: Optional[dict[str, list[str]]] = None,
+    ) -> str:
+        """Persist one scheduler run header through the Store facade."""
+        return self.sqlite.start_scheduler_run(
+            mode,
+            policy_revision=policy_revision,
+            config_revision=config_revision,
+            requested_sources=requested_sources,
+            run_id=run_id,
+            started_at=started_at,
+            bootstrap_manifest=bootstrap_manifest,
+        )
+
+    def record_scheduler_source_summary(self, summary: dict) -> None:
+        """Persist one scheduler source summary without exposing raw payloads."""
+        self.sqlite.record_scheduler_source_summary(summary)
+
+    def complete_scheduler_run(self, run_id: str, **kwargs: object) -> None:
+        """Complete one scheduler run and its bounded terminal summary."""
+        self.sqlite.complete_scheduler_run(run_id, **kwargs)
+
+    def record_bootstrap_partition(self, *args: object, **kwargs: object) -> None:
+        """Persist one resumable bootstrap partition checkpoint."""
+        self.sqlite.record_bootstrap_partition(*args, **kwargs)
+
+    def list_bootstrap_partitions(
+        self, run_id: str, source: Optional[str] = None,
+    ) -> list[dict]:
+        """List bootstrap checkpoints through the Store facade."""
+        return self.sqlite.list_bootstrap_partitions(run_id, source)
+
+    def get_resumable_bootstrap_run(self, source: Optional[str] = None) -> Optional[dict]:
+        """Return the newest unfinished bootstrap run."""
+        return self.sqlite.get_resumable_bootstrap_run(source)
+
+    def list_scheduler_runs(
+        self, *, limit: int = 20, source: Optional[str] = None,
+    ) -> list[dict]:
+        """Return bounded scheduler run history."""
+        return self.sqlite.list_scheduler_runs(limit=limit, source=source)
+
+    def prune_scheduler_history(self, max_runs: int = 100) -> int:
+        """Prune old scheduler summaries without touching corpus data."""
+        return self.sqlite.prune_scheduler_history(max_runs)
 
     def set_source_status(
         self,

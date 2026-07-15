@@ -41,7 +41,8 @@ intent parsing, hybrid retrieval, and prompt augmentation.
 | Intent parser | `src/middleware/intent_parser.py` (`IntentParser`) | Extracts ticker, metrics, question type, timeframe |
 | Retriever | `src/middleware/retriever.py` (`Retriever`) | Selects a retrieval strategy and queries both stores |
 | Prompt augmenter | `src/middleware/prompt_augmenter.py` (`PromptAugmenter`) | Builds the grounded prompt from retrieval results |
-| Unified scheduler | `src/scheduler/__init__.py` (`UnifiedScheduler`) | Orchestrates ingestion with staggered execution + TTL tracking |
+| Unified scheduler | `src/scheduler/__init__.py` (`UnifiedScheduler`) | Runs explicit bootstrap, incremental refresh, repair, and retention controls with budgets/cursors/TTL tracking |
+| Scheduler status | `src/scheduler/status.py` | SQLite-only run summaries and denominator-explicit coverage health |
 | Ingestors | `src/ingestion/`, `src/macros/`, `src/sec/` | Per-source data fetching |
 | Resilience utils | `src/utils/resilience.py` | Retry/backoff, circuit breaker, dead-letter queue |
 | Lexical index | `src/middleware/lexical_index.py` (`LexicalIndex`) | BM25 keyword index over the ChromaDB corpus (Phase 2.1.2.1) |
@@ -161,13 +162,13 @@ Registered tools:
 | `refresh_data` | Yes | Refresh stale or never-fetched sources for one ticker. |
 
 `refresh_data` is intentionally narrow: source aliases are normalized through
-`_normalize_sources()`, and an explicitly invalid request (e.g. `"all"`)
-returns a structured error rather than falling back to a broader refresh.
-Scheduler-managed sources (`sec_filings`, `earnings_transcripts`, `ir_pages`)
-run watchlist-wide via the `UnifiedScheduler`, so the tool skips them and
-reports them in `skipped_scheduler_managed`; only truly per-ticker sources
-(yfinance fundamentals/news, GDELT) are refreshed through
-`_refresh_ticker_sources()`. The human-facing `/refresh` endpoint keeps its
+`_normalize_sources()`, an explicitly invalid or unbounded request (for example
+`"all"`, a universe scope, or more than eight sources) returns a structured
+error, and the target is always one ticker. The handler preflights the same
+source registry, durable request budgets, and persisted provider cooldowns
+used by the scheduler. Scheduler-managed sources (`sec_filings`,
+`earnings_transcripts`, `ir_pages`) are reported as skipped rather than being
+expanded into a broad run. The human-facing `/refresh` endpoint keeps its
 original wider behavior.
 
 ---
@@ -374,6 +375,31 @@ all ingestion:
 Each ingestor marks its per-ticker cache entry fresh in `cache_meta` on
 success, which feeds the freshness reports surfaced by the middleware.
 
+### Operational run modes (Phase 2.3.4.3)
+
+The four operational modes are deliberately separate:
+
+| Mode | Behavior | Safety boundary |
+|---|---|---|
+| `bootstrap` | Explicit, resumable current-universe plus bounded SEC, company-news, market, and macro population | Partition checkpoints; no broad full periodic-filing backfill |
+| `daily` / legacy incremental modes | TTL/cursor/overlap-driven refresh through the source registry | Missing keys and open circuits remain skipped/stale, never fresh |
+| `repair` | Re-indexes stored pending/error narratives and stored SEC artifacts | No provider download; bounded filters and item limit |
+| `retention` | Previews and explicitly applies configured narrative expiry | Daily refresh never invokes it; apply uses the displayed ID set |
+
+Every operation writes one `scheduler_runs` row and one
+`scheduler_run_sources` row per requested source. The rows retain policy and
+registry revisions, timings, counts, cursor/quota/freshness snapshots, and a
+redacted terminal error class/message. `bootstrap_partitions` is the durable
+resume ledger: the manifest is created with the run header, and resumed source
+counts are aggregated from completed checkpoints. Historical terminal runs
+are pruned to the configured bound without deleting active/resumable runs.
+
+`status` combines those rows with `cache_meta` compatibility freshness and the
+SQLite-only `build_coverage_health()` projection. It reports active-security
+denominators by index/scope/sector, recent news/market/SEC coverage, source
+partition states, indexing backlog, corpus date bounds, and last successful
+refresh. It does not invoke network, Chroma embedding, or provider code.
+
 ---
 
 ## Storage Layer
@@ -389,6 +415,9 @@ DDL in `SQLiteStore._inline_schema()`.
 | `fundamentals` | Structured financial metrics | `ticker`, `metric`, `value`, `unit`, `period`, `period_type`, `source_type`, `source_url`, `ingested_at`; `UNIQUE(ticker, metric, period)` |
 | `filings` | SEC filing index / processing state | `ticker`, `filing_type`, `filing_date`, `period`, `accession` (UNIQUE), `source_url`, `file_path`, `status` (`unprocessed`/`parsed`), `summary_embedding_id` |
 | `cache_meta` | Per-(ticker, source) freshness/TTL | `ticker`, `source`, `metric_scope`, `last_updated`, `next_scheduled_update`, `status` (`fresh`/`stale`/`fetching`), `error_message`; `PRIMARY KEY (ticker, source, metric_scope)` |
+| `scheduler_runs` | Bounded operation headers | `run_id`, `mode`, policy/config revisions, timings, source rollups, safe terminal error |
+| `scheduler_run_sources` | Per-source operation summaries | counts, cursor before/after, quota remaining, freshness/next due/cooldown, safe error |
+| `bootstrap_partitions` | Resumable bootstrap manifest/checkpoints | `run_id`, `source`, `partition_key`, status, attempts, item/new/updated/duplicate counts |
 | `ingestion_log` | Audit log of ingestion runs | `run_id`, `ticker`, `source`, `status`, `items_processed`/`items_new`/`items_updated`, `started_at`, `completed_at`, `duration_seconds` |
 | `dead_letter` | Persistently failing items (lazily created) | `source`, `item_key`, `error`, `failed_at`, `retry_count`, `last_error`; `PRIMARY KEY (source, item_key)` |
 

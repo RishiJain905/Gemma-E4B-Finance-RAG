@@ -2502,6 +2502,10 @@ _SOURCE_ALIASES = {
     "yfinance_fundamentals": "yfinance_fundamentals",
     "news": "yfinance_news",
     "yfinance_news": "yfinance_news",
+    "finnhub": "finnhub_news",
+    "finnhub_news": "finnhub_news",
+    "massive": "massive_market",
+    "massive_market": "massive_market",
     "sec": "sec_filings",
     "sec_filings": "sec_filings",
     "gdelt": "gdelt_news",
@@ -2582,7 +2586,9 @@ def _refresh_one_source(ticker: str, logical: str) -> None:
     if logical in SCHEDULER_SOURCE_MAP:
         _refresh_via_scheduler(ticker, logical)
         return
-    _refresh_one_source_direct(ticker, logical)
+    from src.scheduler import UnifiedScheduler
+
+    UnifiedScheduler(store=store).run_bounded_security_refresh(ticker, logical)
 
 
 def _refresh_one_source_direct(ticker: str, logical: str) -> None:
@@ -2608,6 +2614,22 @@ def _refresh_one_source_direct(ticker: str, logical: str) -> None:
         t = ing._fetch_ticker(ticker)
         if t is not None:
             ing._ingest_ticker_news(ticker, t)  # marks cache fresh
+    elif logical == "finnhub_news":
+        from src.ingestion.finnhub_ingestor import FinnhubIngestor
+        result = FinnhubIngestor(store=store).ingest_ticker_news(ticker)
+        if result.get("status") not in {"ok", "success", "no_data"}:
+            raise RuntimeError(
+                f"finnhub refresh failed for {ticker}: "
+                f"{result.get('status') or result.get('error_class') or 'error'}"
+            )
+    elif logical == "massive_market":
+        from src.ingestion.massive_ingestor import MassiveIngestor
+        result = MassiveIngestor(store=store).ingest_market_data(tickers=[ticker])
+        if result.get("status") not in {"ok", "success", "no_data"}:
+            raise RuntimeError(
+                f"massive refresh failed for {ticker}: "
+                f"{result.get('status') or result.get('error_class') or 'error'}"
+            )
     elif logical == "sec_filings":
         from src.sec import FilingScheduler
         sched = FilingScheduler(store=store)

@@ -91,7 +91,12 @@ class FilingScheduler:
 
     # ── Discovery Check ───────────────────────────────
 
-    def run_discovery(self, force: bool = False) -> dict:
+    def run_discovery(
+        self,
+        force: bool = False,
+        *,
+        allow_bootstrap: bool = True,
+    ) -> dict:
         """Run filing discovery for tickers whose cache is stale.
 
         Checks cache_meta for each core ticker. Skips tickers that
@@ -109,7 +114,11 @@ class FilingScheduler:
             }
         """
         if self.daily_index_discovery is not None:
-            daily = self.daily_index_discovery.discover()
+            daily = (
+                self.daily_index_discovery.discover()
+                if allow_bootstrap
+                else self.daily_index_discovery.discover(allow_bootstrap=False)
+            )
             return {
                 "mode": "daily_index",
                 "checked": int(daily.get("downloaded", 0)),
@@ -179,7 +188,12 @@ class FilingScheduler:
         )
         return result
 
-    def run_full_pipeline(self, force: bool = False) -> dict:
+    def run_full_pipeline(
+        self,
+        force: bool = False,
+        *,
+        allow_bootstrap: bool = True,
+    ) -> dict:
         """Run discovery + processing for all core tickers.
 
         This is the main entry point for cron-based scheduling:
@@ -199,7 +213,11 @@ class FilingScheduler:
         """
         logger.info("Starting full filing pipeline run%s...", " (forced)" if force else "")
 
-        discovery_result = self.run_discovery(force=force)
+        discovery_result = (
+            self.run_discovery(force=force)
+            if allow_bootstrap
+            else self.run_discovery(force=force, allow_bootstrap=False)
+        )
 
         if discovery_result.get("mode") == "daily_index":
             processing_result = self.processor.process_pending_filings(limit=50)

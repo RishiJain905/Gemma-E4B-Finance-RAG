@@ -131,6 +131,100 @@ class SQLiteStore:
                     PRIMARY KEY (source, window_kind, window_start)
                 )"""
             )
+            conn.execute(
+                """CREATE TABLE IF NOT EXISTS scheduler_runs (
+                    run_id TEXT PRIMARY KEY,
+                    mode TEXT NOT NULL,
+                    policy_revision TEXT NOT NULL,
+                    config_revision TEXT NOT NULL,
+                    started_at TEXT NOT NULL,
+                    ended_at TEXT,
+                    duration_seconds REAL,
+                    status TEXT NOT NULL DEFAULT 'running',
+                    requested_sources_json TEXT NOT NULL DEFAULT '[]',
+                    completed_sources_json TEXT NOT NULL DEFAULT '[]',
+                    skipped_sources_json TEXT NOT NULL DEFAULT '[]',
+                    failed_sources_json TEXT NOT NULL DEFAULT '[]',
+                    terminal_error_class TEXT,
+                    terminal_error_message TEXT
+                )"""
+            )
+            conn.execute(
+                """CREATE TABLE IF NOT EXISTS scheduler_run_sources (
+                    run_id TEXT NOT NULL REFERENCES scheduler_runs(run_id) ON DELETE CASCADE,
+                    source TEXT NOT NULL,
+                    mode TEXT NOT NULL,
+                    policy_revision TEXT NOT NULL,
+                    config_revision TEXT NOT NULL,
+                    started_at TEXT,
+                    ended_at TEXT,
+                    duration_seconds REAL,
+                    status TEXT NOT NULL,
+                    requested INTEGER NOT NULL DEFAULT 1,
+                    completed INTEGER NOT NULL DEFAULT 0,
+                    skipped INTEGER NOT NULL DEFAULT 0,
+                    failed INTEGER NOT NULL DEFAULT 0,
+                    partitions INTEGER NOT NULL DEFAULT 0,
+                    items INTEGER NOT NULL DEFAULT 0,
+                    requests INTEGER NOT NULL DEFAULT 0,
+                    new_items INTEGER NOT NULL DEFAULT 0,
+                    updated_items INTEGER NOT NULL DEFAULT 0,
+                    duplicates INTEGER NOT NULL DEFAULT 0,
+                    cursor_before_json TEXT,
+                    cursor_after_json TEXT,
+                    quota_remaining INTEGER,
+                    freshness TEXT,
+                    last_success TEXT,
+                    next_due TEXT,
+                    cooldown_reset TEXT,
+                    error_class TEXT,
+                    error_message TEXT,
+                    details_json TEXT NOT NULL DEFAULT '{}',
+                    PRIMARY KEY (run_id, source)
+                )"""
+            )
+            conn.execute(
+                """CREATE TABLE IF NOT EXISTS bootstrap_partitions (
+                    run_id TEXT NOT NULL REFERENCES scheduler_runs(run_id) ON DELETE CASCADE,
+                    source TEXT NOT NULL,
+                    partition_key TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    started_at TEXT,
+                    ended_at TEXT,
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    items INTEGER NOT NULL DEFAULT 0,
+                    new_items INTEGER NOT NULL DEFAULT 0,
+                    updated_items INTEGER NOT NULL DEFAULT 0,
+                    duplicates INTEGER NOT NULL DEFAULT 0,
+                    error_class TEXT,
+                    error_message TEXT,
+                    PRIMARY KEY (run_id, source, partition_key)
+                )"""
+            )
+            bootstrap_columns = {
+                row[1]
+                for row in conn.execute(
+                    "PRAGMA table_info(bootstrap_partitions)"
+                ).fetchall()
+            }
+            for column in ("new_items", "updated_items", "duplicates"):
+                if column not in bootstrap_columns:
+                    conn.execute(
+                        f"ALTER TABLE bootstrap_partitions ADD COLUMN {column} "
+                        "INTEGER NOT NULL DEFAULT 0"
+                    )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_scheduler_runs_started "
+                "ON scheduler_runs(started_at DESC)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_scheduler_run_sources_source "
+                "ON scheduler_run_sources(source, ended_at DESC)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_bootstrap_partitions_status "
+                "ON bootstrap_partitions(source, status, run_id)"
+            )
             corpus_columns = {
                 row[1] for row in conn.execute("PRAGMA table_info(corpus_items)").fetchall()
             }
@@ -299,6 +393,79 @@ CREATE TABLE IF NOT EXISTS source_budget_usage (
     updated_at TEXT NOT NULL,
     PRIMARY KEY (source, window_kind, window_start)
 );
+
+CREATE TABLE IF NOT EXISTS scheduler_runs (
+    run_id TEXT PRIMARY KEY,
+    mode TEXT NOT NULL,
+    policy_revision TEXT NOT NULL,
+    config_revision TEXT NOT NULL,
+    started_at TEXT NOT NULL,
+    ended_at TEXT,
+    duration_seconds REAL,
+    status TEXT NOT NULL DEFAULT 'running',
+    requested_sources_json TEXT NOT NULL DEFAULT '[]',
+    completed_sources_json TEXT NOT NULL DEFAULT '[]',
+    skipped_sources_json TEXT NOT NULL DEFAULT '[]',
+    failed_sources_json TEXT NOT NULL DEFAULT '[]',
+    terminal_error_class TEXT,
+    terminal_error_message TEXT
+);
+
+CREATE TABLE IF NOT EXISTS scheduler_run_sources (
+    run_id TEXT NOT NULL REFERENCES scheduler_runs(run_id) ON DELETE CASCADE,
+    source TEXT NOT NULL,
+    mode TEXT NOT NULL,
+    policy_revision TEXT NOT NULL,
+    config_revision TEXT NOT NULL,
+    started_at TEXT,
+    ended_at TEXT,
+    duration_seconds REAL,
+    status TEXT NOT NULL,
+    requested INTEGER NOT NULL DEFAULT 1,
+    completed INTEGER NOT NULL DEFAULT 0,
+    skipped INTEGER NOT NULL DEFAULT 0,
+    failed INTEGER NOT NULL DEFAULT 0,
+    partitions INTEGER NOT NULL DEFAULT 0,
+    items INTEGER NOT NULL DEFAULT 0,
+    requests INTEGER NOT NULL DEFAULT 0,
+    new_items INTEGER NOT NULL DEFAULT 0,
+    updated_items INTEGER NOT NULL DEFAULT 0,
+    duplicates INTEGER NOT NULL DEFAULT 0,
+    cursor_before_json TEXT,
+    cursor_after_json TEXT,
+    quota_remaining INTEGER,
+    freshness TEXT,
+    last_success TEXT,
+    next_due TEXT,
+    cooldown_reset TEXT,
+    error_class TEXT,
+    error_message TEXT,
+    details_json TEXT NOT NULL DEFAULT '{}',
+    PRIMARY KEY (run_id, source)
+);
+
+CREATE TABLE IF NOT EXISTS bootstrap_partitions (
+    run_id TEXT NOT NULL REFERENCES scheduler_runs(run_id) ON DELETE CASCADE,
+    source TEXT NOT NULL,
+    partition_key TEXT NOT NULL,
+    status TEXT NOT NULL,
+    started_at TEXT,
+    ended_at TEXT,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    items INTEGER NOT NULL DEFAULT 0,
+    new_items INTEGER NOT NULL DEFAULT 0,
+    updated_items INTEGER NOT NULL DEFAULT 0,
+    duplicates INTEGER NOT NULL DEFAULT 0,
+    error_class TEXT,
+    error_message TEXT,
+    PRIMARY KEY (run_id, source, partition_key)
+);
+CREATE INDEX IF NOT EXISTS idx_scheduler_runs_started
+    ON scheduler_runs(started_at DESC);
+CREATE INDEX IF NOT EXISTS idx_scheduler_run_sources_source
+    ON scheduler_run_sources(source, ended_at DESC);
+CREATE INDEX IF NOT EXISTS idx_bootstrap_partitions_status
+    ON bootstrap_partitions(source, status, run_id);
 
 -- ── Ingestion Log ──────────────────────────────────
 CREATE TABLE IF NOT EXISTS ingestion_log (
@@ -1021,6 +1188,341 @@ CREATE INDEX IF NOT EXISTS idx_corpus_events_type_effective
             conn.execute(sql, (status, items, new, updated, run_id))
             conn.commit()
 
+    # -- Scheduler run status (2.3.4.3) -------------------------------------
+
+    @staticmethod
+    def _decode_json_value(value: object, default: object) -> object:
+        """Decode one persisted JSON value while keeping status reads fail-soft."""
+        if value in (None, ""):
+            return default
+        try:
+            decoded = json.loads(str(value))
+        except (TypeError, ValueError):
+            return default
+        return decoded
+
+    def start_scheduler_run(
+        self,
+        mode: str,
+        *,
+        policy_revision: str,
+        config_revision: str,
+        requested_sources: list[str],
+        run_id: Optional[str] = None,
+        started_at: Optional[str] = None,
+        bootstrap_manifest: Optional[dict[str, list[str]]] = None,
+    ) -> str:
+        """Persist one scheduler run header before any source work begins."""
+        run_id = str(run_id or uuid.uuid4())
+        started = str(started_at or datetime.now(timezone.utc).isoformat())
+        requested = [str(source) for source in dict.fromkeys(requested_sources)]
+        with self._connect() as conn:
+            conn.execute(
+                """INSERT INTO scheduler_runs (
+                    run_id, mode, policy_revision, config_revision, started_at,
+                    status, requested_sources_json
+                ) VALUES (?, ?, ?, ?, ?, 'running', ?)""",
+                (
+                    run_id,
+                    str(mode),
+                    str(policy_revision),
+                    str(config_revision),
+                    started,
+                    json.dumps(requested, sort_keys=True),
+                ),
+            )
+            if bootstrap_manifest:
+                conn.executemany(
+                    "INSERT OR IGNORE INTO bootstrap_partitions "
+                    "(run_id, source, partition_key, status) VALUES (?, ?, ?, 'pending')",
+                    [
+                        (run_id, str(source), str(partition))
+                        for source, partitions in bootstrap_manifest.items()
+                        for partition in partitions
+                    ],
+                )
+            conn.commit()
+        return run_id
+
+    def record_scheduler_source_summary(self, summary: dict) -> None:
+        """Upsert one bounded per-source summary for a scheduler run."""
+        run_id = str(summary.get("run_id") or "").strip()
+        source = str(summary.get("source") or "").strip()
+        if not run_id or not source:
+            raise ValueError("run_id and source are required")
+
+        def integer(name: str) -> int:
+            try:
+                return max(int(summary.get(name) or 0), 0)
+            except (TypeError, ValueError):
+                return 0
+
+        details = summary.get("details")
+        details_json = json.dumps(details if isinstance(details, dict) else {}, default=str)
+        values = (
+            run_id,
+            source,
+            str(summary.get("mode") or "incremental"),
+            str(summary.get("policy_revision") or "unknown"),
+            str(summary.get("config_revision") or "unknown"),
+            summary.get("started_at"),
+            summary.get("ended_at"),
+            summary.get("duration_seconds"),
+            str(summary.get("status") or "error"),
+            integer("requested"),
+            integer("completed"),
+            integer("skipped"),
+            integer("failed"),
+            integer("partitions"),
+            integer("items"),
+            integer("requests"),
+            integer("new_items"),
+            integer("updated_items"),
+            integer("duplicates"),
+            json.dumps(summary.get("cursor_before"), default=str)
+            if summary.get("cursor_before") is not None else None,
+            json.dumps(summary.get("cursor_after"), default=str)
+            if summary.get("cursor_after") is not None else None,
+            summary.get("quota_remaining"),
+            summary.get("freshness"),
+            summary.get("last_success"),
+            summary.get("next_due"),
+            summary.get("cooldown_reset"),
+            summary.get("error_class"),
+            summary.get("error_message"),
+            details_json,
+        )
+        with self._connect() as conn:
+            conn.execute(
+                """INSERT INTO scheduler_run_sources (
+                    run_id, source, mode, policy_revision, config_revision,
+                    started_at, ended_at, duration_seconds, status, requested,
+                    completed, skipped, failed, partitions, items, requests,
+                    new_items, updated_items, duplicates, cursor_before_json,
+                    cursor_after_json, quota_remaining, freshness, last_success,
+                    next_due, cooldown_reset, error_class, error_message,
+                    details_json
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                ON CONFLICT(run_id, source) DO UPDATE SET
+                    mode=excluded.mode,
+                    policy_revision=excluded.policy_revision,
+                    config_revision=excluded.config_revision,
+                    started_at=excluded.started_at,
+                    ended_at=excluded.ended_at,
+                    duration_seconds=excluded.duration_seconds,
+                    status=excluded.status,
+                    requested=excluded.requested,
+                    completed=excluded.completed,
+                    skipped=excluded.skipped,
+                    failed=excluded.failed,
+                    partitions=excluded.partitions,
+                    items=excluded.items,
+                    requests=excluded.requests,
+                    new_items=excluded.new_items,
+                    updated_items=excluded.updated_items,
+                    duplicates=excluded.duplicates,
+                    cursor_before_json=excluded.cursor_before_json,
+                    cursor_after_json=excluded.cursor_after_json,
+                    quota_remaining=excluded.quota_remaining,
+                    freshness=excluded.freshness,
+                    last_success=excluded.last_success,
+                    next_due=excluded.next_due,
+                    cooldown_reset=excluded.cooldown_reset,
+                    error_class=excluded.error_class,
+                    error_message=excluded.error_message,
+                    details_json=excluded.details_json""",
+                values,
+            )
+            conn.commit()
+
+    def complete_scheduler_run(
+        self,
+        run_id: str,
+        *,
+        status: str,
+        ended_at: Optional[str] = None,
+        duration_seconds: Optional[float] = None,
+        completed_sources: Optional[list[str]] = None,
+        skipped_sources: Optional[list[str]] = None,
+        failed_sources: Optional[list[str]] = None,
+        terminal_error_class: Optional[str] = None,
+        terminal_error_message: Optional[str] = None,
+    ) -> None:
+        """Close a scheduler run and retain only bounded redacted terminal state."""
+        with self._connect() as conn:
+            conn.execute(
+                """UPDATE scheduler_runs SET
+                    ended_at=?, duration_seconds=?, status=?,
+                    completed_sources_json=?, skipped_sources_json=?,
+                    failed_sources_json=?, terminal_error_class=?,
+                    terminal_error_message=?
+                WHERE run_id=?""",
+                (
+                    ended_at or datetime.now(timezone.utc).isoformat(),
+                    duration_seconds,
+                    str(status),
+                    json.dumps(list(completed_sources or []), sort_keys=True),
+                    json.dumps(list(skipped_sources or []), sort_keys=True),
+                    json.dumps(list(failed_sources or []), sort_keys=True),
+                    terminal_error_class,
+                    str(terminal_error_message)[:2_000]
+                    if terminal_error_message else None,
+                    str(run_id),
+                ),
+            )
+            conn.commit()
+
+    def record_bootstrap_partition(
+        self,
+        run_id: str,
+        source: str,
+        partition_key: str,
+        *,
+        status: str,
+        started_at: Optional[str] = None,
+        ended_at: Optional[str] = None,
+        attempts: int = 0,
+        items: int = 0,
+        new_items: int = 0,
+        updated_items: int = 0,
+        duplicates: int = 0,
+        error_class: Optional[str] = None,
+        error_message: Optional[str] = None,
+    ) -> None:
+        """Checkpoint one bootstrap partition after its writes complete."""
+        with self._connect() as conn:
+            conn.execute(
+                """INSERT INTO bootstrap_partitions (
+                    run_id, source, partition_key, status, started_at, ended_at,
+                    attempts, items, new_items, updated_items, duplicates,
+                    error_class, error_message
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(run_id, source, partition_key) DO UPDATE SET
+                    status=excluded.status,
+                    started_at=COALESCE(excluded.started_at, bootstrap_partitions.started_at),
+                    ended_at=excluded.ended_at,
+                    attempts=excluded.attempts,
+                    items=excluded.items,
+                    new_items=excluded.new_items,
+                    updated_items=excluded.updated_items,
+                    duplicates=excluded.duplicates,
+                    error_class=excluded.error_class,
+                    error_message=excluded.error_message""",
+                (
+                    str(run_id), str(source), str(partition_key), str(status),
+                    started_at, ended_at, max(int(attempts), 0), max(int(items), 0),
+                    max(int(new_items), 0), max(int(updated_items), 0),
+                    max(int(duplicates), 0),
+                    error_class,
+                    str(error_message)[:2_000] if error_message else None,
+                ),
+            )
+            conn.commit()
+
+    def list_bootstrap_partitions(
+        self, run_id: str, source: Optional[str] = None,
+    ) -> list[dict]:
+        """Return durable bootstrap partition checkpoints for one run."""
+        where = ["run_id = ?"]
+        params: list[object] = [str(run_id)]
+        if source is not None:
+            where.append("source = ?")
+            params.append(str(source))
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM bootstrap_partitions WHERE "
+                + " AND ".join(where)
+                + " ORDER BY source, partition_key",
+                params,
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def get_resumable_bootstrap_run(self, source: Optional[str] = None) -> Optional[dict]:
+        """Return the newest unfinished bootstrap run, optionally source-scoped."""
+        params: list[object] = []
+        where = ["mode = 'bootstrap'", "status IN ('running', 'error', 'partial', 'interrupted')"]
+        if source is not None:
+            where.append(
+                "requested_sources_json LIKE ?"
+            )
+            params.append(f'%"{str(source)}"%')
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM scheduler_runs WHERE " + " AND ".join(where)
+                + " ORDER BY started_at DESC LIMIT 1",
+                params,
+            ).fetchone()
+        return dict(row) if row else None
+
+    def list_scheduler_runs(
+        self, *, limit: int = 20, source: Optional[str] = None,
+    ) -> list[dict]:
+        """Return bounded scheduler run headers with their source summaries."""
+        if not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= self.MAX_INVENTORY_LIMIT:
+            raise ValueError(f"limit must be between 1 and {self.MAX_INVENTORY_LIMIT}")
+        params: list[object] = []
+        where = ""
+        if source is not None:
+            where = (
+                "WHERE EXISTS (SELECT 1 FROM scheduler_run_sources rs "
+                "WHERE rs.run_id = scheduler_runs.run_id AND rs.source = ?)"
+            )
+            params.append(str(source))
+        params.append(limit)
+        with self._connect() as conn:
+            runs = conn.execute(
+                "SELECT * FROM scheduler_runs " + where
+                + " ORDER BY started_at DESC LIMIT ?", params,
+            ).fetchall()
+            result = []
+            for row in runs:
+                run = dict(row)
+                for name in (
+                    "requested_sources_json", "completed_sources_json",
+                    "skipped_sources_json", "failed_sources_json",
+                ):
+                    run[name.removesuffix("_json")] = self._decode_json_value(
+                        run.pop(name), []
+                    )
+                sources = conn.execute(
+                    "SELECT * FROM scheduler_run_sources WHERE run_id=? "
+                    "ORDER BY source", (run["run_id"],),
+                ).fetchall()
+                decoded_sources = []
+                for source_row in sources:
+                    source_value = dict(source_row)
+                    for name in ("cursor_before_json", "cursor_after_json", "details_json"):
+                        source_value[name.removesuffix("_json")] = self._decode_json_value(
+                            source_value.pop(name), {} if name == "details_json" else None
+                        )
+                    decoded_sources.append(source_value)
+                run["sources"] = decoded_sources
+                result.append(run)
+        return result
+
+    def prune_scheduler_history(self, max_runs: int = 100) -> int:
+        """Delete oldest completed scheduler summaries beyond the configured bound."""
+        if not isinstance(max_runs, int) or max_runs < 1:
+            raise ValueError("max_runs must be a positive integer")
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT run_id FROM scheduler_runs "
+                "WHERE status NOT IN ('running', 'interrupted') "
+                "AND NOT (mode='bootstrap' AND status IN ('error', 'partial')) "
+                "ORDER BY started_at DESC "
+                "LIMIT -1 OFFSET ?", (max_runs,),
+            ).fetchall()
+            ids = [str(row[0]) for row in rows]
+            if ids:
+                placeholders = ",".join("?" for _ in ids)
+                cursor = conn.execute(
+                    f"DELETE FROM scheduler_runs WHERE run_id IN ({placeholders})",
+                    ids,
+                )
+                conn.commit()
+                return int(cursor.rowcount)
+        return 0
+
     # ── Store Revision (2.2.6.2) ───────────────────────
 
     def get_store_revision(self) -> int:
@@ -1352,29 +1854,156 @@ CREATE INDEX IF NOT EXISTS idx_corpus_events_type_effective
             ).fetchall()
         return [dict(row) for row in rows]
 
-    def list_retryable_corpus_items(self, limit: int = 100) -> list[dict]:
+    def list_retryable_corpus_items(
+        self,
+        limit: int = 100,
+        *,
+        source: Optional[str] = None,
+        security: Optional[str] = None,
+        item_id: Optional[str] = None,
+        date_from: Optional[str] = None,
+        date_to: Optional[str] = None,
+        run_id: Optional[str] = None,
+    ) -> list[dict]:
+        """List pending/error narrative metadata with bounded repair filters."""
         if limit < 1 or limit > self.MAX_INVENTORY_LIMIT:
             raise ValueError(f"limit must be between 1 and {self.MAX_INVENTORY_LIMIT}")
+        conditions = ["ci.indexing_status IN ('pending', 'error')", "ci.is_tombstone=0"]
+        params: list[object] = []
+        if source:
+            conditions.append("ci.source = ?")
+            params.append(str(source))
+        if item_id:
+            conditions.append("(ci.corpus_item_id = ? OR ci.provider_record_id = ?)")
+            params.extend([str(item_id), str(item_id)])
+        if date_from:
+            conditions.append("COALESCE(ci.published_at, ci.effective_at, ci.observed_at) >= ?")
+            params.append(str(date_from))
+        if date_to:
+            conditions.append("COALESCE(ci.published_at, ci.effective_at, ci.observed_at) <= ?")
+            params.append(str(date_to))
+        if run_id:
+            conditions.append(
+                "(ci.metadata_json LIKE ? OR EXISTS ("
+                "SELECT 1 FROM scheduler_runs sr WHERE sr.run_id=? "
+                "AND datetime(ci.ingested_at) >= datetime(sr.started_at) "
+                "AND datetime(ci.ingested_at) <= datetime(COALESCE(sr.ended_at, 'now'))"
+                ") OR EXISTS ("
+                "SELECT 1 FROM ingestion_log il WHERE il.run_id=? "
+                "AND datetime(ci.ingested_at) >= datetime(il.started_at) "
+                "AND datetime(ci.ingested_at) <= datetime(COALESCE(il.completed_at, 'now'))"
+                "))"
+            )
+            normalized_run_id = str(run_id).strip()
+            params.extend([f"%{normalized_run_id}%", normalized_run_id, normalized_run_id])
+        if security:
+            conditions.append(
+                "EXISTS (SELECT 1 FROM corpus_item_securities cis "
+                "LEFT JOIN securities s ON s.security_id = cis.security_id "
+                "WHERE cis.corpus_item_id = ci.corpus_item_id "
+                "AND (cis.security_id = ? OR cis.ticker = ? OR s.ticker = ?))"
+            )
+            normalized = str(security).strip().upper()
+            params.extend([str(security), normalized, normalized])
+        params.append(limit)
         with self._connect() as conn:
             rows = conn.execute(
-                "SELECT * FROM corpus_items WHERE indexing_status IN ('pending', 'error') "
-                "ORDER BY updated_at, corpus_item_id LIMIT ?", (limit,),
+                "SELECT ci.* FROM corpus_items ci WHERE "
+                + " AND ".join(conditions)
+                + " ORDER BY ci.updated_at, ci.corpus_item_id LIMIT ?",
+                params,
             ).fetchall()
         return [self._decode_corpus_row(row) for row in rows]
 
-    def list_news_retention_candidates(self, cutoff: str, *, limit: int) -> list[dict]:
+    def list_retryable_filings(
+        self,
+        limit: int = 100,
+        *,
+        security: Optional[str] = None,
+        item_id: Optional[str] = None,
+        date_from: Optional[str] = None,
+        date_to: Optional[str] = None,
+        run_id: Optional[str] = None,
+    ) -> list[dict]:
+        """List stored SEC artifacts whose vector indexing can be retried."""
+        if limit < 1 or limit > self.MAX_INVENTORY_LIMIT:
+            raise ValueError(f"limit must be between 1 and {self.MAX_INVENTORY_LIMIT}")
+        conditions = ["status = 'index_pending'"]
+        params: list[object] = []
+        if item_id:
+            conditions.append("accession = ?")
+            params.append(str(item_id))
+        if security:
+            conditions.append("ticker = ?")
+            params.append(str(security).strip().upper())
+        if date_from:
+            conditions.append("filing_date >= ?")
+            params.append(str(date_from))
+        if date_to:
+            conditions.append("filing_date <= ?")
+            params.append(str(date_to))
+        if run_id:
+            conditions.append(
+                "(EXISTS ("
+                "SELECT 1 FROM scheduler_runs sr WHERE sr.run_id=? "
+                "AND datetime(filings.ingested_at) >= datetime(sr.started_at) "
+                "AND datetime(filings.ingested_at) <= datetime(COALESCE(sr.ended_at, 'now'))"
+                ") OR EXISTS ("
+                "SELECT 1 FROM ingestion_log il WHERE il.run_id=? "
+                "AND datetime(filings.ingested_at) >= datetime(il.started_at) "
+                "AND datetime(filings.ingested_at) <= datetime(COALESCE(il.completed_at, 'now'))"
+                "))"
+            )
+            normalized_run_id = str(run_id).strip()
+            params.extend([normalized_run_id, normalized_run_id])
+        params.append(limit)
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM filings WHERE " + " AND ".join(conditions)
+                + " ORDER BY filing_date, accession LIMIT ?",
+                params,
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def get_retryable_filing(self, accession: str) -> Optional[dict]:
+        """Read one internal SEC repair row, including its local artifact path."""
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM filings WHERE accession=? AND status='index_pending'",
+                (str(accession),),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def list_news_retention_candidates(
+        self,
+        cutoff: str,
+        *,
+        limit: int,
+        document_family_ids: Optional[list[str]] = None,
+    ) -> list[dict]:
         """Return a bounded set of indexed company-news families older than cutoff."""
         if limit < 1 or limit > self.MAX_MAINTENANCE_LIMIT:
             raise ValueError(
                 f"limit must be between 1 and {self.MAX_MAINTENANCE_LIMIT}"
             )
+        ids = list(dict.fromkeys(str(value) for value in (document_family_ids or []) if value))
+        conditions = [
+            "item_type='news'", "is_tombstone=0", "indexing_status='indexed'",
+            "published_at IS NOT NULL", "published_at < ?",
+        ]
+        params: list[object] = [cutoff]
+        if document_family_ids is not None and not ids:
+            conditions.append("0=1")
+        elif ids:
+            placeholders = ",".join("?" for _ in ids)
+            conditions.append(f"document_family_id IN ({placeholders})")
+            params.extend(ids)
         with self._connect() as conn:
             rows = conn.execute(
                 "SELECT corpus_item_id, document_family_id, published_at "
-                "FROM corpus_items WHERE item_type='news' AND is_tombstone=0 "
-                "AND indexing_status='indexed' AND published_at IS NOT NULL "
-                "AND published_at < ? ORDER BY published_at, corpus_item_id LIMIT ?",
-                (cutoff, limit),
+                "FROM corpus_items WHERE " + " AND ".join(conditions)
+                + " ORDER BY published_at, corpus_item_id LIMIT ?",
+                [*params, limit],
             ).fetchall()
         return [dict(row) for row in rows]
 
