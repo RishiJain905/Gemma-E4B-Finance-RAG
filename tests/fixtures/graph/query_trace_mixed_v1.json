@@ -1,0 +1,611 @@
+{
+  "_comment": "Mixed source-aware golden trace (2.3.5.1). SEC financing (primary) + corroborating company news + structured market observation + macro release, all resolving to one evidence ledger. Schema-compatibility only: kinds, relations, allowlisted metadata, bounded excerpts.",
+  "schema_version": 1,
+  "snapshot": {
+    "complete": true,
+    "created_at": 2000.0,
+    "edge_count": 18,
+    "edges": [
+      {
+        "id": "qmix:edge:21c895e3727eec7f",
+        "metadata": {},
+        "query_id": "qmix",
+        "relation": "compiled_to",
+        "sequence": 0,
+        "source": "qmix:query:request",
+        "target": "qmix:plan:validated"
+      },
+      {
+        "id": "qmix:edge:975a011d45f721e6",
+        "metadata": {},
+        "query_id": "qmix",
+        "relation": "contains",
+        "sequence": 0,
+        "source": "qmix:plan:validated",
+        "target": "qmix:subquery:sq0"
+      },
+      {
+        "id": "qmix:edge:720b3cc84f260ea0",
+        "metadata": {},
+        "query_id": "qmix",
+        "relation": "routed_to",
+        "sequence": 0,
+        "source": "qmix:plan:validated",
+        "target": "qmix:stage:route"
+      },
+      {
+        "id": "qmix:edge:a8de73432d92468c",
+        "metadata": {},
+        "query_id": "qmix",
+        "relation": "routed_to",
+        "sequence": 0,
+        "source": "qmix:subquery:sq0",
+        "target": "qmix:tool:sq0:query_facts"
+      },
+      {
+        "id": "qmix:edge:c460b7e05178c4a4",
+        "metadata": {
+          "status": "ok"
+        },
+        "query_id": "qmix",
+        "relation": "returned",
+        "sequence": 0,
+        "source": "qmix:tool:sq0:query_facts",
+        "target": "qmix:stage:retrieve"
+      },
+      {
+        "id": "qmix:edge:7f133d5fa3ef8b2c",
+        "metadata": {
+          "rank": 1
+        },
+        "query_id": "qmix",
+        "relation": "retrieved",
+        "sequence": 0,
+        "source": "qmix:subquery:sq0",
+        "target": "qmix:evidence:E1"
+      },
+      {
+        "id": "qmix:edge:e56d54c36c462cea",
+        "metadata": {},
+        "query_id": "qmix",
+        "relation": "from_source",
+        "sequence": 0,
+        "source": "qmix:evidence:E1",
+        "target": "qmix:source:massive"
+      },
+      {
+        "id": "qmix:edge:2704c2eeee5f528d",
+        "metadata": {
+          "rank": 2
+        },
+        "query_id": "qmix",
+        "relation": "retrieved",
+        "sequence": 0,
+        "source": "qmix:subquery:sq0",
+        "target": "qmix:evidence:E2"
+      },
+      {
+        "id": "qmix:edge:12ec41f870103173",
+        "metadata": {},
+        "query_id": "qmix",
+        "relation": "from_source",
+        "sequence": 0,
+        "source": "qmix:evidence:E2",
+        "target": "qmix:source:federal_reserve"
+      },
+      {
+        "id": "qmix:edge:d216171d328d0174",
+        "metadata": {
+          "rank": 3
+        },
+        "query_id": "qmix",
+        "relation": "retrieved",
+        "sequence": 0,
+        "source": "qmix:subquery:sq0",
+        "target": "qmix:evidence:E3"
+      },
+      {
+        "id": "qmix:edge:eba1d1fd4084b383",
+        "metadata": {},
+        "query_id": "qmix",
+        "relation": "from_source",
+        "sequence": 0,
+        "source": "qmix:evidence:E3",
+        "target": "qmix:source:sec_8k"
+      },
+      {
+        "id": "qmix:edge:49e2264c2d8fccf1",
+        "metadata": {
+          "rank": 4
+        },
+        "query_id": "qmix",
+        "relation": "retrieved",
+        "sequence": 0,
+        "source": "qmix:subquery:sq0",
+        "target": "qmix:evidence:E4"
+      },
+      {
+        "id": "qmix:edge:d90918e60bf28f1f",
+        "metadata": {},
+        "query_id": "qmix",
+        "relation": "from_source",
+        "sequence": 0,
+        "source": "qmix:evidence:E4",
+        "target": "qmix:source:finnhub"
+      },
+      {
+        "id": "qmix:edge:b250c4117f55d198",
+        "metadata": {},
+        "query_id": "qmix",
+        "relation": "returned",
+        "sequence": 0,
+        "source": "qmix:query:request",
+        "target": "qmix:answer:final"
+      },
+      {
+        "id": "qmix:edge:9db1b6a98a953238",
+        "metadata": {},
+        "query_id": "qmix",
+        "relation": "supports",
+        "sequence": 0,
+        "source": "qmix:evidence:E3",
+        "target": "qmix:answer:final"
+      },
+      {
+        "id": "qmix:edge:a27cdf64e01b32aa",
+        "metadata": {},
+        "query_id": "qmix",
+        "relation": "cited_by",
+        "sequence": 0,
+        "source": "qmix:evidence:E3",
+        "target": "qmix:citation:E3"
+      },
+      {
+        "id": "qmix:edge:f3af5d6d97966443",
+        "metadata": {},
+        "query_id": "qmix",
+        "relation": "supports",
+        "sequence": 0,
+        "source": "qmix:citation:E3",
+        "target": "qmix:answer:final"
+      },
+      {
+        "id": "qmix:edge:e1b3174e02acdf65",
+        "metadata": {
+          "status": "supported"
+        },
+        "query_id": "qmix",
+        "relation": "validated_as",
+        "sequence": 0,
+        "source": "qmix:answer:final",
+        "target": "qmix:stage:validate"
+      }
+    ],
+    "last_sequence": 39,
+    "node_count": 18,
+    "nodes": [
+      {
+        "created_sequence": 0,
+        "id": "qmix:query:request",
+        "kind": "query",
+        "label": "Query",
+        "metadata": {
+          "question_digest": "547c03c8628d73981a1c054028b3e84d3b917652bdb383cb2369858bb36134cf",
+          "question_preview_chars": 200
+        },
+        "query_id": "qmix",
+        "status": "active",
+        "summary": "How did Oracle finance its 2026 debt and what were rates?",
+        "updated_sequence": 0
+      },
+      {
+        "created_sequence": 1,
+        "id": "qmix:stage:compile",
+        "kind": "stage",
+        "label": "Compile",
+        "metadata": {
+          "elapsed_ms": 1.0
+        },
+        "query_id": "qmix",
+        "status": "complete",
+        "summary": "",
+        "updated_sequence": 1
+      },
+      {
+        "created_sequence": 2,
+        "id": "qmix:plan:validated",
+        "kind": "plan",
+        "label": "Validated Query Plan",
+        "metadata": {
+          "lane": "standard",
+          "tickers": [
+            "ORCL"
+          ]
+        },
+        "query_id": "qmix",
+        "status": "complete",
+        "summary": "",
+        "updated_sequence": 2
+      },
+      {
+        "created_sequence": 3,
+        "group_id": "qmix:plan:validated",
+        "id": "qmix:subquery:sq0",
+        "kind": "subquery",
+        "label": "sq0",
+        "metadata": {
+          "subquery_id": "sq0",
+          "tickers": [
+            "ORCL"
+          ]
+        },
+        "query_id": "qmix",
+        "status": "complete",
+        "summary": "",
+        "updated_sequence": 3
+      },
+      {
+        "created_sequence": 4,
+        "id": "qmix:stage:route",
+        "kind": "stage",
+        "label": "Route",
+        "metadata": {
+          "retrieval_strategy": "hybrid"
+        },
+        "query_id": "qmix",
+        "status": "complete",
+        "summary": "",
+        "updated_sequence": 4
+      },
+      {
+        "created_sequence": 9,
+        "id": "qmix:tool:sq0:query_facts",
+        "kind": "tool",
+        "label": "query_facts",
+        "metadata": {
+          "count": 2,
+          "status": "ok",
+          "subquery_id": "sq0"
+        },
+        "query_id": "qmix",
+        "status": "complete",
+        "summary": "",
+        "updated_sequence": 11
+      },
+      {
+        "created_sequence": 8,
+        "id": "qmix:stage:retrieve",
+        "kind": "stage",
+        "label": "Retrieve",
+        "metadata": {
+          "elapsed_ms": 4.0
+        },
+        "query_id": "qmix",
+        "status": "complete",
+        "summary": "",
+        "updated_sequence": 14
+      },
+      {
+        "created_sequence": 15,
+        "id": "qmix:evidence:E1",
+        "kind": "evidence",
+        "label": "Evidence E1",
+        "metadata": {
+          "accessed_at": "2026-05-15T02:00:00Z",
+          "authority_tier": "structured",
+          "canonical_security": "ORCL",
+          "corpus_item_id": "obs-massive-orcl-2026-05-14",
+          "coverage_tier": "unknown",
+          "date_semantics": {
+            "domain_timestamp": "2026-05-14T20:00:00Z",
+            "domain_timestamp_kind": "as_of_at",
+            "effective_at": null,
+            "ingested_at": "2026-05-15T02:00:00Z",
+            "observation_period": "2026-05-14",
+            "published_at": null,
+            "source_vintage": "2026-05-14T20:00:00Z"
+          },
+          "document_family_id": null,
+          "effective_at": null,
+          "event_type": null,
+          "evidence_id": "E1",
+          "evidence_role": null,
+          "exhibit": null,
+          "filing_item": null,
+          "form": null,
+          "index_memberships": [
+            "SP500",
+            "NDX"
+          ],
+          "item_type": "market_observation",
+          "kind": "fact",
+          "normalization_version": "records-v1",
+          "provider": "massive",
+          "published_at": null,
+          "publisher": null,
+          "rank": 1,
+          "sector": "Technology",
+          "security_id": "ORCL-US",
+          "source": "massive",
+          "source_category": "market_data",
+          "source_name": "massive",
+          "source_type": "massive"
+        },
+        "query_id": "qmix",
+        "status": "complete",
+        "summary": "close 178.42 USD 2026-05-14",
+        "updated_sequence": 15
+      },
+      {
+        "created_sequence": 16,
+        "id": "qmix:source:massive",
+        "kind": "source",
+        "label": "MASSIVE",
+        "metadata": {
+          "authority_tier": "structured",
+          "provider": "massive",
+          "source_category": "market_data",
+          "source_name": "massive",
+          "source_type": "massive"
+        },
+        "query_id": "qmix",
+        "status": "complete",
+        "summary": "",
+        "updated_sequence": 16
+      },
+      {
+        "created_sequence": 19,
+        "id": "qmix:evidence:E2",
+        "kind": "evidence",
+        "label": "Evidence E2",
+        "metadata": {
+          "accessed_at": "2026-05-02T02:00:00Z",
+          "authority_tier": "primary",
+          "canonical_security": null,
+          "corpus_item_id": "obs-fred-dff-2026-05-01",
+          "coverage_tier": "global",
+          "date_semantics": {
+            "domain_timestamp": "2026-05-01T18:00:00Z",
+            "domain_timestamp_kind": "published_at",
+            "effective_at": "2026-05-01T00:00:00Z",
+            "ingested_at": "2026-05-02T02:00:00Z",
+            "observation_period": "2026-05-01",
+            "published_at": "2026-05-01T18:00:00Z",
+            "source_vintage": null
+          },
+          "document_family_id": null,
+          "effective_at": "2026-05-01T00:00:00Z",
+          "event_type": "monetary_policy_decision",
+          "evidence_id": "E2",
+          "evidence_role": null,
+          "exhibit": null,
+          "filing_item": null,
+          "form": null,
+          "index_memberships": [],
+          "item_type": "policy_release",
+          "kind": "fact",
+          "normalization_version": "records-v1",
+          "provider": "federal_reserve",
+          "published_at": "2026-05-01T18:00:00Z",
+          "publisher": null,
+          "rank": 2,
+          "sector": null,
+          "security_id": null,
+          "source": "federal_reserve",
+          "source_category": "central_bank",
+          "source_name": "federal_reserve",
+          "source_type": "federal_reserve"
+        },
+        "query_id": "qmix",
+        "status": "complete",
+        "summary": "federal_funds_rate 4.33 percent 2026-05-01",
+        "updated_sequence": 19
+      },
+      {
+        "created_sequence": 20,
+        "id": "qmix:source:federal_reserve",
+        "kind": "source",
+        "label": "FEDERAL RESERVE",
+        "metadata": {
+          "authority_tier": "primary",
+          "provider": "federal_reserve",
+          "source_category": "central_bank",
+          "source_name": "federal_reserve",
+          "source_type": "federal_reserve"
+        },
+        "query_id": "qmix",
+        "status": "complete",
+        "summary": "",
+        "updated_sequence": 20
+      },
+      {
+        "created_sequence": 23,
+        "id": "qmix:evidence:E3",
+        "kind": "evidence",
+        "label": "Evidence E3",
+        "metadata": {
+          "accessed_at": "2026-05-13T22:00:00Z",
+          "authority_tier": "direct_sec",
+          "canonical_security": "ORCL",
+          "corpus_item_id": "sec-orcl-notes-2026",
+          "coverage_tier": "broad",
+          "date_semantics": {
+            "domain_timestamp": "2026-05-13T21:05:00Z",
+            "domain_timestamp_kind": "published_at",
+            "effective_at": null,
+            "ingested_at": "2026-05-13T22:00:00Z",
+            "observation_period": null,
+            "published_at": "2026-05-13T21:05:00Z",
+            "source_vintage": null
+          },
+          "document_family_id": "sec:0001341439-26-000123:item_1_01",
+          "effective_at": null,
+          "event_type": "debt_raise",
+          "evidence_id": "E3",
+          "evidence_role": "primary",
+          "exhibit": "4.1",
+          "filing_item": "1.01",
+          "form": "8-K",
+          "index_memberships": [
+            "SP500",
+            "NDX"
+          ],
+          "item_type": "filing",
+          "kind": "document",
+          "normalization_version": "records-v1",
+          "provider": "sec",
+          "published_at": "2026-05-13T21:05:00Z",
+          "publisher": null,
+          "rank": 3,
+          "sector": "Technology",
+          "security_id": "ORCL-US",
+          "source": "sec",
+          "source_category": "sec",
+          "source_name": "sec",
+          "source_type": "sec_8k"
+        },
+        "query_id": "qmix",
+        "status": "complete",
+        "summary": "Oracle priced $8.0B of senior notes.",
+        "updated_sequence": 23
+      },
+      {
+        "created_sequence": 24,
+        "id": "qmix:source:sec_8k",
+        "kind": "source",
+        "label": "SEC 8K",
+        "metadata": {
+          "authority_tier": "direct_sec",
+          "provider": "sec",
+          "source_category": "sec",
+          "source_name": "sec",
+          "source_type": "sec_8k"
+        },
+        "query_id": "qmix",
+        "status": "complete",
+        "summary": "",
+        "updated_sequence": 24
+      },
+      {
+        "created_sequence": 27,
+        "id": "qmix:evidence:E4",
+        "kind": "evidence",
+        "label": "Evidence E4",
+        "metadata": {
+          "accessed_at": "2026-05-13T22:10:00Z",
+          "authority_tier": "licensed",
+          "canonical_security": "ORCL",
+          "corpus_item_id": "finnhub-orcl-notes-2026",
+          "coverage_tier": "broad",
+          "date_semantics": {
+            "domain_timestamp": "2026-05-13T21:40:00Z",
+            "domain_timestamp_kind": "published_at",
+            "effective_at": null,
+            "ingested_at": "2026-05-13T22:10:00Z",
+            "observation_period": null,
+            "published_at": "2026-05-13T21:40:00Z",
+            "source_vintage": null
+          },
+          "document_family_id": "finnhub:reuters-orcl-notes",
+          "effective_at": null,
+          "event_type": null,
+          "evidence_id": "E4",
+          "evidence_role": "corroborating",
+          "exhibit": null,
+          "filing_item": null,
+          "form": null,
+          "index_memberships": [],
+          "item_type": "news",
+          "kind": "document",
+          "normalization_version": "records-v1",
+          "provider": "finnhub",
+          "published_at": "2026-05-13T21:40:00Z",
+          "publisher": "Reuters",
+          "rank": 4,
+          "sector": "Technology",
+          "security_id": "ORCL-US",
+          "source": "finnhub",
+          "source_category": "company_news",
+          "source_name": "finnhub",
+          "source_type": "finnhub"
+        },
+        "query_id": "qmix",
+        "status": "complete",
+        "summary": "Oracle sells $8 billion in bonds, Reuters reports.",
+        "updated_sequence": 27
+      },
+      {
+        "created_sequence": 28,
+        "id": "qmix:source:finnhub",
+        "kind": "source",
+        "label": "FINNHUB",
+        "metadata": {
+          "authority_tier": "licensed",
+          "provider": "finnhub",
+          "publisher": "Reuters",
+          "source_category": "company_news",
+          "source_name": "finnhub",
+          "source_type": "finnhub"
+        },
+        "query_id": "qmix",
+        "status": "complete",
+        "summary": "",
+        "updated_sequence": 28
+      },
+      {
+        "created_sequence": 31,
+        "id": "qmix:answer:final",
+        "kind": "answer",
+        "label": "Final Answer",
+        "metadata": {
+          "documents": 2,
+          "facts": 2,
+          "status": "grounded"
+        },
+        "query_id": "qmix",
+        "status": "complete",
+        "summary": "",
+        "updated_sequence": 31
+      },
+      {
+        "created_sequence": 32,
+        "id": "qmix:citation:E3",
+        "kind": "citation",
+        "label": "Citation E3",
+        "metadata": {
+          "authority_tier": "direct_sec",
+          "canonical_security": "ORCL",
+          "event_type": "debt_raise",
+          "evidence_id": "E3",
+          "item_type": "filing",
+          "provider": "sec",
+          "source_category": "sec",
+          "support_status": "supported"
+        },
+        "query_id": "qmix",
+        "status": "complete",
+        "summary": "",
+        "updated_sequence": 32
+      },
+      {
+        "created_sequence": 37,
+        "id": "qmix:stage:validate",
+        "kind": "stage",
+        "label": "Validate",
+        "metadata": {
+          "citation_support_rate": 1.0,
+          "validation_status": "supported"
+        },
+        "query_id": "qmix",
+        "status": "complete",
+        "summary": "",
+        "updated_sequence": 37
+      }
+    ],
+    "query_id": "qmix",
+    "question_digest": "547c03c8628d73981a1c054028b3e84d3b917652bdb383cb2369858bb36134cf",
+    "question_preview": "How did Oracle finance its 2026 debt and what were rates?",
+    "schema_version": 1,
+    "updated_at": 2000.0
+  }
+}

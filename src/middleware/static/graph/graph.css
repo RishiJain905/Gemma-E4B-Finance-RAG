@@ -394,7 +394,11 @@ td.mono, td .mono { font-family: var(--mono); }
 .insp-label { font-size: 15px; margin: 2px 0 12px; color: var(--ink); }
 .insp-meta { margin: 0; display: grid; grid-template-columns: minmax(88px, auto) 1fr; gap: 4px 12px; }
 .insp-meta dt { color: var(--ink-dim); font-size: 11px; text-transform: uppercase; letter-spacing: 0.05em; }
-.insp-meta dd { margin: 0; font-family: var(--mono); font-size: 12.5px; word-break: break-word; }
+/* 2.3.5.1: source-aware provenance adds opaque corpus/family ids and a
+   flattened date-semantics line — wrap anywhere and use tabular figures so long
+   ids and timestamps stay legible inside the fixed-width inspector. */
+.insp-meta dd { margin: 0; font-family: var(--mono); font-size: 12.5px;
+  word-break: break-word; overflow-wrap: anywhere; font-variant-numeric: tabular-nums; }
 .insp-meta dd a { color: var(--flow); }
 
 .insp-excerpt-wrap, .insp-prov-wrap { margin-top: 14px; }

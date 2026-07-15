@@ -135,6 +135,9 @@ class EvidenceCitation(BaseModel):
     date_semantics: Optional[dict] = None
     canonical_security: Optional[str] = None
     coverage_tier: Optional[str] = None
+    source_category: Optional[str] = None
+    provider: Optional[str] = None
+    publisher: Optional[str] = None
 
 
 class QueryResponse(BaseModel):

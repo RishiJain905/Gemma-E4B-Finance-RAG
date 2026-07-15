@@ -273,3 +273,77 @@ def test_graph_js_folds_corpus_freshness_leaves():
     assert "foldCorpusForCanvas" in js
     assert "updateCorpusLabelLOD" in js
     assert "freshWorst" in js
+
+
+# ── 2.3.5.1: source-aware live trace ─────────────────────────────────────────
+
+MIXED_FIXTURE = Path(__file__).parent / "fixtures" / "graph" / "query_trace_mixed_v1.json"
+
+
+def test_mixed_source_fixture_matches_wire_schema_and_resolves_to_ledger():
+    """The 2.3.5.1 mixed fixture (SEC financing + company news + market
+    observation + macro release) is schema_version 1 — Phase 2.2 readers still
+    parse it — and every source/evidence/citation resolves to the ledger."""
+    import json
+
+    from src.middleware.graph_observer import (
+        EDGE_RELATIONS,
+        NODE_KINDS,
+        NODE_STATUSES,
+        _DENIED_KEY,
+    )
+
+    fixture = json.loads(MIXED_FIXTURE.read_text(encoding="utf-8"))
+    assert fixture["schema_version"] == 1
+    snapshot = fixture["snapshot"]
+    assert snapshot["schema_version"] == 1 and snapshot["complete"] is True
+
+    node_ids = set()
+    evidence_ids = set()
+    categories = set()
+    for node in snapshot["nodes"]:
+        assert node["kind"] in NODE_KINDS, node["kind"]
+        assert node["status"] in NODE_STATUSES, node["status"]
+        node_ids.add(node["id"])
+        metadata = node.get("metadata") or {}
+        for key in metadata:
+            assert not _DENIED_KEY.search(key), f"denied metadata key: {key}"
+        assert not (_LAYOUT_KEYS & set(metadata)), "fixture must not embed layout"
+        if node["kind"] == "evidence":
+            assert len(node.get("summary", "")) <= 1000
+            evidence_ids.add(metadata.get("evidence_id"))
+            categories.add(metadata.get("source_category"))
+
+    # Four distinct source categories, no provider-specific node kinds.
+    assert categories == {"sec", "company_news", "market_data", "central_bank"}
+
+    for edge in snapshot["edges"]:
+        assert edge["relation"] in EDGE_RELATIONS, edge["relation"]
+        assert edge["source"] in node_ids, f"dangling source {edge['source']}"
+        assert edge["target"] in node_ids, f"dangling target {edge['target']}"
+        # Every source/citation link resolves to a real evidence node.
+        if edge["relation"] in ("from_source", "cited_by"):
+            assert edge["source"].rsplit(":", 1)[-1] in evidence_ids
+
+    # provider/publisher distinction is preserved on the wire.
+    news = next(n for n in snapshot["nodes"]
+                if n["kind"] == "evidence" and n["metadata"].get("source_category") == "company_news")
+    assert news["metadata"]["provider"] == "finnhub"
+    assert news["metadata"]["publisher"] == "Reuters"
+
+
+def test_graph_js_renders_source_aware_metadata_and_subtypes():
+    """The inspector flattens nested date-semantics, and evidence subtypes ride
+    on metadata-driven data attributes (never new node kinds)."""
+    js = JS.read_text(encoding="utf-8")
+    assert "formatMetaValue" in js
+    assert "isPlainObject" in js
+    # Authority tier + primary/corroborating role drive style, not node kinds.
+    assert "atier" in js and "erole" in js
+    assert 'atier="primary"' in js or "atier=\"direct_sec\"" in js
+    assert 'erole="corroborating"' in js
+
+
+def test_graph_css_handles_richer_provenance_values():
+    css = CSS.read_text(encoding="utf-8")
+    assert "overflow-wrap: anywhere" in css

@@ -17,6 +17,10 @@ from typing import Callable, Optional
 
 logger = logging.getLogger(__name__)
 
+# Schema version. 2.3.5.1 only *adds* optional allowlisted metadata keys and
+# reuses the existing node kinds/edge relations/statuses, so Phase 2.2 golden
+# traces stay readable and the version does not bump. Bump this only when a
+# required field or an enum (kind/status/relation) changes incompatibly.
 GRAPH_SCHEMA_VERSION = 1
 NODE_KINDS = frozenset({
     "query", "plan", "subquery", "stage", "tool", "evidence", "source",
@@ -46,24 +50,35 @@ _NODE_METADATA_ALLOWLIST = {
     "stage": frozenset({
         "phase", "elapsed_ms", "reason", "status", "count", "lane",
         "retrieval_rounds", "planning_calls", "reranker_calls", "context_chars",
-        "evidence_dropped", "fallback_reason", "retrieval_strategy",
-        "citation_support_rate", "numeric_claims_supported",
+        "evidence_dropped", "evidence_deduped", "fallback_reason",
+        "retrieval_strategy", "citation_support_rate", "numeric_claims_supported",
         "numeric_claims_unsupported", "validation_status", "ticker", "metrics",
         "period", "kind", "score",
     }),
     "tool": frozenset({"subquery_id", "count", "elapsed_ms", "status"}),
+    # 2.3.5.1: source-aware provenance. Every field is an already-safe scalar,
+    # a bounded date, or an opaque id — never keys, payloads, or full text.
     "evidence": frozenset({
         "evidence_id", "kind", "ticker", "metric", "period", "source_type",
         "rank", "score", "freshness", "unit", "as_of", "store_id", "section",
         "parent_id", "item_type", "event_type", "authority_tier", "source",
         "date_semantics", "canonical_security", "coverage_tier",
+        "security_id", "index_memberships", "sector", "source_category",
+        "source_name", "provider", "publisher", "form", "filing_item",
+        "exhibit", "published_at", "effective_at", "accessed_at",
+        "normalization_version", "corpus_item_id", "document_family_id",
+        "evidence_role",
     }),
-    "source": frozenset({"source_type", "ticker", "freshness", "count"}),
+    "source": frozenset({
+        "source_type", "ticker", "freshness", "count", "source_category",
+        "source_name", "authority_tier", "provider", "publisher",
+    }),
     "answer": frozenset({"status", "facts", "documents", "elapsed_ms"}),
     "citation": frozenset({
         "evidence_id", "source_type", "ticker", "metric", "period", "support_status",
         "item_type", "event_type", "authority_tier", "source",
         "date_semantics", "canonical_security", "coverage_tier",
+        "source_category", "provider", "publisher",
     }),
 }
 _EDGE_METADATA_ALLOWLIST = frozenset({"rank", "score", "status", "elapsed_ms", "reason"})

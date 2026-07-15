@@ -4,6 +4,7 @@ Offline API tests for read-only localhost query graph endpoints.
 
 from __future__ import annotations
 
+import json
 import types
 from unittest.mock import AsyncMock
 
@@ -68,6 +69,31 @@ def test_trace_snapshot_evidence_and_health_are_read_only_and_bounded():
     assert health["trace_count"] == 1
     assert health["limits"]["subscriber_queue"] == 256
     assert client.post("/graph/api/traces").status_code == 405
+
+
+def test_evidence_detail_surfaces_source_aware_metadata():
+    from src.middleware.graph_observer import GraphDelta, GraphNode, TraceHub
+
+    hub = TraceHub()
+    hub.publish(GraphDelta(
+        query_id="q1", sequence=0, operation="upsert_node",
+        node=GraphNode(
+            id="q1:evidence:E1", query_id="q1", kind="evidence",
+            label="Evidence E1", summary="Oracle notes", status="complete",
+            metadata={
+                "evidence_id": "E1", "source_category": "company_news",
+                "provider": "finnhub", "publisher": "Reuters", "item_type": "news",
+                "authority_tier": "licensed", "evidence_role": "corroborating",
+                "api_key": "CANARY",  # denied key must never survive
+            },
+        ),
+    ))
+    detail = _client(hub).get("/graph/api/traces/q1/evidence/E1").json()
+    meta = detail["metadata"]
+    assert meta["source_category"] == "company_news"
+    assert meta["provider"] == "finnhub" and meta["publisher"] == "Reuters"
+    assert meta["evidence_role"] == "corroborating"
+    assert "api_key" not in meta and "CANARY" not in json.dumps(detail)
 
 
 def test_missing_trace_and_evidence_return_404():

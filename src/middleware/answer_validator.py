@@ -104,6 +104,9 @@ class CitationRecord:
     date_semantics: Optional[dict] = None
     canonical_security: Optional[str] = None
     coverage_tier: Optional[str] = None
+    source_category: Optional[str] = None
+    provider: Optional[str] = None
+    publisher: Optional[str] = None
 
     def to_dict(self) -> dict:
         data = {
@@ -128,6 +131,9 @@ class CitationRecord:
             "date_semantics": self.date_semantics,
             "canonical_security": self.canonical_security,
             "coverage_tier": self.coverage_tier,
+            "source_category": self.source_category,
+            "provider": self.provider,
+            "publisher": self.publisher,
         }
         return {key: value for key, value in values.items() if value not in (None, {})}
 
@@ -425,6 +431,9 @@ def _parse_citations(answer: str, by_id: dict) -> list[CitationRecord]:
                     date_semantics=dict(item.date_semantics),
                     canonical_security=item.canonical_security,
                     coverage_tier=item.coverage_tier,
+                    source_category=item.source_category,
+                    provider=item.provider,
+                    publisher=item.publisher,
                 ))
             else:
                 records.append(CitationRecord(

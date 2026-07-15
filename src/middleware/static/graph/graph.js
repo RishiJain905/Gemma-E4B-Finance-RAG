@@ -303,6 +303,11 @@ if (typeof document !== "undefined" && document.getElementById("graph-canvas")) 
         { selector: 'node[kind="tool"]', style: { shape: "hexagon", width: 40, height: 38 } },
         { selector: 'node[kind="evidence"]', style: { shape: "diamond", width: 34, height: 34 } },
         { selector: 'node[kind="evidence"][emd="document"]', style: { shape: "cut-rectangle", width: 34, height: 40 } },
+        // Source-aware subtypes (2.3.5.1): drawn from metadata, never a new node
+        // kind. Primary/authoritative evidence reads bolder; corroborating (a
+        // secondary source on the same event) is lighter and dashed.
+        { selector: 'node[kind="evidence"][atier="primary"], node[kind="evidence"][atier="direct_sec"]', style: { "border-width": 3, "background-color": COL.surface } },
+        { selector: 'node[kind="evidence"][erole="corroborating"]', style: { "border-style": "dashed", "background-opacity": 0.55 } },
         { selector: 'node[kind="source"]', style: { shape: "ellipse", "background-opacity": 0, "border-width": 2.4, width: 30, height: 30 } },
         { selector: 'node[kind="answer"]', style: { shape: "round-rectangle", "border-style": "double", "border-width": 4, width: 96, height: 34, "text-valign": "center", "text-margin-y": 0 } },
         { selector: 'node[kind="citation"]', style: { shape: "tag", width: 40, height: 30 } },
@@ -346,12 +351,17 @@ if (typeof document !== "undefined" && document.getElementById("graph-canvas")) 
 
     /* ══ 3./4. Rendering ══════════════════════════════════════════════════ */
     function nodeToEle(n) {
-      const emd = (n.metadata && n.metadata.kind) || "";
+      const m = n.metadata || {};
+      const emd = m.kind || "";
+      // Source-aware subtypes ride on data attributes (never new node kinds), so
+      // authority tier and primary/corroborating role can drive style/legend.
       return {
         group: "nodes",
         data: {
           id: n.id, label: displayLabel(n), kind: n.kind,
           status: n.status, emd, raw: n,
+          atier: m.authority_tier || "", erole: m.evidence_role || "",
+          scat: m.source_category || "",
         },
       };
     }
@@ -364,6 +374,21 @@ if (typeof document !== "undefined" && document.getElementById("graph-canvas")) 
         return m.evidence_id || m.ticker || n.label || "evidence";
       }
       return n.label || n.kind;
+    }
+    function isPlainObject(v) {
+      return v != null && typeof v === "object" && !Array.isArray(v);
+    }
+    // Render allowlisted metadata values without innerHTML. Nested date-semantics
+    // maps flatten to "key: value · …" so timestamps stay legible in the inspector.
+    function formatMetaValue(val) {
+      if (Array.isArray(val)) return val.join(", ");
+      if (isPlainObject(val)) {
+        return Object.keys(val)
+          .filter((k) => val[k] != null && val[k] !== "")
+          .map((k) => `${k.replace(/_/g, " ")}: ${val[k]}`)
+          .join(" · ");
+      }
+      return String(val);
     }
 
     function activeTrace() {
@@ -853,6 +878,7 @@ if (typeof document !== "undefined" && document.getElementById("graph-canvas")) 
       for (const key of Object.keys(meta)) {
         const val = meta[key];
         if (val == null || val === "" || (Array.isArray(val) && !val.length)) continue;
+        if (isPlainObject(val) && !Object.keys(val).length) continue;
         const dt = document.createElement("dt");
         dt.textContent = key.replace(/_/g, " ");
         const dd = document.createElement("dd");
@@ -861,7 +887,7 @@ if (typeof document !== "undefined" && document.getElementById("graph-canvas")) 
           a.href = val; a.textContent = val; a.rel = "noreferrer noopener"; a.target = "_blank";
           dd.appendChild(a);
         } else {
-          dd.textContent = Array.isArray(val) ? val.join(", ") : String(val);
+          dd.textContent = formatMetaValue(val);
         }
         dl.appendChild(dt); dl.appendChild(dd);
       }
@@ -973,7 +999,13 @@ if (typeof document !== "undefined" && document.getElementById("graph-canvas")) 
       if (m.score != null) parts.push(`score ${m.score}`);
       if (m.elapsed_ms != null) parts.push(`${m.elapsed_ms}ms`);
       if (m.count != null) parts.push(`${m.count}`);
-      if (m.source_type) parts.push(m.source_type);
+      // Source-aware summary: category + item/event type + role, so the table
+      // reads as "who said it, what kind, primary or corroborating".
+      if (m.source_category) parts.push(m.source_category);
+      else if (m.source_type) parts.push(m.source_type);
+      if (m.item_type) parts.push(m.item_type);
+      if (m.event_type) parts.push(m.event_type);
+      if (m.evidence_role) parts.push(m.evidence_role);
       return parts.join(" · ");
     }
     function highlightRows(id) {
