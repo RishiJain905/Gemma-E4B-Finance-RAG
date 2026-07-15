@@ -164,9 +164,31 @@ def dispatch_named_tool(
     if tool.write and not ctx.allow_write:
         return finish({"error": "write tools disabled"}, name, args)
     if tool.write:
-        if ctx.refresh_count + 1 > ctx.max_refreshes:
+        refresh_cost = 1
+        if name == "refresh_data":
+            requested_sources = args.get("sources")
+            if isinstance(requested_sources, list) and requested_sources:
+                refresh_cost = len({
+                    str(source).strip().lower()
+                    for source in requested_sources
+                    if str(source).strip()
+                })
+            else:
+                try:
+                    report = store.get_freshness_report(
+                        str(args.get("ticker") or "").strip().upper()
+                    )
+                    refresh_cost = sum(
+                        1
+                        for status in report.get("sources", {}).values()
+                        if status.get("status") in {"stale", "never_fetched"}
+                    )
+                except Exception:  # noqa: BLE001 - the guard must fail closed
+                    refresh_cost = ctx.max_refreshes - ctx.refresh_count
+                refresh_cost = max(refresh_cost, 1)
+        if ctx.refresh_count + refresh_cost > ctx.max_refreshes:
             return finish({"error": "max refreshes exceeded", "tool": name}, name, args)
-        ctx.refresh_count += 1
+        ctx.refresh_count += refresh_cost
 
     start = perf_counter()
     try:

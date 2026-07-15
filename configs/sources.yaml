@@ -1,0 +1,457 @@
+# configs/sources.yaml
+# Scheduler-owned source cadence, cursor, quota, and bounded-work registry.
+version: "2.3.4.1-r1"
+
+# Explicit bootstrap windows. These values are never consulted by daily or
+# hourly incremental runs.
+bootstrap:
+  sec_lookback_days: 30
+  company_news_days: 30
+  market_history_days: 30
+  macro_history_observations: 5
+  max_sec_partitions: 90
+  max_run_summaries: 100
+
+sources:
+  universe_nasdaq100:
+    capability_group: universe
+    enabled: true
+    scope: universe
+    cadence: daily
+    run_modes: [daily, all]
+    priority: 10
+    dependencies: []
+    cursor_kind: timestamp
+    overlap: null
+    requests_per_minute: 10
+    requests_per_day: 100
+    requests_per_run: 1
+    batch_size: 1
+    max_work_items_per_run: 1
+    retry_policy: public_snapshot
+    ttl_key: universe_nasdaq100
+    ttl_hours: 24
+
+  universe_ivv:
+    capability_group: universe
+    enabled: true
+    scope: universe
+    cadence: daily
+    run_modes: [daily, all]
+    priority: 11
+    dependencies: []
+    cursor_kind: timestamp
+    overlap: null
+    requests_per_minute: 10
+    requests_per_day: 100
+    requests_per_run: 1
+    batch_size: 1
+    max_work_items_per_run: 1
+    retry_policy: public_snapshot
+    ttl_key: universe_ivv
+    ttl_hours: 24
+
+  universe_sec:
+    capability_group: universe
+    enabled: true
+    scope: universe
+    cadence: daily
+    run_modes: [daily, all]
+    priority: 12
+    dependencies: []
+    cursor_kind: timestamp
+    overlap: null
+    requests_per_minute: 10
+    requests_per_day: 100
+    requests_per_run: 1
+    batch_size: 1
+    max_work_items_per_run: 1
+    retry_policy: sec
+    ttl_key: universe_sec
+    ttl_hours: 24
+
+  yfinance:
+    capability_group: company_data
+    enabled: true
+    scope: broad
+    cadence: daily
+    run_modes: [daily, all]
+    priority: 20
+    dependencies: []
+    cursor_kind: none
+    overlap: null
+    requests_per_minute: 60
+    requests_per_day: 5000
+    requests_per_run: 600
+    batch_size: 1
+    max_work_items_per_run: 600
+    retry_policy: market_data
+    ttl_key: fundamentals
+    ttl_hours: 24
+
+  sec_filings:
+    capability_group: company_events
+    enabled: true
+    scope: broad
+    cadence: daily
+    run_modes: [daily, weekly, all]
+    priority: 30
+    dependencies: []
+    cursor_kind: daily_index
+    overlap: 2d
+    requests_per_minute: 10
+    requests_per_day: 1000
+    requests_per_run: 200
+    batch_size: 1
+    max_work_items_per_run: 200
+    retry_policy: sec
+    ttl_key: sec_filings
+    ttl_hours: 12
+
+  sec_companyfacts:
+    capability_group: company_facts
+    enabled: true
+    scope: deep
+    cadence: daily
+    run_modes: [daily, all]
+    priority: 35
+    dependencies: []
+    cursor_kind: timestamp
+    overlap: 24h
+    requests_per_minute: 10
+    requests_per_day: 1000
+    requests_per_run: 100
+    batch_size: 1
+    max_work_items_per_run: 100
+    retry_policy: sec
+    ttl_key: sec_companyfacts
+    ttl_hours: 24
+
+  finnhub:
+    capability_group: company_news
+    enabled: true
+    required_env: FINNHUB_API_KEY
+    scope: broad
+    cadence: daily
+    run_modes: [daily, all]
+    priority: 40
+    dependencies: []
+    cursor_kind: timestamp
+    overlap: 6h
+    requests_per_minute: 30
+    requests_per_day: 500
+    requests_per_run: 200
+    batch_size: 1
+    max_work_items_per_run: 200
+    retry_policy: vendor_news
+    ttl_key: finnhub_news
+    ttl_hours: 6
+
+  massive:
+    capability_group: market_data
+    enabled: true
+    required_env: MASSIVE_API_KEY
+    scope: broad
+    cadence: daily
+    run_modes: [daily, all]
+    priority: 45
+    dependencies: []
+    cursor_kind: date
+    overlap: 2d
+    requests_per_minute: 5
+    requests_per_day: 100
+    requests_per_run: 20
+    batch_size: 4
+    max_work_items_per_run: 1
+    retry_policy: vendor_market
+    ttl_key: massive_market
+    ttl_hours: 24
+
+  fred:
+    capability_group: macro
+    enabled: true
+    scope: global
+    cadence: daily
+    run_modes: [daily, all]
+    priority: 50
+    dependencies: []
+    cursor_kind: date
+    overlap: 1d
+    requests_per_minute: 60
+    requests_per_day: 1000
+    requests_per_run: 100
+    batch_size: 1
+    max_work_items_per_run: 100
+    retry_policy: public_api
+    ttl_key: macro
+    ttl_hours: 24
+
+  federal_reserve:
+    capability_group: official_feeds
+    enabled: true
+    scope: global
+    cadence: daily
+    run_modes: [daily, all]
+    priority: 60
+    dependencies: []
+    cursor_kind: timestamp
+    overlap: 24h
+    requests_per_minute: 30
+    requests_per_day: 500
+    requests_per_run: 10
+    batch_size: 5
+    max_work_items_per_run: 5
+    retry_policy: official_feed
+    ttl_key: federal_reserve
+    ttl_hours: 12
+
+  treasury:
+    capability_group: official_feeds
+    enabled: true
+    scope: global
+    cadence: daily
+    run_modes: [daily, all]
+    priority: 61
+    dependencies: []
+    cursor_kind: date
+    overlap: 2d
+    requests_per_minute: 30
+    requests_per_day: 500
+    requests_per_run: 10
+    batch_size: 3
+    max_work_items_per_run: 3
+    retry_policy: official_feed
+    ttl_key: treasury
+    ttl_hours: 24
+
+  bls:
+    capability_group: official_feeds
+    enabled: true
+    required_env: BLS_API_KEY
+    scope: global
+    cadence: daily
+    run_modes: [daily, all]
+    priority: 62
+    dependencies: []
+    cursor_kind: page_token
+    overlap: null
+    requests_per_minute: 20
+    requests_per_day: 500
+    requests_per_run: 10
+    batch_size: 5
+    max_work_items_per_run: 5
+    retry_policy: official_feed
+    ttl_key: bls
+    ttl_hours: 24
+
+  bea:
+    capability_group: official_feeds
+    enabled: true
+    required_env: BEA_API_KEY
+    scope: global
+    cadence: daily
+    run_modes: [daily, all]
+    priority: 63
+    dependencies: []
+    cursor_kind: page_token
+    overlap: null
+    requests_per_minute: 20
+    requests_per_day: 500
+    requests_per_run: 10
+    batch_size: 4
+    max_work_items_per_run: 4
+    retry_policy: official_feed
+    ttl_key: bea
+    ttl_hours: 24
+
+  eia:
+    capability_group: official_feeds
+    enabled: true
+    required_env: EIA_API_KEY
+    scope: global
+    cadence: daily
+    run_modes: [daily, all]
+    priority: 64
+    dependencies: []
+    cursor_kind: page_token
+    overlap: null
+    requests_per_minute: 20
+    requests_per_day: 500
+    requests_per_run: 10
+    batch_size: 4
+    max_work_items_per_run: 4
+    retry_policy: official_feed
+    ttl_key: eia
+    ttl_hours: 24
+
+  ny_fed:
+    capability_group: official_feeds
+    enabled: true
+    scope: global
+    cadence: daily
+    run_modes: [daily, all]
+    priority: 65
+    dependencies: []
+    cursor_kind: date
+    overlap: 2d
+    requests_per_minute: 30
+    requests_per_day: 500
+    requests_per_run: 10
+    batch_size: 3
+    max_work_items_per_run: 3
+    retry_policy: official_feed
+    ttl_key: ny_fed
+    ttl_hours: 24
+
+  cftc:
+    capability_group: official_feeds
+    enabled: true
+    scope: global
+    cadence: weekly
+    run_modes: [weekly, all]
+    priority: 66
+    dependencies: []
+    cursor_kind: date
+    overlap: 7d
+    requests_per_minute: 20
+    requests_per_day: 100
+    requests_per_run: 5
+    batch_size: 2
+    max_work_items_per_run: 2
+    retry_policy: official_feed
+    ttl_key: cftc
+    ttl_hours: 168
+
+  openfda:
+    capability_group: sector_feeds
+    enabled: true
+    required_env: OPENFDA_API_KEY
+    scope: sector
+    cadence: daily
+    run_modes: [daily, all]
+    priority: 70
+    dependencies: []
+    cursor_kind: timestamp
+    overlap: 24h
+    requests_per_minute: 20
+    requests_per_day: 240
+    requests_per_run: 20
+    batch_size: 3
+    max_work_items_per_run: 20
+    retry_policy: official_feed
+    ttl_key: openfda
+    ttl_hours: 24
+
+  nhtsa:
+    capability_group: sector_feeds
+    enabled: true
+    scope: sector
+    cadence: daily
+    run_modes: [daily, all]
+    priority: 71
+    dependencies: []
+    cursor_kind: timestamp
+    overlap: 24h
+    requests_per_minute: 20
+    requests_per_day: 240
+    requests_per_run: 20
+    batch_size: 2
+    max_work_items_per_run: 20
+    retry_policy: official_feed
+    ttl_key: nhtsa
+    ttl_hours: 24
+
+  usaspending:
+    capability_group: sector_feeds
+    enabled: true
+    scope: sector
+    cadence: daily
+    run_modes: [daily, all]
+    priority: 72
+    dependencies: []
+    cursor_kind: page_token
+    overlap: null
+    requests_per_minute: 10
+    requests_per_day: 100
+    requests_per_run: 20
+    batch_size: 1
+    max_work_items_per_run: 20
+    retry_policy: official_feed
+    ttl_key: usaspending
+    ttl_hours: 24
+
+  gdelt:
+    capability_group: company_news
+    enabled: true
+    scope: deep
+    cadence: hourly
+    run_modes: [hourly, all]
+    priority: 80
+    dependencies: []
+    cursor_kind: timestamp
+    overlap: 6h
+    requests_per_minute: 30
+    requests_per_day: 1000
+    requests_per_run: 100
+    batch_size: 1
+    max_work_items_per_run: 100
+    retry_policy: public_news
+    ttl_key: gdelt_news
+    ttl_hours: 6
+
+  earnings_transcripts:
+    capability_group: deep_documents
+    enabled: true
+    scope: deep
+    cadence: weekly
+    run_modes: [weekly, all]
+    priority: 90
+    dependencies: []
+    cursor_kind: timestamp
+    overlap: 7d
+    requests_per_minute: 20
+    requests_per_day: 500
+    requests_per_run: 100
+    batch_size: 1
+    max_work_items_per_run: 100
+    retry_policy: deep_source
+    ttl_key: transcripts
+    ttl_hours: 168
+
+  ir_pages:
+    capability_group: deep_documents
+    enabled: true
+    scope: deep
+    cadence: daily
+    run_modes: [daily, all]
+    priority: 100
+    dependencies: []
+    cursor_kind: timestamp
+    overlap: 24h
+    requests_per_minute: 20
+    requests_per_day: 500
+    requests_per_run: 100
+    batch_size: 1
+    max_work_items_per_run: 100
+    retry_policy: deep_source
+    ttl_key: ir_pages
+    ttl_hours: 24
+
+  estimates:
+    capability_group: deep_facts
+    enabled: true
+    scope: deep
+    cadence: daily
+    run_modes: [daily, all]
+    priority: 110
+    dependencies: []
+    cursor_kind: timestamp
+    overlap: 24h
+    requests_per_minute: 20
+    requests_per_day: 500
+    requests_per_run: 100
+    batch_size: 1
+    max_work_items_per_run: 100
+    retry_policy: deep_source
+    ttl_key: estimates
+    ttl_hours: 24

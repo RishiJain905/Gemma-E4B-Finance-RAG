@@ -16,6 +16,7 @@ from zipfile import BadZipFile, ZipFile
 
 import requests
 
+from src.ingestion.errors import ErrorClass, ProviderError, safe_message
 from src.storage.store import Store
 from src.universe.coverage import CoverageResolver
 
@@ -155,20 +156,46 @@ class SECDailyIndexDiscovery:
                 if self.request_delay:
                     time.sleep(self.request_delay)
             except Exception as exc:  # noqa: BLE001 - index dates fail independently
-                logger.error("SEC daily index %s failed: %s", index_date, exc)
+                normalized = (
+                    exc
+                    if isinstance(exc, ProviderError)
+                    else ProviderError(
+                        exc,
+                        error_class=ErrorClass.TRANSIENT,
+                        provider_wide=False,
+                    )
+                )
+                logger.error(
+                    "SEC daily index %s failed: %s",
+                    index_date,
+                    normalized.safe_message,
+                )
                 result["failed"] = int(result["failed"]) + 1
                 errors = result["errors"]
                 assert isinstance(errors, list)
-                errors.append(f"{index_date}: {exc}")
+                errors.append(f"{index_date}: {safe_message(normalized.safe_message)}")
+                if result.get("error_class") is None or normalized.provider_wide:
+                    result.update({
+                        "error_class": normalized.error_class.value,
+                        "retry_after": normalized.retry_after,
+                        "reset_at": normalized.reset_at,
+                        "provider_wide": normalized.provider_wide,
+                        "circuit_open": normalized.circuit_open,
+                    })
         return result
 
-    def discover(self, *, through: Optional[str] = None) -> dict[str, object]:
-        """Refresh from the durable cursor with a configured overlap window."""
+    def discover(
+        self,
+        *,
+        through: Optional[str] = None,
+        allow_bootstrap: bool = True,
+    ) -> dict[str, object]:
+        """Refresh from the durable cursor, optionally allowing initial bulk bootstrap."""
         bootstrap: dict[str, object] = {
             "discovered": 0, "registered": 0, "replayed": True,
         }
         bootstrap_error: Optional[str] = None
-        if self.store.get_sec_daily_index_cursor() is None:
+        if allow_bootstrap and self.store.get_sec_daily_index_cursor() is None:
             try:
                 bootstrap = self.bootstrap_from_submissions_bulk()
             except Exception as exc:  # noqa: BLE001 - daily refresh remains independent
