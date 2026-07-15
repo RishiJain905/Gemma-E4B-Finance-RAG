@@ -265,6 +265,27 @@ a query never errors because a retrieval stage failed.
 | `rerank_candidates` | `30` | `RERANK_CANDIDATES` | Candidate pool retrieved before re-ranking. |
 | `rerank_top_n` | `5` | `RERANK_TOP_N` | Documents kept after re-ranking (= `top_k_documents`). |
 
+#### Evidence taxonomy, authority ranking & duplicate-coverage packing (Phase 2.3.3.3)
+
+Source-independent, additive, fail-soft post-relevance policy applied on top
+of the fused/re-ranked evidence set. Authority boosting is capped below
+exact-entity, type, and latest-recency ranking terms, and duplicate packing
+keeps a bounded amount of useful secondary coverage while preventing
+syndicated copies of the same story from spending the whole evidence budget.
+
+| Field | Default | Env | Meaning |
+|-------|---------|-----|---------|
+| `enable_evidence_taxonomy` | `true` | `ENABLE_EVIDENCE_TAXONOMY` | Classify retrieved evidence into the source-independent item/event taxonomy (authority tier, primary/secondary role) used by ranking and Live Trace. |
+| `enable_authority_ranking` | `true` | `ENABLE_AUTHORITY_RANKING` | Apply the capped authority-tier boost on top of relevance ranking. |
+| `enable_duplicate_coverage_packing` | `true` | `ENABLE_DUPLICATE_COVERAGE_PACKING` | Keep a bounded number of secondary/corroborating items per event instead of dropping or over-including syndicated duplicates. |
+| `authority_max_boost` | `0.025` | `AUTHORITY_MAX_BOOST` | Hard ceiling on the authority-tier score boost. |
+| `max_secondary_per_event` | `2` | `MAX_SECONDARY_PER_EVENT` | Max secondary/corroborating evidence items packed per primary event. |
+
+These three switches default **on** — unlike the eight Phase 2.3.6.1 rollout
+gates below, which default off — because they shipped and were evaluated in
+2.3.3.3, ahead of the 2.3.4–2.3.6 registry/migration work. Flip them off to
+compare against pre-2.3.3.3 relevance-only ranking.
+
 #### Analytical tools (Phase 2.1.4)
 
 | Field | Default | Env | Meaning |
@@ -540,6 +561,49 @@ can be supplied as the resolver config. It logs a deprecation warning, maps
 `sources.yaml` is the scheduler-owned registry for cadence, cursor overlap,
 request limits, work limits, retry policy, and optional environment-key
 availability. Its `version` is persisted in every scheduler run summary.
+`SourceRegistry.load()` (`src/scheduler/source_registry.py`) validates every
+entry; an invalid entry or unknown `dependencies` name is disabled
+(`status: invalid_configuration`) without crashing registry load or any other
+source. One representative entry:
+
+```yaml
+sources:
+  finnhub:
+    capability_group: company_news
+    enabled: true
+    required_env: FINNHUB_API_KEY
+    scope: broad
+    cadence: daily
+    run_modes: [daily, all]
+    priority: 40
+    dependencies: []
+    cursor_kind: timestamp
+    overlap: 6h
+    requests_per_minute: 30
+    requests_per_day: 500
+    requests_per_run: 200
+    batch_size: 1
+    max_work_items_per_run: 200
+    retry_policy: vendor_news
+    ttl_key: finnhub_news
+    ttl_hours: 6
+```
+
+| Field | Meaning |
+|-------|---------|
+| `capability_group` | Non-authoritative grouping label surfaced in status/policy explanations (e.g. `company_news`, `market_data`, `official_feeds`). |
+| `enabled` | Registry-level on/off; combined with capability rollout flags and `required_env` to compute `is_available`. |
+| `required_env` | Optional env var name gating availability. A missing key sets `status: disabled_missing_key` for that source only; status reports `configured: true|false`, never a value or fingerprint. |
+| `scope` | One of `universe`, `broad`, `deep`, `sector`, `global`. |
+| `cadence` / `run_modes` | Scheduling cadence and the CLI run modes (`daily`/`hourly`/`weekly`/`all`) that select this source. |
+| `priority` | Ascending execution order within a run (the legacy `weight`). |
+| `dependencies` | Other registry source names that must be available first; an unavailable dependency skips this source with `reason: dependency_unavailable`. |
+| `cursor_kind` | `date`, `timestamp`, `page_token`, `daily_index`, or `none` — the incremental-cursor shape `CursorManager` persists per source+partition. |
+| `overlap` | Re-fetch overlap window layered on top of the last cursor (e.g. `6h`, `2d`) so a late-arriving record is never missed. |
+| `requests_per_minute` / `requests_per_day` / `requests_per_run` | Durable request budgets (`RunBudget`), persisted across process restarts. |
+| `batch_size` / `max_work_items_per_run` | Bound on per-run work (partitions/tickers/pages) independent of the raw request budget. |
+| `retry_policy` | Named backoff/circuit policy passed to `provider_request_policy` (e.g. `sec`, `vendor_news`, `vendor_market`, `official_feed`, `public_api`, `deep_source`). |
+| `ttl_key` / `ttl_hours` | Freshness TTL — the same `cache_meta` mechanism used by the legacy scheduler. |
 
 Phase 2.3 rollout switches are additive and default off:
 
@@ -561,11 +625,32 @@ enable_phase2_3_retrieval: false
 enable_phase2_3_corpus_projection: false
 ```
 
-The middleware switches may be overridden by `ENABLE_PHASE2_3_RETRIEVAL` and
+These are the complete set of eight Phase 2.3.6.1 capability switches — one
+universe flag, five `sources.yaml` capability-group flags, and two middleware
+flags — and every one defaults to `false`. The middleware switches may be
+overridden by `ENABLE_PHASE2_3_RETRIEVAL` and
 `ENABLE_PHASE2_3_CORPUS_PROJECTION`. Credentials are referenced only by
 environment-variable name (`required_env`). Status reports
 `configured: true|false`; it never prints a value or fingerprint. A missing
 optional key disables only that source.
+
+### Provider error taxonomy and circuits (Phase 2.3.4.2)
+
+Every adapter failure is normalized (`src/ingestion/errors.py`) into one of
+eight `ErrorClass` values: `authentication`, `entitlement`, `rate_limited`,
+`quota_exhausted` (all four provider-wide — they stop only that source, never
+another), `transient`, `contract`, `item` (source-local), or `permanent`.
+Only `rate_limited` and `transient` are retryable. Every message is
+credential-redacted (`safe_message`) before it reaches logs,
+`scheduler_run_sources`, or the dead-letter queue — an API key, bearer token,
+or `?api_key=`/`?token=` query value is never persisted or printed.
+
+A provider-wide failure opens a per-source circuit persisted in
+`source_circuit_state` with a cooldown reset parsed by `parse_retry_after`
+(numeric seconds or an HTTP-date `Retry-After` header). The circuit is
+consulted on every later invocation — including a fresh process — until its
+reset time passes, so a rate-limited or unentitled provider stops being
+retried without ever blocking a different source in the same run.
 
 Turning a switch off stops new capability-specific work and restores the
 Phase 2.2 retrieval/projection behavior. It does not remove migration tables,

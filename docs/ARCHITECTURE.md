@@ -400,6 +400,47 @@ denominators by index/scope/sector, recent news/market/SEC coverage, source
 partition states, indexing backlog, corpus date bounds, and last successful
 refresh. It does not invoke network, Chroma embedding, or provider code.
 
+### Source registry, budgets, and provider circuits (Phase 2.3.4.1–2.3.4.2)
+
+`configs/sources.yaml` replaced the scheduler's static source dictionary with
+a validated, data-driven registry. `SourceRegistry.load()`
+(`src/scheduler/source_registry.py`) parses each entry into a `SourceSpec`
+(`capability_group`, `scope`, `cadence`/`run_modes`, `priority`,
+`dependencies`, `cursor_kind`, `overlap`, `requests_per_minute/day/run`,
+`batch_size`, `max_work_items_per_run`, `retry_policy`, `ttl_key`/`ttl_hours`,
+optional `required_env`); an invalid entry or unknown dependency is converted
+to a disabled `status: invalid_configuration` spec instead of raising, so one
+bad definition never crashes registry load or another source's run
+(`SourceSpec.is_available`). `UnifiedScheduler` reads `self.SOURCES` from the
+loaded registry rather than a hard-coded dict.
+
+- **Incremental cursors.** `CursorManager` (`src/scheduler/cursors.py`)
+  persists one transactional `source_cursors` row per source+partition and
+  orders partitions fair-oldest-first on resume; each source's `overlap`
+  window (e.g. `6h`, `2d`) is re-fetched on top of the last cursor so a
+  late-arriving record is never missed by an incremental run.
+- **Durable budgets.** `RunBudget` (`src/scheduler/budget.py`) enforces
+  per-run minute/day/run request and work-item caps *before* work starts, and
+  persists attempted/successful counts across process restarts via
+  `Store.get_source_budget_usage` / `record_source_budget_usage`. `--force`
+  bypasses only freshness (TTL) checks — it never bypasses registry
+  availability, request budgets, or an open provider circuit.
+- **Error taxonomy.** `src/ingestion/errors.py` normalizes every adapter
+  failure into one of eight `ErrorClass` values: `authentication`,
+  `entitlement`, `rate_limited`, `quota_exhausted` (provider-wide — stop only
+  that source), `transient`, `contract`, `item` (source-local), and
+  `permanent`. Only `rate_limited`/`transient` are retryable. `ProviderError`
+  carries a `safe_message` (credential/token-redacted before it reaches logs,
+  `scheduler_run_sources`, or the DLQ) and a parsed retry window
+  (`parse_retry_after`, accepting numeric seconds or an HTTP-date Retry-After
+  header).
+- **Provider circuits.** A provider-wide failure opens a per-source circuit
+  persisted in `source_circuit_state` with its cooldown reset timestamp; the
+  circuit is consulted on every later invocation, including a fresh process,
+  until the reset passes — so an exhausted or unentitled provider stops being
+  retried without ever blocking a different source in the same run. Failures
+  are additionally recorded in a deduplicated bounded dead-letter queue.
+
 ---
 
 ## Storage Layer
@@ -686,6 +727,42 @@ model; every page is hard-bounded and keyed to `Store.retrieval_revision()` via
 opaque cursors so a mid-browse ingestion write is detected (HTTP 409) rather than
 silently mixing revisions. The overview is cached for a short TTL keyed by
 revision.
+
+### Phase 2.3 scale — source-aware Live Trace and Corpus Explorer
+
+Both projections extend additively to the broad-universe corpus without
+changing the observability-graph schema (`schema_version` stays `1`) or the
+query path.
+
+- **Source-aware Live Trace (2.3.5.1).** `evidence`/`source`/`citation` nodes
+  carry additional allowlisted fields on top of the Phase 2.2 shape: security
+  identity (`security_id`, `canonical_security`), index membership
+  (`index_memberships`), `sector`, `source_category`, `authority_tier`,
+  `coverage_tier`, provider vs. publisher (`provider`, `publisher`,
+  `source_name`), `item_type`/`event_type`, filing `form`/`filing_item`/
+  `exhibit`, date semantics (`published_at`, `effective_at`, `accessed_at`),
+  and an `evidence_role` of `primary` or `corroborating` so the trace shows
+  which source directly substantiates a claim versus which one corroborates
+  it. Every field is an already-safe scalar, bounded date, or opaque id —
+  never a key, payload, or full document body. The shared `stage:route` node
+  identity is preserved through both the legacy and adaptive-fallback paths,
+  and the Phase 2.2 golden trace fixture is untouched by the additive fields.
+- **Aggregation-first Corpus Explorer (2.3.5.2–2.3.5.3).** The explorer opens
+  on a bounded aggregate landing (market universe → index → sector → security
+  → source category → item/event type → time bucket) instead of rendering the
+  corpus directly, with a persistent, combinable facet rail backed by
+  authoritative SQLite-only counts. `CorpusGraph`
+  (`src/middleware/corpus_graph.py`) adds `aggregates()`, `facets()`,
+  `groups()`, and `item_detail()` alongside the Phase 2.2.7.2 `overview()`/
+  `search()`/`detail()`/`neighbors()`; every method is paged and
+  revision-aware — a mid-browse ingestion write is detected and surfaced as
+  HTTP 409 (`CorpusRevisionChanged`) rather than silently mixing revisions.
+  URL-hash deep links hold the full filter state client-side (no server
+  storage, no cookies). The bounded-scale fixture exercised in the offline
+  gate seeds 600 securities across 11 sectors with overlapping index
+  memberships and 100,000 corpus items, asserting warm p95 under 250 ms for
+  overview/facet queries and under 300 ms for a filtered first page on the
+  reference machine.
 
 ### Serving & security
 
