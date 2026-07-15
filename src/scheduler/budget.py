@@ -58,6 +58,7 @@ class RunBudget:
             float(now_fn()) if minute_started is None else float(minute_started)
         )
         self._minute_requests = int(minute_requests)
+        self._last_request_started: Optional[float] = None
         self.attempted_requests = 0
         self.successful_requests = 0
         self.work_items_started = 0
@@ -207,24 +208,62 @@ class RunBudget:
         if retry_after is not None:
             self.retry_after = str(retry_after)
 
-    def wrap_http_get(self, request: Callable[..., object]) -> Callable[..., object]:
-        """Wrap an adapter HTTP callable with per-attempt quota reservations."""
+    def wrap_http_get(
+        self,
+        request: Callable[..., object],
+        *,
+        wait_for_minute: bool = False,
+        max_wait_seconds: float = 60.0,
+        sleep_fn: Callable[[float], None] = time.sleep,
+    ) -> Callable[..., object]:
+        """Wrap HTTP calls with quota reservations and optional minute pacing."""
 
         def budgeted_request(*args: object, **kwargs: object) -> object:
+            if wait_for_minute and self._last_request_started is not None:
+                minimum_interval = 60.0 / self.requests_per_minute
+                elapsed = float(self._now_fn()) - self._last_request_started
+                pacing_delay = max(minimum_interval - elapsed, 0.0)
+                if pacing_delay > max(float(max_wait_seconds), 0.0):
+                    self.exhausted_reason = "requests_per_minute"
+                    raise BudgetExhaustedError(
+                        "source request budget exhausted: requests_per_minute"
+                    )
+                if pacing_delay > 0:
+                    sleep_fn(pacing_delay)
             if not self.reserve(requests=1, work_items=0):
+                if wait_for_minute and self.exhausted_reason == "requests_per_minute":
+                    remaining = max(
+                        60.0 - (float(self._now_fn()) - self._minute_started),
+                        0.0,
+                    )
+                    if 0 < remaining <= max(float(max_wait_seconds), 0.0):
+                        sleep_fn(remaining)
+                        if self.reserve(requests=1, work_items=0):
+                            self._last_request_started = float(self._now_fn())
+                            return self._perform_request(request, args, kwargs)
                 raise BudgetExhaustedError(
                     f"source request budget exhausted: {self.exhausted_reason}"
                 )
-            response = request(*args, **kwargs)
-            headers = getattr(response, "headers", None)
-            if isinstance(headers, Mapping):
-                self.update_provider_limits(headers)
-            status_code = int(getattr(response, "status_code", 200))
-            if status_code < 400:
-                self.record_success()
-            return response
+            self._last_request_started = float(self._now_fn())
+            return self._perform_request(request, args, kwargs)
 
         return budgeted_request
+
+    def _perform_request(
+        self,
+        request: Callable[..., object],
+        args: tuple[object, ...],
+        kwargs: dict[str, object],
+    ) -> object:
+        """Execute one already-reserved request and record provider limits."""
+        response = request(*args, **kwargs)
+        headers = getattr(response, "headers", None)
+        if isinstance(headers, Mapping):
+            self.update_provider_limits(headers)
+        status_code = int(getattr(response, "status_code", 200))
+        if status_code < 400:
+            self.record_success()
+        return response
 
     @property
     def minute_started(self) -> float:

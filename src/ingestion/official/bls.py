@@ -46,6 +46,7 @@ class BLSIngestor:
         api_key: Optional[str] = None,
         base_url: str = "",
         http_get: Optional[Callable[..., Any]] = None,
+        http_post: Optional[Callable[..., Any]] = None,
         timeout: float = 30.0,
         now_fn: Callable[[], object] = utc_now,
     ) -> None:
@@ -56,6 +57,7 @@ class BLSIngestor:
         self.api_key = resolve_api_key(api_key, self.API_KEY_ENV)
         self.base_url = str(base_url).rstrip("/")
         self.http_get = http_get or requests.get
+        self.http_post = http_post or requests.post
         self.timeout = max(float(timeout), 0.1)
         self.now_fn = now_fn
 
@@ -161,13 +163,18 @@ class BLSIngestor:
                 persist_records(self.store, self.parse(payload, accessed_at=accessed), output)
                 output["pages"] = 1
             else:
-                params = {
+                body = {
                     "seriesid": [str(entry["series_id"]) for entry in entries if entry.get("series_id") != "release"],
                     "startyear": accessed[:4],
                     "endyear": accessed[:4],
                     "registrationkey": self.api_key,
                 }
-                fetched = request_payload(self.http_get, str(entries[0]["endpoint"]), params=params, timeout=self.timeout)
+                fetched = request_payload(
+                    self.http_post,
+                    str(entries[0]["endpoint"]),
+                    json_body=body,
+                    timeout=self.timeout,
+                )
                 output["requests"] = 1
                 persist_records(self.store, self.parse(fetched, accessed_at=accessed), output)
                 output["pages"] = 1

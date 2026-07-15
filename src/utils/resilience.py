@@ -250,6 +250,14 @@ class ProviderRequestPolicy:
                     response_error = ProviderError.from_response(
                         response, now=self.now_fn()
                     )
+                    if self.source.startswith("sec") and status_code in {403, 429}:
+                        response_error = ProviderError(
+                            response_error.safe_message,
+                            error_class=ErrorClass.RATE_LIMITED,
+                            status_code=status_code,
+                            retry_after=response_error.retry_after,
+                            reset_at=response_error.reset_at,
+                        )
                     if response_error.error_class is ErrorClass.PERMANENT:
                         return response
                     raise response_error
@@ -314,17 +322,22 @@ def provider_request_policy(
 ) -> ProviderRequestPolicy:
     """Build the small source-policy variants referenced by the registry."""
     policy = str(policy_name or "").lower()
+    max_attempts = 3
     if policy in {"vendor_news", "vendor_market", "market_data"}:
         values = {"base_delay": 1.0, "max_sleep": 30.0, "cooldown_seconds": 900.0}
+        if source == "massive":
+            max_attempts = 1
     elif policy in {"sec", "public_snapshot"}:
         values = {"base_delay": 1.0, "max_sleep": 20.0, "cooldown_seconds": 300.0}
+        if policy == "sec":
+            max_attempts = 1
     elif policy in {"official_feed", "public_api", "public_news"}:
         values = {"base_delay": 1.0, "max_sleep": 30.0, "cooldown_seconds": 300.0}
     else:
         values = {"base_delay": 1.0, "max_sleep": 30.0, "cooldown_seconds": 300.0}
     return ProviderRequestPolicy(
         source=source,
-        max_attempts=3,
+        max_attempts=max_attempts,
         jitter_ratio=0.2,
         sleep_fn=sleep_fn,
         now_fn=now_fn,

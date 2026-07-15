@@ -168,9 +168,9 @@ sources:
     dependencies: []
     cursor_kind: date
     overlap: 2d
-    requests_per_minute: 5
-    requests_per_day: 100
-    requests_per_run: 20
+    requests_per_minute: 4
+    requests_per_day: 1000
+    requests_per_run: 60
     batch_size: 4
     max_work_items_per_run: 1
     retry_policy: vendor_market

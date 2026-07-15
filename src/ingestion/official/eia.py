@@ -72,13 +72,19 @@ class EIAIngestor:
         accessed = accessed_at or self._now_timestamp()
         records: list[object] = []
         for row in rows:
-            series_id = str(row_value(row, "seriesId", "series_id") or "").strip()
+            series_id = str(
+                row_value(row, "seriesId", "series_id", "series") or ""
+            ).strip()
             period = row_value(row, "period", "observation_date")
             value = parse_number(row_value(row, "value", "data_value"))
             if not series_id or not period or value is None:
                 continue
             for entry in entries:
-                if series_id != str(entry["dataset_id"]):
+                expected_series = str(entry.get("facet_series") or entry["dataset_id"])
+                if series_id and series_id not in {
+                    expected_series,
+                    str(entry["dataset_id"]),
+                }:
                     continue
                 vintage = row_value(row, "vintage_date", "vintage_at", "last_updated") or accessed
                 provider_id = str(row_value(row, "record_id", "id") or f"{series_id}:{period}")
@@ -88,7 +94,7 @@ class EIAIngestor:
                         source_name=self.SOURCE_NAME,
                         source_category=str(entry["source_category"]),
                         metric_id=str(entry["name"]),
-                        series_id=series_id,
+                        series_id=str(entry["dataset_id"]),
                         value=value,
                         unit=unit,
                         frequency=str(entry["frequency"]),
@@ -99,8 +105,8 @@ class EIAIngestor:
                         accessed_at=accessed,
                         published_at=vintage,
                         metadata=metadata_values(
-                            dataset_id=series_id,
-                            series_id=series_id,
+                            dataset_id=str(entry["dataset_id"]),
+                            series_id=str(entry["dataset_id"]),
                             frequency=str(entry["frequency"]),
                         ),
                     )
@@ -126,17 +132,36 @@ class EIAIngestor:
                 persist_records(self.store, self.parse(payload, accessed_at=accessed), output)
                 output["pages"] = 1
             else:
-                params = {
-                    "api_key": self.api_key,
-                    "data[0]": ",".join(str(entry["dataset_id"]) for entry in entries),
-                    "frequency": "daily",
-                    "sort[0][column]": "period",
-                    "sort[0][direction]": "desc",
-                }
-                fetched = request_payload(self.http_get, str(entries[0]["endpoint"]), params=params, timeout=self.timeout)
-                output["requests"] = 1
-                persist_records(self.store, self.parse(fetched, accessed_at=accessed), output)
-                output["pages"] = 1
+                for entry in entries:
+                    params = {
+                        "api_key": self.api_key,
+                        "data[0]": str(entry.get("data_column") or "value"),
+                        "frequency": str(entry["frequency"]),
+                        "sort[0][column]": "period",
+                        "sort[0][direction]": "desc",
+                        "length": 5,
+                    }
+                    if entry.get("facet_series"):
+                        params["facets[series][]"] = str(entry["facet_series"])
+                    for facet, value in (entry.get("facets") or {}).items():
+                        params[f"facets[{facet}][]"] = str(value)
+                    fetched = request_payload(
+                        self.http_get,
+                        str(entry["endpoint"]),
+                        params=params,
+                        timeout=self.timeout,
+                    )
+                    output["requests"] = int(output["requests"]) + 1
+                    persist_records(
+                        self.store,
+                        self.parse(
+                            fetched,
+                            entry_name=str(entry["name"]),
+                            accessed_at=accessed,
+                        ),
+                        output,
+                    )
+                    output["pages"] = int(output["pages"]) + 1
         except OfficialProviderError as exc:
             output["status"] = status_for_error(exc)
             output["error_class"] = exc.error_class

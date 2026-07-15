@@ -342,12 +342,21 @@ class UnifiedScheduler:
         except Exception as exc:  # noqa: BLE001 - preserve source isolation
             logger.error("Could not mark scheduler source %s stale: %s", name, exc)
 
-    def _budgeted_http_get(self, name: str):
+    def _budgeted_http_request(
+        self,
+        name: str,
+        request_fn,
+        *,
+        wait_for_minute: bool = False,
+    ):
         """Return a budgeted, retrying HTTP callable with one source circuit."""
-        import requests
         from src.utils.resilience import provider_request_policy
 
-        budgeted_get = self._active_budgets[name].wrap_http_get(requests.get)
+        budgeted_request = self._active_budgets[name].wrap_http_get(
+            request_fn,
+            wait_for_minute=wait_for_minute,
+            max_wait_seconds=60,
+        )
         policy = self._provider_policies.get(name)
         if policy is None:
             policy = provider_request_policy(
@@ -358,9 +367,25 @@ class UnifiedScheduler:
             self._provider_policies[name] = policy
 
         def request(*args: object, **kwargs: object) -> object:
-            return policy.request(lambda: budgeted_get(*args, **kwargs))
+            return policy.request(lambda: budgeted_request(*args, **kwargs))
 
         return request
+
+    def _budgeted_http_get(self, name: str, *, wait_for_minute: bool = False):
+        """Return a budgeted GET callable."""
+        import requests
+
+        return self._budgeted_http_request(
+            name,
+            requests.get,
+            wait_for_minute=wait_for_minute,
+        )
+
+    def _budgeted_http_post(self, name: str):
+        """Return a budgeted POST callable."""
+        import requests
+
+        return self._budgeted_http_request(name, requests.post)
 
     def _is_stale(self, name: str) -> bool:
         """True if the source has never run, is marked stale, or is past TTL."""
@@ -405,7 +430,7 @@ class UnifiedScheduler:
                 return MassiveIngestor(
                     store=self.store,
                     coverage_resolver=self.coverage,
-                    http_get=self._budgeted_http_get(name),
+                    http_get=self._budgeted_http_get(name, wait_for_minute=True),
                     overlap_days=int((self.SOURCES[name].overlap or "0d")[:-1]),
                     initial_lookback_days=int(
                         self.bootstrap_config.get("market_history_days", 30)
@@ -428,10 +453,15 @@ class UnifiedScheduler:
 
         official = self._official_ingestor(name)
         if official is not None:
+            kwargs = {
+                "store": self.store,
+                "coverage_resolver": self.coverage,
+                "http_get": self._budgeted_http_get(name),
+            }
+            if name in {"bls", "usaspending"}:
+                kwargs["http_post"] = self._budgeted_http_post(name)
             return official(
-                store=self.store,
-                coverage_resolver=self.coverage,
-                http_get=self._budgeted_http_get(name),
+                **kwargs,
             ).ingest()
 
         if name == "yfinance":
@@ -632,21 +662,13 @@ class UnifiedScheduler:
 
     def _run_universe_source(self, name: str) -> dict:
         """Fetch and atomically reconcile one configured universe snapshot."""
-        from src.universe.providers import (
-            IVVHoldingsProvider,
-            Nasdaq100Provider,
-            SECCompanyTickersProvider,
-        )
+        from src.universe.providers import provider_from_config
         from src.universe.registry import UniverseRegistry
 
-        if name == "universe_nasdaq100":
-            provider = Nasdaq100Provider()
-        elif name == "universe_ivv":
-            provider = IVVHoldingsProvider()
-        else:
-            provider = SECCompanyTickersProvider(
-                user_agent=os.environ.get("SEC_EDGAR_USER_AGENT")
-            )
+        provider = provider_from_config(
+            name,
+            sec_user_agent=os.environ.get("SEC_EDGAR_USER_AGENT"),
+        )
         rows = provider.fetch()
         result = UniverseRegistry(self.store).refresh(
             provider.source,
@@ -1276,7 +1298,7 @@ class UnifiedScheduler:
 
     @staticmethod
     def _result_metric(result: dict, keys: tuple[str, ...]) -> int:
-        """Read the first bounded numeric metric from a source result."""
+        """Read a direct metric or sum independent nested capability metrics."""
         values = [result]
         details = result.get("details")
         if isinstance(details, dict):
@@ -1291,6 +1313,20 @@ class UnifiedScheduler:
                         return max(int(value.get(key) or 0), 0)
                 except (TypeError, ValueError):
                     continue
+        nested_results = [
+            value
+            for value in result.values()
+            if isinstance(value, dict)
+            and any(
+                marker in value
+                for marker in ("status", "terminal_status", "capability")
+            )
+        ]
+        if nested_results:
+            return sum(
+                UnifiedScheduler._result_metric(value, keys)
+                for value in nested_results
+            )
         return 0
 
     def _source_run_summary(
@@ -1817,6 +1853,21 @@ class UnifiedScheduler:
                             source_result["updated"] = int(source_result["updated"]) + updated_items
                             source_result["duplicates"] = int(source_result["duplicates"]) + duplicate_items
                             details.append({"partition": partition, **detail})
+                            if part_status == "partial":
+                                errors = detail.get("errors")
+                                first_error = (
+                                    str(errors[0])
+                                    if isinstance(errors, list) and errors
+                                    else None
+                                )
+                                source_result.update({
+                                    "status": "partial",
+                                    "reason": reason or "provider_partial",
+                                    "error": first_error,
+                                    "error_class": normalize_error_class(
+                                        detail.get("error_class")
+                                    ) or ErrorClass.ITEM.value,
+                                })
                         except ProviderError as exc:
                             if exc.provider_wide:
                                 budget.open_provider_circuit(
@@ -1832,7 +1883,11 @@ class UnifiedScheduler:
                                     reset_at=exc.reset_at,
                                 )
                             source_result.update({
-                                "status": "error" if not exc.provider_wide else "skipped",
+                                "status": (
+                                    "partial"
+                                    if int(source_result["items"]) > 0
+                                    else "error" if not exc.provider_wide else "skipped"
+                                ),
                                 "reason": exc.error_class.value,
                                 "error": exc.safe_message,
                                 "error_class": exc.error_class.value,

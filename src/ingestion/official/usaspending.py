@@ -5,6 +5,7 @@ USAspending federal-award events with exact recipient/UEI registry mapping.
 from __future__ import annotations
 
 import logging
+from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Mapping, Optional
 
 import requests
@@ -47,6 +48,7 @@ class USAspendingIngestor:
         api_key: Optional[str] = None,
         base_url: str = "",
         http_get: Optional[Callable[..., Any]] = None,
+        http_post: Optional[Callable[..., Any]] = None,
         timeout: float = 30.0,
         max_pages: int = 20,
         now_fn: Callable[[], object] = utc_now,
@@ -55,6 +57,7 @@ class USAspendingIngestor:
         self.coverage = coverage_resolver
         self.base_url = str(base_url).rstrip("/")
         self.http_get = http_get or requests.get
+        self.http_post = http_post or requests.post
         self.timeout = max(float(timeout), 0.1)
         self.max_pages = max(int(max_pages), 1)
         self.now_fn = now_fn
@@ -78,8 +81,18 @@ class USAspendingIngestor:
             award_id = str(row_value(row, "Award ID", "award_id", "AwardID") or "").strip()
             recipient = str(row_value(row, "Recipient Name", "recipient_name") or "").strip()
             uei = str(row_value(row, "Recipient UEI", "recipient_uei", "uei") or "").strip()
-            start_date = row_value(row, "Period of Performance Start Date", "start_date")
-            modified = row_value(row, "Last Modified Date", "last_modified_date", "date") or accessed
+            start_date = row_value(
+                row,
+                "Period of Performance Start Date",
+                "Start Date",
+                "start_date",
+            )
+            modified = row_value(
+                row,
+                "Last Modified Date",
+                "last_modified_date",
+                "date",
+            ) or start_date or accessed
             if not award_id or not start_date or not recipient:
                 continue
             url = source_url(row_value(row, "Link", "link", "url"), str(entry["endpoint"]))
@@ -143,21 +156,43 @@ class USAspendingIngestor:
                 persist_records(self.store, self.parse(payload, accessed_at=accessed), output)
                 output["pages"] = 1
             else:
-                page_url = str(entries[0]["endpoint"])
-                seen: set[str] = set()
-                while page_url and len(seen) < self.max_pages:
-                    if page_url in seen:
-                        raise ValueError("USAspending repeated pagination URL")
-                    seen.add(page_url)
-                    fetched = request_payload(self.http_get, page_url, timeout=self.timeout)
-                    output["requests"] = int(output["requests"]) + 1
-                    persist_records(self.store, self.parse(fetched, accessed_at=accessed), output)
-                    output["pages"] = int(output["pages"]) + 1
-                    from . import next_page
-
-                    page_url = next_page(fetched, self.base_url)
-                if page_url:
-                    raise ValueError("USAspending pagination limit reached")
+                now = datetime.fromisoformat(accessed.replace("Z", "+00:00"))
+                if now.tzinfo is None:
+                    now = now.replace(tzinfo=timezone.utc)
+                body = {
+                    "filters": {
+                        "time_period": [{
+                            "start_date": (now - timedelta(days=30)).date().isoformat(),
+                            "end_date": now.date().isoformat(),
+                        }],
+                        "award_type_codes": ["A", "B", "C", "D"],
+                    },
+                    "fields": [
+                        "Award ID",
+                        "Recipient Name",
+                        "Start Date",
+                        "Award Amount",
+                        "Awarding Agency",
+                        "Description",
+                    ],
+                    "page": 1,
+                    "limit": 100,
+                    "sort": "Start Date",
+                    "order": "desc",
+                }
+                fetched = request_payload(
+                    self.http_post,
+                    str(entries[0]["endpoint"]),
+                    json_body=body,
+                    timeout=self.timeout,
+                )
+                output["requests"] = 1
+                persist_records(
+                    self.store,
+                    self.parse(fetched, accessed_at=accessed),
+                    output,
+                )
+                output["pages"] = 1
         except OfficialProviderError as exc:
             output["status"] = status_for_error(exc)
             output["error_class"] = exc.error_class

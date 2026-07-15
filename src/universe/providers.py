@@ -13,17 +13,29 @@ from pathlib import Path
 from typing import Iterable, Optional
 
 import requests
+import yaml
 
 from .models import SnapshotValidationError, UniverseRecord, normalize_symbol
 
 logger = logging.getLogger(__name__)
 
-NASDAQ100_URL = "https://www.nasdaq.com/solutions/global-indexes/nasdaq-100/companies"
+NASDAQ100_URL = "https://api.nasdaq.com/api/quote/list-type/nasdaq100"
 IVV_HOLDINGS_URL = (
-    "https://www.ishares.com/us/products/239726/ishares-core-sp-500-etf/"
-    "1467271812596.ajax?fileType=csv&fileName=IVV_holdings&dataType=fund"
+    "https://www.blackrock.com/varnish-api/blk-one01-product-data/product-data/"
+    "api/v1/get-fund-document?appType=PRODUCT_PAGE&appSubType=ISHARES&"
+    "targetSite=us-ishares&locale=en_US&portfolioId=239726&component=holdings&"
+    "userType=individual"
 )
 SEC_COMPANY_TICKERS_URL = "https://www.sec.gov/files/company_tickers_exchange.json"
+UNIVERSE_CONFIG_PATH = Path(__file__).resolve().parents[2] / "configs" / "universe.yaml"
+_BROWSER_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36"
+    ),
+    "Accept": "application/json",
+    "Accept-Language": "en-US,en;q=0.9",
+}
 
 
 class _TableParser(HTMLParser):
@@ -118,19 +130,29 @@ class Nasdaq100Provider:
 
     def fetch(self) -> list[UniverseRecord]:
         """Download and parse the current Nasdaq-100 constituent payload."""
-        response = requests.get(self.source_url, timeout=self.timeout)
+        response = requests.get(
+            self.source_url,
+            headers=_BROWSER_HEADERS,
+            timeout=self.timeout,
+        )
         response.raise_for_status()
-        return self.parse(response.text)
+        return self.parse(response.json())
 
-    def parse(self, payload: str | bytes | Path) -> list[UniverseRecord]:
-        """Parse a pinned Nasdaq CSV or HTML table into records only."""
-        text = _read_text(payload)
-        mappings = self._mappings(text)
+    def parse(self, payload: object) -> list[UniverseRecord]:
+        """Parse Nasdaq's JSON API or a pinned CSV/HTML fixture into records."""
+        if isinstance(payload, dict):
+            data = payload.get("data")
+            nested = data.get("data") if isinstance(data, dict) else None
+            mappings = nested.get("rows", []) if isinstance(nested, dict) else []
+            if not isinstance(mappings, list):
+                mappings = []
+        else:
+            mappings = self._mappings(_read_text(payload))
         rows = []
         for raw in mappings:
             row = _clean_mapping(raw)
             symbol = _pick(row, "symbol", "ticker")
-            name = _pick(row, "company name", "company", "name")
+            name = _pick(row, "company name", "companyname", "company", "name")
             if not symbol or not name:
                 raise SnapshotValidationError(
                     "nasdaq snapshot requires non-empty Symbol and Company Name fields"
@@ -186,7 +208,11 @@ class IVVHoldingsProvider:
 
     def fetch(self) -> list[UniverseRecord]:
         """Download and parse the current IVV holdings CSV."""
-        response = requests.get(self.source_url, timeout=self.timeout)
+        response = requests.get(
+            self.source_url,
+            headers={**_BROWSER_HEADERS, "Accept": "text/csv,*/*;q=0.8"},
+            timeout=self.timeout,
+        )
         response.raise_for_status()
         return self.parse(response.content)
 
@@ -297,3 +323,44 @@ class SECCompanyTickersProvider:
         if not entries:
             raise SnapshotValidationError("sec snapshot contains no ticker records")
         return entries
+
+
+def provider_from_config(
+    name: str,
+    *,
+    config_path: Optional[Path] = None,
+    sec_user_agent: Optional[str] = None,
+) -> Nasdaq100Provider | IVVHoldingsProvider | SECCompanyTickersProvider:
+    """Build one universe adapter from the checked-in provider contract."""
+    path = config_path or UNIVERSE_CONFIG_PATH
+    with path.open(encoding="utf-8") as config_file:
+        config = yaml.safe_load(config_file) or {}
+    provider_key = {
+        "universe_nasdaq100": "nasdaq100",
+        "universe_ivv": "sp500",
+        "universe_sec": "sec_identity",
+    }.get(name)
+    if provider_key is None:
+        raise ValueError(f"unknown universe provider: {name}")
+    provider = (config.get("providers") or {}).get(provider_key)
+    if not isinstance(provider, dict):
+        raise ValueError(f"missing universe provider configuration: {provider_key}")
+    common = {
+        "source_url": str(provider["url"]),
+        "timeout": float(provider.get("timeout_seconds", 30)),
+    }
+    if name == "universe_nasdaq100":
+        return Nasdaq100Provider(
+            **common,
+            min_constituents=int(provider["min_constituents"]),
+        )
+    if name == "universe_ivv":
+        return IVVHoldingsProvider(
+            **common,
+            min_constituents=int(provider["min_constituents"]),
+        )
+    return SECCompanyTickersProvider(
+        **common,
+        min_records=int(provider["min_records"]),
+        user_agent=sec_user_agent,
+    )

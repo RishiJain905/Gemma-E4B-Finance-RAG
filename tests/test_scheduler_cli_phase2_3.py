@@ -243,6 +243,54 @@ def test_adapter_failure_counts_never_classify_as_success():
     assert UnifiedScheduler._classify_detail({"failed": 1, "registered": 2})[0] == "partial"
 
 
+def test_bootstrap_preserves_partial_adapter_status(scheduler):
+    scheduler._bootstrap_partitions = MagicMock(return_value=["AAA"])
+    scheduler._run_bootstrap_partition = MagicMock(
+        return_value={
+            "status": "partial",
+            "stored": 1,
+            "malformed": 1,
+            "errors": ["one malformed provider row"],
+        },
+    )
+
+    result = scheduler.run_bootstrap(source="finnhub")
+    persisted = scheduler.store.list_scheduler_runs(
+        limit=1, source="finnhub",
+    )[0]["sources"][0]
+
+    assert result["sources"]["finnhub"]["status"] == "partial"
+    assert persisted["status"] == "partial"
+
+
+def test_bootstrap_sums_nested_capability_item_metrics(scheduler):
+    scheduler._bootstrap_partitions = MagicMock(return_value=["__global__"])
+    scheduler._run_bootstrap_partition = MagicMock(
+        return_value={
+            "market": {"status": "error", "accepted_items": 0, "stored": 0},
+            "corporate_actions": {
+                "status": "ok",
+                "accepted_items": 134,
+                "stored": 83,
+                "updated": 51,
+            },
+            "news": {
+                "status": "ok",
+                "accepted_items": 479,
+                "stored": 427,
+                "duplicates": 52,
+            },
+        },
+    )
+
+    result = scheduler.run_bootstrap(source="massive")
+
+    assert result["sources"]["massive"]["items"] == 613
+    assert result["sources"]["massive"]["new"] == 510
+    assert result["sources"]["massive"]["updated"] == 51
+    assert result["sources"]["massive"]["duplicates"] == 52
+
+
 def test_bootstrap_resume_uses_durable_manifest_and_cumulative_counts(scheduler):
     scheduler._bootstrap_partitions = MagicMock(return_value=["A", "B"])
     failed_once = {"B"}
@@ -459,3 +507,24 @@ def test_sec_bootstrap_persists_provider_wide_cooldown(scheduler):
     assert provider["status"] == "circuit_open"
     assert provider["error_class"] == "rate_limited"
     assert provider["cursor_value"] == reset_at
+
+
+def test_provider_cooldown_after_accepted_items_is_truthful_partial(scheduler):
+    scheduler._bootstrap_partitions = MagicMock(
+        return_value=["2026-07-13", "2026-07-14"],
+    )
+    scheduler._run_bootstrap_partition = MagicMock(side_effect=[
+        {"status": "success", "items": 3, "new": 3},
+        {
+            "failed": 1,
+            "errors": ["rate limited"],
+            "error_class": "rate_limited",
+            "provider_wide": True,
+            "reset_at": "2099-07-14T12:05:00Z",
+        },
+    ])
+
+    result = scheduler.run_bootstrap(source="sec_filings")
+
+    assert result["sources"]["sec_filings"]["status"] == "partial"
+    assert result["sources"]["sec_filings"]["items"] == 3

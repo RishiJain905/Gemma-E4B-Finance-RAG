@@ -136,7 +136,7 @@ class FREDIngestor:
 
             # Store the current observation for the normal path. Bootstrap can
             # explicitly retain the bounded history returned by the same call.
-            rows = series if store_history else [(latest_date, latest)]
+            rows = series.items() if store_history else [(latest_date, latest)]
             for observed_date, observed_value in rows:
                 period = (
                     observed_date.date().isoformat()

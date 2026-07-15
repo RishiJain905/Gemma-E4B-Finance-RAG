@@ -12,6 +12,7 @@ import logging
 import os
 import re
 from calendar import monthrange
+from dataclasses import replace
 from datetime import date, datetime, timezone
 from email.utils import parsedate_to_datetime
 from pathlib import Path
@@ -199,17 +200,24 @@ def catalog_entries(agency: str, entry_names: Optional[Iterable[str]] = None) ->
 
 
 def request_payload(
-    http_get: Callable[..., Any],
+    http_request: Callable[..., Any],
     url: str,
     *,
     params: Optional[Mapping[str, object]] = None,
+    json_body: Optional[Mapping[str, object]] = None,
     timeout: float = 30.0,
 ) -> object:
     """Perform one provider request and classify its response without retrying."""
+    kwargs: dict[str, object] = {"timeout": timeout}
+    if params is not None:
+        kwargs["params"] = dict(params)
+    if json_body is not None:
+        kwargs["json"] = dict(json_body)
     try:
-        response = http_get(url, params=dict(params or {}), timeout=timeout)
+        response = http_request(url, **kwargs)
     except TypeError:
-        response = http_get(url, params=dict(params or {}))
+        kwargs.pop("timeout", None)
+        response = http_request(url, **kwargs)
     status_code = int(getattr(response, "status_code", 200))
     if status_code >= 400:
         message = _response_error_text(response)
@@ -497,10 +505,12 @@ def result(source: str, capability: str) -> dict[str, object]:
 
 def persist_records(store: object, records: Iterable[object], output: dict[str, object]) -> None:
     """Persist normalized records through Store and classify replay/change outcomes."""
+    canonical_item_ids: dict[str, str] = {}
     for record in records:
         try:
             if isinstance(record, NarrativeRecord):
                 stored = store.upsert_narrative(record)
+                canonical_item_ids[record.corpus_item_id] = str(stored["corpus_item_id"])
                 if stored.get("indexing_status") == "error":
                     output["malformed"] = int(output["malformed"]) + 1
                     output["errors"].append(str(stored.get("index_error") or "narrative indexing failed"))
@@ -517,6 +527,12 @@ def persist_records(store: object, records: Iterable[object], output: dict[str, 
                 else:
                     output["duplicates"] = int(output["duplicates"]) + 1
             elif isinstance(record, EventRecord):
+                linked_items = tuple(
+                    canonical_item_ids.get(item_id, item_id)
+                    for item_id in record.source_corpus_item_ids
+                )
+                if linked_items != record.source_corpus_item_ids:
+                    record = replace(record, source_corpus_item_ids=linked_items)
                 stored = store.upsert_event(record)
                 if stored.get("created"):
                     output["stored"] = int(output["stored"]) + 1

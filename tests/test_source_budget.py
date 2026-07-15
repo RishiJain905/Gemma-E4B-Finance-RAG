@@ -105,3 +105,34 @@ def test_budgeted_http_client_reserves_each_attempt_and_applies_headers():
     assert budget.attempted_requests == 1
     assert budget.successful_requests == 1
     assert budget.provider_reset == "123"
+
+
+def test_budgeted_http_client_waits_for_next_minute_without_bypassing_quota():
+    clock = {"now": 10.0}
+    sleeps = []
+
+    class Response:
+        status_code = 200
+        headers = {}
+
+    budget = _budget(
+        requests_per_minute=1,
+        now_fn=lambda: clock["now"],
+        minute_started=0.0,
+    )
+
+    def sleep(seconds):
+        sleeps.append(seconds)
+        clock["now"] += seconds
+
+    http_get = budget.wrap_http_get(
+        lambda *_args, **_kwargs: Response(),
+        wait_for_minute=True,
+        max_wait_seconds=60,
+        sleep_fn=sleep,
+    )
+
+    assert http_get("https://example.test/first").status_code == 200
+    assert http_get("https://example.test/second").status_code == 200
+    assert sleeps == [60.0]
+    assert budget.attempted_requests == 2

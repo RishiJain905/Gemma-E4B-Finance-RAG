@@ -73,7 +73,7 @@ entries:
     source_category: official_macro
     sectors: [global]
     payload_type: structured
-    endpoint: https://home.treasury.gov/resource-center/data-chart-center/interest-rates
+    endpoint: https://home.treasury.gov/sites/default/files/interest-rates/yield.xml
     field: BC_10YEAR
     series_id: DGS10
   - name: treasury_real_yield_10y
@@ -85,8 +85,9 @@ entries:
     source_category: official_macro
     sectors: [global]
     payload_type: structured
-    endpoint: https://home.treasury.gov/resource-center/data-chart-center/interest-rates
-    field: REAL_10YEAR
+    endpoint: https://home.treasury.gov/sites/default/files/interest-rates/real_yield.xml
+    field: TC_10YEAR
+    field_aliases: [REAL_10YEAR]
     series_id: DFII10
   - name: treasury_bill_rate_4w
     agency: treasury
@@ -97,8 +98,9 @@ entries:
     source_category: official_macro
     sectors: [global]
     payload_type: structured
-    endpoint: https://home.treasury.gov/resource-center/data-chart-center/interest-rates
-    field: BILL_4WEEK
+    endpoint: https://home.treasury.gov/sites/default/files/interest-rates/daily_treas_bill_rates.xml
+    field: CS_4WK_YIELD_AVG
+    field_aliases: [BILL_4WEEK]
     series_id: DTB4WK
 
   - name: bls_cpi
@@ -212,6 +214,8 @@ entries:
     sectors: [energy]
     payload_type: structured
     endpoint: https://api.eia.gov/v2/petroleum/pri/spt/data/
+    data_column: value
+    facet_series: RWTC
   - name: eia_energy_inventories
     agency: eia
     dataset_id: PET.WCRSTUS1.W
@@ -222,6 +226,8 @@ entries:
     sectors: [energy]
     payload_type: structured
     endpoint: https://api.eia.gov/v2/petroleum/stoc/wstk/data/
+    data_column: value
+    facet_series: WCRSTUS1
   - name: eia_generation
     agency: eia
     dataset_id: ELEC.GEN.ALL-US-99.M
@@ -232,6 +238,11 @@ entries:
     sectors: [utilities]
     payload_type: structured
     endpoint: https://api.eia.gov/v2/electricity/electric-power-operational-data/data/
+    data_column: generation
+    facets:
+      location: US
+      sectorid: 99
+      fueltypeid: ALL
   - name: eia_energy_production
     agency: eia
     dataset_id: NG.PROD.TX-1.M
@@ -242,6 +253,10 @@ entries:
     sectors: [energy]
     payload_type: structured
     endpoint: https://api.eia.gov/v2/natural-gas/prod/sum/data/
+    data_column: value
+    facets:
+      duoarea: STX
+      process: FGW
 
   - name: ny_fed_sofr
     agency: ny_fed
@@ -343,8 +358,10 @@ entries:
     source_category: official_regulatory
     sectors: [automotive]
     payload_type: both
-    endpoint: https://api.nhtsa.gov/recalls/recallsByVehicle
+    endpoint: https://data.transportation.gov/resource/6axg-epim.json
     event_type: recall
+    limit: 100
+    order_by: report_received_date DESC
   - name: nhtsa_investigations
     agency: nhtsa
     dataset_id: vehicle-investigations
@@ -354,8 +371,10 @@ entries:
     source_category: official_regulatory
     sectors: [automotive]
     payload_type: both
-    endpoint: https://www.nhtsa.gov/api/vehicle-safety
+    endpoint: https://data.transportation.gov/resource/b3rp-be92.json
     event_type: investigation
+    limit: 100
+    order_by: open_date DESC
 
   - name: usaspending_awards
     agency: usaspending
