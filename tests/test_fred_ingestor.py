@@ -24,6 +24,17 @@ if "chromadb" not in sys.modules:
 from src.storage.store import Store
 
 
+@pytest.fixture(autouse=True)
+def mock_default_chroma_store():
+    """Keep every FRED unit test independent of the live Chroma directory."""
+    with patch("src.storage.store.ChromaStore") as mock_cls:
+        instance = MagicMock()
+        instance.heartbeat.return_value = True
+        instance.count.return_value = 0
+        mock_cls.return_value = instance
+        yield instance
+
+
 @pytest.fixture
 def mock_chroma():
     """Patch ChromaStore construction; yield the mock instance."""
@@ -109,6 +120,32 @@ class TestFREDIngestor:
         result = store.get_fundamental("MACRO", "FEDFUNDS")
         assert result is not None
         assert result["value"] == 5.75
+
+    def test_fetch_indicator_store_history_persists_each_dated_value(self, store):
+        """Bootstrap history iterates dated Series items, not scalar values."""
+        from src.macros.fred_ingestor import FREDIngestor
+        import pandas as pd
+
+        ingestor = FREDIngestor(store=store)
+        mock_fred = MagicMock()
+        dates = pd.date_range("2026-01-01", periods=3, freq="ME")
+        mock_fred.get_series.return_value = pd.Series([5.25, 5.5, 5.75], index=dates)
+
+        with patch.object(ingestor, "_client", mock_fred):
+            value = ingestor.fetch_indicator("FEDFUNDS", store_history=True)
+
+        assert value == 5.75
+        with store.sqlite._connect() as conn:
+            rows = conn.execute(
+                "SELECT period, value FROM fundamentals WHERE ticker=? AND metric=? "
+                "ORDER BY period",
+                ("MACRO", "FEDFUNDS"),
+            ).fetchall()
+        assert [(row["period"], row["value"]) for row in rows] == [
+            ("2026-01-31", 5.25),
+            ("2026-02-28", 5.5),
+            ("2026-03-31", 5.75),
+        ]
 
     def test_fetch_indicator_empty_series(self):
         """Empty series response returns None."""

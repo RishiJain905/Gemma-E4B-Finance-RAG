@@ -8,7 +8,7 @@ from email.utils import format_datetime
 import pytest
 
 from src.ingestion.errors import ErrorClass, ProviderError, parse_retry_after
-from src.utils.resilience import ProviderRequestPolicy
+from src.utils.resilience import ProviderRequestPolicy, provider_request_policy
 
 
 class _Response:
@@ -143,3 +143,50 @@ def test_retry_after_sleep_is_capped_without_losing_provider_reset() -> None:
     assert sleeps == [30.0]
     assert policy.last_error is not None
     assert policy.last_error.reset_at == "2026-07-14T12:10:00Z"
+
+
+def test_massive_minute_limit_is_rate_limited_without_immediate_retry() -> None:
+    calls = 0
+    policy = provider_request_policy(
+        "massive",
+        "vendor_market",
+        sleep_fn=lambda _delay: None,
+        now_fn=lambda: datetime(2026, 7, 14, 12, 0, tzinfo=timezone.utc),
+    )
+
+    def request() -> _Response:
+        nonlocal calls
+        calls += 1
+        return _Response(
+            429,
+            payload={"error": "maximum requests per minute; wait or upgrade your subscription"},
+        )
+
+    with pytest.raises(ProviderError) as caught:
+        policy.request(request)
+
+    assert calls == 1
+    assert caught.value.error_class is ErrorClass.RATE_LIMITED
+
+
+@pytest.mark.parametrize("status_code", [403, 429])
+def test_sec_throttling_is_rate_limited_once_with_cooldown(status_code: int) -> None:
+    calls = 0
+    policy = ProviderRequestPolicy(
+        source="sec_filings",
+        max_attempts=1,
+        now_fn=lambda: datetime(2026, 7, 14, 12, 0, tzinfo=timezone.utc),
+    )
+
+    def request() -> _Response:
+        nonlocal calls
+        calls += 1
+        return _Response(status_code, headers={"Retry-After": "60"})
+
+    with pytest.raises(ProviderError) as caught:
+        policy.request(request)
+
+    assert calls == 1
+    assert caught.value.error_class is ErrorClass.RATE_LIMITED
+    assert caught.value.reset_at == "2026-07-14T12:01:00Z"
+    assert policy.remaining_work_skipped is False

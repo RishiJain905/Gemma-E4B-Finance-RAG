@@ -136,7 +136,7 @@ class MassiveIngestor:
     NEWS_STATUS_SOURCE = "massive_news"
     FILINGS_STATUS_SOURCE = "massive_filings"
     COVERAGE_SOURCE = "massive"
-    GROUPED_PATH = "/v2/aggs/grouped/locale/us/markets/stocks"
+    GROUPED_PATH = "/v2/aggs/grouped/locale/us/market/stocks"
     SPLITS_PATH = "/v3/reference/splits"
     DIVIDENDS_PATH = "/v3/reference/dividends"
     NEWS_PATH = "/v2/reference/news"
@@ -202,6 +202,7 @@ class MassiveIngestor:
             if cursor_before else today - timedelta(days=self.initial_lookback_days)
         )
         last = date.fromisoformat(end_date) if end_date else today
+        last = min(last, today - timedelta(days=1))
         if first > last:
             return self._finish(result, "ok", cursor_after=cursor_before)
 
@@ -936,6 +937,11 @@ class MassiveIngestor:
             for key in ("results", "data", "items"):
                 if isinstance(payload.get(key), list):
                     return payload[key]
+            if (
+                str(payload.get("status") or "").upper() == "OK"
+                and payload.get("resultsCount") == 0
+            ):
+                return []
         return None
 
     def _next_page_url(self, payload: object) -> Optional[str]:

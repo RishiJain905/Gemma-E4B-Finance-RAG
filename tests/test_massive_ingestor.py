@@ -103,6 +103,7 @@ def test_grouped_market_summary_filters_locally_and_corrected_bars_upsert(
     assert second_result["updated"] >= 1
     assert len(calls) == 2
     assert all("grouped" in url for url in calls)
+    assert all("/locale/us/market/stocks/" in url for url in calls)
     assert all("AAA" not in url and "BBB" not in url for url in calls)
     assert store.sqlite.count_observations() == 10  # 2 securities x 5 OHLCV metrics
     assert store.get_source_cursor("massive_market", "US") == "2026-07-13"
@@ -119,6 +120,38 @@ def test_grouped_market_summary_filters_locally_and_corrected_bars_upsert(
     assert metadata["adjusted"] is True
     assert metadata["market_date"] == "2026-07-13"
     assert metadata["provider_revision"] == "rev-2"
+
+
+def test_grouped_market_zero_result_envelope_is_an_empty_market_day() -> None:
+    from src.ingestion.massive_ingestor import MassiveIngestor
+
+    assert MassiveIngestor._rows_from_payload(
+        {"status": "OK", "queryCount": 0, "resultsCount": 0},
+    ) == []
+
+
+def test_grouped_market_does_not_request_incomplete_current_day(tmp_path: Path) -> None:
+    from src.ingestion.massive_ingestor import MassiveIngestor
+
+    store, _chroma = _store(tmp_path)
+    calls: list[str] = []
+
+    def http_get(url: str, **_kwargs) -> FakeResponse:
+        calls.append(url)
+        return FakeResponse(_load("grouped-2026-07-13.json"))
+
+    result = MassiveIngestor(
+        store=store,
+        coverage_resolver=_coverage(),
+        api_key="test-massive-key",
+        http_get=http_get,
+        now_fn=lambda: "2026-07-14T12:00:00Z",
+    ).ingest_market_data(start_date="2026-07-13", end_date="2026-07-14")
+
+    assert result["status"] == "ok"
+    assert len(calls) == 1
+    assert calls[0].endswith("/2026-07-13")
+    assert result["cursor_after"] == "2026-07-13"
 
 
 def test_massive_splits_and_dividends_are_structured_idempotent_events(

@@ -12,6 +12,7 @@ import pytest
 import yaml
 
 from src.storage.store import Store
+from src.ingestion.official import make_event, make_narrative, persist_records, result
 
 
 FIXTURES = Path(__file__).parent / "fixtures" / "providers" / "official"
@@ -277,6 +278,196 @@ def test_replaying_each_official_fixture_is_idempotent(
         assert chroma.add_document.call_count == first["stored"]
 
 
+def test_event_links_follow_deduplicated_narrative_identity(tmp_path: Path) -> None:
+    store, _chroma = _store(tmp_path)
+    accessed = "2026-07-15T00:00:00Z"
+    original = make_narrative(
+        source_name="usaspending",
+        source_category="official_award",
+        provider_record_id="award-original",
+        title="Federal award",
+        body="Shared award description",
+        source_url_value="https://example.test/award",
+        published_at=accessed,
+        accessed_at=accessed,
+    )
+    duplicate = make_narrative(
+        source_name="usaspending",
+        source_category="official_award",
+        provider_record_id="award-duplicate",
+        title="Federal award",
+        body="Shared award description",
+        source_url_value="https://example.test/award",
+        published_at=accessed,
+        accessed_at=accessed,
+    )
+    event = make_event(
+        source_name="usaspending",
+        source_category="official_award",
+        provider_record_id="event-duplicate",
+        event_type="award",
+        effective_at=accessed,
+        source_url_value="https://example.test/award",
+        accessed_at=accessed,
+        source_corpus_item_ids=(duplicate.corpus_item_id,),
+    )
+    first = result("usaspending", "government_awards")
+    second = result("usaspending", "government_awards")
+
+    persist_records(store, [original], first)
+    persist_records(store, [duplicate, event], second)
+
+    assert second["malformed"] == 0
+    stored_event = store.sqlite.get_event(event.event_id)
+    assert stored_event is not None
+    assert stored_event["source_corpus_item_ids"] == [original.corpus_item_id]
+
+
 def test_csv_fixture_is_pinned_and_parseable_without_network() -> None:
     rows = list(csv.DictReader(io.StringIO(_load_text("treasury_daily.csv"))))
     assert rows[0]["source_id"] == "treasury-20260713"
+
+
+def test_treasury_parses_current_atom_xml_feed(tmp_path: Path) -> None:
+    from src.ingestion.official.treasury import TreasuryIngestor
+
+    store, _chroma = _store(tmp_path)
+    payload = """<?xml version="1.0" encoding="utf-8"?>
+    <feed xmlns="http://www.w3.org/2005/Atom"
+          xmlns:d="http://schemas.microsoft.com/ado/2007/08/dataservices">
+      <entry><content><properties xmlns="http://schemas.microsoft.com/ado/2007/08/dataservices/metadata">
+        <d:NEW_DATE>2026-07-14T00:00:00</d:NEW_DATE>
+        <d:BC_10YEAR>4.27</d:BC_10YEAR>
+      </properties></content></entry>
+    </feed>"""
+
+    result = TreasuryIngestor(store=store).ingest(
+        payload=payload,
+        entry_names=["treasury_nominal_yield_10y"],
+    )
+
+    assert result["stored"] == 1
+    assert store.sqlite.list_observations(source_name="treasury", limit=10)[0][
+        "value_numeric"
+    ] == 4.27
+
+
+def test_treasury_parses_current_static_xml_shape(tmp_path: Path) -> None:
+    from src.ingestion.official.treasury import TreasuryIngestor
+
+    store, _chroma = _store(tmp_path)
+    payload = """<QR_BC_CM><LIST_G_NEW_DATE><G_NEW_DATE>
+      <BID_CURVE_DATE>14-JUL-26</BID_CURVE_DATE>
+      <LIST_G_BC_CAT><G_BC_CAT><BC_10YEAR>4.27</BC_10YEAR></G_BC_CAT></LIST_G_BC_CAT>
+    </G_NEW_DATE></LIST_G_NEW_DATE></QR_BC_CM>"""
+
+    result = TreasuryIngestor(store=store).ingest(
+        payload=payload,
+        entry_names=["treasury_nominal_yield_10y"],
+    )
+
+    assert result["stored"] == 1
+
+
+def test_bls_live_contract_uses_one_json_post(tmp_path: Path) -> None:
+    from src.ingestion.official.bls import BLSIngestor
+
+    store, _chroma = _store(tmp_path)
+    response = FakeResponse({
+        "status": "REQUEST_SUCCEEDED",
+        "Results": {
+            "series": [{
+                "seriesID": "CUUR0000SA0",
+                "data": [{"year": "2026", "period": "M06", "value": "319.1"}],
+            }]
+        },
+    })
+    post = MagicMock(return_value=response)
+
+    result = BLSIngestor(
+        store=store,
+        api_key="bls-test",
+        http_post=post,
+        now_fn=lambda: "2026-07-15T00:00:00Z",
+    ).ingest(entry_names=["bls_cpi"])
+
+    assert result["stored"] == 1
+    assert post.call_count == 1
+    assert post.call_args.kwargs["json"]["seriesid"] == ["CUUR0000SA0"]
+
+
+def test_eia_live_contract_uses_route_facet_and_value_column(tmp_path: Path) -> None:
+    from src.ingestion.official.eia import EIAIngestor
+
+    store, _chroma = _store(tmp_path)
+    get = MagicMock(return_value=FakeResponse({
+        "response": {
+            "data": [{"period": "2026-07-14", "series": "RWTC", "value": "100.25"}]
+        }
+    }))
+
+    result = EIAIngestor(
+        store=store,
+        api_key="eia-test",
+        http_get=get,
+        now_fn=lambda: "2026-07-15T00:00:00Z",
+    ).ingest(entry_names=["eia_energy_prices"])
+
+    assert result["stored"] == 1
+    params = get.call_args.kwargs["params"]
+    assert params["data[0]"] == "value"
+    assert params["facets[series][]"] == "RWTC"
+    assert params["length"] > 0
+
+
+def test_nhtsa_parses_current_dot_data_portal_fields(tmp_path: Path) -> None:
+    from src.ingestion.official.nhtsa import NHTSAIngestor
+
+    store, _chroma = _store(tmp_path)
+    payload = {
+        "results": [{
+            "nhtsa_id": "26V001000",
+            "report_received_date": "2026-07-14T00:00:00.000",
+            "manufacturer": "Alpha Motors",
+            "component": "AIR BAGS",
+            "defect_summary": "Air bag inflator may rupture",
+            "recall_link": {"url": "https://www.nhtsa.gov/recalls?nhtsaId=26V001000"},
+        }]
+    }
+
+    result = NHTSAIngestor(store=store).ingest(
+        payload=payload,
+        entry_names=["nhtsa_recalls"],
+    )
+
+    assert result["stored"] == 2
+    assert store.sqlite.get_event("event/nhtsa/26V001000") is not None
+
+
+def test_usaspending_live_contract_uses_bounded_contract_post(tmp_path: Path) -> None:
+    from src.ingestion.official.usaspending import USAspendingIngestor
+
+    store, _chroma = _store(tmp_path)
+    response = FakeResponse({
+        "results": [{
+            "Award ID": "CONT_AWD_1",
+            "Recipient Name": "Alpha Defense Systems",
+            "Start Date": "2026-07-10",
+            "Award Amount": 1000000,
+            "Awarding Agency": "Department of Defense",
+            "Description": "Production contract",
+        }],
+        "page_metadata": {"hasNext": False, "page": 1},
+    })
+    post = MagicMock(return_value=response)
+
+    result = USAspendingIngestor(
+        store=store,
+        http_post=post,
+        now_fn=lambda: "2026-07-15T00:00:00Z",
+    ).ingest()
+
+    assert result["stored"] == 2
+    body = post.call_args.kwargs["json"]
+    assert body["limit"] == 100
+    assert body["filters"]["award_type_codes"] == ["A", "B", "C", "D"]

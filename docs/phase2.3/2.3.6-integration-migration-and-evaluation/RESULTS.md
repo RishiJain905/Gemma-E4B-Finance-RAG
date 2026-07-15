@@ -31,6 +31,23 @@ one commit per task.
   requests returned grounded, cited, non-degraded answers through the complete
   intent → retrieval → augmentation → generation pipeline.
 
+## Live rollout, stage 1 (2026-07-15)
+
+After enablement, the first live bootstrap surfaced ten first-contact adapter
+defects (iShares CSV preamble, Nasdaq bot-blocking, Massive path/pacing, five
+official-feed endpoint/contract mismatches, SEC 403 misclassified as
+entitlement). All were fixed and live-verified on `phase-2.3-live-fixes`:
+
+- Universe landed: **103 Nasdaq-100 + 504 S&P 500 active memberships**, 10,410
+  SEC identities; corpus items 2,541 → 15,057+.
+- Repaired bootstrap run `cfa768d2` truthfully `partial`: 52,139 Massive market
+  observations, 15,737 Finnhub news items (bounded, resumable), all official
+  feeds green; SEC filings correctly `rate_limited` with persisted cooldown.
+- First live `daily` run `3d6ea343` healthy: TTL fresh-skips, cursor+overlap
+  dedup collapsing 7,952 duplicate news items, idempotent official replays,
+  and only SEC still inside its provider-side cooldown (one bounded attempt,
+  isolation preserved).
+
 ## Caveats
 
 - **Phase sign-off is intentionally incomplete here:** the all-ticker inventory,

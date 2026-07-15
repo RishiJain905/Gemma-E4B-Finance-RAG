@@ -115,6 +115,8 @@ def error_class_for_http(status_code: int, message: str = "") -> ErrorClass:
     lowered = message.lower()
     if status_code == 401:
         return ErrorClass.AUTHENTICATION
+    if status_code == 429:
+        return ErrorClass.RATE_LIMITED
     if status_code == 403 or any(
         marker in lowered
         for marker in (
@@ -127,8 +129,6 @@ def error_class_for_http(status_code: int, message: str = "") -> ErrorClass:
         )
     ):
         return ErrorClass.ENTITLEMENT
-    if status_code == 429:
-        return ErrorClass.RATE_LIMITED
     if status_code >= 500 or status_code in {408, 425}:
         return ErrorClass.TRANSIENT
     return ErrorClass.PERMANENT

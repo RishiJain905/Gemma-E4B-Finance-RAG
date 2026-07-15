@@ -5,6 +5,8 @@ U.S. Treasury daily nominal, real-yield, and bill-rate ingestion.
 from __future__ import annotations
 
 import logging
+import xml.etree.ElementTree as ET
+from datetime import datetime
 from typing import Any, Callable, Optional
 
 import requests
@@ -73,7 +75,13 @@ class TreasuryIngestor:
             vintage = row_value(row, "vintage_at", "vintage_date", "retrieved_at") or accessed
             source_id = str(row_value(row, "source_id", "id") or f"treasury-{observation_date}")
             for entry in entries:
-                value = parse_number(row_value(row, str(entry["field"])))
+                value = parse_number(
+                    row_value(
+                        row,
+                        str(entry["field"]),
+                        *[str(field) for field in entry.get("field_aliases", [])],
+                    )
+                )
                 if value is None:
                     continue
                 endpoint = source_url(str(entry["endpoint"]), str(entry["endpoint"]))
@@ -140,6 +148,58 @@ class TreasuryIngestor:
     def _rows(payload: object) -> list[dict[str, object]]:
         from . import rows_from_payload
 
+        if isinstance(payload, (str, bytes)):
+            text = payload.decode("utf-8") if isinstance(payload, bytes) else payload
+            if text.lstrip().startswith("<"):
+                root = ET.fromstring(text)
+                rows = []
+                for entry in root.findall(".//{http://www.w3.org/2005/Atom}entry"):
+                    row = {
+                        node.tag.rsplit("}", 1)[-1]: node.text.strip()
+                        for node in entry.iter()
+                        if node.text and node.text.strip()
+                    }
+                    observation_date = (
+                        row.get("NEW_DATE")
+                        or row.get("CF_NEW_DATE")
+                        or row.get("QUOTE_DATE")
+                    )
+                    if observation_date:
+                        row["Date"] = str(observation_date)[:10]
+                    rows.append(row)
+                if rows:
+                    return rows
+                for entry in root.iter():
+                    if entry.tag.rsplit("}", 1)[-1] not in {
+                        "G_NEW_DATE",
+                        "G_INDEX_DATE",
+                    }:
+                        continue
+                    row = {
+                        node.tag.rsplit("}", 1)[-1]: node.text.strip()
+                        for node in entry.iter()
+                        if node.text and node.text.strip() and len(node) == 0
+                    }
+                    observation_date = (
+                        row.get("BID_CURVE_DATE")
+                        or row.get("TIPS_CURVE_DATE")
+                        or row.get("QUOTE_DATE")
+                        or row.get("CF_NEW_DATE")
+                    )
+                    if observation_date:
+                        date_text = str(observation_date).split("T", 1)[0]
+                        for date_format in ("%m/%d/%Y", "%d-%b-%y"):
+                            try:
+                                date_text = datetime.strptime(
+                                    date_text,
+                                    date_format,
+                                ).date().isoformat()
+                                break
+                            except ValueError:
+                                continue
+                        row["Date"] = date_text
+                        rows.append(row)
+                return rows
         return rows_from_payload(payload)
 
     def _now_timestamp(self) -> str:

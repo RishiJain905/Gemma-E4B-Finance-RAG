@@ -72,8 +72,24 @@ class NHTSAIngestor:
         records: list[object] = []
         for row in rows:
             event_type = str(row_value(row, "event_type", "type") or "").lower()
-            provider_id = str(row_value(row, "NHTSA_ID", "nhtsa_id", "id") or "").strip()
-            reported = row_value(row, "ReportDate", "report_date", "date")
+            provider_id = str(
+                row_value(
+                    row,
+                    "NHTSA_ID",
+                    "nhtsa_id",
+                    "nhtsa_action_number",
+                    "id",
+                )
+                or ""
+            ).strip()
+            reported = row_value(
+                row,
+                "ReportDate",
+                "report_date",
+                "report_received_date",
+                "open_date",
+                "date",
+            )
             manufacturer = str(row_value(row, "Manufacturer", "manufacturer") or "").strip()
             if not provider_id or not reported:
                 continue
@@ -82,9 +98,29 @@ class NHTSAIngestor:
                 if configured_type and event_type and configured_type != event_type:
                     continue
                 actual_type = event_type or configured_type or "safety_event"
-                title = str(row_value(row, "Summary", "summary", "Component") or f"NHTSA {actual_type} {provider_id}")
+                title = str(
+                    row_value(
+                        row,
+                        "Summary",
+                        "summary",
+                        "defect_summary",
+                        "subject",
+                        "Component",
+                    )
+                    or f"NHTSA {actual_type} {provider_id}"
+                )
                 component = str(row_value(row, "Component", "component") or "")
-                url = source_url(row_value(row, "URL", "url", "link"), str(entry["endpoint"]))
+                raw_url = row_value(
+                    row,
+                    "URL",
+                    "url",
+                    "link",
+                    "recall_link",
+                    "nhtsa_link",
+                )
+                if isinstance(raw_url, Mapping):
+                    raw_url = raw_url.get("url")
+                url = source_url(raw_url, str(entry["endpoint"]))
                 narrative = make_narrative(
                     source_name=self.SOURCE_NAME,
                     source_category=str(entry["source_category"]),
@@ -143,7 +179,17 @@ class NHTSAIngestor:
                 output["pages"] = 1
             else:
                 for entry in entries:
-                    fetched = request_payload(self.http_get, str(entry["endpoint"]), timeout=self.timeout)
+                    params = {
+                        "$limit": int(entry.get("limit") or 100),
+                        "$order": str(entry.get("order_by") or ""),
+                    }
+                    params = {key: value for key, value in params.items() if value != ""}
+                    fetched = request_payload(
+                        self.http_get,
+                        str(entry["endpoint"]),
+                        params=params,
+                        timeout=self.timeout,
+                    )
                     output["requests"] = int(output["requests"]) + 1
                     persist_records(
                         self.store,
