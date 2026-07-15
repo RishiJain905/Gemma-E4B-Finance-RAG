@@ -61,10 +61,20 @@ def test_scenario_1_full_daily_run(store):
     result = scheduler.run_daily()
 
     # Daily sources ran; hourly/weekly-only sources were not part of the run.
-    assert set(result) == {
+    assert {
         "yfinance", "fred", "sec_filings", "sec_companyfacts", "ir_pages", "estimates",
-    }
-    assert all(r["status"] == "success" for r in result.values())
+        "universe_nasdaq100", "universe_ivv", "universe_sec", "finnhub", "massive",
+        "federal_reserve", "treasury", "bls", "bea", "eia", "ny_fed", "openfda",
+        "nhtsa", "usaspending",
+    } <= set(result)
+    assert all(
+        result[name]["status"] == "success"
+        for name in (
+            "yfinance", "fred", "sec_filings", "sec_companyfacts", "ir_pages",
+            "estimates", "universe_nasdaq100", "universe_ivv", "universe_sec",
+            "federal_reserve", "treasury", "ny_fed", "nhtsa", "usaspending",
+        )
+    )
     assert "gdelt" not in result
     assert "earnings_transcripts" not in result
 
@@ -151,7 +161,9 @@ def test_scenario_4_dead_letter_queue(store):
     pending_sources = {p["source"] for p in pending}
     assert "fred" in pending_sources
     assert "gdelt" in pending_sources
-    assert len(pending) == len(scheduler.SOURCES)
+    assert len(pending) == sum(
+        spec.is_available for spec in scheduler.SOURCES.values()
+    )
 
     # "Fix" the source and retry from the DLQ.
     assert dlq.retry("fred", "scheduler") is True

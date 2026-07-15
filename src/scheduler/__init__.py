@@ -20,11 +20,16 @@ CLI (for cron):
 
 import json
 import logging
+import os
 import time
+from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
+from src.scheduler.budget import BudgetExhaustedError, RunBudget
+from src.scheduler.cursors import CursorManager
+from src.scheduler.source_registry import VALID_SCOPES, SourceRegistry, SourceSpec
 from src.storage.store import Store
 from src.universe.coverage import CoverageResolver
 
@@ -47,6 +52,22 @@ class UnifiedScheduler:
 
     # Synthetic ticker used for the scheduler's own cadence tracking.
     SCHEDULER_TICKER = "SCHEDULER"
+    BUDGETED_HTTP_SOURCES = frozenset(
+        {
+            "finnhub",
+            "massive",
+            "federal_reserve",
+            "treasury",
+            "bls",
+            "bea",
+            "eia",
+            "ny_fed",
+            "cftc",
+            "openfda",
+            "nhtsa",
+            "usaspending",
+        }
+    )
 
     SOURCES = {
         "yfinance": {
@@ -99,6 +120,7 @@ class UnifiedScheduler:
     WEEKLY_SOURCES = ["earnings_transcripts", "sec_filings"]
 
     DEFAULT_WATCHLIST_PATH = Path(__file__).parent.parent.parent / "configs/watchlist.yaml"
+    DEFAULT_SOURCES_PATH = Path(__file__).parent.parent.parent / "configs/sources.yaml"
 
     def __init__(
         self,
@@ -106,33 +128,46 @@ class UnifiedScheduler:
         inter_source_delay: float = 2.0,
         watchlist_path: Optional[Path] = None,
         coverage_resolver: Optional[CoverageResolver] = None,
-    ):
+        registry: Optional[SourceRegistry] = None,
+        sources_path: Optional[Path] = None,
+    ) -> None:
         self.store = store or Store()
         self.inter_source_delay = inter_source_delay
         self.watchlist_path = watchlist_path or self.DEFAULT_WATCHLIST_PATH
+        self.registry = registry or SourceRegistry.load(
+            sources_path or self.DEFAULT_SOURCES_PATH
+        )
+        # Compatibility surface for callers that enumerate scheduler.SOURCES.
+        self.SOURCES = dict(self.registry.sources)
+        self.DAILY_SOURCES = [
+            spec.name
+            for spec in self.registry.select("daily", include_disabled=True)
+        ]
+        self.HOURLY_SOURCES = [
+            spec.name
+            for spec in self.registry.select("hourly", include_disabled=True)
+        ]
+        self.WEEKLY_SOURCES = [
+            spec.name
+            for spec in self.registry.select("weekly", include_disabled=True)
+        ]
         self.coverage = coverage_resolver or CoverageResolver(self.store)
         self.ttls = self._load_ttls()
+        self.cursors = CursorManager(self.store)
+        self._selected_partitions: dict[str, list[str]] = {}
+        self._active_budgets: dict[str, RunBudget] = {}
+        self._budget_windows: dict[str, tuple[str, str]] = {}
         self._dlq = None  # lazy
 
     # ── Config ─────────────────────────────────────────
 
     def _load_ttls(self) -> dict:
-        """Load the schedule TTL map (hours) from watchlist.yaml."""
-        defaults = {
-            "fundamentals": 24, "news": 6, "macro": 24, "sec_filings": 12,
-            "sec_companyfacts": 24,
-            "gdelt_news": 6, "transcripts": 168, "ir_pages": 24,
-            "estimates": 24,
+        """Return the registry-owned TTL map keyed for legacy consumers."""
+        return {
+            spec.ttl_key: spec.ttl_hours
+            for spec in self.registry.sources.values()
+            if spec.status != "invalid_configuration"
         }
-        try:
-            import yaml
-            if self.watchlist_path.exists():
-                with open(self.watchlist_path) as f:
-                    cfg = yaml.safe_load(f) or {}
-                defaults.update(cfg.get("schedule", {}) or {})
-        except Exception:
-            pass
-        return defaults
 
     @property
     def dlq(self):
@@ -148,17 +183,93 @@ class UnifiedScheduler:
 
     # ── Ordering / staleness helpers ───────────────────
 
-    def _ordered_sources(self) -> list[tuple[str, dict]]:
-        """Return (name, config) pairs sorted by ascending weight."""
-        return sorted(self.SOURCES.items(), key=lambda kv: kv[1]["weight"])
+    def _ordered_sources(self) -> list[tuple[str, SourceSpec]]:
+        """Return source specifications sorted by configured priority."""
+        return sorted(
+            self.SOURCES.items(),
+            key=lambda item: (item[1].priority, item[0]),
+        )
 
     @staticmethod
     def _scheduler_cache_source(name: str) -> str:
         return f"unified:{name}"
 
     def _ttl_for(self, name: str) -> int:
-        ttl_key = self.SOURCES[name]["ttl_key"]
-        return int(self.ttls.get(ttl_key, 24))
+        return int(self.SOURCES[name].ttl_hours)
+
+    def _new_budget(self, spec: SourceSpec) -> RunBudget:
+        """Create a run budget from durable provider usage windows."""
+        now = datetime.now(timezone.utc)
+        day_start = now.date().isoformat()
+        minute_start = now.strftime("%Y-%m-%dT%H:%MZ")
+        usage = self.store.get_source_budget_usage(
+            spec.name,
+            day_start=day_start,
+            minute_start=minute_start,
+        )
+        provider_remaining = usage.get("provider_remaining")
+        provider_reset = usage.get("provider_reset")
+        if provider_remaining is not None and provider_reset is not None:
+            try:
+                reset_at = float(provider_reset)
+            except ValueError:
+                try:
+                    reset_at = datetime.fromisoformat(
+                        str(provider_reset).replace("Z", "+00:00")
+                    ).timestamp()
+                except ValueError:
+                    reset_at = None
+            if reset_at is not None and reset_at <= now.timestamp():
+                provider_remaining = None
+                provider_reset = None
+        self._budget_windows[spec.name] = (day_start, minute_start)
+        return RunBudget(
+            requests_per_minute=spec.requests_per_minute,
+            requests_per_day=spec.requests_per_day,
+            requests_per_run=spec.requests_per_run,
+            max_work_items=spec.max_work_items_per_run,
+            day_requests=int(usage.get("day_requests") or 0),
+            minute_requests=int(usage.get("minute_requests") or 0),
+            provider_remaining=provider_remaining,
+            provider_reset=provider_reset,
+        )
+
+    def _remember_budget(self, name: str, budget: RunBudget) -> None:
+        """Persist request attempts and provider limits for later processes."""
+        day_start, minute_start = self._budget_windows[name]
+        self.store.record_source_budget_usage(
+            name,
+            day_start=day_start,
+            minute_start=minute_start,
+            attempted_requests=budget.attempted_requests,
+            successful_requests=budget.successful_requests,
+            provider_remaining=budget.provider_remaining,
+            provider_reset=budget.provider_reset,
+        )
+
+    def _remember_budget_safely(self, name: str, budget: RunBudget) -> None:
+        """Persist accounting without allowing bookkeeping to stop later sources."""
+        try:
+            self._remember_budget(name, budget)
+        except Exception as exc:  # noqa: BLE001 - preserve source isolation
+            logger.error("Could not persist budget usage for %s: %s", name, exc)
+
+    def _mark_scheduler_stale(self, name: str, error: str) -> None:
+        """Best-effort scheduler freshness update for one failed source."""
+        try:
+            self.store.upsert_cache_stale(
+                self.SCHEDULER_TICKER,
+                self._scheduler_cache_source(name),
+                error,
+            )
+        except Exception as exc:  # noqa: BLE001 - preserve source isolation
+            logger.error("Could not mark scheduler source %s stale: %s", name, exc)
+
+    def _budgeted_http_get(self, name: str):
+        """Return a requests-compatible callable gated by the active source budget."""
+        import requests
+
+        return self._active_budgets[name].wrap_http_get(requests.get)
 
     def _is_stale(self, name: str) -> bool:
         """True if the source has never run, is marked stale, or is past TTL."""
@@ -180,6 +291,38 @@ class UnifiedScheduler:
 
         Raises on failure so the caller can record an error / DLQ entry.
         """
+        if name in {"universe_nasdaq100", "universe_ivv", "universe_sec"}:
+            return self._run_universe_source(name)
+
+        if name == "finnhub":
+            from src.ingestion.finnhub_ingestor import FinnhubIngestor
+
+            tickers = self._selected_partitions.get(name, [])
+            return FinnhubIngestor(
+                store=self.store,
+                coverage_resolver=self.coverage,
+                http_get=self._budgeted_http_get(name),
+                overlap_hours=int((self.SOURCES[name].overlap or "0h")[:-1]),
+            ).ingest_news(tickers=tickers)
+
+        if name == "massive":
+            from src.ingestion.massive_ingestor import MassiveIngestor
+
+            return MassiveIngestor(
+                store=self.store,
+                coverage_resolver=self.coverage,
+                http_get=self._budgeted_http_get(name),
+                overlap_days=int((self.SOURCES[name].overlap or "0d")[:-1]),
+            ).ingest_all()
+
+        official = self._official_ingestor(name)
+        if official is not None:
+            return official(
+                store=self.store,
+                coverage_resolver=self.coverage,
+                http_get=self._budgeted_http_get(name),
+            ).ingest()
+
         if name == "yfinance":
             from src.ingestion.yfinance_ingestor import YFinanceIngestor
             YFinanceIngestor(
@@ -242,6 +385,76 @@ class UnifiedScheduler:
             return {"tickers_processed": len(results), "facts_stored": stored}
 
         raise ValueError(f"Unknown source: {name}")
+
+    def _run_universe_source(self, name: str) -> dict:
+        """Fetch and atomically reconcile one configured universe snapshot."""
+        from src.universe.providers import (
+            IVVHoldingsProvider,
+            Nasdaq100Provider,
+            SECCompanyTickersProvider,
+        )
+        from src.universe.registry import UniverseRegistry
+
+        if name == "universe_nasdaq100":
+            provider = Nasdaq100Provider()
+        elif name == "universe_ivv":
+            provider = IVVHoldingsProvider()
+        else:
+            provider = SECCompanyTickersProvider(
+                user_agent=os.environ.get("SEC_EDGAR_USER_AGENT")
+            )
+        rows = provider.fetch()
+        result = UniverseRegistry(self.store).refresh(
+            provider.source,
+            datetime.now(timezone.utc).isoformat(),
+            rows,
+        )
+        return asdict(result)
+
+    @staticmethod
+    def _official_ingestor(name: str):
+        """Return the configured official adapter class, if ``name`` is official."""
+        if name == "federal_reserve":
+            from src.ingestion.official.federal_reserve import FederalReserveIngestor
+
+            return FederalReserveIngestor
+        if name == "treasury":
+            from src.ingestion.official.treasury import TreasuryIngestor
+
+            return TreasuryIngestor
+        if name == "bls":
+            from src.ingestion.official.bls import BLSIngestor
+
+            return BLSIngestor
+        if name == "bea":
+            from src.ingestion.official.bea import BEAIngestor
+
+            return BEAIngestor
+        if name == "eia":
+            from src.ingestion.official.eia import EIAIngestor
+
+            return EIAIngestor
+        if name == "ny_fed":
+            from src.ingestion.official.ny_fed import NYFedIngestor
+
+            return NYFedIngestor
+        if name == "cftc":
+            from src.ingestion.official.cftc import CFTCIngestor
+
+            return CFTCIngestor
+        if name == "openfda":
+            from src.ingestion.official.openfda import OpenFDAIngestor
+
+            return OpenFDAIngestor
+        if name == "nhtsa":
+            from src.ingestion.official.nhtsa import NHTSAIngestor
+
+            return NHTSAIngestor
+        if name == "usaspending":
+            from src.ingestion.official.usaspending import USAspendingIngestor
+
+            return USAspendingIngestor
+        return None
 
     def _load_core_tickers(self) -> list[str]:
         """Compatibility alias for CompanyFacts deep-coverage tickers."""
@@ -306,19 +519,158 @@ class UnifiedScheduler:
                 stale_error,
             )
 
+    @staticmethod
+    def _classify_detail(detail: dict) -> tuple[str, Optional[str]]:
+        """Map fail-soft adapter envelopes to scheduler run/freshness states."""
+        skipped = {
+            "disabled_missing_key",
+            "disabled_authentication",
+            "disabled_entitlement",
+            "rate_limited",
+            "skipped_no_key",
+        }
+        top_status = str(detail.get("status") or "").lower()
+        if top_status in skipped:
+            return "skipped", top_status
+        if top_status == "error":
+            return "error", "provider_error"
+        if top_status == "partial":
+            return "partial", "provider_partial"
+
+        nested_statuses = {
+            str(value.get("status") or "").lower()
+            for value in detail.values()
+            if isinstance(value, dict) and value.get("status")
+        }
+        adverse = nested_statuses & (skipped | {"error", "partial"})
+        if adverse:
+            healthy = nested_statuses & {"ok", "success", "completed"}
+            if healthy or "partial" in adverse:
+                return "partial", "provider_partial"
+            if "error" in adverse:
+                return "error", "provider_error"
+            if len(adverse) == 1:
+                return "skipped", next(iter(adverse))
+            return "error", "provider_error"
+        return "success", None
+
     def _run_sources(
         self, names: list[str], force: bool = False, deep_sec: bool = False,
     ) -> dict:
-        """Run the given sources in weight order with staggered execution."""
+        """Run configured sources sequentially with isolated failures and budgets."""
         ordered = [(n, c) for n, c in self._ordered_sources() if n in names]
         results: dict[str, dict] = {}
 
-        for i, (name, cfg) in enumerate(ordered):
-            if not self.coverage.is_enabled(name):
+        for i, (name, spec) in enumerate(ordered):
+            if not spec.is_available:
+                results[name] = {
+                    "status": "skipped",
+                    "reason": spec.status,
+                    "detail": spec.disabled_reason,
+                }
+                continue
+            try:
+                policy_enabled = self.coverage.is_enabled(name)
+            except ValueError as exc:
+                results[name] = {
+                    "status": "skipped",
+                    "reason": "policy_unavailable",
+                    "detail": str(exc),
+                }
+                continue
+            except Exception as exc:  # noqa: BLE001 - isolate preflight failures
+                logger.error("Scheduler preflight for %s failed: %s", name, exc)
+                results[name] = {
+                    "status": "error",
+                    "reason": "preflight_error",
+                    "error": str(exc),
+                }
+                self._mark_scheduler_stale(name, str(exc))
+                continue
+            if not policy_enabled:
                 results[name] = {"status": "skipped", "reason": "policy_disabled"}
                 continue
-            if not force and not self._is_stale(name):
-                results[name] = {"status": "skipped", "reason": "cache_fresh"}
+            if not force:
+                try:
+                    if not self._is_stale(name):
+                        results[name] = {
+                            "status": "skipped",
+                            "reason": "cache_fresh",
+                        }
+                        continue
+                except Exception as exc:  # noqa: BLE001 - isolate preflight failures
+                    logger.error("Freshness preflight for %s failed: %s", name, exc)
+                    results[name] = {
+                        "status": "error",
+                        "reason": "preflight_error",
+                        "error": str(exc),
+                    }
+                    self._mark_scheduler_stale(name, str(exc))
+                    continue
+
+            try:
+                unavailable_dependencies = [
+                    dependency
+                    for dependency in spec.dependencies
+                    if not self.registry.get(dependency).is_available
+                ]
+            except Exception as exc:  # noqa: BLE001 - isolate preflight failures
+                logger.error("Dependency preflight for %s failed: %s", name, exc)
+                results[name] = {
+                    "status": "error",
+                    "reason": "preflight_error",
+                    "error": str(exc),
+                }
+                self._mark_scheduler_stale(name, str(exc))
+                continue
+            if unavailable_dependencies:
+                results[name] = {
+                    "status": "skipped",
+                    "reason": "dependency_unavailable",
+                    "detail": unavailable_dependencies,
+                }
+                continue
+
+            try:
+                budget = self._new_budget(spec)
+                self._active_budgets[name] = budget
+                if name == "finnhub":
+                    partitions = self.cursors.order_partitions(
+                        "finnhub_news",
+                        self.coverage.tickers_for(name),
+                    )
+                    selected: list[str] = []
+                    for partition in partitions:
+                        if not budget.reserve_work(work_items=1):
+                            break
+                        selected.append(partition)
+                    self._selected_partitions[name] = selected
+                    has_capacity = bool(selected)
+                elif name in self.BUDGETED_HTTP_SOURCES:
+                    has_capacity = budget.reserve_work(work_items=1)
+                else:
+                    has_capacity = budget.reserve(
+                        requests=spec.batch_size,
+                        work_items=1,
+                        force=force,
+                    )
+            except Exception as exc:  # noqa: BLE001 - isolate preflight failures
+                logger.error("Budget preflight for %s failed: %s", name, exc)
+                results[name] = {
+                    "status": "error",
+                    "reason": "preflight_error",
+                    "error": str(exc),
+                }
+                self._mark_scheduler_stale(name, str(exc))
+                continue
+            if not has_capacity:
+                results[name] = {
+                    "status": "skipped",
+                    "reason": "budget_exhausted",
+                    "detail": budget.exhausted_reason or "no_work_items",
+                    "budget": budget.snapshot(),
+                }
+                self._remember_budget_safely(name, budget)
                 continue
 
             start = time.monotonic()
@@ -326,33 +678,54 @@ class UnifiedScheduler:
                 detail = self._run_source(
                     name, deep=(deep_sec and name == "sec_filings"), force=force,
                 )
+                request_count = int(detail.get("requests", 0) or 0)
+                run_status, result_reason = self._classify_detail(detail)
+                if (
+                    name not in self.BUDGETED_HTTP_SOURCES
+                    and run_status in {"success", "partial"}
+                ):
+                    budget.record_success(request_count or spec.batch_size)
                 results[name] = {
-                    "status": "success",
+                    "status": run_status,
                     "duration_s": round(time.monotonic() - start, 2),
                     "details": detail,
+                    "budget": budget.snapshot(),
                 }
-                self.store.mark_cache_fresh(
-                    self.SCHEDULER_TICKER,
-                    self._scheduler_cache_source(name),
-                    self._ttl_for(name),
-                )
+                if result_reason is not None:
+                    results[name]["reason"] = result_reason
+                if run_status == "success":
+                    self.store.mark_cache_fresh(
+                        self.SCHEDULER_TICKER,
+                        self._scheduler_cache_source(name),
+                        self._ttl_for(name),
+                    )
+                else:
+                    self._mark_scheduler_stale(name, result_reason or run_status)
+            except BudgetExhaustedError as e:
+                results[name] = {
+                    "status": "skipped",
+                    "reason": "budget_exhausted",
+                    "duration_s": round(time.monotonic() - start, 2),
+                    "error": str(e),
+                    "budget": budget.snapshot(),
+                }
+                self._mark_scheduler_stale(name, str(e))
             except Exception as e:  # noqa: BLE001 - isolate per-source failures
                 logger.error("Scheduler source %s failed: %s", name, e)
                 results[name] = {
                     "status": "error",
                     "duration_s": round(time.monotonic() - start, 2),
                     "error": str(e),
+                    "budget": budget.snapshot(),
                 }
-                self.store.upsert_cache_stale(
-                    self.SCHEDULER_TICKER,
-                    self._scheduler_cache_source(name),
-                    str(e),
-                )
+                self._mark_scheduler_stale(name, str(e))
                 if self.dlq is not None:
                     try:
                         self.dlq.add(name, "scheduler", str(e))
                     except Exception:  # noqa: BLE001
                         pass
+
+            self._remember_budget_safely(name, budget)
 
             # Stagger delay between sources (not after the last one).
             if i < len(ordered) - 1 and self.inter_source_delay > 0:
@@ -362,31 +735,117 @@ class UnifiedScheduler:
 
     # ── Run modes ──────────────────────────────────────
 
-    def run_all_stale(self, force: bool = False) -> dict:
+    def _run_mode(
+        self,
+        mode: str,
+        *,
+        force: bool,
+        source: Optional[str],
+        scope: Optional[str],
+    ) -> dict:
+        specs = self.registry.select(
+            mode,
+            source=source,
+            scope=scope,
+            include_disabled=True,
+        )
+        return self._run_sources(
+            [spec.name for spec in specs],
+            force=force,
+            deep_sec=mode == "weekly",
+        )
+
+    def run_all_stale(
+        self,
+        force: bool = False,
+        source: Optional[str] = None,
+        scope: Optional[str] = None,
+    ) -> dict:
         """Run every source whose cache TTL has expired (or all if force)."""
-        return self._run_sources(list(self.SOURCES.keys()), force=force)
+        return self._run_mode(
+            "all", force=force, source=source, scope=scope
+        )
 
-    def run_daily(self, force: bool = False) -> dict:
-        """Morning market-open run: Yahoo Finance + FRED + SEC discovery."""
-        return self._run_sources(self.DAILY_SOURCES, force=force)
+    def run_daily(
+        self,
+        force: bool = False,
+        source: Optional[str] = None,
+        scope: Optional[str] = None,
+    ) -> dict:
+        """Run registry sources whose allowed cadence includes daily."""
+        return self._run_mode(
+            "daily", force=force, source=source, scope=scope
+        )
 
-    def run_hourly(self, force: bool = False) -> dict:
-        """Intraday news check: GDELT only."""
-        return self._run_sources(self.HOURLY_SOURCES, force=force)
+    def run_hourly(
+        self,
+        force: bool = False,
+        source: Optional[str] = None,
+        scope: Optional[str] = None,
+    ) -> dict:
+        """Run registry sources whose allowed cadence includes hourly."""
+        return self._run_mode(
+            "hourly", force=force, source=source, scope=scope
+        )
 
-    def run_weekly(self, force: bool = False) -> dict:
-        """Weekend deep-dive: earnings transcripts + full SEC pipeline."""
-        return self._run_sources(self.WEEKLY_SOURCES, force=force, deep_sec=True)
+    def run_weekly(
+        self,
+        force: bool = False,
+        source: Optional[str] = None,
+        scope: Optional[str] = None,
+    ) -> dict:
+        """Run weekly sources, including the full SEC pipeline."""
+        return self._run_mode(
+            "weekly", force=force, source=source, scope=scope
+        )
 
     # ── Status ─────────────────────────────────────────
 
-    def status_report(self) -> dict:
+    def status_report(
+        self,
+        source: Optional[str] = None,
+        scope: Optional[str] = None,
+    ) -> dict:
         """Return freshness/run status for every source."""
         sources: dict[str, dict] = {}
-        for name, cfg in self._ordered_sources():
+        if scope is not None and scope not in VALID_SCOPES:
+            raise ValueError(f"invalid source scope: {scope}")
+        selected = (
+            [self.registry.get(source)]
+            if source is not None
+            else list(self.registry.sources.values())
+        )
+        if scope is not None:
+            selected = [spec for spec in selected if spec.scope == scope]
+        selected.sort(key=lambda spec: (spec.priority, spec.name))
+        for spec in selected:
+            name = spec.name
             cache_source = self._scheduler_cache_source(name)
             status = self.store.get_cache_status(self.SCHEDULER_TICKER, cache_source)
             ttl = self._ttl_for(name)
+            try:
+                coverage = self.coverage.explain(name)
+            except ValueError as exc:
+                coverage = {"source": name, "enabled": False, "error": str(exc)}
+            registry_status = {
+                "registry_status": spec.status,
+                "registry_reason": spec.disabled_reason,
+                "cadence": spec.cadence,
+                "run_modes": list(spec.run_modes),
+                "scope": spec.scope,
+                "cursor_kind": spec.cursor_kind,
+            }
+            if not spec.is_available:
+                sources[name] = {
+                    "status": spec.status,
+                    "last_run": None,
+                    "age_hours": None,
+                    "ttl_hours": ttl,
+                    "error": spec.disabled_reason,
+                    "coverage": coverage,
+                    **registry_status,
+                }
+                continue
             if not status:
                 sources[name] = {
                     "status": "never_fetched",
@@ -394,7 +853,8 @@ class UnifiedScheduler:
                     "age_hours": None,
                     "ttl_hours": ttl,
                     "error": None,
-                    "coverage": self.coverage.explain(name),
+                    "coverage": coverage,
+                    **registry_status,
                 }
                 continue
             age = Store._age_hours(status.get("last_updated"))
@@ -411,7 +871,8 @@ class UnifiedScheduler:
                 "age_hours": round(age, 2) if age is not None else None,
                 "ttl_hours": ttl,
                 "error": status.get("error_message"),
-                "coverage": self.coverage.explain(name),
+                "coverage": coverage,
+                **registry_status,
             }
 
         # Persisted counters only: status must never invoke an embedding call.
@@ -426,20 +887,22 @@ class UnifiedScheduler:
                     "FROM filings"
                 ).fetchone()
             )
-        sources.setdefault("sec_filings", {})["filing_text_index"] = {
-            "pending": int(filing_index.get("pending") or 0),
-            "sections": int(filing_index.get("sections") or 0),
-            "chunks": int(filing_index.get("chunks") or 0),
-        }
+        if "sec_filings" in sources:
+            sources["sec_filings"]["filing_text_index"] = {
+                "pending": int(filing_index.get("pending") or 0),
+                "sections": int(filing_index.get("sections") or 0),
+                "chunks": int(filing_index.get("chunks") or 0),
+            }
 
         return {
             "sources": sources,
+            "registry_version": self.registry.version,
             "timestamp": datetime.now(timezone.utc).isoformat(),
         }
 
     # ── Reset ──────────────────────────────────────────
 
-    def reset_schedule(self):
+    def reset_schedule(self) -> None:
         """Mark every scheduler source stale so the next run re-runs all."""
         for name in self.SOURCES:
             self.store.upsert_cache_stale(
@@ -447,26 +910,56 @@ class UnifiedScheduler:
             )
 
 
-def main():
+def main() -> None:
     """CLI entry point for cron jobs."""
     import argparse
 
     parser = argparse.ArgumentParser(description="Unified ingestion scheduler")
     parser.add_argument("mode", choices=["daily", "hourly", "weekly", "all", "status"])
     parser.add_argument("--force", action="store_true", help="Skip freshness checks")
+    parser.add_argument("--source", help="Run or report one registered source")
+    parser.add_argument(
+        "--scope",
+        choices=["universe", "broad", "deep", "sector", "global"],
+        help="Run or report sources in one coverage scope",
+    )
     args = parser.parse_args()
 
     scheduler = UnifiedScheduler()
     if args.mode == "status":
-        print(json.dumps(scheduler.status_report(), indent=2))
+        if args.source is None and args.scope is None:
+            result = scheduler.status_report()
+        else:
+            result = scheduler.status_report(source=args.source, scope=args.scope)
     elif args.mode == "all":
-        print(json.dumps(scheduler.run_all_stale(force=args.force), indent=2))
+        if args.source is None and args.scope is None:
+            result = scheduler.run_all_stale(force=args.force)
+        else:
+            result = scheduler.run_all_stale(
+                force=args.force, source=args.source, scope=args.scope
+            )
     elif args.mode == "daily":
-        print(json.dumps(scheduler.run_daily(force=args.force), indent=2))
+        if args.source is None and args.scope is None:
+            result = scheduler.run_daily(force=args.force)
+        else:
+            result = scheduler.run_daily(
+                force=args.force, source=args.source, scope=args.scope
+            )
     elif args.mode == "hourly":
-        print(json.dumps(scheduler.run_hourly(force=args.force), indent=2))
+        if args.source is None and args.scope is None:
+            result = scheduler.run_hourly(force=args.force)
+        else:
+            result = scheduler.run_hourly(
+                force=args.force, source=args.source, scope=args.scope
+            )
     elif args.mode == "weekly":
-        print(json.dumps(scheduler.run_weekly(force=args.force), indent=2))
+        if args.source is None and args.scope is None:
+            result = scheduler.run_weekly(force=args.force)
+        else:
+            result = scheduler.run_weekly(
+                force=args.force, source=args.source, scope=args.scope
+            )
+    print(json.dumps(result, indent=2))
 
 
 if __name__ == "__main__":

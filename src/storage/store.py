@@ -788,6 +788,50 @@ class Store:
             retry_after=retry_after,
         )
 
+    def set_source_cursors(self, updates: list[dict]) -> list[dict]:
+        """Atomically commit multiple logical source cursor partitions."""
+        return self.sqlite.set_source_cursors(updates)
+
+    def list_source_cursor_states(self, source: str) -> list[dict]:
+        """List persisted cursor states for fair partition work selection."""
+        return self.sqlite.list_source_cursor_states(source)
+
+    def get_source_budget_usage(
+        self,
+        source: str,
+        *,
+        day_start: str,
+        minute_start: str,
+    ) -> dict:
+        """Load durable day/minute quota usage for one provider source."""
+        return self.sqlite.get_source_budget_usage(
+            source,
+            day_start=day_start,
+            minute_start=minute_start,
+        )
+
+    def record_source_budget_usage(
+        self,
+        source: str,
+        *,
+        day_start: str,
+        minute_start: str,
+        attempted_requests: int,
+        successful_requests: int,
+        provider_remaining: Optional[int] = None,
+        provider_reset: Optional[str] = None,
+    ) -> None:
+        """Persist one run's quota usage without coupling it to freshness."""
+        self.sqlite.record_source_budget_usage(
+            source,
+            day_start=day_start,
+            minute_start=minute_start,
+            attempted_requests=attempted_requests,
+            successful_requests=successful_requests,
+            provider_remaining=provider_remaining,
+            provider_reset=provider_reset,
+        )
+
     def set_source_status(
         self,
         source: str,
@@ -1102,8 +1146,22 @@ class Store:
             )
         }
         ttls = self._schedule_ttls()
+        configured = dict(self.SCHEDULER_SOURCES)
+        try:
+            import yaml
+
+            source_path = Path(__file__).parent.parent.parent / "configs/sources.yaml"
+            with open(source_path, encoding="utf-8") as config_file:
+                source_config = yaml.safe_load(config_file) or {}
+            configured = {
+                str(name): {"ttl_key": str(spec["ttl_key"])}
+                for name, spec in (source_config.get("sources") or {}).items()
+                if isinstance(spec, dict) and spec.get("ttl_key")
+            }
+        except Exception:
+            logger.warning("Could not load scheduler source registry", exc_info=True)
         rows = []
-        for source, cfg in self.SCHEDULER_SOURCES.items():
+        for source, cfg in configured.items():
             row = persisted.get(source, {})
             rows.append({
                 "source": source,
@@ -1410,18 +1468,24 @@ class Store:
     }
 
     def _schedule_ttls(self) -> dict:
-        """Lazily load the schedule TTL map from configs/watchlist.yaml."""
+        """Lazily load scheduler TTLs from the validated source registry file."""
         cached = getattr(self, "_ttl_cache", None)
         if cached is not None:
             return cached
         ttls = dict(self._DEFAULT_TTLS)
         try:
             import yaml
-            wl_path = Path(__file__).parent.parent.parent / "configs/watchlist.yaml"
-            if wl_path.exists():
-                with open(wl_path) as f:
-                    config = yaml.safe_load(f) or {}
-                ttls.update(config.get("schedule", {}) or {})
+            source_path = Path(__file__).parent.parent.parent / "configs/sources.yaml"
+            if source_path.exists():
+                with open(source_path, encoding="utf-8") as config_file:
+                    config = yaml.safe_load(config_file) or {}
+                for source in (config.get("sources") or {}).values():
+                    if not isinstance(source, dict):
+                        continue
+                    ttl_key = source.get("ttl_key")
+                    ttl_hours = source.get("ttl_hours")
+                    if ttl_key and ttl_hours is not None:
+                        ttls[str(ttl_key)] = int(ttl_hours)
         except Exception:
             pass
         self._ttl_cache = ttls

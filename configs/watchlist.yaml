@@ -14,17 +14,6 @@ macro_tickers:
   - TLT    # Long-term treasuries (rates proxy)
   - GLD    # Gold (inflation/hedge proxy)
 
-# Ingestion schedule (hours)
-schedule:
-  fundamentals: 24
-  news: 6
-  finnhub_news: 6
-  massive_market: 24
-  massive_actions: 24
-  macro: 24
-  sec_filings: 12
-  sec_companyfacts: 24
-  gdelt_news: 6
-  transcripts: 168
-  ir_pages: 24
-  estimates: 24
+# Scheduler cadence and TTLs moved to configs/sources.yaml in Phase 2.3.4.1.
+# Keep the empty mapping for one-release YFinance watchlist compatibility.
+schedule: {}

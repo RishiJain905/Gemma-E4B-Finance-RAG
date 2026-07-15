@@ -96,6 +96,7 @@ class SQLiteStore:
                     cursor_type TEXT NOT NULL DEFAULT 'none',
                     overlap_value TEXT,
                     last_successful_run_id TEXT,
+                    last_successful_at TEXT,
                     version TEXT NOT NULL DEFAULT '1',
                     status TEXT NOT NULL DEFAULT 'unknown',
                     error_class TEXT,
@@ -108,6 +109,27 @@ class SQLiteStore:
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_source_cursors_status "
                 "ON source_cursors(source, status, updated_at)"
+            )
+            cursor_columns = {
+                row[1]
+                for row in conn.execute("PRAGMA table_info(source_cursors)").fetchall()
+            }
+            if "last_successful_at" not in cursor_columns:
+                conn.execute(
+                    "ALTER TABLE source_cursors ADD COLUMN last_successful_at TEXT"
+                )
+            conn.execute(
+                """CREATE TABLE IF NOT EXISTS source_budget_usage (
+                    source TEXT NOT NULL,
+                    window_kind TEXT NOT NULL CHECK (window_kind IN ('minute', 'day')),
+                    window_start TEXT NOT NULL,
+                    attempted_requests INTEGER NOT NULL DEFAULT 0,
+                    successful_requests INTEGER NOT NULL DEFAULT 0,
+                    provider_remaining INTEGER,
+                    provider_reset TEXT,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY (source, window_kind, window_start)
+                )"""
             )
             corpus_columns = {
                 row[1] for row in conn.execute("PRAGMA table_info(corpus_items)").fetchall()
@@ -253,6 +275,7 @@ CREATE TABLE IF NOT EXISTS source_cursors (
     cursor_type TEXT NOT NULL DEFAULT 'none',
     overlap_value TEXT,
     last_successful_run_id TEXT,
+    last_successful_at TEXT,
     version TEXT NOT NULL DEFAULT '1',
     status TEXT NOT NULL DEFAULT 'unknown',
     error_class TEXT,
@@ -263,6 +286,19 @@ CREATE TABLE IF NOT EXISTS source_cursors (
 );
 CREATE INDEX IF NOT EXISTS idx_source_cursors_status
     ON source_cursors(source, status, updated_at);
+
+-- -- Provider budget usage (separate from freshness and cursors) -----------
+CREATE TABLE IF NOT EXISTS source_budget_usage (
+    source TEXT NOT NULL,
+    window_kind TEXT NOT NULL CHECK (window_kind IN ('minute', 'day')),
+    window_start TEXT NOT NULL,
+    attempted_requests INTEGER NOT NULL DEFAULT 0,
+    successful_requests INTEGER NOT NULL DEFAULT 0,
+    provider_remaining INTEGER,
+    provider_reset TEXT,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (source, window_kind, window_start)
+);
 
 -- ── Ingestion Log ──────────────────────────────────
 CREATE TABLE IF NOT EXISTS ingestion_log (
@@ -1701,18 +1737,28 @@ CREATE INDEX IF NOT EXISTS idx_corpus_events_type_effective
             overlap_value = str(overlap_value)
         if error_message is not None:
             error_message = str(error_message)[:2_000]
+        updated_at = datetime.now(timezone.utc).isoformat()
+        last_successful_at = (
+            updated_at if status in {"success", "ok", "partial"} else None
+        )
         with self._connect() as conn:
             conn.execute(
                 """INSERT INTO source_cursors (
                     source, partition_key, cursor_value, cursor_type,
-                    overlap_value, last_successful_run_id, version, status,
+                    overlap_value, last_successful_run_id, last_successful_at,
+                    version, status,
                     error_class, error_message, retry_after, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(source, partition_key) DO UPDATE SET
                     cursor_value=excluded.cursor_value,
                     cursor_type=excluded.cursor_type,
                     overlap_value=excluded.overlap_value,
                     last_successful_run_id=excluded.last_successful_run_id,
+                    last_successful_at=CASE
+                        WHEN excluded.status IN ('success', 'ok', 'partial')
+                        THEN excluded.updated_at
+                        ELSE source_cursors.last_successful_at
+                    END,
                     version=excluded.version,
                     status=excluded.status,
                     error_class=excluded.error_class,
@@ -1726,16 +1772,199 @@ CREATE INDEX IF NOT EXISTS idx_corpus_events_type_effective
                     cursor_type,
                     overlap_value,
                     last_successful_run_id,
+                    last_successful_at,
                     str(version or "1"),
                     status,
                     error_class,
                     error_message,
                     retry_after,
-                    datetime.now(timezone.utc).isoformat(),
+                    updated_at,
                 ),
             )
             conn.commit()
         return self.get_source_cursor_state(source, partition_key) or {}
+
+    def set_source_cursors(self, updates: list[dict]) -> list[dict]:
+        """Atomically upsert multiple source cursor partitions."""
+        normalized = [self._normalize_source_cursor_update(update) for update in updates]
+        if not normalized:
+            return []
+        with self._connect() as conn:
+            for update in normalized:
+                conn.execute(
+                    """INSERT INTO source_cursors (
+                        source, partition_key, cursor_value, cursor_type,
+                        overlap_value, last_successful_run_id, last_successful_at,
+                        version, status,
+                        error_class, error_message, retry_after, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(source, partition_key) DO UPDATE SET
+                        cursor_value=excluded.cursor_value,
+                        cursor_type=excluded.cursor_type,
+                        overlap_value=excluded.overlap_value,
+                        last_successful_run_id=excluded.last_successful_run_id,
+                        last_successful_at=CASE
+                            WHEN excluded.status IN ('success', 'ok', 'partial')
+                            THEN excluded.updated_at
+                            ELSE source_cursors.last_successful_at
+                        END,
+                        version=excluded.version,
+                        status=excluded.status,
+                        error_class=excluded.error_class,
+                        error_message=excluded.error_message,
+                        retry_after=excluded.retry_after,
+                        updated_at=excluded.updated_at""",
+                    (
+                        update["source"],
+                        update["partition_key"],
+                        update["cursor_value"],
+                        update["cursor_type"],
+                        update["overlap_value"],
+                        update["last_successful_run_id"],
+                        (
+                            update["updated_at"]
+                            if update["status"] in {"success", "ok", "partial"}
+                            else None
+                        ),
+                        update["version"],
+                        update["status"],
+                        update["error_class"],
+                        update["error_message"],
+                        update["retry_after"],
+                        update["updated_at"],
+                    ),
+                )
+            conn.commit()
+        return [
+            self.get_source_cursor_state(update["source"], update["partition_key"])
+            or {}
+            for update in normalized
+        ]
+
+    @staticmethod
+    def _normalize_source_cursor_update(update: dict) -> dict:
+        """Validate and normalize one bulk cursor update before its transaction."""
+        source = str(update.get("source") or "").strip()
+        partition_key = str(update.get("partition_key") or "").strip()
+        if not source or not partition_key:
+            raise ValueError("source and partition_key are required")
+        cursor_value = update.get("cursor_value")
+        overlap_value = update.get("overlap_value")
+        error_message = update.get("error_message")
+        return {
+            "source": source,
+            "partition_key": partition_key,
+            "cursor_value": str(cursor_value) if cursor_value is not None else None,
+            "cursor_type": str(update.get("cursor_type") or "none").strip(),
+            "overlap_value": (
+                str(overlap_value) if overlap_value is not None else None
+            ),
+            "last_successful_run_id": update.get("last_successful_run_id"),
+            "version": str(update.get("version") or "1"),
+            "status": str(update.get("status") or "success").strip(),
+            "error_class": update.get("error_class"),
+            "error_message": (
+                str(error_message)[:2_000] if error_message is not None else None
+            ),
+            "retry_after": update.get("retry_after"),
+            "updated_at": str(
+                update.get("updated_at") or datetime.now(timezone.utc).isoformat()
+            ),
+        }
+
+    def list_source_cursor_states(self, source: str) -> list[dict]:
+        """Return cursor states for one source ordered by oldest update first."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM source_cursors WHERE source=? "
+                "ORDER BY updated_at, partition_key",
+                (str(source),),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def get_source_budget_usage(
+        self,
+        source: str,
+        *,
+        day_start: str,
+        minute_start: str,
+    ) -> dict:
+        """Load persisted provider usage for the current day and minute windows."""
+        with self._connect() as conn:
+            rows = {
+                str(row["window_kind"]): dict(row)
+                for row in conn.execute(
+                    "SELECT * FROM source_budget_usage WHERE source=? AND "
+                    "((window_kind='day' AND window_start=?) OR "
+                    "(window_kind='minute' AND window_start=?))",
+                    (str(source), str(day_start), str(minute_start)),
+                ).fetchall()
+            }
+        day = rows.get("day", {})
+        minute = rows.get("minute", {})
+        return {
+            "day_requests": int(day.get("attempted_requests") or 0),
+            "minute_requests": int(minute.get("attempted_requests") or 0),
+            "provider_remaining": day.get("provider_remaining"),
+            "provider_reset": day.get("provider_reset"),
+        }
+
+    def record_source_budget_usage(
+        self,
+        source: str,
+        *,
+        day_start: str,
+        minute_start: str,
+        attempted_requests: int,
+        successful_requests: int,
+        provider_remaining: Optional[int] = None,
+        provider_reset: Optional[str] = None,
+    ) -> None:
+        """Atomically add one run's quota counters to day and minute windows."""
+        attempted_requests = max(int(attempted_requests), 0)
+        successful_requests = max(int(successful_requests), 0)
+        now = datetime.now(timezone.utc).isoformat()
+        with self._connect() as conn:
+            for kind, window_start in (
+                ("day", str(day_start)),
+                ("minute", str(minute_start)),
+            ):
+                conn.execute(
+                    """INSERT INTO source_budget_usage (
+                        source, window_kind, window_start, attempted_requests,
+                        successful_requests, provider_remaining, provider_reset,
+                        updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(source, window_kind, window_start) DO UPDATE SET
+                        attempted_requests=(
+                            source_budget_usage.attempted_requests
+                            + excluded.attempted_requests
+                        ),
+                        successful_requests=(
+                            source_budget_usage.successful_requests
+                            + excluded.successful_requests
+                        ),
+                        provider_remaining=COALESCE(
+                            excluded.provider_remaining,
+                            source_budget_usage.provider_remaining
+                        ),
+                        provider_reset=COALESCE(
+                            excluded.provider_reset,
+                            source_budget_usage.provider_reset
+                        ),
+                        updated_at=excluded.updated_at""",
+                    (
+                        str(source),
+                        kind,
+                        window_start,
+                        attempted_requests,
+                        successful_requests,
+                        provider_remaining if kind == "day" else None,
+                        provider_reset if kind == "day" else None,
+                        now,
+                    ),
+                )
+            conn.commit()
 
     def set_source_status(
         self,

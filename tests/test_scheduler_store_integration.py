@@ -66,13 +66,13 @@ def test_scheduler_hourly_only_gdelt(store):
 
 
 def test_scheduler_weekly_marks_store(store):
-    """run_weekly() runs earnings transcripts + SEC and records them fresh."""
+    """run_weekly() selects legacy deep sources plus weekly registry feeds."""
     sched = UnifiedScheduler(store=store, inter_source_delay=0)
     sched.reset_schedule()
     sched._run_source = MagicMock(return_value={"ok": True})
 
     results = sched.run_weekly(force=True)
-    assert set(results) == {"earnings_transcripts", "sec_filings"}
+    assert set(results) == {"earnings_transcripts", "sec_filings", "cftc"}
     report = sched.status_report()
     assert report["sources"]["earnings_transcripts"]["status"] in ("fresh", "success")
 
@@ -86,3 +86,14 @@ def test_scheduler_error_marks_source_stale(store):
     cache = store.get_cache_status("SCHEDULER", "unified:gdelt")
     assert cache is not None
     assert cache["status"] == "stale"
+
+
+def test_scheduler_freshness_does_not_create_or_advance_a_cursor(store):
+    """Successful cadence bookkeeping remains separate from incremental state."""
+    sched = UnifiedScheduler(store=store, inter_source_delay=0)
+    sched._run_source = MagicMock(return_value={"ok": True})
+
+    sched.run_daily(force=True, source="fred")
+
+    assert store.get_cache_status("SCHEDULER", "unified:fred")["status"] == "fresh"
+    assert store.get_source_cursor("fred", "global") is None
