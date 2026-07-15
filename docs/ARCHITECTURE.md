@@ -410,6 +410,34 @@ WAL journaling and foreign keys are enabled per connection. The schema is
 loaded from `docs/phase1.2/schema.sql` if present, otherwise from the inline
 DDL in `SQLiteStore._inline_schema()`.
 
+### Ordered schema migration and Phase 2.3 backfill
+
+`SQLiteStore` distinguishes a brand-new database from an existing application
+database. New databases bootstrap from the canonical (or inline fallback)
+final DDL. Existing databases retain their Phase 2.2 tables and are upgraded by
+five standard-library SQL migrations in dependency order:
+
+```text
+identities -> corpus bridge -> observations/events -> refresh state -> indexes
+```
+
+Each applied file is checksum-protected in `schema_migrations`. Conditional
+legacy columns (`security_id`, filing index metadata, retention accounting)
+are added transactionally by the runner because SQLite has no portable
+`ADD COLUMN IF NOT EXISTS`. No migration deletes a row or Chroma family.
+
+The explicit `scripts/migrate_phase2_3.py` command performs data backfill. It
+creates deterministic legacy security/corpus IDs, attaches a CIK only when the
+ticker-to-CIK mapping is unique, and links legacy structured tables through
+nullable canonical security IDs. Chroma is read metadata-only and one SQLite
+ledger row is created per stable family; unchanged text is never re-embedded.
+Ambiguous/orphan records enter `identity_reconciliation_errors`. Stage cursors
+and a Store revision increment commit with every bounded batch.
+
+All Phase 2.3 rollout controls are additive and default off. Disabling a
+capability stops new scheduling or selects the Phase 2.2 query/projection path;
+it never hides or destroys stored evidence. Operational rollback is flags-only.
+
 | Table | Purpose | Key columns |
 |-------|---------|-------------|
 | `fundamentals` | Structured financial metrics | `ticker`, `metric`, `value`, `unit`, `period`, `period_type`, `source_type`, `source_url`, `ingested_at`; `UNIQUE(ticker, metric, period)` |
@@ -418,6 +446,10 @@ DDL in `SQLiteStore._inline_schema()`.
 | `scheduler_runs` | Bounded operation headers | `run_id`, `mode`, policy/config revisions, timings, source rollups, safe terminal error |
 | `scheduler_run_sources` | Per-source operation summaries | counts, cursor before/after, quota remaining, freshness/next due/cooldown, safe error |
 | `bootstrap_partitions` | Resumable bootstrap manifest/checkpoints | `run_id`, `source`, `partition_key`, status, attempts, item/new/updated/duplicate counts |
+| `schema_migrations` | Ordered schema history | version, name, SHA-256 checksum, applied timestamp |
+| `identity_reconciliation_errors` | Review queue for unresolved legacy identities | stable id, stage/table/row, identifier, issue type, candidates |
+| `phase2_3_backfill_progress` | Resumable metadata migration cursors | stage, cursor, completion, processed count |
+| `source_circuit_state` | Additive provider circuit/cooldown state | source, status, failures, cooldown, safe error metadata |
 | `ingestion_log` | Audit log of ingestion runs | `run_id`, `ticker`, `source`, `status`, `items_processed`/`items_new`/`items_updated`, `started_at`, `completed_at`, `duration_seconds` |
 | `dead_letter` | Persistently failing items (lazily created) | `source`, `item_key`, `error`, `failed_at`, `retry_count`, `last_error`; `PRIMARY KEY (source, item_key)` |
 

@@ -3,6 +3,10 @@
 revision: "2.3.2.3-r1"
 fallback_when_registry_empty: deep
 
+# The former watchlist `core` set is preserved as explicit deep coverage.
+# Rollout flags live with the owning universe/source/middleware configuration;
+# disabling them does not alter this policy or stored evidence.
+
 deep:
   tickers: [NVDA, AMD, AAPL, MSFT, META, CRWD]
   allow_outside_indexes: []

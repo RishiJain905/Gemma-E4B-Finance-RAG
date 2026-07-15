@@ -10,6 +10,7 @@
 CREATE TABLE IF NOT EXISTS fundamentals (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     ticker TEXT NOT NULL,                            -- 'NVDA', 'AMD', etc.
+    security_id TEXT REFERENCES securities(security_id), -- Phase 2.3 canonical identity
     metric TEXT NOT NULL,                            -- 'revenue_q1_2026', 'pe_ratio_ttm', 'gross_margin'
     value REAL,                                      -- The numeric value
     unit TEXT DEFAULT 'usd',                         -- 'usd', 'percent', 'ratio', 'shares'
@@ -26,6 +27,7 @@ CREATE TABLE IF NOT EXISTS fundamentals (
 CREATE TABLE IF NOT EXISTS sec_companyfacts (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     ticker TEXT NOT NULL,
+    security_id TEXT REFERENCES securities(security_id),
     cik TEXT NOT NULL,
     taxonomy TEXT NOT NULL,
     concept TEXT NOT NULL,
@@ -58,6 +60,7 @@ CREATE TABLE IF NOT EXISTS sec_companyfacts (
 CREATE TABLE IF NOT EXISTS filings (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     ticker TEXT NOT NULL,
+    security_id TEXT REFERENCES securities(security_id),
     filing_type TEXT NOT NULL,                       -- '10-K', '10-Q', '8-K', 'earnings_call', 'press_release'
     filing_date TEXT,                                -- Date of filing
     period TEXT,                                     -- Period covered (for 10-Q: '2026-Q1')
@@ -70,6 +73,11 @@ CREATE TABLE IF NOT EXISTS filings (
     index_error TEXT,                                -- Retryable filing-text index failure reason
     index_section_count INTEGER DEFAULT 0,           -- Verified section parents written
     index_chunk_count INTEGER DEFAULT 0,             -- Verified child chunks written
+    cik TEXT,
+    primary_document TEXT,
+    discovery_scope TEXT DEFAULT 'deep',
+    items_json TEXT DEFAULT '[]',
+    exhibits_json TEXT DEFAULT '[]',
     ingested_at TEXT DEFAULT (datetime('now'))
 );
 
@@ -78,6 +86,7 @@ CREATE TABLE IF NOT EXISTS filings (
 -- The middleware checks this before serving cached data.
 CREATE TABLE IF NOT EXISTS cache_meta (
     ticker TEXT NOT NULL,
+    security_id TEXT REFERENCES securities(security_id),
     source TEXT NOT NULL,                            -- 'sec', 'yfinance', 'fred', 'gdelt'
     metric_scope TEXT DEFAULT 'all',                 -- 'all', 'fundamentals', 'filings', 'news'
     last_updated TEXT,                               -- When we last fetched this
@@ -199,6 +208,19 @@ CREATE TABLE IF NOT EXISTS universe_errors (
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
+CREATE TABLE IF NOT EXISTS identity_reconciliation_errors (
+    error_id TEXT PRIMARY KEY,
+    stage TEXT NOT NULL,
+    legacy_table TEXT NOT NULL,
+    legacy_row_id TEXT,
+    identifier TEXT,
+    issue_type TEXT NOT NULL CHECK (issue_type IN ('orphan', 'ambiguous', 'conflict')),
+    candidates_json TEXT NOT NULL DEFAULT '[]',
+    details_json TEXT NOT NULL DEFAULT '{}',
+    status TEXT NOT NULL DEFAULT 'open',
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
 CREATE INDEX IF NOT EXISTS idx_securities_active_ticker
     ON securities(active, normalized_ticker);
 CREATE INDEX IF NOT EXISTS idx_securities_cik ON securities(cik);
@@ -247,6 +269,7 @@ CREATE TABLE IF NOT EXISTS corpus_items (
     content_hash TEXT NOT NULL,
     metadata_json TEXT NOT NULL DEFAULT '{}',
     document_family TEXT NOT NULL,
+    document_family_id TEXT,
     indexing_status TEXT NOT NULL CHECK (
         indexing_status IN ('pending', 'indexed', 'error', 'not_applicable')
     ),
@@ -254,6 +277,11 @@ CREATE TABLE IF NOT EXISTS corpus_items (
     license_label TEXT NOT NULL,
     normalization_version TEXT NOT NULL,
     evidence_authority TEXT NOT NULL,
+    narrative_bytes INTEGER NOT NULL DEFAULT 0,
+    metadata_bytes INTEGER NOT NULL DEFAULT 0,
+    is_tombstone INTEGER NOT NULL DEFAULT 0,
+    retired_at TEXT,
+    retention_reason TEXT,
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
     updated_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
@@ -399,3 +427,154 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_corpus_events_provider
     WHERE provider_record_id IS NOT NULL AND provider_record_id <> '';
 CREATE INDEX IF NOT EXISTS idx_corpus_events_type_effective
     ON corpus_events(event_type, effective_at);
+
+-- -- Ordered migration and bounded refresh state (2.3.4 / 2.3.6.1) ---------
+CREATE TABLE IF NOT EXISTS schema_migrations (
+    version INTEGER PRIMARY KEY,
+    name TEXT NOT NULL,
+    checksum TEXT NOT NULL,
+    applied_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS sec_daily_indexes (
+    index_date TEXT PRIMARY KEY,
+    source_url TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('processed')),
+    registered_count INTEGER NOT NULL DEFAULT 0,
+    processed_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS source_cursors (
+    source TEXT NOT NULL,
+    partition_key TEXT NOT NULL,
+    cursor_value TEXT,
+    cursor_type TEXT NOT NULL DEFAULT 'none',
+    overlap_value TEXT,
+    last_successful_run_id TEXT,
+    last_successful_at TEXT,
+    version TEXT NOT NULL DEFAULT '1',
+    status TEXT NOT NULL DEFAULT 'unknown',
+    error_class TEXT,
+    error_message TEXT,
+    retry_after REAL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (source, partition_key)
+);
+
+CREATE TABLE IF NOT EXISTS source_budget_usage (
+    source TEXT NOT NULL,
+    window_kind TEXT NOT NULL CHECK (window_kind IN ('minute', 'day')),
+    window_start TEXT NOT NULL,
+    attempted_requests INTEGER NOT NULL DEFAULT 0,
+    successful_requests INTEGER NOT NULL DEFAULT 0,
+    provider_remaining INTEGER,
+    provider_reset TEXT,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (source, window_kind, window_start)
+);
+
+CREATE TABLE IF NOT EXISTS scheduler_runs (
+    run_id TEXT PRIMARY KEY,
+    mode TEXT NOT NULL,
+    policy_revision TEXT NOT NULL,
+    config_revision TEXT NOT NULL,
+    started_at TEXT NOT NULL,
+    ended_at TEXT,
+    duration_seconds REAL,
+    status TEXT NOT NULL DEFAULT 'running',
+    requested_sources_json TEXT NOT NULL DEFAULT '[]',
+    completed_sources_json TEXT NOT NULL DEFAULT '[]',
+    skipped_sources_json TEXT NOT NULL DEFAULT '[]',
+    failed_sources_json TEXT NOT NULL DEFAULT '[]',
+    terminal_error_class TEXT,
+    terminal_error_message TEXT
+);
+
+CREATE TABLE IF NOT EXISTS scheduler_run_sources (
+    run_id TEXT NOT NULL REFERENCES scheduler_runs(run_id) ON DELETE CASCADE,
+    source TEXT NOT NULL,
+    mode TEXT NOT NULL,
+    policy_revision TEXT NOT NULL,
+    config_revision TEXT NOT NULL,
+    started_at TEXT,
+    ended_at TEXT,
+    duration_seconds REAL,
+    status TEXT NOT NULL,
+    requested INTEGER NOT NULL DEFAULT 1,
+    completed INTEGER NOT NULL DEFAULT 0,
+    skipped INTEGER NOT NULL DEFAULT 0,
+    failed INTEGER NOT NULL DEFAULT 0,
+    partitions INTEGER NOT NULL DEFAULT 0,
+    items INTEGER NOT NULL DEFAULT 0,
+    requests INTEGER NOT NULL DEFAULT 0,
+    new_items INTEGER NOT NULL DEFAULT 0,
+    updated_items INTEGER NOT NULL DEFAULT 0,
+    duplicates INTEGER NOT NULL DEFAULT 0,
+    cursor_before_json TEXT,
+    cursor_after_json TEXT,
+    quota_remaining INTEGER,
+    freshness TEXT,
+    last_success TEXT,
+    next_due TEXT,
+    cooldown_reset TEXT,
+    error_class TEXT,
+    error_message TEXT,
+    details_json TEXT NOT NULL DEFAULT '{}',
+    PRIMARY KEY (run_id, source)
+);
+
+CREATE TABLE IF NOT EXISTS bootstrap_partitions (
+    run_id TEXT NOT NULL REFERENCES scheduler_runs(run_id) ON DELETE CASCADE,
+    source TEXT NOT NULL,
+    partition_key TEXT NOT NULL,
+    status TEXT NOT NULL,
+    started_at TEXT,
+    ended_at TEXT,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    items INTEGER NOT NULL DEFAULT 0,
+    new_items INTEGER NOT NULL DEFAULT 0,
+    updated_items INTEGER NOT NULL DEFAULT 0,
+    duplicates INTEGER NOT NULL DEFAULT 0,
+    error_class TEXT,
+    error_message TEXT,
+    PRIMARY KEY (run_id, source, partition_key)
+);
+
+CREATE TABLE IF NOT EXISTS source_circuit_state (
+    source TEXT PRIMARY KEY,
+    status TEXT NOT NULL DEFAULT 'closed',
+    failure_count INTEGER NOT NULL DEFAULT 0,
+    opened_at TEXT,
+    cooldown_until TEXT,
+    error_class TEXT,
+    error_message TEXT,
+    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS phase2_3_backfill_progress (
+    stage TEXT PRIMARY KEY,
+    cursor_value TEXT,
+    completed INTEGER NOT NULL DEFAULT 0 CHECK (completed IN (0, 1)),
+    rows_processed INTEGER NOT NULL DEFAULT 0,
+    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_fundamentals_security ON fundamentals(security_id);
+CREATE INDEX IF NOT EXISTS idx_sec_companyfacts_security ON sec_companyfacts(security_id);
+CREATE INDEX IF NOT EXISTS idx_filings_security ON filings(security_id);
+CREATE INDEX IF NOT EXISTS idx_cache_meta_security ON cache_meta(security_id);
+CREATE INDEX IF NOT EXISTS idx_identity_errors_status
+    ON identity_reconciliation_errors(status, issue_type, stage);
+CREATE INDEX IF NOT EXISTS idx_source_cursors_status
+    ON source_cursors(source, status, updated_at);
+CREATE INDEX IF NOT EXISTS idx_scheduler_runs_started ON scheduler_runs(started_at DESC);
+CREATE INDEX IF NOT EXISTS idx_scheduler_run_sources_source
+    ON scheduler_run_sources(source, ended_at DESC);
+CREATE INDEX IF NOT EXISTS idx_bootstrap_partitions_status
+    ON bootstrap_partitions(source, status, run_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_corpus_items_document_family
+    ON corpus_items(document_family_id);
+CREATE INDEX IF NOT EXISTS idx_corpus_items_retention
+    ON corpus_items(item_type, is_tombstone, indexing_status, published_at);
+CREATE INDEX IF NOT EXISTS idx_corpus_observations_market_key
+    ON corpus_observations(source_name, metric_id, period_end, tickers_json);

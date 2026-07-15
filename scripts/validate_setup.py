@@ -28,7 +28,7 @@ check((PROJECT / "data").is_dir(), "data/ directory missing")
 
 # 2. Config files
 for cfg in ["storage.yaml", "middleware.yaml", "watchlist.yaml",
-            "sources.yaml", "coverage.yaml", "official_sources.yaml",
+            "sources.yaml", "universe.yaml", "coverage.yaml", "official_sources.yaml",
             "fred.yaml", "gdelt.yaml", "ir.yaml", "model.yaml"]:
     check((PROJECT / "configs" / cfg).exists(), f"configs/{cfg} missing")
 
@@ -67,6 +67,13 @@ try:
     check(not invalid, f"Invalid scheduler source definitions: {', '.join(invalid)}",
           is_error=True)
     print(f"OK   Scheduler registry ({len(registry.sources)} sources, revision {registry.version})")
+    configured = sum(
+        int(item["configured"]) for item in registry.status().values()
+    )
+    print(
+        f"OK   Source credentials configured "
+        f"({configured}/{len(registry.sources)}; values never displayed)"
+    )
 except Exception as e:  # noqa: BLE001
     errors.append(f"Scheduler registry check failed: {e}")
 

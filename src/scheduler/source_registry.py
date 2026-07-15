@@ -341,6 +341,7 @@ class SourceRegistry:
                 "run_modes": list(spec.run_modes),
                 "cursor_kind": spec.cursor_kind,
                 "required_env": spec.required_env,
+                "configured": spec.required_env is None or spec.status != "disabled_missing_key",
             }
             for name, spec in sorted(
                 self.sources.items(), key=lambda item: (item[1].priority, item[0])

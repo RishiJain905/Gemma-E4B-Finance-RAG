@@ -2,6 +2,16 @@
 # Scheduler-owned source cadence, cursor, quota, and bounded-work registry.
 version: "2.3.4.1-r1"
 
+# Phase 2.3 capability rollout gates. These are intentionally independent of
+# per-source definitions so schema/config can ship before network work starts.
+# Disabling a capability never removes previously stored evidence.
+feature_flags:
+  sec_broad_events: false
+  company_news: false
+  grouped_market_data: false
+  official_feeds: false
+  sector_feeds: false
+
 # Explicit bootstrap windows. These values are never consulted by daily or
 # hourly incremental runs.
 bootstrap:

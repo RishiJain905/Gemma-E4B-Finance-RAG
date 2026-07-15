@@ -525,6 +525,10 @@ capabilities use the `universe` scope.
 enabled capabilities, ticker count/identity, and policy revision. It never
 returns config paths, provider keys, or raw YAML.
 
+The six tickers from the deprecated `watchlist.yaml -> core` list remain the
+explicit `coverage.yaml -> deep.tickers` set. Migration does not broaden
+deep-only CompanyFacts, filing-text, transcript, IR, or estimates work.
+
 For one compatibility release, a legacy YAML containing `core` and `extended`
 can be supplied as the resolver config. It logs a deprecation warning, maps
 `core` to `deep.tickers`, and maps `extended` to `broad.additions`.
@@ -536,6 +540,60 @@ can be supplied as the resolver config. It logs a deprecation warning, maps
 `sources.yaml` is the scheduler-owned registry for cadence, cursor overlap,
 request limits, work limits, retry policy, and optional environment-key
 availability. Its `version` is persisted in every scheduler run summary.
+
+Phase 2.3 rollout switches are additive and default off:
+
+```yaml
+# configs/universe.yaml
+feature_flags:
+  universe_refresh: false
+
+# configs/sources.yaml
+feature_flags:
+  sec_broad_events: false
+  company_news: false
+  grouped_market_data: false
+  official_feeds: false
+  sector_feeds: false
+
+# configs/middleware.yaml
+enable_phase2_3_retrieval: false
+enable_phase2_3_corpus_projection: false
+```
+
+The middleware switches may be overridden by `ENABLE_PHASE2_3_RETRIEVAL` and
+`ENABLE_PHASE2_3_CORPUS_PROJECTION`. Credentials are referenced only by
+environment-variable name (`required_env`). Status reports
+`configured: true|false`; it never prints a value or fingerprint. A missing
+optional key disables only that source.
+
+Turning a switch off stops new capability-specific work and restores the
+Phase 2.2 retrieval/projection behavior. It does not remove migration tables,
+security links, corpus metadata, or indexed narratives. Rollback is therefore
+flags-only and non-destructive; removal requires a separately authorized
+maintenance command.
+
+### Phase 2.3 schema and metadata migration
+
+`src/storage/migrations.py` applies the ordered SQL files under
+`src/storage/migrations/` and records version, name, checksum, and timestamp in
+`schema_migrations`. Reopening or rerunning is a no-op; a changed checksum is
+rejected. The order is identities, corpus metadata, structured
+observations/events, refresh/circuit state, then indexes.
+
+Legacy Phase 2.2 data is backfilled explicitly, never during a request:
+
+```text
+python scripts/migrate_phase2_3.py --batch-size 100
+python scripts/migrate_phase2_3.py --batch-size 100 --max-batches 5
+```
+
+The command checkpoints each bounded stage in `phase2_3_backfill_progress` and
+bumps `store_revision` in the same commit. It reads Chroma metadata in bounded
+pages, creates one `corpus_items` row per family, and never invokes an embedding
+or Chroma write. Unknown/conflicting identities remain in
+`identity_reconciliation_errors` for review rather than being guessed or
+dropped.
 
 The top-level `bootstrap` block is used only by the explicit bootstrap command:
 
