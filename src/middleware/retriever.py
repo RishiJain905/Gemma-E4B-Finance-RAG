@@ -733,6 +733,8 @@ class Retriever:
         limit: int,
     ) -> list[dict]:
         """Apply taxonomy, bounded post-relevance ranking, and coverage packing."""
+        if not bool(getattr(self.config, "enable_phase2_3_retrieval", True)):
+            return list(documents)[:limit]
         try:
             from .evidence_taxonomy import (
                 normalize_evidence,

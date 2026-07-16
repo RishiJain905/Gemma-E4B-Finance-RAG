@@ -1,5 +1,9 @@
 # configs/middleware.yaml
 # Middleware configuration
+# The committed source-of-truth values below remain unchanged; this additive
+# selector makes the current safe surface explicit. MIDDLEWARE_PROFILE can
+# select legacy/evaluation for an isolated runtime.
+profile: recommended
 
 llama_endpoint: "http://127.0.0.1:8087/v1/chat/completions"
 embedding_endpoint: "http://127.0.0.1:8087/v1/embeddings"

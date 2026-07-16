@@ -3248,6 +3248,8 @@ async def _post_and_parse(payload: dict) -> tuple[str, list[SourceCitation]]:
 def _extract_citations(text: str) -> list[SourceCitation]:
     """Extract [Source: ...] citations from model output."""
     import re
+    if config is not None and not bool(getattr(config, "enable_citations", True)):
+        return []
     citations = []
     pattern = r'\[Source:\s*([^\]]+)\]'
     for match in re.finditer(pattern, text):

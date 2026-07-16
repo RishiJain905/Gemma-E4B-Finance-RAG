@@ -310,6 +310,19 @@ Additive, flag-gated, and local-safe; all off by default.
 
 ---
 
+## Configuration Profiles (Phase 2.3.7.4)
+
+`src/middleware/config.py` resolves middleware settings in this order: code
+defaults, a selected profile, explicit YAML values, and environment overrides.
+The committed `configs/middleware.yaml` selects `recommended`, which matches
+the currently enabled source-of-truth set. `legacy` is a complete Phase 2.2
+rollback with Phase 2.2.3+ optional capabilities off; `evaluation` keeps the
+recommended flags but records trace/progress metadata for promotion arms and is
+not a production default. Profile files are validated as reviewed bundles;
+explicit YAML/environment dependency violations are clamped off with a logged
+warning. This keeps each arm reproducible while preserving one explicit,
+tested rollback path.
+
 ## Data Sources
 
 | Source | Module | Storage target | Scheduler cadence | TTL (hours) |
