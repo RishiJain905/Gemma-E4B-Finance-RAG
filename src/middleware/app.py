@@ -1234,6 +1234,70 @@ def _stage_timing(timings: dict[str, object], name: str, stage_start: float) -> 
     return elapsed
 
 
+QUALITY_STAGE_TIMING_FIELDS = (
+    "intent_plan_ms",
+    "catalog_tools_ms",
+    "dense_retrieval_ms",
+    "lexical_retrieval_ms",
+    "fusion_rerank_ms",
+    "prompt_construction_ms",
+    "model_ttft_ms",
+    "model_total_ms",
+    "end_to_end_ms",
+)
+
+
+def _available_timing(value) -> Optional[float]:
+    """Normalize an observed duration; missing/unobserved stages stay unavailable."""
+    if not isinstance(value, (int, float)) or isinstance(value, bool) or value <= 0:
+        return None
+    return round(float(value), 1)
+
+
+def _quality_stage_timings(
+    timings: dict[str, object], *, end_to_end_ms: Optional[float] = None
+) -> dict[str, Optional[float]]:
+    """Project legacy timing details onto the stable Phase 2.3.7.7 stage schema."""
+    retrieval = timings.get("retrieval")
+    retrieval = retrieval if isinstance(retrieval, dict) else {}
+    existing = timings.get("stages")
+    existing = existing if isinstance(existing, dict) else {}
+
+    intent_parts = [
+        value for value in (timings.get("intent_parse"), timings.get("query_plan"))
+        if _available_timing(value) is not None
+    ]
+    dense_parts = [
+        value for value in (retrieval.get("embedding"), retrieval.get("chroma"))
+        if _available_timing(value) is not None
+    ]
+    stages = {
+        "intent_plan_ms": _available_timing(sum(intent_parts)) if intent_parts else None,
+        "catalog_tools_ms": _available_timing(timings.get("catalog_tools")),
+        "dense_retrieval_ms": _available_timing(sum(dense_parts)) if dense_parts else None,
+        "lexical_retrieval_ms": _available_timing(retrieval.get("lexical")),
+        "fusion_rerank_ms": _available_timing(retrieval.get("fusion_rerank")),
+        "prompt_construction_ms": _available_timing(timings.get("prompt_build")),
+        "model_ttft_ms": _available_timing(timings.get("model_ttft")),
+        "model_total_ms": _available_timing(
+            timings.get("model_total", timings.get("model_call"))
+        ),
+        "end_to_end_ms": _available_timing(end_to_end_ms),
+    }
+    for timing_field in QUALITY_STAGE_TIMING_FIELDS:
+        if stages[timing_field] is None:
+            stages[timing_field] = _available_timing(existing.get(timing_field))
+    return stages
+
+
+def _refresh_quality_stage_timings(
+    timings: dict[str, object], *, end_to_end_ms: Optional[float] = None
+) -> None:
+    timings["stages"] = _quality_stage_timings(
+        timings, end_to_end_ms=end_to_end_ms,
+    )
+
+
 def _return_timings_enabled() -> bool:
     """Return whether response timing metadata should be included."""
     return_timings = getattr(config, "return_timings", True)
@@ -1262,7 +1326,9 @@ async def _build_query_context(request: QueryRequest) -> dict:
         raise HTTPException(status_code=503, detail="Store not initialized")
 
     start = time.time()
-    timings: dict[str, object] = {}
+    timings: dict[str, object] = {
+        "stages": {field: None for field in QUALITY_STAGE_TIMING_FIELDS},
+    }
     _reset_request_scoped_state(request.answer_policy)
 
     compile_start = time.perf_counter()
@@ -1413,9 +1479,11 @@ async def _build_legacy_query_context(
     retrieval_timings = retrieval.get("timings", {}) if isinstance(retrieval, dict) else {}
     timings["retrieval"] = {
         "total": retrieval_ms,
-        "embedding": round(float(retrieval_timings.get("embedding", 0.0) or 0.0), 1),
-        "chroma": round(float(retrieval_timings.get("chroma", 0.0) or 0.0), 1),
-        "sqlite": round(float(retrieval_timings.get("sqlite", 0.0) or 0.0), 1),
+        "embedding": _available_timing(retrieval_timings.get("embedding")),
+        "chroma": _available_timing(retrieval_timings.get("chroma")),
+        "sqlite": _available_timing(retrieval_timings.get("sqlite")),
+        "lexical": _available_timing(retrieval_timings.get("lexical")),
+        "fusion_rerank": _available_timing(retrieval_timings.get("fusion_rerank")),
     }
     grounding_level = _grounding_level(retrieval)
 
@@ -1762,12 +1830,24 @@ async def _build_adaptive_query_context(shared: dict) -> dict:
     from .retriever import Retriever
 
     r = retriever or Retriever(store=store, config=config)
+    from . import deterministic_router
+
+    def timed_execute_route(*args, **kwargs):
+        tool_started = time.perf_counter()
+        try:
+            return deterministic_router.execute_route(*args, **kwargs)
+        finally:
+            timings["catalog_tools"] = float(timings.get("catalog_tools") or 0.0) + (
+                time.perf_counter() - tool_started
+            ) * 1000
+
     result = orchestrate(
         plan,
         store,
         config,
         retriever=r,
         available_metrics=_adaptive_available_metrics(),
+        execute_fn=timed_execute_route,
         retrieval_cache=_get_retrieval_cache(),
         refresh=bool(getattr(request, "refresh", False)),
     )
@@ -1789,6 +1869,20 @@ async def _build_adaptive_query_context(shared: dict) -> dict:
         "strategy": result.lane.value,
         "retrieval_strategy": result.retrieval_strategy or "vector",
         "timings": {},
+    }
+    retrieval_timings = (
+        getattr(r, "_timings", {})
+        if int(result.retrieval_rounds_used or 0) > 0
+        else {}
+    )
+    retrieval_timings = retrieval_timings if isinstance(retrieval_timings, dict) else {}
+    timings["retrieval"] = {
+        "total": _available_timing(timings.get("orchestration")),
+        "embedding": _available_timing(retrieval_timings.get("embedding")),
+        "chroma": _available_timing(retrieval_timings.get("chroma")),
+        "sqlite": _available_timing(retrieval_timings.get("sqlite")),
+        "lexical": _available_timing(retrieval_timings.get("lexical")),
+        "fusion_rerank": _available_timing(retrieval_timings.get("fusion_rerank")),
     }
     if result.sufficiency is not None:
         specific = bool(plan.entities) or bool(plan.metrics) or bool(
@@ -2003,6 +2097,7 @@ def _build_query_response(
     intent = context["intent"]
     retrieval = context["retrieval"]
     elapsed_ms = round((time.time() - context["start"]) * 1000, 1)
+    _refresh_quality_stage_timings(context["timings"], end_to_end_ms=elapsed_ms)
     # Usable-evidence counts (2.2.1.1) — shared by /query and the
     # /query/stream terminal metadata event since both call this function.
     n_facts, n_docs = evidence_counts(retrieval)
@@ -2167,7 +2262,7 @@ def _try_deterministic_response(context: dict) -> Optional[QueryResponse]:
         if collector is not None:
             collector.record_deterministic_answer(rendered.template.value)
 
-        context["timings"]["model_call"] = 0.0
+        context["timings"]["model_call"] = None
         context["timings"]["deterministic_answer"] = round(
             (time.perf_counter() - started_at) * 1000, 1
         )
@@ -2237,13 +2332,19 @@ async def _answer_query_context(request: QueryRequest, context: dict) -> QueryRe
         ):
             context["orchestration"]["model_calls"] = 1
         temperature, max_tokens = _task_settings(request, intent)
-        answer_text, citations = await _invoke_model(
-            prompt=context["augmented_prompt"],
-            temperature=temperature,
-            max_tokens=max_tokens,
-            intent=intent,
-            grounding_level=grounding_level,
-        )
+        model_started = time.perf_counter()
+        try:
+            answer_text, citations = await _invoke_model(
+                prompt=context["augmented_prompt"],
+                temperature=temperature,
+                max_tokens=max_tokens,
+                intent=intent,
+                grounding_level=grounding_level,
+            )
+        finally:
+            context["timings"]["model_total"] = (
+                time.perf_counter() - model_started
+            ) * 1000
         if not answer_text.startswith("Error calling model:"):
             _mark_model_health(True)
         if intent.get("question_type") == "projection":
@@ -2616,11 +2717,16 @@ async def _query_stream_events(
 
     # 4. Stream the final synthesis.
     _emit_stage("generate", "started")
+    model_started = time.perf_counter()
     for chunk in _drain_progress(emitter):
         yield chunk
     answer_parts: list[str] = []
     try:
         async for token in token_source:
+            if "model_ttft" not in context["timings"]:
+                context["timings"]["model_ttft"] = (
+                    time.perf_counter() - model_started
+                ) * 1000
             answer_parts.append(token)
             yield _sse("token", {"token": token})
     except Exception as exc:  # noqa: BLE001 - streaming must never fail a query
@@ -2643,6 +2749,9 @@ async def _query_stream_events(
         async for chunk in _stream_degraded_answer(request, context):
             yield chunk
         return
+    context["timings"]["model_total"] = (
+        time.perf_counter() - model_started
+    ) * 1000
     _emit_stage("generate", "completed")
     for chunk in _drain_progress(emitter):
         yield chunk

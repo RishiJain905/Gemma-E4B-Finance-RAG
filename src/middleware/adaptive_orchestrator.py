@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 from time import perf_counter
 from dataclasses import dataclass, field
 from enum import Enum
@@ -1193,6 +1194,21 @@ def _retrieve_derived_subquery(
     return facts, docs
 
 
+def _timed_rerank(r: "Retriever", query: str, docs: list[dict], *, top_n: int):
+    """Run one adaptive rerank and expose its duration through Retriever timings."""
+    started = time.perf_counter()
+    try:
+        return r.reranker.rerank(query, docs, top_n=top_n)
+    finally:
+        timings = getattr(r, "_timings", None)
+        if not isinstance(timings, dict):
+            timings = {}
+            r._timings = timings
+        timings["fusion_rerank"] = float(timings.get("fusion_rerank") or 0.0) + (
+            time.perf_counter() - started
+        ) * 1000
+
+
 def _maybe_rerank_fused_documents(
     r: "Retriever",
     plan: QueryPlan,
@@ -1216,7 +1232,9 @@ def _maybe_rerank_fused_documents(
         result.add_reason("rerank_budget_exhausted")
         return fused[:top_k]
     try:
-        reranked = r.reranker.rerank(plan.retrieval_query, list(fused), top_n=top_k)
+        reranked = _timed_rerank(
+            r, plan.retrieval_query, list(fused), top_n=top_k,
+        )
     except Exception:  # noqa: BLE001 - reranker should not raise
         logger.warning("Fused rerank failed; keeping fusion order", exc_info=True)
         result.add_reason("rerank_fallback")
@@ -1552,7 +1570,7 @@ def _conditional_rerank(
         return pool[:top_k]
 
     try:
-        reranked = r.reranker.rerank(plan.retrieval_query, pool, top_n=top_k)
+        reranked = _timed_rerank(r, plan.retrieval_query, pool, top_n=top_k)
     except Exception:  # noqa: BLE001 - defensive: reranker should not raise
         logger.warning("Conditional rerank failed; keeping RRF order", exc_info=True)
         result.add_reason("rerank_fallback")

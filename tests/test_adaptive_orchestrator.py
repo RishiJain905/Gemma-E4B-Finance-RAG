@@ -635,6 +635,7 @@ def test_conditional_rerank_runs_on_channel_disagreement():
     assert reranker.calls == 1
     assert result.rerank_ran is True
     assert "rerank_signal_channel_disagreement" in result.reason_codes
+    assert retriever._timings["fusion_rerank"] > 0
 
 
 # ── 10. Rerank skipped for an exact fact lookup ───────────

@@ -175,6 +175,30 @@ def _subquestion_fields(case: dict, answer: str) -> tuple[list, Optional[float]]
     return ids, round(len(addressed) / len(subs), 4)
 
 
+QUALITY_STAGE_TIMING_FIELDS = (
+    "intent_plan_ms",
+    "catalog_tools_ms",
+    "dense_retrieval_ms",
+    "lexical_retrieval_ms",
+    "fusion_rerank_ms",
+    "prompt_construction_ms",
+    "model_ttft_ms",
+    "model_total_ms",
+    "end_to_end_ms",
+)
+
+
+def _normalize_stage_timings(timings: Optional[dict]) -> dict[str, Optional[float]]:
+    """Return the stable 2.3.7.7 stage schema without inventing measurements."""
+    raw = timings if isinstance(timings, dict) else {}
+    stages = raw.get("stages") if isinstance(raw.get("stages"), dict) else {}
+    normalized: dict[str, Optional[float]] = {}
+    for field in QUALITY_STAGE_TIMING_FIELDS:
+        value = stages.get(field)
+        normalized[field] = round(float(value), 1) if isinstance(value, (int, float)) else None
+    return normalized
+
+
 def _row(case: dict, *, answer: str, detected_ticker, detected_intent,
          facts_used, documents_used, retrieved_sources, context: str = "",
          evidence_trace: Optional[dict] = None, trace_complete: bool = True,
@@ -191,7 +215,12 @@ def _row(case: dict, *, answer: str, detected_ticker, detected_intent,
          decomposition: Optional[dict] = None,
          answer_validation: Optional[dict] = None,
          coverage_metadata: Optional[dict] = None,
-         config_label: Optional[str] = None) -> dict:
+         config_label: Optional[str] = None,
+         timings: Optional[dict] = None,
+         answer_origin: Optional[str] = None,
+         generation_skipped: Optional[bool] = None,
+         structured_values: Optional[list] = None,
+         embedding_calls: Optional[int] = None) -> dict:
     """Assemble a well-formed result row (always has every RESULT_KEY)."""
     ans = answer or ""
     sq_ids, sq_cov = _subquestion_fields(case, ans)
@@ -216,6 +245,12 @@ def _row(case: dict, *, answer: str, detected_ticker, detected_intent,
         "model_available": bool(model_available),
         "error": error,
         "case": case,
+        "timings": timings if isinstance(timings, dict) else None,
+        "stage_timings": _normalize_stage_timings(timings),
+        "answer_origin": answer_origin,
+        "generation_skipped": generation_skipped,
+        "structured_values": list(structured_values or []),
+        "embedding_calls": embedding_calls,
         # ── Conversational / compound fields (2.2.1.3) ──
         "conversation_id": conversation_id,
         "turn_index": turn_index,
@@ -480,6 +515,11 @@ def _row_from_endpoint(case: dict, data: dict, latency_s: float,
         decomposition=data.get("decomposition"),
         answer_validation=data.get("answer_validation"),
         coverage_metadata=data.get("coverage_metadata"),
+        timings=data.get("timings"),
+        answer_origin=data.get("answer_origin"),
+        generation_skipped=data.get("generation_skipped"),
+        structured_values=data.get("structured_values"),
+        embedding_calls=data.get("embedding_calls"),
         **_ctx_kwargs(ctx, data, trace),
     )
 
@@ -800,6 +840,11 @@ def _row_from_direct(case: dict, data: dict, latency_s: float,
         model_available=model_available,
         error=error,
         coverage_metadata=data.get("coverage_metadata"),
+        timings=data.get("timings"),
+        answer_origin=data.get("answer_origin"),
+        generation_skipped=data.get("generation_skipped"),
+        structured_values=data.get("structured_values"),
+        embedding_calls=data.get("embedding_calls"),
         **_ctx_kwargs(ctx, data, trace),
     )
 

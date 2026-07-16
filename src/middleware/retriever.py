@@ -926,6 +926,7 @@ class Retriever:
                 channels["lexical_status"] = dict(self.lexical.last_status)
 
         # 3. RRF fuse.
+        fusion_started = time.perf_counter()
         fused = rrf_fuse(vector_hits, lexical_hits, k=self.config.rrf_k)
 
         # 4. Hydrate fused ids to full doc dicts (text + metadata).
@@ -940,6 +941,10 @@ class Retriever:
                                         "metadata": {}}))
             d["fusion_score"] = float(rrf_score)
             fused_docs.append(d)
+        self._timings.setdefault("fusion_rerank", 0.0)
+        self._timings["fusion_rerank"] += (
+            time.perf_counter() - fusion_started
+        ) * 1000
 
         # Record the strategy actually used (vector if lexical produced nothing)
         # and the per-channel ranked ids for the conditional-rerank signal.
@@ -966,6 +971,7 @@ class Retriever:
 
         # Re-rank or truncate to the final count.
         if self.config.enable_reranker and fused_docs:
+            rerank_started = time.perf_counter()
             try:
                 fused_docs = self.reranker.rerank(
                     query, fused_docs, top_n=n_results,
@@ -974,6 +980,11 @@ class Retriever:
             except Exception as e:  # noqa: BLE001 - fallback to fused order
                 logger.warning("Reranker failed, using fused order: %s", e)
                 fused_docs = fused_docs[:n_results]
+            finally:
+                self._timings.setdefault("fusion_rerank", 0.0)
+                self._timings["fusion_rerank"] += (
+                    time.perf_counter() - rerank_started
+                ) * 1000
         else:
             fused_docs = fused_docs[:n_results]
 
