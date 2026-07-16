@@ -3,8 +3,11 @@ src/storage/sqlite_store.py
 SQLite storage layer for structured financial data.
 """
 
+import base64
+import binascii
 import json
 import logging
+import os
 import sqlite3
 import uuid
 from datetime import datetime, timezone
@@ -29,6 +32,32 @@ class SQLiteStore:
     MAX_INVENTORY_LIMIT = 200
     MAX_INVENTORY_OFFSET = 10_000
     MAX_MAINTENANCE_LIMIT = 10_000
+    MAX_COVERAGE_LIMIT = 200
+    MAX_COVERAGE_TICKER_LIMIT = 1_000
+    MAX_COVERAGE_OFFSET = 10_000
+
+    _COVERAGE_OPERATIONS = frozenset({
+        "summary",
+        "list_securities",
+        "contains_security",
+        "security_sources",
+        "list_sources",
+        "list_item_types",
+        "list_metrics",
+    })
+    _COVERAGE_CANONICAL_TABLES = frozenset({
+        "securities",
+        "security_memberships",
+        "corpus_items",
+        "corpus_item_securities",
+        "corpus_observations",
+        "observation_securities",
+        "corpus_events",
+        "event_securities",
+    })
+    _COVERAGE_POLICY_PATH = (
+        Path(__file__).parent.parent.parent / "configs" / "coverage.yaml"
+    )
 
     SCHEMA_SQL = Path(__file__).parent.parent.parent / "docs/phase1.2/schema.sql"
     DEFAULT_DB_PATH = Path(__file__).parent.parent.parent / "data/finance.db"
@@ -3671,6 +3700,832 @@ CREATE INDEX IF NOT EXISTS idx_securities_industry ON securities(industry);
                     "SELECT DISTINCT ticker FROM fundamentals ORDER BY ticker"
                 ).fetchall()
             return [row["ticker"] for row in rows]
+
+    # -- Capability inventory (2.3.7.1) -------------------------------------
+
+    @classmethod
+    def _validate_coverage_page(
+        cls, limit: Optional[int], *, ticker_only: bool = False,
+    ) -> int:
+        """Validate a bounded coverage page and return its effective limit."""
+        maximum = cls.MAX_COVERAGE_TICKER_LIMIT if ticker_only else cls.MAX_COVERAGE_LIMIT
+        if limit is None:
+            return maximum if ticker_only else 100
+        if not isinstance(limit, int) or isinstance(limit, bool):
+            raise ValueError("limit must be an integer")
+        if not 1 <= limit <= maximum:
+            raise ValueError(f"limit must be between 1 and {maximum}")
+        return limit
+
+    @classmethod
+    def _coverage_cursor_offset(cls, cursor: Optional[str], revision: int) -> int:
+        """Decode one opaque, revision-bound coverage cursor."""
+        if not cursor:
+            return 0
+        try:
+            padding = "=" * (-len(cursor) % 4)
+            payload = json.loads(base64.urlsafe_b64decode(
+                (str(cursor) + padding).encode("ascii")
+            ).decode("utf-8"))
+            if payload.get("version") != 1 or int(payload.get("revision")) != revision:
+                raise ValueError
+            offset = int(payload.get("offset"))
+        except (TypeError, ValueError, KeyError, json.JSONDecodeError,
+                UnicodeDecodeError, binascii.Error) as exc:
+            raise ValueError("invalid or expired coverage cursor") from exc
+        if not 0 <= offset <= cls.MAX_COVERAGE_OFFSET:
+            raise ValueError("invalid coverage cursor offset")
+        return offset
+
+    @staticmethod
+    def _coverage_cursor(offset: int, revision: int) -> str:
+        payload = json.dumps(
+            {"version": 1, "offset": int(offset), "revision": int(revision)},
+            separators=(",", ":"),
+        ).encode("utf-8")
+        return base64.urlsafe_b64encode(payload).decode("ascii").rstrip("=")
+
+    @staticmethod
+    def _coverage_filter_values(value: object) -> set[str]:
+        if value is None:
+            return set()
+        values = value if isinstance(value, (list, tuple, set)) else [value]
+        return {str(item).strip() for item in values if str(item).strip()}
+
+    @staticmethod
+    def _coverage_date(value: object, field: str) -> Optional[str]:
+        if value in (None, ""):
+            return None
+        try:
+            return SQLiteStore._validate_as_of(str(value))
+        except ValueError as exc:
+            raise ValueError(f"{field} must be an ISO date in YYYY-MM-DD format") from exc
+
+    def _coverage_policy(self) -> dict:
+        """Load non-secret tier policy used to explain canonical memberships."""
+        cached = getattr(self, "_coverage_policy_cache", None)
+        if cached is not None:
+            return cached
+        policy: dict = {}
+        try:
+            import yaml
+
+            with self._COVERAGE_POLICY_PATH.open(encoding="utf-8") as handle:
+                loaded = yaml.safe_load(handle) or {}
+            if isinstance(loaded, dict):
+                policy = loaded
+        except (OSError, TypeError, ValueError):
+            logger.warning("Could not load coverage policy for inventory", exc_info=True)
+        self._coverage_policy_cache = policy
+        return policy
+
+    def _coverage_tiers(
+        self,
+        security: dict,
+        memberships: list[dict],
+        *,
+        as_of: Optional[str] = None,
+    ) -> list[str]:
+        """Project policy scopes without turning provider capability into evidence."""
+        del as_of  # The caller supplies memberships already evaluated at the date.
+        ticker = self._normalize_universe_symbol(security.get("ticker"))
+        policy = self._coverage_policy()
+        tiers: set[str] = set()
+        if memberships:
+            tiers.add("broad")
+        broad_additions = {
+            self._normalize_universe_symbol(value)
+            for value in ((policy.get("broad") or {}).get("additions") or [])
+        }
+        deep_tickers = {
+            self._normalize_universe_symbol(value)
+            for value in ((policy.get("deep") or {}).get("tickers") or [])
+        }
+        if ticker in broad_additions:
+            tiers.add("broad")
+        if ticker in deep_tickers:
+            tiers.add("deep")
+
+        sector = str(security.get("sector") or "").strip().casefold()
+        rules = ((policy.get("sector") or {}).get("rules") or {})
+        if any(
+            sector == str(value).strip().casefold()
+            for values in rules.values()
+            if isinstance(values, list)
+            for value in values
+        ):
+            tiers.add("sector")
+        return [tier for tier in ("broad", "deep", "sector") if tier in tiers]
+
+    @classmethod
+    def _coverage_tables_exist(cls, conn: sqlite3.Connection) -> bool:
+        rows = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        ).fetchall()
+        return cls._COVERAGE_CANONICAL_TABLES <= {str(row[0]) for row in rows}
+
+    @staticmethod
+    def _coverage_membership_active(row: dict, as_of: Optional[str]) -> bool:
+        if as_of is None:
+            return bool(row.get("active"))
+        effective_from = str(row.get("effective_from") or "")
+        effective_to = str(row.get("effective_to") or "")
+        return bool(
+            effective_from <= as_of
+            and (not effective_to or effective_to >= as_of)
+        )
+
+    @staticmethod
+    def _coverage_evidence_matches(row: dict, filters: dict) -> bool:
+        for key in ("source", "source_category", "item_type"):
+            values = SQLiteStore._coverage_filter_values(filters.get(key))
+            if values and str(row.get(key) or "") not in values:
+                return False
+        for key, comparison in (("date_from", "gte"), ("date_to", "lte")):
+            value = filters.get(key)
+            if not value:
+                continue
+            occurred = str(row.get("occurred_at") or "")
+            if not occurred:
+                return False
+            if comparison == "gte" and occurred[:10] < str(value):
+                return False
+            if comparison == "lte" and occurred[:10] > str(value):
+                return False
+        return True
+
+    @staticmethod
+    def _coverage_envelope(
+        *, basis: str, revision: int, filters: dict,
+        universe_snapshot_at: Optional[str] = None,
+    ) -> dict:
+        return {
+            "status": "ok",
+            "coverage_basis": basis,
+            "total_securities": 0,
+            "active_securities": 0,
+            "coverage_tiers": {"broad": 0, "deep": 0, "sector": 0},
+            "securities": [],
+            "source_categories": [],
+            "sources": [],
+            "item_types": [],
+            "item_type_details": [],
+            "metrics": [],
+            "metric_details": [],
+            "filters_applied": dict(filters),
+            "result_count": 0,
+            "total_matching": 0,
+            "complete": True,
+            "next_cursor": None,
+            "data_revision": int(revision),
+            "universe_snapshot_at": universe_snapshot_at,
+        }
+
+    @staticmethod
+    def _coverage_page(
+        result: dict, key: str, values: list, *, limit: int,
+        offset: int, revision: int,
+    ) -> dict:
+        total = len(values)
+        page = values[offset:offset + limit]
+        complete = offset + len(page) >= total
+        result[key] = page
+        result["result_count"] = len(page)
+        result["total_matching"] = total
+        result["complete"] = complete
+        result["next_cursor"] = (
+            SQLiteStore._coverage_cursor(offset + len(page), revision)
+            if not complete else None
+        )
+        return result
+
+    def _canonical_evidence(self, conn: sqlite3.Connection) -> list[dict]:
+        """Return distinct linked evidence facets, never narrative bodies."""
+        sql = """
+            SELECT DISTINCT security_id, source, source_category, item_type,
+                            occurred_at
+            FROM (
+                SELECT cis.security_id, ci.source, ci.source_category, ci.item_type,
+                       COALESCE(ci.published_at, ci.effective_at, ci.as_of_at,
+                                ci.ingested_at) AS occurred_at
+                FROM corpus_items ci
+                JOIN corpus_item_securities cis
+                  ON cis.corpus_item_id = ci.corpus_item_id
+                UNION ALL
+                SELECT os.security_id, co.source_name, co.source_category,
+                       'observation', COALESCE(co.published_at, co.as_of_at,
+                                              co.period_end, co.ingested_at)
+                FROM corpus_observations co
+                JOIN observation_securities os
+                  ON os.observation_id = co.observation_id
+                UNION ALL
+                SELECT es.security_id, ce.source_name, ce.source_category,
+                       'event', COALESCE(ce.published_at, ce.effective_at,
+                                         ce.announced_at, ce.ingested_at)
+                FROM corpus_events ce
+                JOIN event_securities es ON es.event_id = ce.event_id
+            )
+            ORDER BY security_id, source, item_type, occurred_at
+        """
+        return [dict(row) for row in conn.execute(sql).fetchall()]
+
+    def _legacy_evidence(self, conn: sqlite3.Connection) -> list[dict]:
+        """Project old tables into an explicitly partial evidence inventory."""
+        sql = """
+            SELECT UPPER(REPLACE(ticker, '.', '-')) AS ticker,
+                   source_type AS source, 'legacy' AS source_category,
+                   'fundamental' AS item_type, ingested_at AS occurred_at,
+                   metric AS metric
+            FROM fundamentals
+            WHERE ticker IS NOT NULL AND ticker <> ''
+            UNION ALL
+            SELECT UPPER(REPLACE(ticker, '.', '-')), 'sec_companyfacts',
+                   'legacy', 'observation', ingested_at, concept
+            FROM sec_companyfacts
+            WHERE ticker IS NOT NULL AND ticker <> ''
+            UNION ALL
+            SELECT UPPER(REPLACE(ticker, '.', '-')), 'sec_filings',
+                   'sec_filing', 'sec_filing', filing_date, NULL
+            FROM filings
+            WHERE ticker IS NOT NULL AND ticker <> ''
+            UNION ALL
+            SELECT UPPER(REPLACE(ticker, '.', '-')), source, 'legacy',
+                   'freshness', last_updated, NULL
+            FROM cache_meta
+            WHERE ticker IS NOT NULL AND ticker <> '' AND ticker <> 'SCHEDULER'
+            ORDER BY ticker, source, item_type, occurred_at
+        """
+        return [dict(row) for row in conn.execute(sql).fetchall()]
+
+    def _canonical_security_inventory(
+        self, conn: sqlite3.Connection, filters: dict,
+    ) -> tuple[list[dict], list[dict], Optional[str]]:
+        rows = [dict(row) for row in conn.execute(
+            "SELECT * FROM securities ORDER BY ticker, security_id"
+        ).fetchall()]
+        as_of = filters.get("as_of")
+        memberships_by_security: dict[str, list[dict]] = {}
+        for row in conn.execute(
+            "SELECT * FROM security_memberships ORDER BY security_id, index_code"
+        ).fetchall():
+            membership = dict(row)
+            if self._coverage_membership_active(membership, as_of):
+                memberships_by_security.setdefault(str(row["security_id"]), []).append(membership)
+        evidence = self._canonical_evidence(conn)
+        evidence_by_security: dict[str, list[dict]] = {}
+        for row in evidence:
+            evidence_by_security.setdefault(str(row["security_id"]), []).append(row)
+
+        requested_ticker = self._normalize_universe_symbol(filters.get("ticker"))
+        requested_index = str(filters.get("index") or "").strip()
+        requested_sector = str(filters.get("sector") or "").strip().casefold()
+        requested_industry = str(filters.get("industry") or "").strip().casefold()
+        active_filter = filters.get("active", True)
+        if active_filter is not None and not isinstance(active_filter, bool):
+            active_filter = str(active_filter).strip().lower() in {"1", "true", "yes"}
+        matching: list[dict] = []
+        for security in rows:
+            security_id = str(security["security_id"])
+            memberships = memberships_by_security.get(security_id, [])
+            security_evidence = evidence_by_security.get(security_id, [])
+            if active_filter is not None and bool(security.get("active")) != active_filter:
+                continue
+            if as_of:
+                first_seen = str(security.get("first_seen_at") or "")[:10]
+                last_seen = str(security.get("last_seen_at") or "")[:10]
+                if first_seen and first_seen > as_of:
+                    continue
+                if last_seen and last_seen < as_of:
+                    continue
+            if requested_ticker and self._normalize_universe_symbol(security.get("ticker")) != requested_ticker:
+                continue
+            if requested_index and requested_index not in {m.get("index_code") for m in memberships}:
+                continue
+            if requested_sector and str(security.get("sector") or "").casefold() != requested_sector:
+                continue
+            if requested_industry and str(security.get("industry") or "").casefold() != requested_industry:
+                continue
+            tiers = self._coverage_tiers(security, memberships, as_of=as_of)
+            requested_tiers = self._coverage_filter_values(filters.get("coverage_tier"))
+            if requested_tiers and not requested_tiers.intersection(tiers):
+                continue
+            evidence_filters = any(
+                filters.get(key) not in (None, "", [], ())
+                for key in ("source", "source_category", "item_type", "date_from", "date_to")
+            )
+            if evidence_filters and not any(
+                self._coverage_evidence_matches(row, filters)
+                for row in security_evidence
+            ):
+                continue
+            matching.append({
+                "security_id": security_id,
+                "ticker": security.get("ticker"),
+                "name": security.get("company_name"),
+                "company_name": security.get("company_name"),
+                "active": bool(security.get("active")),
+                "active_memberships": sorted({
+                    str(row.get("index_code")) for row in memberships
+                    if row.get("index_code")
+                }),
+                "coverage_tier": tiers,
+                "sector": security.get("sector"),
+                "industry": security.get("industry"),
+                "evidence_count": len(security_evidence),
+            })
+        snapshot = conn.execute(
+            "SELECT MAX(observed_at) FROM security_memberships"
+        ).fetchone()[0]
+        if snapshot is None:
+            snapshot = conn.execute(
+                "SELECT MAX(updated_at) FROM securities"
+            ).fetchone()[0]
+        return matching, evidence, str(snapshot) if snapshot else None
+
+    def _legacy_security_inventory(
+        self, conn: sqlite3.Connection, filters: dict,
+    ) -> tuple[list[dict], list[dict], Optional[str]]:
+        tickers = [str(row[0]) for row in conn.execute(
+            """
+            SELECT ticker FROM fundamentals
+            UNION SELECT ticker FROM sec_companyfacts
+            UNION SELECT ticker FROM filings
+            UNION SELECT ticker FROM cache_meta WHERE ticker <> 'SCHEDULER'
+            ORDER BY ticker
+            """
+        ).fetchall()]
+        evidence = self._legacy_evidence(conn)
+        evidence_by_ticker: dict[str, list[dict]] = {}
+        for row in evidence:
+            evidence_by_ticker.setdefault(str(row["ticker"]), []).append(row)
+        requested_ticker = self._normalize_universe_symbol(filters.get("ticker"))
+        requested_tiers = self._coverage_filter_values(filters.get("coverage_tier"))
+        matching: list[dict] = []
+        deep_tickers = {
+            self._normalize_universe_symbol(value)
+            for value in ((self._coverage_policy().get("deep") or {}).get("tickers") or [])
+        }
+        for raw_ticker in tickers:
+            ticker = self._normalize_universe_symbol(raw_ticker)
+            if requested_ticker and ticker != requested_ticker:
+                continue
+            security_evidence = evidence_by_ticker.get(ticker, [])
+            if any(filters.get(key) not in (None, "", [], ())
+                   for key in ("index", "sector", "industry")):
+                continue
+            tiers = ["deep"] if ticker in deep_tickers else []
+            if requested_tiers and not requested_tiers.intersection(tiers):
+                continue
+            evidence_filters = any(
+                filters.get(key) not in (None, "", [], ())
+                for key in ("source", "source_category", "item_type", "date_from", "date_to")
+            )
+            if evidence_filters and not any(
+                self._coverage_evidence_matches(row, filters)
+                for row in security_evidence
+            ):
+                continue
+            matching.append({
+                "security_id": f"legacy:{ticker}",
+                "ticker": ticker,
+                "name": ticker,
+                "company_name": ticker,
+                "active": True,
+                "active_memberships": [],
+                "coverage_tier": tiers,
+                "sector": None,
+                "industry": None,
+                "evidence_count": len(security_evidence),
+            })
+        snapshot = max(
+            (str(row.get("occurred_at")) for row in evidence if row.get("occurred_at")),
+            default=None,
+        )
+        return matching, evidence, snapshot
+
+    def _coverage_source_catalog(
+        self, conn: sqlite3.Connection, evidence: list[dict],
+    ) -> list[dict]:
+        """Merge configured source capability with persisted terminal state."""
+        specs: dict = {}
+        try:
+            from src.scheduler.source_registry import SourceRegistry
+
+            registry = SourceRegistry.load(environ=os.environ)
+            specs = registry.sources
+        except Exception:  # noqa: BLE001 - inventory remains useful without config
+            logger.warning("Could not load source registry for coverage", exc_info=True)
+        policy_sources = (self._coverage_policy().get("sources") or {})
+        states: dict[str, dict] = {}
+        try:
+            for row in conn.execute(
+                "SELECT source, status, updated_at FROM source_cursors "
+                "ORDER BY updated_at DESC, source"
+            ).fetchall():
+                states.setdefault(str(row["source"]), {
+                    "last_terminal_status": row["status"],
+                    "last_terminal_at": row["updated_at"],
+                })
+            for row in conn.execute(
+                "SELECT source, status, last_updated FROM cache_meta "
+                "WHERE ticker <> 'SCHEDULER' ORDER BY last_updated DESC"
+            ).fetchall():
+                source = str(row["source"])
+                states.setdefault(source, {
+                    "last_terminal_status": row["status"],
+                    "last_terminal_at": row["last_updated"],
+                })
+        except sqlite3.Error:
+            logger.warning("Could not read source terminal state", exc_info=True)
+
+        evidence_by_source: dict[str, dict] = {}
+        for row in evidence:
+            source = str(row.get("source") or "")
+            if not source:
+                continue
+            item = evidence_by_source.setdefault(source, {
+                "evidence_count": 0, "item_types": set(), "source_category": None,
+            })
+            item["evidence_count"] += 1
+            if row.get("item_type"):
+                item["item_types"].add(str(row["item_type"]))
+            item["source_category"] = item["source_category"] or row.get("source_category")
+
+        names = sorted(set(specs) | set(policy_sources) | set(evidence_by_source))
+        result: list[dict] = []
+        for name in names:
+            spec = specs.get(name)
+            policy = policy_sources.get(name) or {}
+            state = states.get(name, {})
+            configured = bool(spec or name in policy_sources)
+            enabled = bool(spec.enabled) if spec else bool(policy.get("enabled", False))
+            available = bool(spec.is_available) if spec else False
+            category = (
+                evidence_by_source.get(name, {}).get("source_category")
+                or (spec.capability_group if spec else None)
+                or name
+            )
+            evidence_count = int(
+                evidence_by_source.get(name, {}).get("evidence_count", 0)
+            )
+            capability = {
+                "configured": configured,
+                "enabled": enabled,
+                "available": available,
+                "scope": spec.scope if spec else (policy.get("scopes") or []),
+                "capabilities": sorted({
+                    str(value) for value in (policy.get("capabilities") or [])
+                }),
+                "last_terminal_status": state.get("last_terminal_status"),
+                "last_terminal_at": state.get("last_terminal_at"),
+            }
+            result.append({
+                "source": name,
+                "source_category": category,
+                "configured": configured,
+                "enabled": enabled,
+                "available": available,
+                "scope": spec.scope if spec else (policy.get("scopes") or []),
+                "capabilities": capability["capabilities"],
+                "last_terminal_status": state.get("last_terminal_status"),
+                "last_terminal_at": state.get("last_terminal_at"),
+                "evidence_count": evidence_count,
+                "has_evidence": evidence_count > 0,
+                "item_types": sorted(evidence_by_source.get(name, {}).get("item_types", set())),
+                "capability": capability,
+            })
+        return result
+
+    def _coverage_metric_details(
+        self, conn: sqlite3.Connection, filters: dict,
+    ) -> list[dict]:
+        rows: list[dict] = []
+        canonical = self._coverage_tables_exist(conn)
+        ticker = self._normalize_universe_symbol(filters.get("ticker"))
+        security_ids: set[str] = set()
+        if ticker and canonical:
+            security_ids = {
+                str(row[0]) for row in conn.execute(
+                    "SELECT security_id FROM securities WHERE normalized_ticker=?",
+                    (ticker,),
+                ).fetchall()
+            }
+        if canonical:
+            metric_sql = """
+                SELECT co.metric_id AS metric, co.source_name AS source,
+                       co.source_category, co.ingested_at AS occurred_at,
+                       os.security_id, s.ticker
+                FROM corpus_observations co
+                LEFT JOIN observation_securities os
+                  ON os.observation_id = co.observation_id
+                LEFT JOIN securities s ON s.security_id = os.security_id
+                UNION ALL
+                SELECT f.metric, f.source_type AS source,
+                       'legacy' AS source_category, f.ingested_at,
+                       f.security_id, f.ticker
+                FROM fundamentals f
+                UNION ALL
+                SELECT cf.concept AS metric, 'sec_companyfacts' AS source,
+                       'legacy' AS source_category, cf.ingested_at,
+                       cf.security_id, cf.ticker
+                FROM sec_companyfacts cf
+            """
+        else:
+            metric_sql = """
+                SELECT metric, source_type AS source, 'legacy' AS source_category,
+                       ingested_at AS occurred_at, security_id, ticker
+                FROM fundamentals
+                UNION ALL
+                SELECT concept AS metric, 'sec_companyfacts' AS source,
+                       'legacy' AS source_category, ingested_at AS occurred_at,
+                       security_id, ticker
+                FROM sec_companyfacts
+            """
+        for row in conn.execute(metric_sql).fetchall():
+            item = dict(row)
+            if ticker:
+                if canonical:
+                    if security_ids:
+                        in_registry = item.get("security_id") in security_ids
+                        in_legacy_row = (
+                            self._normalize_universe_symbol(item.get("ticker")) == ticker
+                        )
+                        if not in_registry and not in_legacy_row:
+                            continue
+                    elif self._normalize_universe_symbol(item.get("ticker")) != ticker:
+                        continue
+                elif self._normalize_universe_symbol(item.get("ticker")) != ticker:
+                    continue
+            if not self._coverage_evidence_matches(item, filters):
+                continue
+            rows.append(item)
+        grouped: dict[tuple[str, str], dict] = {}
+        for row in rows:
+            metric = str(row.get("metric") or "").strip()
+            source = str(row.get("source") or "").strip()
+            if not metric:
+                continue
+            key = (metric, source)
+            item = grouped.setdefault(key, {
+                "metric": metric,
+                "source": source,
+                "source_category": row.get("source_category"),
+                "observation_count": 0,
+                "tickers": set(),
+            })
+            item["observation_count"] += 1
+            if row.get("ticker"):
+                item["tickers"].add(
+                    self._normalize_universe_symbol(row.get("ticker"))
+                )
+        for item in grouped.values():
+            item["tickers"] = sorted(item["tickers"])
+        return sorted(grouped.values(), key=lambda row: (row["metric"], row["source"]))
+
+    def describe_coverage(
+        self,
+        operation: str = "summary",
+        *,
+        ticker: Optional[str] = None,
+        filters: Optional[dict] = None,
+        limit: Optional[int] = None,
+        cursor: Optional[str] = None,
+        ticker_only: bool = False,
+    ) -> dict:
+        """Return the bounded, read-only Phase 2.3.7.1 coverage projection."""
+        operation = str(operation or "summary").strip().lower()
+        if operation not in self._COVERAGE_OPERATIONS:
+            raise ValueError(f"unsupported coverage operation: {operation}")
+        clean_filters = dict(filters or {})
+        if ticker:
+            clean_filters["ticker"] = self._normalize_universe_symbol(ticker)
+        if ticker_only:
+            clean_filters["ticker_only"] = True
+        for key in ("as_of", "date_from", "date_to"):
+            if clean_filters.get(key):
+                clean_filters[key] = self._coverage_date(clean_filters[key], key)
+        revision = self.get_store_revision()
+        page_limit = self._validate_coverage_page(limit, ticker_only=ticker_only)
+        offset = self._coverage_cursor_offset(cursor, revision)
+
+        try:
+            with self._connect() as conn:
+                canonical = self._coverage_tables_exist(conn)
+                basis = "canonical" if canonical else "legacy_partial"
+                result = self._coverage_envelope(
+                    basis=basis, revision=revision, filters=clean_filters,
+                )
+                inventory_filters = clean_filters
+                if operation in {"contains_security", "security_sources"}:
+                    inventory_filters = dict(clean_filters)
+                    inventory_filters.pop("ticker", None)
+                if canonical:
+                    securities, evidence, snapshot = self._canonical_security_inventory(
+                        conn, inventory_filters,
+                    )
+                else:
+                    securities, evidence, snapshot = self._legacy_security_inventory(
+                        conn, inventory_filters,
+                    )
+                evidence_scope = evidence
+                requested_ticker = clean_filters.get("ticker")
+                if requested_ticker and operation not in {
+                    "contains_security", "security_sources",
+                }:
+                    security_ids = {
+                        str(row.get("security_id")) for row in securities
+                        if row.get("security_id")
+                    }
+                    evidence_scope = [
+                        row for row in evidence
+                        if (
+                            str(row.get("security_id")) in security_ids
+                            or self._normalize_universe_symbol(row.get("ticker"))
+                            == requested_ticker
+                        )
+                    ]
+                result["universe_snapshot_at"] = snapshot
+                if canonical:
+                    all_rows = [dict(row) for row in conn.execute(
+                        "SELECT * FROM securities"
+                    ).fetchall()]
+                    result["total_securities"] = len(all_rows)
+                    result["active_securities"] = sum(bool(row.get("active")) for row in all_rows)
+                    tier_counts = {"broad": 0, "deep": 0, "sector": 0}
+                    for row in all_rows:
+                        memberships = [dict(item) for item in conn.execute(
+                            "SELECT * FROM security_memberships WHERE security_id=? AND active=1",
+                            (row["security_id"],),
+                        ).fetchall()]
+                        for tier in self._coverage_tiers(row, memberships):
+                            tier_counts[tier] += 1
+                    result["coverage_tiers"] = tier_counts
+                else:
+                    result["total_securities"] = len({row["ticker"] for row in securities})
+                    result["active_securities"] = result["total_securities"]
+                    result["coverage_tiers"] = {
+                        "broad": 0,
+                        "deep": sum("deep" in row["coverage_tier"] for row in securities),
+                        "sector": 0,
+                    }
+
+                if operation == "summary":
+                    source_rows = self._coverage_source_catalog(conn, evidence_scope)
+                    item_counts: dict[str, int] = {}
+                    for row in evidence_scope:
+                        if not self._coverage_evidence_matches(row, clean_filters):
+                            continue
+                        item_type = str(row.get("item_type") or "")
+                        if item_type:
+                            item_counts[item_type] = item_counts.get(item_type, 0) + 1
+                    metric_details = self._coverage_metric_details(conn, clean_filters)
+                    result["source_categories"] = source_rows
+                    result["sources"] = source_rows
+                    result["item_types"] = sorted(item_counts)
+                    result["item_type_details"] = [
+                        {"item_type": key, "evidence_count": count}
+                        for key, count in sorted(item_counts.items())
+                    ]
+                    result["metrics"] = sorted({row["metric"] for row in metric_details})
+                    result["metric_details"] = metric_details
+                    result["result_count"] = result["active_securities"]
+                    result["total_matching"] = result["active_securities"]
+                    return result
+
+                if operation == "list_securities":
+                    return self._coverage_page(
+                        result, "securities", securities,
+                        limit=page_limit, offset=offset, revision=revision,
+                    )
+
+                if operation == "contains_security":
+                    requested = clean_filters.get("ticker")
+                    found = next(
+                        (row for row in securities if row["ticker"] == requested), None
+                    )
+                    if found:
+                        result["covered"] = True
+                        result["security"] = found
+                    else:
+                        result["covered"] = False
+                        result["security"] = None
+                        prefix = str(requested or "")[:4]
+                        result["suggestions"] = [
+                            row["ticker"] for row in securities
+                            if prefix and row["ticker"].startswith(prefix)
+                        ][:5]
+                    result["result_count"] = 1 if found else 0
+                    result["total_matching"] = result["result_count"]
+                    return result
+
+                if operation == "security_sources":
+                    requested = clean_filters.get("ticker")
+                    found = next(
+                        (row for row in securities if row["ticker"] == requested), None
+                    )
+                    if not found:
+                        result["covered"] = False
+                        result["security"] = None
+                        result["sources"] = []
+                        result["result_count"] = 0
+                        result["total_matching"] = 0
+                        result["suggestions"] = [
+                            row["ticker"] for row in securities
+                            if str(requested or "")[:4]
+                            and row["ticker"].startswith(str(requested)[:4])
+                        ][:5]
+                        return result
+                    security_id = found["security_id"]
+                    security_evidence = [
+                        row for row in evidence
+                        if (row.get("security_id") == security_id
+                            or row.get("ticker") == requested)
+                    ]
+                    source_rows = self._coverage_source_catalog(conn, security_evidence)
+                    result["covered"] = True
+                    result["security"] = found
+                    result["sources"] = source_rows
+                    result["source_categories"] = source_rows
+                    result["item_types"] = sorted({
+                        str(row["item_type"]) for row in security_evidence
+                        if row.get("item_type")
+                    })
+                    result["result_count"] = len(source_rows)
+                    result["total_matching"] = len(source_rows)
+                    return result
+
+                if operation == "list_sources":
+                    source_rows = self._coverage_source_catalog(conn, evidence_scope)
+                    if clean_filters.get("source"):
+                        source_rows = [row for row in source_rows
+                                       if row["source"] in self._coverage_filter_values(clean_filters["source"])]
+                    if clean_filters.get("source_category"):
+                        source_rows = [row for row in source_rows
+                                       if row["source_category"] in self._coverage_filter_values(clean_filters["source_category"])]
+                    page = self._coverage_page(
+                        result, "sources", source_rows,
+                        limit=page_limit, offset=offset, revision=revision,
+                    )
+                    page["source_categories"] = list(page["sources"])
+                    return page
+
+                if operation == "list_item_types":
+                    details: dict[tuple[str, str], int] = {}
+                    for row in evidence_scope:
+                        if not self._coverage_evidence_matches(row, clean_filters):
+                            continue
+                        key = (str(row.get("item_type") or ""), str(row.get("source_category") or ""))
+                        if key[0]:
+                            details[key] = details.get(key, 0) + 1
+                    detail_rows = [
+                        {"item_type": item_type, "source_category": source_category,
+                         "evidence_count": count}
+                        for (item_type, source_category), count in sorted(details.items())
+                    ]
+                    names = sorted({row["item_type"] for row in detail_rows})
+                    page = self._coverage_page(
+                        result, "item_types", names,
+                        limit=page_limit, offset=offset, revision=revision,
+                    )
+                    page["item_type_details"] = [
+                        row for row in detail_rows if row["item_type"] in page["item_types"]
+                    ]
+                    return page
+
+                metric_details = self._coverage_metric_details(conn, clean_filters)
+                names = sorted({row["metric"] for row in metric_details})
+                page = self._coverage_page(
+                    result, "metrics", names,
+                    limit=page_limit, offset=offset, revision=revision,
+                )
+                page["metric_details"] = [
+                    row for row in metric_details if row["metric"] in page["metrics"]
+                ]
+                ticker_inventory_filters = dict(clean_filters)
+                ticker_inventory_filters.pop("ticker", None)
+                ticker_inventory = self._coverage_metric_details(
+                    conn, ticker_inventory_filters,
+                )
+                page["tickers"] = sorted({
+                    ticker
+                    for row in ticker_inventory
+                    for ticker in row.get("tickers", [])
+                })
+                return page
+        except ValueError:
+            raise
+        except Exception:  # noqa: BLE001 - inventory failures are truthful, not guessed
+            logger.exception("Coverage inventory unavailable")
+            unavailable = self._coverage_envelope(
+                basis="unavailable", revision=revision, filters=clean_filters,
+            )
+            unavailable.update({
+                "status": "unavailable",
+                "complete": False,
+                "answer_origin": "deterministic_coverage",
+                "message": "Coverage inventory is unavailable.",
+            })
+            return unavailable
 
     _ORDER_SQL = {"asc": "ASC", "desc": "DESC"}
     _OP_SQL = {"lt": "<", "lte": "<=", "gt": ">", "gte": ">=", "eq": "=", "ne": "!="}

@@ -144,6 +144,20 @@ class QueryResponse(BaseModel):
     """Structured response from the middleware."""
 
     answer: str = Field(..., description="Grounded answer from the model")
+    answer_origin: Optional[str] = Field(
+        None,
+        description=(
+            "Origin of the answer, including deterministic_coverage for answers "
+            "rendered from the authoritative capability inventory."
+        ),
+    )
+    coverage_metadata: Optional[dict] = Field(
+        None,
+        description=(
+            "Coverage answer metadata: Store revision, coverage basis, result "
+            "completeness, pagination cursor, and applied filters."
+        ),
+    )
     citations: list[SourceCitation] = Field(default_factory=list,
                                             description="Sources used in the answer")
     detected_ticker: Optional[str] = None

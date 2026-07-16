@@ -495,6 +495,8 @@ class OrchestrationResult:
     tool_execution: Optional["ExecutionResult"] = None
     calculations: list[dict] = field(default_factory=list)
     deterministic_answer: Optional[str] = None
+    answer_origin: Optional[str] = None
+    answer_metadata: Optional[dict] = None
     subqueries_executed: list[str] = field(default_factory=list)
     retrieval_rounds_used: int = 0
     planning_ran: bool = False
@@ -646,7 +648,11 @@ def _run_adaptive(
     # (re-grade + context budget) still runs so hit and miss produce the same
     # response shape. An explicit refresh never looks up (but still stores the
     # fresh result). Any cache/revision error is a miss, never a failure.
-    cache_key = _retrieval_cache_key(
+    coverage_route = bool(
+        decision.tool_invocations
+        and decision.tool_invocations[0].reason_code == dr.REASON_COVERAGE
+    )
+    cache_key = None if coverage_route else _retrieval_cache_key(
         retrieval_cache, store, plan, config, lane, available_metrics)
     if cache_key is not None and not refresh:
         cached = retrieval_cache.get(cache_key)
@@ -797,6 +803,8 @@ def _execute_fast(
         )
 
     result.deterministic_answer = execution.answer
+    result.answer_origin = execution.answer_origin
+    result.answer_metadata = execution.answer_metadata
     result.merged_facts = _normalize_tool_facts(execution)
     result.merged_documents = []  # fast lane never retrieves documents
     result.subqueries_executed = _sq0_ids(plan)

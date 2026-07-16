@@ -1,0 +1,59 @@
+{
+  "version": "2.3.7.1",
+  "queries": [
+    {
+      "id": "summary",
+      "question": "Summarize the coverage inventory.",
+      "operation": "summary",
+      "arguments": {}
+    },
+    {
+      "id": "all_tickers",
+      "question": "What tickers do you know about?",
+      "operation": "list_securities",
+      "arguments": {"ticker_only": true}
+    },
+    {
+      "id": "contains_security",
+      "question": "Do you cover NVIDIA?",
+      "operation": "contains_security",
+      "arguments": {"ticker": "NVDA"}
+    },
+    {
+      "id": "security_sources",
+      "question": "What sources and data types are available for NVDA?",
+      "operation": "security_sources",
+      "arguments": {"ticker": "NVDA"}
+    },
+    {
+      "id": "sector_index_evidence",
+      "question": "Which healthcare securities have SEC filings?",
+      "operation": "list_securities",
+      "arguments": {
+        "filters": {
+          "sector": "Health Care",
+          "index": "sp500",
+          "source_category": "sec_filing"
+        }
+      }
+    },
+    {
+      "id": "item_types",
+      "question": "Which item types are available?",
+      "operation": "list_item_types",
+      "arguments": {}
+    },
+    {
+      "id": "sources",
+      "question": "Which sources are configured?",
+      "operation": "list_sources",
+      "arguments": {}
+    },
+    {
+      "id": "metrics",
+      "question": "Which metrics do you have for NVDA?",
+      "operation": "list_metrics",
+      "arguments": {"ticker": "NVDA"}
+    }
+  ]
+}

@@ -94,6 +94,7 @@ curl http://127.0.0.1:8000/tools
   "enabled": true,
   "allow_write_tools": false,
   "tools": [
+    { "name": "describe_coverage", "description": "Read-only capability inventory...", "write": false },
     { "name": "query_facts", "description": "Rank, filter...", "write": false },
     { "name": "refresh_data", "description": "Use ONLY...", "write": true }
   ]
@@ -102,11 +103,39 @@ curl http://127.0.0.1:8000/tools
 
 ---
 
+## `describe_coverage` tool
+
+`describe_coverage` is a bounded, read-only inventory of the canonical Phase
+2.3 security registry and corpus ledger. It does not call a provider, the
+model, or ingestion. Callers use the Store facade; the tool never joins SQLite
+tables or scans Chroma directly.
+
+Supported operations are `summary`, `list_securities`, `contains_security`,
+`security_sources`, `list_sources`, `list_item_types`, and `list_metrics`.
+Arguments are `operation` plus optional `ticker`, `filters`, `limit`, `cursor`,
+and `ticker_only`. Filters may include `index`, `sector`, `industry`,
+`coverage_tier`, `item_type`, `source`, `source_category`, `active`, `as_of`,
+`date_from`, and `date_to`.
+
+Responses include `coverage_basis` (`canonical` or `legacy_partial`), registry
+and corpus counts, membership tiers, stored evidence, configured/enabled/
+available source capability, terminal source status, item types, metric
+families, `data_revision`, and `universe_snapshot_at`. Detail pages are bounded
+and set `complete: false` with an opaque `next_cursor` when more rows remain.
+An explicit ticker-only inventory is complete when it fits the safe 1,000-ticker
+bound. Missing canonical tables are disclosed through `coverage_basis` rather
+than silently treated as complete canonical coverage.
+
+---
+
 ## POST `/query`
 
 Full RAG pipeline: parse intent → check/refresh freshness → hybrid retrieval →
 prompt augmentation → model call. If the model server is down, returns a
 **degraded** answer built from raw retrieved data (`model_available: false`).
+Explicit capability-coverage questions are answered deterministically from
+`describe_coverage`; an unavailable inventory produces an unavailable answer,
+not a model-generated guess.
 When `enable_tools` is on, `/query` may advertise registered tools to the model
 and perform extra model round-trips before the final answer. Write tools are
 additionally gated by `allow_write_tools` and per-query refresh limits.
@@ -132,6 +161,8 @@ additionally gated by `allow_write_tools` and per-query refresh limits.
 | Field | Type | Meaning |
 |-------|------|---------|
 | `answer` | string | Grounded answer (or degraded raw-data summary). |
+| `answer_origin` | string \| null | Answer source; `deterministic_coverage` identifies a capability-inventory answer. |
+| `coverage_metadata` | object \| null | Coverage basis, Store revision, snapshot, completeness, pagination, and applied filters for a deterministic coverage answer. |
 | `citations` | array | `SourceCitation` objects parsed from `[Source: type/ticker]` markers. |
 | `detected_ticker` | string \| null | Ticker the parser detected. |
 | `detected_intent` | string \| null | Question type (`fact_lookup`, `comparison`, `trend`, `explanation`, `sentiment`, `news`, `risk`, `general`). |

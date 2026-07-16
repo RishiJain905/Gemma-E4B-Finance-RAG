@@ -1833,6 +1833,9 @@ async def _build_adaptive_query_context(shared: dict) -> dict:
         "compiled": shared["compiled"],
         "retrieval_query": retrieval_query,
         "orchestration": _orchestration_metadata(result),
+        "deterministic_answer": result.deterministic_answer,
+        "answer_origin": result.answer_origin,
+        "coverage_metadata": result.answer_metadata,
         "evidence_sufficiency": sufficiency_meta,
         "evidence_ledger": evidence_ledger,
         "graph_evidence_ids": graph_evidence_ids,
@@ -2001,6 +2004,8 @@ def _build_query_response(
 
     return QueryResponse(
         answer=answer_text,
+        answer_origin=context.get("answer_origin"),
+        coverage_metadata=context.get("coverage_metadata"),
         citations=citations,
         detected_ticker=intent.get("ticker"),
         detected_intent=intent.get("question_type"),
@@ -2036,40 +2041,56 @@ async def _answer_query_context(request: QueryRequest, context: dict) -> QueryRe
     grounding_level = context["grounding_level"]
     stage_start = time.perf_counter()
     _emit_stage("generate", "started")
-    model_available = await _check_model_health()
-    if model_available:
-        temperature, max_tokens = _task_settings(request, intent)
-        answer_text, citations = await _invoke_model(
-            prompt=context["augmented_prompt"],
-            temperature=temperature,
-            max_tokens=max_tokens,
-            intent=intent,
-            grounding_level=grounding_level,
-        )
-        if not answer_text.startswith("Error calling model:"):
-            _mark_model_health(True)
-        if intent.get("question_type") == "projection":
-            from .guardrails import apply_projection_guardrail
-
-            answer_text, _flagged = apply_projection_guardrail(
-                answer_text,
-                context["augmented_prompt"],
-            )
-    else:
-        logger.warning("Model unavailable - returning degraded answer")
-        _emit_stage("generate", "fallback", reason="model_unavailable")
-        answer_text = _format_degraded_answer(
-            retrieval, intent, context.get("evidence_sufficiency"))
+    deterministic_coverage = (
+        context.get("answer_origin") == "deterministic_coverage"
+        and context.get("deterministic_answer") is not None
+    )
+    if deterministic_coverage:
+        # The coverage tool already produced the final answer from the local
+        # authoritative inventory. Do not probe or call the model, and do not
+        # run citation validation designed for model-generated prose.
+        model_available = True
+        answer_text = str(context["deterministic_answer"])
         citations = []
+        validation = None
+        evidence_citations = None
+    else:
+        model_available = await _check_model_health()
+        if model_available:
+            temperature, max_tokens = _task_settings(request, intent)
+            answer_text, citations = await _invoke_model(
+                prompt=context["augmented_prompt"],
+                temperature=temperature,
+                max_tokens=max_tokens,
+                intent=intent,
+                grounding_level=grounding_level,
+            )
+            if not answer_text.startswith("Error calling model:"):
+                _mark_model_health(True)
+            if intent.get("question_type") == "projection":
+                from .guardrails import apply_projection_guardrail
+
+                answer_text, _flagged = apply_projection_guardrail(
+                    answer_text,
+                    context["augmented_prompt"],
+                )
+        else:
+            logger.warning("Model unavailable - returning degraded answer")
+            _emit_stage("generate", "fallback", reason="model_unavailable")
+            answer_text = _format_degraded_answer(
+                retrieval, intent, context.get("evidence_sufficiency"))
+            citations = []
+
+        # Deterministic citation/numeric validation (2.2.4.3). off -> passthrough;
+        # report -> metadata only; enforce -> may downgrade/refuse. Updates the
+        # context grounding so _build_query_response reflects an enforced downgrade.
+        answer_text, grounding_level, validation, evidence_citations = _apply_answer_validation(
+            context, answer_text, grounding_level)
+
     _stage_timing(context["timings"], "model_call", stage_start)
     if model_available:
         _emit_stage("generate", "completed")
 
-    # Deterministic citation/numeric validation (2.2.4.3). off -> passthrough;
-    # report -> metadata only; enforce -> may downgrade/refuse. Updates the
-    # context grounding so _build_query_response reflects an enforced downgrade.
-    answer_text, grounding_level, validation, evidence_citations = _apply_answer_validation(
-        context, answer_text, grounding_level)
     context["grounding_level"] = grounding_level
     _emit_graph_terminal(
         context,

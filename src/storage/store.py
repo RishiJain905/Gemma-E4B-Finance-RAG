@@ -494,6 +494,26 @@ class Store:
         """Return one canonical security by ticker or opaque id."""
         return self.sqlite.get_security(ticker_or_id)
 
+    def describe_coverage(
+        self,
+        operation: str = "summary",
+        *,
+        ticker: Optional[str] = None,
+        filters: Optional[dict] = None,
+        limit: Optional[int] = None,
+        cursor: Optional[str] = None,
+        ticker_only: bool = False,
+    ) -> dict:
+        """Return the bounded, read-only capability inventory projection."""
+        return self.sqlite.describe_coverage(
+            operation,
+            ticker=ticker,
+            filters=filters,
+            limit=limit,
+            cursor=cursor,
+            ticker_only=ticker_only,
+        )
+
     def resolve_security(
         self,
         symbol: str,

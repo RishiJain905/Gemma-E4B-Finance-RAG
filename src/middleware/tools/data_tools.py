@@ -113,10 +113,22 @@ PRICE_TARGET_METRICS = [
 
 
 def list_metrics_handler(store, ticker=None):
-    """Return the metrics and tickers available in `fundamentals`, so the model never invents one."""
+    """Return the compatibility metric/ticker shape from the coverage contract."""
+    inventory = store.describe_coverage(
+        operation="list_metrics",
+        ticker=ticker.upper() if ticker else None,
+        ticker_only=True,
+    )
+    tickers = inventory.get("tickers")
+    if tickers is None:
+        tickers = [
+            row.get("ticker")
+            for row in inventory.get("securities", [])
+            if row.get("ticker")
+        ]
     return {
-        "metrics": store.sqlite.list_metrics(ticker.upper() if ticker else None),
-        "tickers": store.sqlite.list_tickers(),
+        "metrics": list(inventory.get("metrics") or []),
+        "tickers": [str(ticker) for ticker in tickers if ticker],
     }
 
 
