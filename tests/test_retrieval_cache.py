@@ -215,6 +215,18 @@ def test_key_changes_with_store_revision():
     assert k1 != k2
 
 
+def test_key_changes_with_corpus_revision():
+    cfg = make_config()
+    plan = make_plan(entities=("NVDA",))
+    first = build_cache_key(
+        plan=plan, config=cfg, lane=Lane.STANDARD, revision=7, corpus_revision=3
+    )
+    second = build_cache_key(
+        plan=plan, config=cfg, lane=Lane.STANDARD, revision=7, corpus_revision=4
+    )
+    assert first != second
+
+
 def test_key_changes_with_config_fingerprint():
     plan = make_plan(entities=("NVDA",))
     cfg_a = make_config(top_k_documents=5)
@@ -223,6 +235,32 @@ def test_key_changes_with_config_fingerprint():
     k_b = build_cache_key(plan=plan, config=cfg_b, lane=Lane.STANDARD, revision=1)
     assert k_a != k_b
     assert config_fingerprint(cfg_a) != config_fingerprint(cfg_b)
+
+
+def test_key_includes_lexical_backend_profile_filters_and_candidate_limits():
+    plan = make_plan(entities=("NVDA",))
+    plan.evidence_filters = {"item_type": "sec_filing", "security": "nvda"}
+    base = make_config(
+        lexical_backend="fts5", profile="recommended", rerank_candidates=30,
+    )
+    rollback = make_config(
+        lexical_backend="memory", profile="legacy", rerank_candidates=30,
+    )
+    wider = make_config(
+        lexical_backend="fts5", profile="recommended", rerank_candidates=60,
+    )
+
+    key = build_cache_key(plan=plan, config=base, lane=Lane.STANDARD, revision=4)
+
+    assert '"lexical_backend": "fts5"' in key
+    assert '"retrieval_profile": "recommended"' in key
+    assert '"item_type": "sec_filing"' in key
+    assert key != build_cache_key(
+        plan=plan, config=rollback, lane=Lane.STANDARD, revision=4
+    )
+    assert key != build_cache_key(
+        plan=plan, config=wider, lane=Lane.STANDARD, revision=4
+    )
 
 
 def test_key_stable_for_identical_request():

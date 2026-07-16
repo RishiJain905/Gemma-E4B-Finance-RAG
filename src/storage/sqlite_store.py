@@ -5,6 +5,7 @@ SQLite storage layer for structured financial data.
 
 import base64
 import binascii
+import hashlib
 import json
 import logging
 import os
@@ -21,7 +22,7 @@ from src.ingestion.normalization import (
     syndicated_news_key,
 )
 from src.ingestion.records import EventRecord, NarrativeRecord, ObservationRecord
-from src.storage.migrations import apply_migrations
+from src.storage.migrations import apply_migrations, fts5_available
 
 logger = logging.getLogger(__name__)
 
@@ -35,6 +36,9 @@ class SQLiteStore:
     MAX_COVERAGE_LIMIT = 200
     MAX_COVERAGE_TICKER_LIMIT = 1_000
     MAX_COVERAGE_OFFSET = 10_000
+    MAX_LEXICAL_RESULTS = 200
+    MAX_LEXICAL_TERMS = 32
+    MAX_RECONCILIATION_SAMPLES = 100
 
     _COVERAGE_OPERATIONS = frozenset({
         "summary",
@@ -1388,6 +1392,373 @@ CREATE INDEX IF NOT EXISTS idx_securities_industry ON securities(industry);
         logger.debug("Store revision bumped to %d (%s)", revision, reason or "")
         return revision
 
+    # -- Persistent lexical index (2.3.7.5) ---------------------------------
+
+    @staticmethod
+    def _lexical_table_exists(conn: sqlite3.Connection) -> bool:
+        return conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='corpus_fts'"
+        ).fetchone() is not None
+
+    def fts5_available(self) -> bool:
+        """Return whether this runtime supports FTS5 and the index was created."""
+        with self._connect() as conn:
+            return fts5_available(conn) and self._lexical_table_exists(conn)
+
+    def get_lexical_index_state(self) -> dict:
+        """Return the singleton persistent index state without raising."""
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT schema_version, indexed_revision, indexed_at, row_count, "
+                "rebuild_cursor, rebuild_revision FROM lexical_index_state WHERE id=1"
+            ).fetchone()
+        if row is None:
+            return {
+                "schema_version": 1, "indexed_revision": 0, "indexed_at": None,
+                "row_count": 0, "rebuild_cursor": 0, "rebuild_revision": 0,
+            }
+        return dict(row)
+
+    @staticmethod
+    def _lexical_row(chunk: dict, family_id: Optional[str] = None) -> tuple[str, ...]:
+        metadata = dict(chunk.get("metadata") or {})
+        chunk_id = str(chunk.get("id") or metadata.get("child_chunk_id") or "").strip()
+        if not chunk_id:
+            raise ValueError("lexical chunk id is required")
+        resolved_family = str(
+            family_id
+            or metadata.get("document_family_id")
+            or metadata.get("parent_id")
+            or metadata.get("corpus_item_id")
+            or chunk_id.split("#", 1)[0]
+        )
+        tickers = metadata.get("tickers") or metadata.get("ticker") or ""
+        if isinstance(tickers, (list, tuple, set)):
+            tickers = ",".join(sorted(str(value).upper() for value in tickers if value))
+        else:
+            tickers = ",".join(
+                value.strip().upper() for value in str(tickers).split(",") if value.strip()
+            )
+        return (
+            str(metadata.get("title") or metadata.get("section_heading") or ""),
+            str(chunk.get("document") or chunk.get("text") or ""),
+            str(tickers),
+            str(metadata.get("source_category") or ""),
+            str(metadata.get("item_type") or ""),
+            chunk_id,
+            resolved_family,
+            str(metadata.get("source_name") or metadata.get("source") or ""),
+            str(metadata.get("event_type") or ""),
+            str(metadata.get("form") or ""),
+            str(metadata.get("item") or metadata.get("filing_item") or ""),
+            str(metadata.get("authority_tier") or metadata.get("evidence_authority") or ""),
+            str(metadata.get("indexing_status") or "indexed"),
+            str(metadata.get("published_at") or metadata.get("date") or ""),
+            str(metadata.get("effective_at") or ""),
+            str(metadata.get("as_of_at") or ""),
+        )
+
+    @staticmethod
+    def _insert_lexical_row(conn: sqlite3.Connection, row: tuple[str, ...]) -> None:
+        conn.execute(
+            "INSERT INTO corpus_fts (title, body, ticker, source_category, item_type, "
+            "chunk_id, family_id, source, event_type, form, item, authority_tier, "
+            "indexing_status, published_at, effective_at, as_of_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            row,
+        )
+
+    @classmethod
+    def _replace_lexical_families_conn(
+        cls,
+        conn: sqlite3.Connection,
+        families: dict[str, list[dict]],
+    ) -> bool:
+        changed = False
+        for family_id, chunks in families.items():
+            expected_rows = {
+                row[5]: row for row in (
+                    cls._lexical_row(chunk, str(family_id)) for chunk in chunks
+                )
+            }
+            current_rows = conn.execute(
+                "SELECT rowid, title, body, ticker, source_category, item_type, chunk_id, "
+                "family_id, source, event_type, form, item, authority_tier, indexing_status, "
+                "published_at, effective_at, as_of_at FROM corpus_fts WHERE family_id=?",
+                (str(family_id),),
+            ).fetchall()
+            current_by_id: dict[str, list[sqlite3.Row]] = {}
+            for current in current_rows:
+                current_by_id.setdefault(str(current[6]), []).append(current)
+
+            for chunk_id, rows in current_by_id.items():
+                expected = expected_rows.get(chunk_id)
+                values = tuple(str(value or "") for value in rows[0][1:])
+                if len(rows) == 1 and expected is not None and values == expected:
+                    continue
+                conn.execute("DELETE FROM corpus_fts WHERE chunk_id=?", (chunk_id,))
+                changed = True
+                if expected is not None:
+                    cls._insert_lexical_row(conn, expected)
+            for chunk_id, expected in expected_rows.items():
+                if chunk_id not in current_by_id:
+                    cls._insert_lexical_row(conn, expected)
+                    changed = True
+        return changed
+
+    @staticmethod
+    def _update_lexical_state(
+        conn: sqlite3.Connection,
+        revision: int,
+        *,
+        indexed: bool = True,
+    ) -> None:
+        row_count = int(conn.execute("SELECT COUNT(*) FROM corpus_fts").fetchone()[0])
+        if indexed:
+            conn.execute(
+                "UPDATE lexical_index_state SET indexed_revision=?, indexed_at=datetime('now'), "
+                "row_count=?, rebuild_cursor=0, rebuild_revision=0 WHERE id=1",
+                (int(revision), row_count),
+            )
+        else:
+            conn.execute(
+                "UPDATE lexical_index_state SET row_count=? WHERE id=1", (row_count,)
+            )
+
+    def replace_lexical_families(
+        self,
+        families: dict[str, list[dict]],
+        *,
+        revision: Optional[int] = None,
+    ) -> int:
+        """Apply stable-id family deltas and state in one SQLite transaction."""
+        with self._connect() as conn:
+            if revision is None:
+                revision = self._bump_revision_in_transaction(conn)
+            if self._lexical_table_exists(conn):
+                self._replace_lexical_families_conn(conn, families)
+                current = int(conn.execute(
+                    "SELECT revision FROM store_revision WHERE id=1"
+                ).fetchone()[0])
+                self._update_lexical_state(conn, revision, indexed=current == revision)
+            conn.commit()
+        return int(revision)
+
+    def replace_lexical_family(
+        self,
+        family_id: str,
+        chunks: list[dict],
+        *,
+        revision: Optional[int] = None,
+    ) -> int:
+        return self.replace_lexical_families(
+            {str(family_id): list(chunks)}, revision=revision
+        )
+
+    def delete_lexical_families(
+        self,
+        family_ids: list[str],
+        *,
+        revision: Optional[int] = None,
+    ) -> int:
+        families = {str(value): [] for value in dict.fromkeys(family_ids) if value}
+        return self.replace_lexical_families(families, revision=revision)
+
+    def search_lexical(
+        self,
+        match_query: str,
+        *,
+        limit: int,
+        revision: int,
+        where: Optional[dict] = None,
+        filters: Optional[dict] = None,
+    ) -> list[dict]:
+        """Run one parameterized, hard-bounded FTS5 BM25 query."""
+        if limit < 1 or limit > self.MAX_LEXICAL_RESULTS:
+            raise ValueError(f"limit must be between 1 and {self.MAX_LEXICAL_RESULTS}")
+        predicates = ["corpus_fts MATCH ?", "indexing_status='indexed'"]
+        params: list[object] = [match_query]
+        merged = dict(filters or {})
+        merged.update(where or {})
+        ticker = merged.get("security") or merged.get("ticker")
+        if ticker:
+            predicates.append("(',' || ticker || ',') LIKE ('%,' || ? || ',%')")
+            params.append(str(ticker).upper())
+        for facet, column in (
+            ("source_category", "source_category"),
+            ("source", "source"),
+            ("item_type", "item_type"),
+            ("event_type", "event_type"),
+            ("form", "form"),
+            ("item", "item"),
+            ("authority_tier", "authority_tier"),
+            ("indexing_status", "indexing_status"),
+        ):
+            value = merged.get(facet)
+            if value not in (None, ""):
+                predicates.append(f"{column}=?")
+                params.append(str(value))
+        for prefix, column in (
+            ("published", "published_at"),
+            ("effective", "effective_at"),
+            ("as_of", "as_of_at"),
+        ):
+            if merged.get(f"{prefix}_from"):
+                predicates.append(f"{column}>=?")
+                params.append(str(merged[f"{prefix}_from"]))
+            if merged.get(f"{prefix}_to"):
+                predicates.append(f"{column}<=?")
+                params.append(str(merged[f"{prefix}_to"]))
+        params.append(limit)
+        with self._connect() as conn:
+            state = conn.execute(
+                "SELECT indexed_revision FROM lexical_index_state WHERE id=1"
+            ).fetchone()
+            if state is None or int(state[0]) != int(revision):
+                return []
+            rows = conn.execute(
+                "SELECT chunk_id, bm25(corpus_fts, 3.0, 1.0) AS rank "
+                "FROM corpus_fts WHERE " + " AND ".join(predicates)
+                + " ORDER BY rank, chunk_id LIMIT ?",
+                params,
+            ).fetchall()
+        return [
+            {"chunk_id": str(row[0]), "score": float(-row[1])}
+            for row in rows
+        ]
+
+    def rebuild_lexical_index(
+        self,
+        page_reader,
+        *,
+        batch_size: int,
+        target_revision: int,
+        max_batches: Optional[int] = None,
+        restart: bool = False,
+    ) -> dict:
+        """Backfill FTS in committed batches and persist a resumable cursor."""
+        if batch_size < 1 or batch_size > self.MAX_MAINTENANCE_LIMIT:
+            raise ValueError("invalid lexical rebuild batch_size")
+        state = self.get_lexical_index_state()
+        if (
+            not restart
+            and state["indexed_revision"] == int(target_revision)
+            and state["rebuild_cursor"] == 0
+        ):
+            return {"status": "completed", "processed": 0, "cursor": 0,
+                    "row_count": state["row_count"]}
+        if restart or state["rebuild_revision"] != int(target_revision):
+            with self._connect() as conn:
+                if not self._lexical_table_exists(conn):
+                    return {"status": "degraded", "processed": 0, "cursor": 0}
+                conn.execute("DELETE FROM corpus_fts")
+                conn.execute(
+                    "UPDATE lexical_index_state SET indexed_revision=0, indexed_at=NULL, "
+                    "row_count=0, rebuild_cursor=0, rebuild_revision=? WHERE id=1",
+                    (int(target_revision),),
+                )
+                conn.commit()
+            cursor = 0
+        else:
+            cursor = int(state["rebuild_cursor"])
+
+        processed = 0
+        batches = 0
+        while max_batches is None or batches < max_batches:
+            rows = list(page_reader(cursor, batch_size) or [])
+            if not rows:
+                with self._connect() as conn:
+                    self._update_lexical_state(conn, target_revision)
+                    conn.commit()
+                return {"status": "completed", "processed": processed,
+                        "cursor": 0, "row_count": self.get_lexical_index_state()["row_count"]}
+            with self._connect() as conn:
+                for chunk in rows:
+                    lexical_row = self._lexical_row(chunk)
+                    conn.execute("DELETE FROM corpus_fts WHERE chunk_id=?", (lexical_row[5],))
+                    self._insert_lexical_row(conn, lexical_row)
+                cursor += len(rows)
+                conn.execute(
+                    "UPDATE lexical_index_state SET rebuild_cursor=?, row_count=(SELECT COUNT(*) "
+                    "FROM corpus_fts) WHERE id=1", (cursor,),
+                )
+                conn.commit()
+            processed += len(rows)
+            batches += 1
+            if len(rows) < batch_size:
+                with self._connect() as conn:
+                    self._update_lexical_state(conn, target_revision)
+                    conn.commit()
+                return {"status": "completed", "processed": processed,
+                        "cursor": 0, "row_count": self.get_lexical_index_state()["row_count"]}
+        return {"status": "in_progress", "processed": processed, "cursor": cursor}
+
+    @staticmethod
+    def _lexical_digest(row: tuple[str, ...]) -> str:
+        payload = json.dumps(row, ensure_ascii=False, separators=(",", ":"))
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+    def reconcile_lexical_index(
+        self,
+        chunks,
+        *,
+        repair: bool,
+        revision: int,
+    ) -> dict:
+        """Stream expected chunks and report/repair identity/content drift."""
+        issues = {name: [] for name in ("missing", "duplicate", "stale", "orphan")}
+        counts = {name: 0 for name in issues}
+        with self._connect() as conn:
+            conn.execute(
+                "CREATE TEMP TABLE lexical_expected (chunk_id TEXT PRIMARY KEY)"
+            )
+            for chunk in chunks:
+                expected = self._lexical_row(chunk)
+                chunk_id = expected[5]
+                conn.execute(
+                    "INSERT OR REPLACE INTO lexical_expected (chunk_id) VALUES (?)", (chunk_id,)
+                )
+                current = conn.execute(
+                    "SELECT title, body, ticker, source_category, item_type, chunk_id, family_id, "
+                    "source, event_type, form, item, authority_tier, indexing_status, published_at, "
+                    "effective_at, as_of_at FROM corpus_fts WHERE chunk_id=?", (chunk_id,),
+                ).fetchall()
+                if not current:
+                    categories = ["missing"]
+                else:
+                    categories = []
+                    if len(current) > 1:
+                        categories.append("duplicate")
+                    if tuple(str(value or "") for value in current[0]) != expected:
+                        categories.append("stale")
+                for category in categories:
+                    counts[category] += 1
+                    if len(issues[category]) < self.MAX_RECONCILIATION_SAMPLES:
+                        issues[category].append(chunk_id)
+                if repair and categories:
+                    conn.execute("DELETE FROM corpus_fts WHERE chunk_id=?", (chunk_id,))
+                    self._insert_lexical_row(conn, expected)
+
+            counts["orphan"] = int(conn.execute(
+                "SELECT COUNT(DISTINCT chunk_id) FROM corpus_fts WHERE chunk_id NOT IN "
+                "(SELECT chunk_id FROM lexical_expected)"
+            ).fetchone()[0])
+            orphan_samples = conn.execute(
+                "SELECT DISTINCT chunk_id FROM corpus_fts WHERE chunk_id NOT IN "
+                "(SELECT chunk_id FROM lexical_expected) ORDER BY chunk_id LIMIT ?",
+                (self.MAX_RECONCILIATION_SAMPLES,),
+            ).fetchall()
+            issues["orphan"] = [str(row[0]) for row in orphan_samples]
+            if repair and counts["orphan"]:
+                conn.execute(
+                    "DELETE FROM corpus_fts WHERE chunk_id NOT IN "
+                    "(SELECT chunk_id FROM lexical_expected)"
+                )
+            if repair:
+                self._update_lexical_state(conn, revision)
+            conn.commit()
+        return {"counts": counts, "samples": issues, "repaired": bool(repair)}
+
     # -- Normalized corpus records (2.3.3.1) ---------------------------------
 
     @staticmethod
@@ -1481,8 +1852,13 @@ CREATE INDEX IF NOT EXISTS idx_securities_industry ON securities(industry);
                 return row, layer
         return None, None
 
-    def upsert_narrative_record(self, record: NarrativeRecord) -> dict:
-        """Atomically upsert narrative metadata, provenance, and security links."""
+    def upsert_narrative_record(
+        self,
+        record: NarrativeRecord,
+        *,
+        lexical_chunks=None,
+    ) -> dict:
+        """Atomically upsert narrative metadata, provenance, and lexical chunks."""
         canonical_url = normalize_canonical_url(record.canonical_url)
         headline = normalize_headline(record.title)
         news_key = (
@@ -1628,12 +2004,23 @@ CREATE INDEX IF NOT EXISTS idx_securities_industry ON securities(industry);
                     "(corpus_item_id, security_id, ticker) VALUES (?, ?, ?)",
                     (item_id, security_id, ticker),
                 )
+            needs_index = initial_status != "not_applicable" and (
+                created or content_changed or authority_promoted
+                or previous_status in {"pending", "error"}
+            )
             revision = self._bump_revision_in_transaction(conn)
+            if self._lexical_table_exists(conn):
+                if needs_index and lexical_chunks is not None:
+                    chunks = (
+                        lexical_chunks(item_id)
+                        if callable(lexical_chunks)
+                        else lexical_chunks
+                    )
+                    self._replace_lexical_families_conn(
+                        conn, {item_id: list(chunks)}
+                    )
+                self._update_lexical_state(conn, revision)
             conn.commit()
-        needs_index = initial_status != "not_applicable" and (
-            created or content_changed or authority_promoted
-            or previous_status in {"pending", "error"}
-        )
         return {
             "corpus_item_id": item_id,
             "created": created,
@@ -1658,6 +2045,11 @@ CREATE INDEX IF NOT EXISTS idx_securities_industry ON securities(industry);
                 "updated_at=datetime('now') WHERE corpus_item_id=?",
                 (status, error[:2_000] if error else None, corpus_item_id),
             )
+            if self._lexical_table_exists(conn):
+                conn.execute(
+                    "UPDATE corpus_fts SET indexing_status=? WHERE family_id=?",
+                    (status, corpus_item_id),
+                )
             conn.commit()
 
     def get_corpus_item(self, corpus_item_id: str) -> Optional[dict]:
@@ -1855,6 +2247,12 @@ CREATE INDEX IF NOT EXISTS idx_securities_industry ON securities(industry);
             raise ValueError("too many corpus items for one retention run")
         placeholders = ",".join("?" for _ in item_ids)
         with self._connect() as conn:
+            eligible = conn.execute(
+                f"SELECT corpus_item_id, document_family_id FROM corpus_items "
+                f"WHERE corpus_item_id IN ({placeholders}) AND item_type='news' "
+                f"AND is_tombstone=0 AND indexing_status='indexed'",
+                item_ids,
+            ).fetchall()
             cursor = conn.execute(
                 f"UPDATE corpus_items SET is_tombstone=1, narrative_bytes=0, "
                 f"indexing_status='not_applicable', index_error=NULL, retired_at=?, "
@@ -1865,7 +2263,14 @@ CREATE INDEX IF NOT EXISTS idx_securities_industry ON securities(industry);
             )
             changed = int(cursor.rowcount)
             if changed:
-                self._bump_revision_in_transaction(conn)
+                revision = self._bump_revision_in_transaction(conn)
+                if self._lexical_table_exists(conn):
+                    families = {
+                        str(row["document_family_id"] or row["corpus_item_id"]): []
+                        for row in eligible
+                    }
+                    self._replace_lexical_families_conn(conn, families)
+                    self._update_lexical_state(conn, revision)
             conn.commit()
         return changed
 

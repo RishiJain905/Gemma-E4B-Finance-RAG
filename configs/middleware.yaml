@@ -229,6 +229,7 @@ conversation_rewrite_timeout_s: 15.0
 # Phase 2.1.2 — hybrid retrieval & re-ranking.
 # Lexical (BM25) channel + RRF fusion (2.1.2.1). Low-risk; on by default.
 enable_lexical: true
+lexical_backend: fts5               # fts5 (persistent) | memory (legacy rollback)
 rrf_k: 60
 # Cross-encoder re-ranker (2.1.2.2). Opt-in — the cross-encoder backend
 # downloads a HuggingFace model on first use. Backend "llm" reuses the

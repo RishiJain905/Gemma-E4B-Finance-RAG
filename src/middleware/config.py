@@ -341,6 +341,7 @@ class MiddlewareConfig:
         # Phase 2.1.2 — hybrid retrieval & re-ranking.
         # Lexical (BM25) channel + RRF fusion (2.1.2.1).
         self.enable_lexical: bool = True
+        self.lexical_backend: str = "fts5"
         self.rrf_k: int = 60
         # Cross-encoder re-ranker (2.1.2.2). Opt-in by default — the
         # cross-encoder backend downloads a model on first use.
@@ -362,6 +363,11 @@ class MiddlewareConfig:
 
         self._load_selected_sources(config_path, profile)
         self._apply_env_overrides()
+        if self.lexical_backend not in {"fts5", "memory"}:
+            logger.warning(
+                "Invalid lexical_backend=%r; using fts5", self.lexical_backend
+            )
+            self.lexical_backend = "fts5"
         self._clamp_conversation_limits()
         self._clamp_adaptive_limits()
         self._clamp_corrective_limits()
@@ -553,6 +559,7 @@ class MiddlewareConfig:
                     pass
 
         _bool("ENABLE_LEXICAL", "enable_lexical")
+        _str("LEXICAL_BACKEND", "lexical_backend")
         _bool("ENABLE_CITATIONS", "enable_citations")
         _bool("ENABLE_RERANKER", "enable_reranker")
         _str("RERANKER_BACKEND", "reranker_backend")

@@ -36,6 +36,7 @@ enable_fetch_on_miss: true
 enable_conversation_rewrite: false
 enable_llm_rewrite_fallback: false
 enable_lexical: true
+lexical_backend: memory
 enable_reranker: false
 enable_evidence_taxonomy: false
 enable_authority_ranking: false

@@ -233,9 +233,15 @@ class Retriever:
 
     @property
     def lexical(self) -> LexicalIndex:
-        """Lazily-built, cached BM25 index over the chroma corpus."""
+        """Lazily initialize the configured persistent or rollback backend."""
         if self._lexical is None:
-            self._lexical = LexicalIndex(self.store)
+            backend = getattr(self.config, "lexical_backend", None)
+            if backend not in {"fts5", "memory"}:
+                backend = "memory"
+            self._lexical = LexicalIndex(
+                self.store,
+                backend=backend,
+            )
         return self._lexical
 
     @property
@@ -264,7 +270,7 @@ class Retriever:
         cost and the index is ready for fusion.
         """
         try:
-            self.lexical._ensure()  # noqa: SLF001
+            self.lexical.warm()
         except Exception as e:  # noqa: BLE001 - never fail startup
             logger.warning("Lexical index warm-up failed: %s", e)
 
@@ -389,7 +395,22 @@ class Retriever:
         self._timings = {"embedding": 0.0, "chroma": 0.0, "sqlite": 0.0}
         # Request-local channel ids (review D): the doc path writes the most
         # recent fusion's per-channel ranked ids here, never onto self.
-        channels: dict = {"vector_ids": [], "lexical_ids": []}
+        try:
+            revision_reader = getattr(self.store, "corpus_revision", None)
+            if not callable(revision_reader):
+                revision_reader = getattr(self.store, "retrieval_revision")
+            corpus_revision = int(revision_reader())
+        except Exception:  # noqa: BLE001 - revision uncertainty disables lexical only
+            corpus_revision = None
+        channels: dict = {
+            "vector_ids": [], "lexical_ids": [],
+            "corpus_revision": corpus_revision,
+            "lexical_status": {
+                "mode": "disabled" if not self.config.enable_lexical else "pending",
+                "degraded": False,
+                "reason": None,
+            },
+        }
         ticker = intent.get("ticker")
         metrics = intent.get("metrics", [])
         question_type = intent.get("question_type", "general")
@@ -502,6 +523,10 @@ class Retriever:
             "strategy": strategy,
             "retrieval_strategy": self._doc_retrieval_strategy,
             "timings": {k: round(v, 1) for k, v in self._timings.items()},
+            "retrieval_trace": {
+                "corpus_revision": corpus_revision,
+                "lexical": dict(channels["lexical_status"]),
+            },
         }
         # Channel ids are only meaningful to the candidate (pool) consumer and
         # are omitted from the legacy retrieve() dict so its shape is unchanged.
@@ -872,19 +897,33 @@ class Retriever:
 
         # 2. Lexical (BM25) channel — same ticker + broad shape; best-effort.
         lexical_hits: list[dict] = []
+        lexical_started = time.perf_counter()
         try:
             lexical_hits = self.lexical.search(query=query, k=candidates,
-                                                where=vfilter, filters=filters)
+                                                where=vfilter, filters=filters,
+                                                corpus_revision=(
+                                                    channels.get("corpus_revision")
+                                                    if channels is not None else None
+                                                ))
             if ticker:
                 seen = {h["id"] for h in lexical_hits}
                 for h in self.lexical.search(
                     query=query, k=broad_n, where=None, filters=filters,
+                    corpus_revision=(
+                        channels.get("corpus_revision")
+                        if channels is not None else None
+                    ),
                 ):
                     if h["id"] not in seen:
                         lexical_hits.append(h)
                         seen.add(h["id"])
         except Exception as e:  # noqa: BLE001 - never let lexical break a query
             logger.warning("Lexical search failed, vector-only fallback: %s", e)
+        finally:
+            self._timings.setdefault("lexical", 0.0)
+            self._timings["lexical"] += (time.perf_counter() - lexical_started) * 1000
+            if channels is not None:
+                channels["lexical_status"] = dict(self.lexical.last_status)
 
         # 3. RRF fuse.
         fused = rrf_fuse(vector_hits, lexical_hits, k=self.config.rrf_k)

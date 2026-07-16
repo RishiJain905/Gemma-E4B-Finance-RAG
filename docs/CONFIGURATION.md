@@ -297,12 +297,31 @@ a query never errors because a retrieval stage failed.
 | Field | Default | Env | Meaning |
 |-------|---------|-----|---------|
 | `enable_lexical` | `true` | `ENABLE_LEXICAL` | Add the BM25 lexical channel and RRF fusion. |
+| `lexical_backend` | `fts5` | `LEXICAL_BACKEND` | `fts5` uses the persistent SQLite index without loading all Chroma text at startup; `memory` selects the legacy full-corpus `rank_bm25` rollback path. All three profiles assign this key. |
 | `rrf_k` | `60` | — | RRF constant; larger dampens the contribution of top ranks. |
 | `enable_reranker` | `false` | `ENABLE_RERANKER` | Re-rank fused candidates. The `cross-encoder` backend downloads a HuggingFace model on first use. |
 | `reranker_backend` | `cross-encoder` | `RERANKER_BACKEND` | `cross-encoder` (sentence-transformers) or `llm` (reuse TraceAlchemy on `:8087`, no download). |
 | `reranker_model` | `cross-encoder/ms-marco-MiniLM-L-6-v2` | `RERANKER_MODEL` | Cross-encoder model id. |
 | `rerank_candidates` | `30` | `RERANK_CANDIDATES` | Candidate pool retrieved before re-ranking. |
 | `rerank_top_n` | `5` | `RERANK_TOP_N` | Documents kept after re-ranking (= `top_k_documents`). |
+
+The `fts5` backend probes SQLite support at startup. If the module or table is
+unavailable, health reports `lexical_mode: degraded` and queries remain bounded
+vector-only. An FTS query error or SQLite/Chroma corpus-revision mismatch also
+skips lexical fusion for that request and records the reason under
+`retrieval_trace.lexical`.
+
+Rebuild or reconcile the index without embedding or generation calls:
+
+```bash
+python scripts/rebuild_lexical_index.py --batch-size 100
+python scripts/rebuild_lexical_index.py --reconcile
+python scripts/rebuild_lexical_index.py --reconcile --repair
+```
+
+The rebuild cursor commits after every batch and resumes automatically. Use
+`--restart` to discard saved progress; `--db-path` and `--chroma-path` select
+isolated stores for maintenance or tests.
 
 #### Evidence taxonomy, authority ranking & duplicate-coverage packing (Phase 2.3.3.3)
 

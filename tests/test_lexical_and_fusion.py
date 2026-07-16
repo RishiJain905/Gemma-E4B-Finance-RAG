@@ -201,6 +201,7 @@ def test_retriever_hybrid_uses_both_channels(monkeypatch):
 
 @pytest.mark.integration
 @pytest.mark.network
+@pytest.mark.live
 def test_lexical_index_real_corpus():
     """Build the BM25 index over the real chroma corpus (needs :8087 up for
     the Store init). Skips if the embedding endpoint is unreachable."""

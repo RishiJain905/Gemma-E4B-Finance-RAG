@@ -193,6 +193,65 @@ class ChromaStore:
 
     # ── CRUD Operations ──────────────────────────────
 
+    def prepare_document(
+        self,
+        document_id: str,
+        text: str,
+        metadata: Optional[dict] = None,
+        ticker: Optional[str] = None,
+        source: Optional[str] = None,
+        date: Optional[str] = None,
+        replace_family: bool = False,
+    ) -> list[dict]:
+        """Return the exact deterministic chunks ``add_document`` will store."""
+        meta = dict(metadata or {})
+        if ticker:
+            meta["ticker"] = ticker.upper()
+        if source:
+            meta["source"] = source
+        if date:
+            meta["date"] = date
+        if self.chunk_strategy == "structural":
+            chunk_objects = chunk_document(
+                text,
+                source=source,
+                max_chars=self.chunk_chars,
+                overlap_sentences=self.overlap_sentences,
+                strategy="structural",
+                fixed_overlap_chars=self.chunk_overlap,
+            )
+            chunks = [chunk["text"] for chunk in chunk_objects]
+            sections = [chunk["section"] for chunk in chunk_objects]
+        else:
+            chunks = self._chunk_text(text, self.chunk_chars, self.chunk_overlap)
+            sections = [""] * len(chunks)
+        if not chunks:
+            return []
+        is_section_family = source == "sec_filing"
+        family_id = str(meta.get("document_family_id") or document_id)
+        if replace_family:
+            meta["document_family_id"] = family_id
+        if len(chunks) == 1 and not is_section_family and not replace_family:
+            return [{"id": document_id, "document": chunks[0], "metadata": meta}]
+        total = len(chunks)
+        rows: list[dict] = []
+        for index, chunk in enumerate(chunks):
+            chunk_id = f"{family_id}#{index}"
+            chunk_meta = dict(meta)
+            chunk_meta.update({
+                "parent_id": family_id,
+                "chunk_index": index,
+                "chunk_ordinal": index,
+                "chunk_count": total,
+                "child_chunk_id": chunk_id,
+            })
+            if is_section_family:
+                chunk_meta["document_id"] = chunk_id
+            if self.chunk_strategy == "structural":
+                chunk_meta["section"] = sections[index]
+            rows.append({"id": chunk_id, "document": chunk, "metadata": chunk_meta})
+        return rows
+
     def add_document(self,
                      document_id: str,
                      text: str,
@@ -492,6 +551,52 @@ class ChromaStore:
                 "metadata": results["metadatas"][0] if results["metadatas"] else None,
             }
         return None
+
+    def get_documents(self, document_ids: list[str]) -> list[dict]:
+        """Hydrate one hard-bounded stable-id set without scanning the corpus."""
+        ids = list(dict.fromkeys(str(value) for value in document_ids if value))
+        if not ids:
+            return []
+        if len(ids) > self.MAX_READ_LIMIT:
+            raise ValueError(f"at most {self.MAX_READ_LIMIT} document ids are allowed")
+        results = self.collection.get(ids=ids, include=["documents", "metadatas"])
+        rows = self._format_get_results(results)
+        by_id = {row["id"]: row for row in rows}
+        return [by_id[value] for value in ids if value in by_id]
+
+    def iter_document_batches(self, *, batch_size: int = 100, offset: int = 0):
+        """Yield bounded pages for offline rebuild/reconciliation commands."""
+        if batch_size < 1 or batch_size > self.MAX_READ_LIMIT:
+            raise ValueError(f"batch_size must be between 1 and {self.MAX_READ_LIMIT}")
+        current = max(0, int(offset))
+        while True:
+            results = self.collection.get(
+                limit=batch_size,
+                offset=current,
+                include=["documents", "metadatas"],
+            )
+            rows = self._format_get_results(results)
+            if not rows:
+                return
+            yield rows
+            current += len(rows)
+            if len(rows) < batch_size:
+                return
+
+    def corpus_revision(self) -> Optional[int]:
+        """Return the generation explicitly exposed by the Chroma collection."""
+        metadata = self.collection.metadata or {}
+        value = metadata.get("corpus_revision")
+        return None if value is None else int(value)
+
+    def mark_corpus_revision(self, revision: int) -> None:
+        """Expose a fully committed cross-store generation without embedding."""
+        metadata = dict(self.collection.metadata or {})
+        current = int(metadata.get("corpus_revision", 0) or 0)
+        if int(revision) < current:
+            return
+        metadata["corpus_revision"] = int(revision)
+        self.collection.modify(metadata=metadata)
 
     def delete_document(self, document_id: str):
         """Remove a document from the collection."""

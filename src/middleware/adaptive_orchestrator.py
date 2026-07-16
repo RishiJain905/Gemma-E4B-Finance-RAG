@@ -1765,8 +1765,14 @@ def _retrieval_cache_key(
         # Drop the whole cache if the config/model fingerprint changed since the
         # last request (a redeploy that swapped the model or a retrieval toggle).
         cache.check_fingerprint(config_fingerprint(config))
+        revision = int(revision_fn())
+        corpus_revision_fn = getattr(store, "corpus_revision", None)
+        corpus_revision = (
+            int(corpus_revision_fn()) if callable(corpus_revision_fn) else revision
+        )
         return build_cache_key(
-            plan=plan, config=config, lane=lane, revision=int(revision_fn()),
+            plan=plan, config=config, lane=lane, revision=revision,
+            corpus_revision=corpus_revision,
             available_metrics=available_metrics,
             as_of=getattr(plan, "as_of", None),
         )

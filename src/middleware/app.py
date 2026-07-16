@@ -1094,6 +1094,12 @@ async def health(request: Request):
             "conversation_max_turns": int(getattr(config, "conversation_max_turns", 8)),
             "conversation_max_history_chars": int(
                 getattr(config, "conversation_max_history_chars", 8000)),
+            "lexical_backend": str(getattr(config, "lexical_backend", "fts5")),
+            "lexical_mode": (
+                retriever.lexical.mode
+                if bool(getattr(config, "enable_lexical", True)) and retriever is not None
+                else "disabled"
+            ),
         }
         # Local query-graph observer (2.2.7.4). Advertised only when enabled so
         # older/observer-off servers stay byte-compatible and the chat client
