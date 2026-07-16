@@ -705,18 +705,36 @@ class ChromaStore:
             raise ValueError(
                 f"offset must be between 0 and {cls.MAX_INVENTORY_OFFSET}")
 
+    # One unbounded collection.get() compiles a single SQL plan over every
+    # row; past ~30k chunks Chroma's SQLite backend fails with "too many SQL
+    # variables" (surfaced by the 2.3.7.6 100k benchmark gate).
+    _METADATA_SCAN_PAGE = 5000
+
     def _all_metadata(self) -> list[dict]:
-        """Read metadata only; never asks Chroma for document bodies."""
-        results = self.collection.get(include=["metadatas"])
-        ids = list(results.get("ids") or [])
-        metadatas = list(results.get("metadatas") or [])
-        return [
-            {
-                "id": ids[index],
-                "metadata": metadatas[index] if index < len(metadatas) else {},
-            }
-            for index in range(len(ids))
-        ]
+        """Read metadata only, in bounded pages; never asks for documents."""
+        rows: list[dict] = []
+        offset = 0
+        while True:
+            results = self.collection.get(
+                include=["metadatas"],
+                limit=self._METADATA_SCAN_PAGE,
+                offset=offset,
+            )
+            ids = list(results.get("ids") or [])
+            if not ids:
+                break
+            metadatas = list(results.get("metadatas") or [])
+            rows.extend(
+                {
+                    "id": ids[index],
+                    "metadata": metadatas[index] if index < len(metadatas) else {},
+                }
+                for index in range(len(ids))
+            )
+            if len(ids) < self._METADATA_SCAN_PAGE:
+                break
+            offset += len(ids)
+        return rows
 
     def get_source_counts(self, *, limit: int = 100, offset: int = 0) -> list[dict]:
         """Return metadata-only counts grouped by Chroma source."""
