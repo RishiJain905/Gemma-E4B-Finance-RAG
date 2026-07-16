@@ -1,0 +1,83 @@
+{
+  "schema_version": "phase2.3.7.6.query-fixture.v1",
+  "description": "Deterministic storage benchmark labels. Relevance selectors are evaluated against generated metadata, so the fixture is valid at every corpus size.",
+  "queries": [
+    {
+      "id": "exact-symbol-nvda",
+      "category": "exact-symbol",
+      "query": "NVDA benchmark revenue guidance",
+      "k": 10,
+      "filters": {},
+      "relevance": [
+        {
+          "grade": 3,
+          "metadata": {
+            "benchmark_topic": "exact-symbol",
+            "ticker": "NVDA"
+          }
+        },
+        {
+          "grade": 1,
+          "metadata": {
+            "ticker": "NVDA"
+          }
+        }
+      ]
+    },
+    {
+      "id": "phrase-free-cash-flow",
+      "category": "phrase",
+      "query": "free cash flow conversion operating leverage",
+      "k": 10,
+      "filters": {},
+      "relevance": [
+        {
+          "grade": 3,
+          "metadata": {
+            "benchmark_topic": "phrase"
+          }
+        }
+      ]
+    },
+    {
+      "id": "finance-terminology-liquidity",
+      "category": "finance-terminology",
+      "query": "net interest margin liquidity coverage ratio",
+      "k": 10,
+      "filters": {},
+      "relevance": [
+        {
+          "grade": 3,
+          "metadata": {
+            "benchmark_topic": "finance-terminology"
+          }
+        }
+      ]
+    },
+    {
+      "id": "filtered-amd-earnings-2025",
+      "category": "filtered",
+      "query": "AMD benchmark guidance disclosure",
+      "k": 10,
+      "filters": {
+        "ticker": "AMD",
+        "source": "sec",
+        "item_type": "earnings",
+        "published_from": "2025-01-01",
+        "published_to": "2025-12-31"
+      },
+      "relevance": [
+        {
+          "grade": 3,
+          "metadata": {
+            "benchmark_topic": "filtered",
+            "ticker": "AMD",
+            "source": "sec",
+            "source_name": "sec",
+            "item_type": "earnings"
+          }
+        }
+      ]
+    }
+  ]
+}
