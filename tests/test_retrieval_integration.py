@@ -28,6 +28,12 @@ def hybrid_app(monkeypatch):
         assert ret is not None, "retriever not built on startup"
         monkeypatch.setattr(ret.config, "enable_lexical", True)
         monkeypatch.setattr(ret.config, "enable_reranker", True)
+        # Pin the legacy retrieval path: these tests assert the classic
+        # IntentParser -> Retriever hybrid+rerank wiring, which the promoted
+        # adaptive default (2.3.7.4 arm1) would otherwise route around.
+        monkeypatch.setattr(m.config, "enable_adaptive_rag", False)
+        monkeypatch.setattr(m.config, "enable_deterministic_tool_routing", False)
+        monkeypatch.setattr(m.config, "enable_deterministic_answers", False)
 
         vhits = [
             {"id": "v1", "document": "NVIDIA datacenter growth surged.",

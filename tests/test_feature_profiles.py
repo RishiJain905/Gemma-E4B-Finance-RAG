@@ -66,9 +66,10 @@ CURRENT_SAFE_DEFAULTS = {
     "enable_graph_observer": True,
     "enable_tools": True,
     "allow_write_tools": True,
-    "enable_deterministic_tool_routing": False,
-    "enable_deterministic_answers": False,
-    "enable_adaptive_rag": False,
+    # Promoted by the measured 2.3.7.4 arm1 comparison (2026-07-16).
+    "enable_deterministic_tool_routing": True,
+    "enable_deterministic_answers": True,
+    "enable_adaptive_rag": True,
     "adaptive_enable_planning_call": False,
     "adaptive_conditional_rerank": True,
     "enable_evidence_sufficiency": False,
@@ -119,6 +120,9 @@ def test_all_profiles_have_exact_validated_effective_flags() -> None:
         "evaluation": {**CURRENT_SAFE_DEFAULTS},
         "legacy": {
             **CURRENT_SAFE_DEFAULTS,
+            "enable_deterministic_tool_routing": False,
+            "enable_deterministic_answers": False,
+            "enable_adaptive_rag": False,
             "enable_phase2_3_retrieval": False,
             "enable_phase2_3_corpus_projection": False,
             "enable_tool_final_streaming": False,

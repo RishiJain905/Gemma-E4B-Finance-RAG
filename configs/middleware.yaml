@@ -99,9 +99,9 @@ max_refreshes_per_query: 2
 # Phase 2.3.7.4 promotion decision. Env overrides:
 # ENABLE_DETERMINISTIC_TOOL_ROUTING, MAX_DETERMINISTIC_TOOLS_PER_QUERY,
 # ENABLE_DETERMINISTIC_ANSWERS.
-enable_deterministic_tool_routing: false
+enable_deterministic_tool_routing: true
 max_deterministic_tools_per_query: 3
-enable_deterministic_answers: false
+enable_deterministic_answers: true
 
 # Phase 2.2.3.3 — bounded adaptive-RAG orchestration.
 # When enable_adaptive_rag is on, 2.2.3.4 routes a request through the
@@ -117,7 +117,7 @@ enable_deterministic_answers: false
 # ADAPTIVE_ENABLE_PLANNING_CALL, ADAPTIVE_MAX_SUBQUERIES,
 # ADAPTIVE_MAX_RETRIEVAL_ROUNDS, ADAPTIVE_MAX_PLANNING_CALLS,
 # ADAPTIVE_MAX_CONTEXT_CHARS, ADAPTIVE_CONDITIONAL_RERANK.
-enable_adaptive_rag: false
+enable_adaptive_rag: true
 adaptive_enable_planning_call: false
 adaptive_max_subqueries: 3           # clamp 1–3 (includes sq0)
 adaptive_max_retrieval_rounds: 2     # clamp 1–2

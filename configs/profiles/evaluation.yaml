@@ -19,9 +19,9 @@ enable_graph_observer: true
 enable_tools: true
 allow_write_tools: true
 
-enable_deterministic_tool_routing: false
-enable_deterministic_answers: false
-enable_adaptive_rag: false
+enable_deterministic_tool_routing: true
+enable_deterministic_answers: true
+enable_adaptive_rag: true
 adaptive_enable_planning_call: false
 adaptive_conditional_rerank: true
 enable_evidence_sufficiency: false
