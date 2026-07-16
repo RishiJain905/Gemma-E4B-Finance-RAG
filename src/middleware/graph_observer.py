@@ -73,7 +73,10 @@ _NODE_METADATA_ALLOWLIST = {
         "source_type", "ticker", "freshness", "count", "source_category",
         "source_name", "authority_tier", "provider", "publisher",
     }),
-    "answer": frozenset({"status", "facts", "documents", "elapsed_ms"}),
+    "answer": frozenset({
+        "status", "facts", "documents", "elapsed_ms", "answer_origin",
+        "generation_skipped", "generation_skip_reason",
+    }),
     "citation": frozenset({
         "evidence_id", "source_type", "ticker", "metric", "period", "support_status",
         "item_type", "event_type", "authority_tier", "source",
@@ -620,7 +623,10 @@ def event_graph_deltas(event, *, excerpt_chars: int, question_preview_chars: int
     elif event.type == EVENT_STAGE:
         name = str(payload.get("stage", "stage"))
         phase = str(payload.get("phase", "started"))
-        status = {"started": "active", "completed": "complete", "fallback": "fallback"}.get(
+        status = {
+            "started": "active", "completed": "complete",
+            "fallback": "fallback", "skipped": "complete",
+        }.get(
             phase, "error"
         )
         nodes.append(GraphNode(

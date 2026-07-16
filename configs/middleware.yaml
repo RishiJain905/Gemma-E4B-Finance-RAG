@@ -88,8 +88,11 @@ max_refreshes_per_query: 2
 # projection/bounded-calculation requests are routed to the existing read-only
 # tools before any model call (deterministic_router.route). Off by default so
 # 2.2.3.4 can A/B the route against the current model tool loop first.
-# enable_deterministic_answers additionally lets a fully-covered route skip
-# model generation and answer from a short template. Env overrides:
+# Phase 2.3.7.3: enable_deterministic_answers lets only a fully-covered,
+# allowlisted, read-only route skip model generation after strict template,
+# provenance, citation, numeric, freshness, and conflict validation. Any fast
+# path error falls back once to normal generation. It remains false until the
+# Phase 2.3.7.4 promotion decision. Env overrides:
 # ENABLE_DETERMINISTIC_TOOL_ROUTING, MAX_DETERMINISTIC_TOOLS_PER_QUERY,
 # ENABLE_DETERMINISTIC_ANSWERS.
 enable_deterministic_tool_routing: false

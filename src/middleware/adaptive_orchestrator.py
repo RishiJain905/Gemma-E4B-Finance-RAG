@@ -1882,7 +1882,11 @@ def _normalize_tool_facts(execution: "ExecutionResult") -> list[dict]:
             facts.append({
                 "metric": f"coverage_{operation}",
                 "value": display,
-                "ticker": "CATALOG",
+                "ticker": (
+                    inv.arguments.get("ticker")
+                    if operation == "security_sources"
+                    else "CATALOG"
+                ),
                 "period": res.get("universe_snapshot_at"),
                 "source_type": "catalog",
                 "kind": "tool_result",
@@ -1914,9 +1918,49 @@ def _normalize_tool_facts(execution: "ExecutionResult") -> list[dict]:
                     if isinstance(fact, dict) and fact.get("value") is not None:
                         facts.append({
                             "metric": metric, "value": fact.get("value"),
+                            "unit": fact.get("unit"),
                             "period": fact.get("period"), "ticker": res.get("ticker"),
                             "source_type": "estimates",
                         })
+
+        guidance = res.get("guidance")
+        if isinstance(guidance, dict):
+            for metric, fact in guidance.items():
+                if isinstance(fact, dict) and fact.get("value") is not None:
+                    facts.append({
+                        "metric": f"guidance_{metric}", "value": fact.get("value"),
+                        "unit": fact.get("unit"), "period": fact.get("period"),
+                        "ticker": res.get("ticker"), "source_type": "guidance",
+                    })
+
+        macro = res.get("macro")
+        if isinstance(macro, dict):
+            for metric, fact in macro.items():
+                if isinstance(fact, dict) and fact.get("value") is not None:
+                    facts.append({
+                        "metric": metric, "value": fact.get("value"),
+                        "unit": fact.get("unit"),
+                        "period": fact.get("period") or fact.get("as_of"),
+                        "ticker": "MACRO", "source_type": fact.get("source_type", "fred"),
+                    })
+                elif isinstance(fact, (int, float)):
+                    facts.append({
+                        "metric": metric, "value": fact, "ticker": "MACRO",
+                        "source_type": "fred",
+                    })
+
+        if inv.name == "check_freshness":
+            ticker = res.get("ticker") or inv.arguments.get("ticker")
+            for source, detail in (res.get("sources") or {}).items():
+                if isinstance(detail, dict):
+                    status = detail.get("status") or detail.get("freshness") or "unknown"
+                    period = detail.get("as_of") or detail.get("last_fetched")
+                else:
+                    status, period = detail, None
+                facts.append({
+                    "metric": f"freshness_{source}", "value": status,
+                    "period": period, "ticker": ticker, "source_type": "freshness",
+                })
     return facts
 
 

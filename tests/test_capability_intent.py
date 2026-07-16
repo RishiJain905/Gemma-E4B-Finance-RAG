@@ -163,7 +163,7 @@ def test_catalog_question_uses_catalog_lane_without_retrieval_or_planner():
     )
 
     assert result.lane is Lane.CATALOG
-    assert result.answer_origin == "deterministic_coverage"
+    assert result.answer_origin == "deterministic"
     assert "AAPL" in result.deterministic_answer
     retriever.retrieve.assert_not_called()
     retriever.retrieve_candidates.assert_not_called()

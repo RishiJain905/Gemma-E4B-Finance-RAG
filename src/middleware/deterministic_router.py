@@ -55,6 +55,7 @@ REASON_ESTIMATES = "route_get_estimates"
 REASON_PRICE_TARGETS = "route_get_price_targets"
 REASON_GUIDANCE = "route_get_guidance"
 REASON_MACRO = "route_get_macro_snapshot"
+REASON_FRESHNESS = "route_check_freshness"
 REASON_SENTIMENT = "route_get_sentiment"
 REASON_COVERAGE = "route_describe_coverage"
 
@@ -191,6 +192,12 @@ _COVERAGE_SIGNAL_RE = re.compile(
     r"\b(?:cover(?:age|ed)?|know about|answer questions about|available "
     r"sources?|sources?|data types?|item types?|metric families?|all tickers?|"
     r"every ticker|which companies|which securities)\b",
+    re.IGNORECASE,
+)
+
+_FRESHNESS_STATUS_RE = re.compile(
+    r"\b(?:freshness|data freshness|source status|sources? stale|sources? fresh|"
+    r"how (?:fresh|current|recent)|when (?:was|were).*(?:updated|fetched))\b",
     re.IGNORECASE,
 )
 _ALL_TICKERS_RE = re.compile(
@@ -580,6 +587,24 @@ def route(plan: "QueryPlan", available_metrics: Iterable[str]) -> RouteDecision:
         return _abstain(ABSTAIN_REFRESH_REQUESTED, [ABSTAIN_REFRESH_REQUESTED])
 
     # Guard: a requested metric that does not exist → abstain, no tool call.
+    # A freshness/source-status lookup is read-only and reports the cached
+    # status itself. It is distinct from an imperative refresh request above.
+    if _FRESHNESS_STATUS_RE.search(text):
+        if len(entities) != 1:
+            return _abstain(ABSTAIN_AMBIGUOUS_ENTITY, [ABSTAIN_AMBIGUOUS_ENTITY])
+        subquery_id = plan.subqueries[0].id if plan.subqueries else "sq0"
+        return RouteDecision(
+            matched=True,
+            complete=True,
+            tool_invocations=[ToolInvocation(
+                "check_freshness",
+                {"ticker": entities[0]},
+                subquery_id,
+                REASON_FRESHNESS,
+            )],
+            reason_codes=[REASON_FRESHNESS],
+        )
+
     coverage = _coverage_invocation(plan)
     if coverage is not None:
         incomplete: list[str] = []
@@ -1207,8 +1232,9 @@ def execute_route(
 
     if build_answer and result.complete and not result.error:
         result.answer = build_deterministic_answer(decision, result)
+        if result.answer is not None:
+            result.answer_origin = "deterministic"
         if decision.tool_invocations and decision.tool_invocations[0].reason_code == REASON_COVERAGE:
-            result.answer_origin = "deterministic_coverage"
             if _is_filtered_security_source_set(result.invocations):
                 result.answer_metadata = _coverage_set_answer_metadata(result.invocations)
             else:

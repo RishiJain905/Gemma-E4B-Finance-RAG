@@ -476,6 +476,9 @@ def _emit_graph_terminal(
             "status": context.get("grounding_level"),
             "facts": len(usable_facts(context.get("retrieval"))),
             "documents": len(usable_documents(context.get("retrieval"))),
+            "answer_origin": context.get("answer_origin"),
+            "generation_skipped": context.get("generation_skipped"),
+            "generation_skip_reason": context.get("generation_skip_reason"),
         },
     }]
     query_node = _node_id(query_id, "query", "request")
@@ -1386,6 +1389,7 @@ async def _build_legacy_query_context(
     )
 
     freshness_meta = await _freshness_stage(retrieval_intent, request.refresh, timings)
+    write_requested = bool(freshness_meta.pop("_write_requested", False))
 
     stage_start = time.perf_counter()
     _emit_stage("retrieve", "started")
@@ -1469,6 +1473,7 @@ async def _build_legacy_query_context(
         "evidence_ledger": evidence_ledger,
         "graph_evidence_ids": graph_evidence_ids,
         "calculations": [],
+        "_write_requested": write_requested,
     }
 
 
@@ -1743,6 +1748,7 @@ async def _build_adaptive_query_context(shared: dict) -> dict:
 
     intent = plan.to_legacy_intent()
     freshness_meta = await _freshness_stage(intent, request.refresh, timings)
+    write_requested = bool(freshness_meta.pop("_write_requested", False))
 
     stage_start = time.perf_counter()
     _emit_stage("retrieve", "started")
@@ -1795,7 +1801,15 @@ async def _build_adaptive_query_context(shared: dict) -> dict:
         calculations = [dict(c) for c in result.tool_execution.calculations]
 
     # Request-local [E#] evidence ledger over the pre-budgeted evidence.
-    evidence_ledger = _build_evidence_ledger(retrieval) if _evidence_ids_enabled() else []
+    deterministic_evidence = bool(
+        getattr(config, "enable_deterministic_answers", False)
+        and result.tool_execution is not None
+    )
+    evidence_ledger = (
+        _build_evidence_ledger(retrieval)
+        if _evidence_ids_enabled() or deterministic_evidence
+        else []
+    )
     graph_evidence_ids = _emit_graph_evidence(retrieval, evidence_ledger)
     _emit_graph_dropped_evidence(result, retrieval)
 
@@ -1852,12 +1866,14 @@ async def _build_adaptive_query_context(shared: dict) -> dict:
         "retrieval_query": retrieval_query,
         "orchestration": _orchestration_metadata(result),
         "deterministic_answer": result.deterministic_answer,
-        "answer_origin": result.answer_origin,
+        "answer_origin": None,
         "coverage_metadata": result.answer_metadata,
         "evidence_sufficiency": sufficiency_meta,
         "evidence_ledger": evidence_ledger,
         "graph_evidence_ids": graph_evidence_ids,
         "calculations": calculations,
+        "_orchestration_result": result,
+        "_write_requested": write_requested,
     }
 
 
@@ -2023,6 +2039,8 @@ def _build_query_response(
     return QueryResponse(
         answer=answer_text,
         answer_origin=context.get("answer_origin"),
+        generation_skipped=context.get("generation_skipped"),
+        generation_skip_reason=context.get("generation_skip_reason"),
         coverage_metadata=context.get("coverage_metadata"),
         citations=citations,
         detected_ticker=intent.get("ticker"),
@@ -2052,68 +2070,201 @@ def _build_query_response(
     )
 
 
+def _source_citations_from_validation(report) -> list[SourceCitation]:
+    """Project supported evidence citations onto the legacy source list."""
+    citations: list[SourceCitation] = []
+    seen: set[tuple] = set()
+    for record in report.citations:
+        if record.support_status != "supported" or not record.ticker:
+            continue
+        key = (
+            record.source_type or "tool", record.ticker, record.metric,
+            record.period, record.source_url,
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        citations.append(SourceCitation(
+            source_type=record.source_type or "tool",
+            ticker=record.ticker,
+            metric=record.metric,
+            period=record.period,
+            source_url=record.source_url,
+        ))
+    return citations
+
+
+def _discard_deterministic_trace() -> None:
+    collector = _evidence_trace_var.get()
+    if collector is not None and hasattr(collector, "discard_deterministic_answer"):
+        collector.discard_deterministic_answer()
+
+
+def _try_deterministic_response(context: dict) -> Optional[QueryResponse]:
+    """Validate and finalize the shared deterministic fast path, or fall back.
+
+    The entire render/validate/response/graph sequence is one fail-soft
+    boundary. Returning ``None`` means the caller must run normal generation
+    exactly once.
+    """
+    if not bool(getattr(config, "enable_deterministic_answers", False)):
+        return None
+    result = context.get("_orchestration_result")
+    if result is None:
+        return None
+
+    from . import deterministic_answers
+
+    contract = deterministic_answers.check_final_answer_contract(
+        result,
+        evidence_ledger=context.get("evidence_ledger") or [],
+        freshness=context.get("freshness"),
+        write_requested=bool(context.get("_write_requested")),
+    )
+    if not contract.eligible:
+        return None
+
+    started_at = time.perf_counter()
+    try:
+        rendered = deterministic_answers.render_deterministic_answer(
+            result, evidence_ledger=context.get("evidence_ledger") or [],
+        )
+        if rendered.template is not contract.template:
+            raise deterministic_answers.DeterministicAnswerError(
+                "contract and renderer selected different templates"
+            )
+
+        from .answer_validator import validate_deterministic_answer
+
+        validation_values = [
+            *(context.get("calculations") or []),
+            *rendered.validation_values,
+        ]
+        report = validate_deterministic_answer(
+            rendered.text,
+            context.get("evidence_ledger") or [],
+            calculations=validation_values,
+        )
+        validation = report.to_metadata()
+        validation["enforcement"] = "deterministic"
+        evidence_citations = [_evidence_citation_model(c) for c in report.citations]
+        citations = _source_citations_from_validation(report)
+
+        context["answer_origin"] = "deterministic"
+        context["generation_skipped"] = True
+        context["generation_skip_reason"] = deterministic_answers.GENERATION_SKIP_REASON
+        context["grounding_level"] = "grounded"
+        if isinstance(context.get("orchestration"), dict):
+            context["orchestration"]["model_calls"] = 0
+
+        collector = _evidence_trace_var.get()
+        if collector is not None:
+            collector.record_deterministic_answer(rendered.template.value)
+
+        context["timings"]["model_call"] = 0.0
+        context["timings"]["deterministic_answer"] = round(
+            (time.perf_counter() - started_at) * 1000, 1
+        )
+        _emit_stage(
+            "generate", "skipped",
+            reason=deterministic_answers.GENERATION_SKIP_REASON,
+        )
+        response = _build_query_response(
+            context=context,
+            answer_text=rendered.text,
+            citations=citations,
+            model_available=True,
+            validation=validation,
+            evidence_citations=evidence_citations,
+        )
+        _emit_graph_terminal(
+            context,
+            model_available=True,
+            evidence_citations=evidence_citations,
+            validation=validation,
+            citations=citations,
+        )
+        return response
+    except Exception:  # noqa: BLE001 - the normal model path is the safety net
+        logger.exception("Deterministic final-answer path failed; using model generation")
+        _discard_deterministic_trace()
+        context["answer_origin"] = None
+        context["generation_skipped"] = None
+        context["generation_skip_reason"] = None
+        _emit_stage("generate", "fallback", reason="deterministic_fast_path_error")
+        return None
+
+
+def _deterministic_contract_eligible(context: dict) -> bool:
+    """Cheap streaming preflight used to avoid probing the model unnecessarily."""
+    if not bool(getattr(config, "enable_deterministic_answers", False)):
+        return False
+    result = context.get("_orchestration_result")
+    if result is None:
+        return False
+    from .deterministic_answers import check_final_answer_contract
+
+    return check_final_answer_contract(
+        result,
+        evidence_ledger=context.get("evidence_ledger") or [],
+        freshness=context.get("freshness"),
+        write_requested=bool(context.get("_write_requested")),
+    ).eligible
+
+
 async def _answer_query_context(request: QueryRequest, context: dict) -> QueryResponse:
     """Complete a prepared query context through the non-streaming model path."""
     intent = context["intent"]
     retrieval = context["retrieval"]
     grounding_level = context["grounding_level"]
+    deterministic = _try_deterministic_response(context)
+    if deterministic is not None:
+        return deterministic
+
     stage_start = time.perf_counter()
     _emit_stage("generate", "started")
-    deterministic_coverage = (
-        context.get("answer_origin") == "deterministic_coverage"
-        and context.get("deterministic_answer") is not None
-    )
-    if deterministic_coverage:
-        # The coverage tool already produced the final answer from the local
-        # authoritative inventory. Do not probe or call the model, and do not
-        # run citation validation designed for model-generated prose.
-        model_available = True
-        answer_text = str(context["deterministic_answer"])
-        citations = []
-        validation = None
-        evidence_citations = None
+    model_available = await _check_model_health()
+    if model_available:
         if (
             isinstance(context.get("orchestration"), dict)
             and "model_calls" in context["orchestration"]
         ):
-            context["orchestration"]["model_calls"] = 0
-    else:
-        model_available = await _check_model_health()
-        if model_available:
-            if (
-                isinstance(context.get("orchestration"), dict)
-                and "model_calls" in context["orchestration"]
-            ):
-                context["orchestration"]["model_calls"] = 1
-            temperature, max_tokens = _task_settings(request, intent)
-            answer_text, citations = await _invoke_model(
-                prompt=context["augmented_prompt"],
-                temperature=temperature,
-                max_tokens=max_tokens,
-                intent=intent,
-                grounding_level=grounding_level,
+            context["orchestration"]["model_calls"] = 1
+        temperature, max_tokens = _task_settings(request, intent)
+        answer_text, citations = await _invoke_model(
+            prompt=context["augmented_prompt"],
+            temperature=temperature,
+            max_tokens=max_tokens,
+            intent=intent,
+            grounding_level=grounding_level,
+        )
+        if not answer_text.startswith("Error calling model:"):
+            _mark_model_health(True)
+        if intent.get("question_type") == "projection":
+            from .guardrails import apply_projection_guardrail
+
+            answer_text, _flagged = apply_projection_guardrail(
+                answer_text,
+                context["augmented_prompt"],
             )
-            if not answer_text.startswith("Error calling model:"):
-                _mark_model_health(True)
-            if intent.get("question_type") == "projection":
-                from .guardrails import apply_projection_guardrail
+        if bool(getattr(config, "enable_deterministic_answers", False)):
+            context["answer_origin"] = "model"
+            context["generation_skipped"] = False
+    else:
+        logger.warning("Model unavailable - returning degraded answer")
+        _emit_stage("generate", "fallback", reason="model_unavailable")
+        answer_text = _format_degraded_answer(
+            retrieval, intent, context.get("evidence_sufficiency"))
+        citations = []
+        if bool(getattr(config, "enable_deterministic_answers", False)):
+            context["answer_origin"] = "degraded"
+            context["generation_skipped"] = False
 
-                answer_text, _flagged = apply_projection_guardrail(
-                    answer_text,
-                    context["augmented_prompt"],
-                )
-        else:
-            logger.warning("Model unavailable - returning degraded answer")
-            _emit_stage("generate", "fallback", reason="model_unavailable")
-            answer_text = _format_degraded_answer(
-                retrieval, intent, context.get("evidence_sufficiency"))
-            citations = []
-
-        # Deterministic citation/numeric validation (2.2.4.3). off -> passthrough;
-        # report -> metadata only; enforce -> may downgrade/refuse. Updates the
-        # context grounding so _build_query_response reflects an enforced downgrade.
-        answer_text, grounding_level, validation, evidence_citations = _apply_answer_validation(
-            context, answer_text, grounding_level)
+    # Deterministic citation/numeric validation (2.2.4.3). off -> passthrough;
+    # report -> metadata only; enforce -> may downgrade/refuse. Updates the
+    # context grounding so _build_query_response reflects an enforced downgrade.
+    answer_text, grounding_level, validation, evidence_citations = _apply_answer_validation(
+        context, answer_text, grounding_level)
 
     _stage_timing(context["timings"], "model_call", stage_start)
     if model_available:
@@ -2166,8 +2317,18 @@ async def query(request: QueryRequest):
 def _response_to_dict(response: QueryResponse) -> dict:
     """Return a pydantic model as a JSON-serializable dict."""
     if hasattr(response, "model_dump"):
-        return response.model_dump()
-    return response.dict()
+        data = response.model_dump()
+    else:
+        data = response.dict()
+    # Keep optional rollout/observer fields byte-compatible on runtimes whose
+    # pydantic serializer does not yet honor Field(exclude_if=...).
+    for key in (
+        "generation_skipped", "generation_skip_reason", "evidence_sufficiency",
+        "evidence_citations", "answer_validation", "graph_trace_id",
+    ):
+        if data.get(key) is None:
+            data.pop(key, None)
+    return data
 
 
 def _sse(event: str, data: dict) -> str:
@@ -2316,21 +2477,23 @@ async def query_stream(request: QueryRequest):
         if request_emitter is not None:
             request_emitter.error("query failed", terminal=True)
         raise
-    model_available = await _check_model_health()
-
     run_tool_final = (
         tool_final and _tools_supported and not _context_used_deterministic_tools(context)
     )
-
-    # Model-unavailable: the pre-2.2.6 legacy path returns 404 (byte-identical).
-    # The new paths (progress events or tool-final) degrade gracefully to a
-    # streamed degraded answer instead, so a transient model outage never
-    # poisons the client's streaming capability.
-    if not model_available and emitter is None and not run_tool_final:
-        raise HTTPException(status_code=404, detail="Streaming unavailable when model is unavailable")
+    model_available: Optional[bool] = None
+    if not _deterministic_contract_eligible(context):
+        model_available = await _check_model_health()
+        # Feature-off/ineligible requests retain the legacy capability response.
+        if not model_available and emitter is None and not run_tool_final:
+            raise HTTPException(
+                status_code=404,
+                detail="Streaming unavailable when model is unavailable",
+            )
 
     return StreamingResponse(
-        _query_stream_events(request, context, emitter, run_tool_final, model_available),
+        _query_stream_events(
+            request, context, emitter, run_tool_final, model_available,
+        ),
         media_type="text/event-stream",
     )
 
@@ -2379,12 +2542,29 @@ async def _query_stream_events(
     context: dict,
     emitter,
     run_tool_final: bool,
-    model_available: bool,
+    model_available: Optional[bool],
 ):
     """SSE generator: flush progress, stream the final answer, emit metadata."""
     # 1. Flush the buffered context-build progress (query_started + stages).
     for chunk in _drain_progress(emitter):
         yield chunk
+
+    # 2.3.7.3: render/validate/finalize before any model health probe or call.
+    deterministic = _try_deterministic_response(context)
+    if deterministic is not None:
+        for chunk in _drain_progress(emitter):
+            yield chunk
+        yield _sse("token", {"token": deterministic.answer})
+        metadata = _response_to_dict(deterministic)
+        metadata.pop("answer", None)
+        yield _sse("metadata", metadata)
+        return
+
+    if model_available is None:
+        model_available = await _check_model_health()
+    # Model-unavailable: the pre-2.2.6 legacy path historically returned a
+    # capability 404. Once the SSE generator has started, preserve the newer
+    # fail-soft behavior and return one degraded answer instead.
 
     stage_start = time.perf_counter()
     temperature, max_tokens = _task_settings(request, context["intent"])
@@ -2772,6 +2952,7 @@ def _evaluate_and_refresh(ticker: Optional[str], do_refresh: bool) -> dict:
         return meta
 
     if do_refresh:
+        meta["_write_requested"] = True
         refreshed, _errors = _refresh_ticker_sources(ticker, stale)
         meta["refreshed_during_query"] = refreshed
         meta["stale_sources_used"] = [s for s in stale if s not in refreshed]

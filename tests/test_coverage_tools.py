@@ -350,7 +350,7 @@ def test_coverage_questions_route_to_read_only_tool_and_render_deterministically
 
     execution = dr.execute_route(decision, coverage_store)
     assert execution.error is False
-    assert execution.answer_origin == "deterministic_coverage"
+    assert execution.answer_origin == "deterministic"
     assert execution.answer_metadata["complete"] is True
     assert "AAPL" in execution.answer
     assert "4" in execution.answer
@@ -362,7 +362,7 @@ def test_coverage_failure_renders_unavailable_without_model_fallback():
     decision = dr.route(_plan("What tickers do you know about?"), [])
     execution = dr.execute_route(decision, broken)
     assert execution.error is False
-    assert execution.answer_origin == "deterministic_coverage"
+    assert execution.answer_origin == "deterministic"
     assert "unavailable" in execution.answer.lower()
     assert "db unavailable" not in execution.answer
 
@@ -370,18 +370,58 @@ def test_coverage_failure_renders_unavailable_without_model_fallback():
 @pytest.mark.asyncio
 async def test_query_response_preserves_coverage_origin_without_model_probe(monkeypatch):
     from src.middleware import app as middleware_app
+    from src.middleware.adaptive_orchestrator import Lane, OrchestrationResult
+    from src.middleware.config import MiddlewareConfig
+    from src.middleware.evidence import assign_evidence_ids, build_evidence_items
 
     async def fail_model_probe():
         raise AssertionError("coverage answer must not probe the model")
 
     monkeypatch.setattr(middleware_app, "_check_model_health", fail_model_probe)
+    config = MiddlewareConfig(config_path=None)
+    config.enable_deterministic_answers = True
+    monkeypatch.setattr(middleware_app, "config", config)
+    plan = _plan("What tickers do you know about?")
+    execution = dr.ExecutionResult(
+        invocations=[dr.ExecutedInvocation(
+            name="describe_coverage",
+            arguments={"operation": "list_securities", "ticker_only": True},
+            subquery_id="sq0",
+            reason_code=dr.REASON_COVERAGE,
+            result={
+                "status": "ok",
+                "complete": True,
+                "next_cursor": None,
+                "securities": [
+                    {"ticker": ticker} for ticker in ("AAPL", "AMD", "HUM", "NVDA")
+                ],
+                "result_count": 4,
+                "total_matching": 4,
+            },
+        )],
+        complete=True,
+    )
+    orchestration_result = OrchestrationResult(
+        lane=Lane.CATALOG,
+        plan=plan,
+        tool_execution=execution,
+        set_complete=True,
+        result_set_size=4,
+    )
+    facts = [{
+        "ticker": "CATALOG",
+        "metric": "coverage_list_securities",
+        "value": "AAPL, AMD, HUM, NVDA",
+        "source_type": "catalog",
+    }]
+    ledger = assign_evidence_ids(build_evidence_items(facts, []))
     context = {
         "start": time.time(),
         "timings": {},
         "intent": {"ticker": None, "question_type": "general"},
-        "freshness": {"overall": "unknown"},
+        "freshness": {"overall": "unknown", "stale_sources_used": []},
         "retrieval": {
-            "facts": [], "documents": [], "retrieval_strategy": "fast",
+            "facts": facts, "documents": [], "retrieval_strategy": "fast",
         },
         "grounding_level": "grounded",
         "augmented_prompt": "",
@@ -389,22 +429,27 @@ async def test_query_response_preserves_coverage_origin_without_model_probe(monk
         "conversation": None,
         "compiled": None,
         "retrieval_query": None,
-        "orchestration": {"deterministic_tools": ["describe_coverage"]},
-        "deterministic_answer": "The active security registry contains 4 securities: AAPL, AMD, HUM, NVDA.",
-        "answer_origin": "deterministic_coverage",
+        "orchestration": {
+            "lane": "catalog", "deterministic_tools": ["describe_coverage"],
+            "model_calls": 0,
+        },
+        "answer_origin": None,
         "coverage_metadata": {
             "data_revision": 42, "complete": True, "total_matching": 4,
         },
-        "evidence_ledger": [],
+        "evidence_ledger": ledger,
+        "graph_evidence_ids": ["E1"],
         "calculations": [],
         "evidence_sufficiency": None,
+        "_orchestration_result": orchestration_result,
     }
 
     response = await middleware_app._answer_query_context(
         middleware_app.QueryRequest(question="What tickers do you know about?"),
         context,
     )
-    assert response.answer_origin == "deterministic_coverage"
+    assert response.answer_origin == "deterministic"
+    assert response.generation_skipped is True
     assert response.coverage_metadata["data_revision"] == 42
     assert "AAPL" in response.answer
 

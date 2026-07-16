@@ -58,7 +58,7 @@ EVENT_GRAPH = "graph_observer"
 STAGE_NAMES = frozenset(
     {"compile", "route", "retrieve", "grade", "correct", "pack", "generate", "validate"}
 )
-STAGE_PHASES = frozenset({"started", "completed", "fallback"})
+STAGE_PHASES = frozenset({"started", "completed", "fallback", "skipped"})
 
 # Tool-completion status values.
 TOOL_STATUS_OK = "ok"

@@ -52,6 +52,9 @@ class EvidenceTrace:
     # happened (the successful answer path): a rejected planner attempt shows
     # up as a reason code, never as evidence.
     orchestration: Optional[dict] = None
+    answer_origin: Optional[str] = None
+    generation_skipped: bool = False
+    deterministic_template: Optional[str] = None
     schema_version: int = SCHEMA_VERSION
 
     def to_dict(self) -> dict:
@@ -64,7 +67,13 @@ class EvidenceTrace:
         evidence retrieved, no tools called) — only a missing system/user
         prompt marks an incomplete trace.
         """
-        return bool(self.system_prompt) and bool(self.user_prompt)
+        return (
+            bool(self.system_prompt) and bool(self.user_prompt)
+        ) or (
+            self.answer_origin == "deterministic"
+            and self.generation_skipped
+            and bool(self.deterministic_template)
+        )
 
 
 class EvidenceTraceCollector:
@@ -102,6 +111,7 @@ class EvidenceTraceCollector:
         self._tool_results: list[dict] = []
         self._orchestration: Optional[dict] = None
         self._evidence_items: list[dict] = []
+        self._deterministic_template: Optional[str] = None
 
     def record_evidence_ledger(self, items) -> None:
         """Attach the request-local ``[E#]`` evidence ledger (2.2.4.3).
@@ -150,22 +160,34 @@ class EvidenceTraceCollector:
         """
         self._tool_results = []
 
+    def record_deterministic_answer(self, template: str) -> None:
+        """Mark a validated answer that used evidence without a model prompt."""
+        self._deterministic_template = str(template)
+
+    def discard_deterministic_answer(self) -> None:
+        """Clear a failed fast-path attempt before normal model fallback."""
+        self._deterministic_template = None
+
     def finalize(self) -> Optional[EvidenceTrace]:
         """Return the completed trace, or ``None`` if no model call ever
         recorded a prompt (e.g. the degraded model-unavailable path, which
         must not claim model-visible evidence)."""
-        if self._system_prompt is None or self._user_prompt is None:
+        deterministic = self._deterministic_template is not None
+        if not deterministic and (self._system_prompt is None or self._user_prompt is None):
             return None
         return EvidenceTrace(
             answer_policy=self._answer_policy,
             grounding_level=self._grounding_level,
             raw_question=self._raw_question,
             retrieval_query=self._retrieval_query,
-            system_prompt=self._system_prompt,
-            user_prompt=self._user_prompt,
+            system_prompt=self._system_prompt or "",
+            user_prompt=self._user_prompt or "",
             facts=list(self._facts),
             documents=list(self._documents),
             tool_results=list(self._tool_results),
             evidence_items=list(self._evidence_items),
             orchestration=dict(self._orchestration) if self._orchestration else None,
+            answer_origin="deterministic" if deterministic else "model",
+            generation_skipped=deterministic,
+            deterministic_template=self._deterministic_template,
         )
