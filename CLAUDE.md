@@ -91,6 +91,39 @@ When Using Plan mode:
 Built-in agents:
 -Built-in agent types (`Explore`, `general-purpose`) are always spawned with an explicit `model:` — default `model: "sonnet"` — and never on Fable 5. Their definitions otherwise resolve their own model (Explore was observed defaulting to Opus 4.8), and an inheriting built-in in a Fable session would burn Fable tokens on survey work. Built-ins are for cheap search/survey only; anything needing more intelligence routes through the presets above or stays inline with the orchestrator.
 
+### Babysitting delegated work (anti-stall rules)
+
+Two silent stalls cost ~11 hours on 2026-07-16 (a wrapper that never reported a
+finished job; a delegate zombied on its own dead verify subprocess behind a
+change-only monitor). These rules are mandatory for every delegated job —
+Codex or Claude, background or detached:
+
+- **Never trust the messenger.** A wrapper/agent promising to "report when
+  done" is not a completion signal. Poll the underlying job state directly
+  (runtime status, job log file, working-tree writes) and read results from
+  durable artifacts, not from the delegate's mailbox message.
+- **Every watcher needs a stall timeout, not just change detection.** Emit on
+  phase change AND on X minutes with no change (X = 2× the longest healthy
+  phase seen so far; ~15 min default for verify/test phases). A phase that
+  never changes must page the orchestrator, because silence is
+  indistinguishable from progress.
+- **Dual completion signals.** Primary notification plus an independent
+  watcher with a hard deadline. When a watcher expires, re-arm it; never
+  interpret watcher expiry or quiet as success.
+- **Detach long-running work from the harness task system.** Harness
+  background tasks can be killed externally; anything expected to run >15 min
+  (eval sweeps, benchmarks) launches as a detached OS process writing to a log
+  file, with a monitor tailing that file for both success and failure
+  signatures.
+- **Stalled-but-complete → take over.** If a delegate is stuck but its
+  working tree/artifacts look finished, kill it, run the verify gate yourself,
+  and hand back from the artifacts. Don't wait for it, and don't re-dispatch
+  work that already exists.
+- **Time-box phases at dispatch.** State the expected duration in the
+  dispatch note (implementation 30–60 min, verify ≤10 min per pass). One
+  phase exceeding its box with zero new writes → inspect the job log
+  immediately; a dead child process under a live job is the default suspect.
+
 ### Loops: which primitive to trigger
 
 A loop = repeated work cycles until a stop condition. The deterministic stop condition for all code loops in this repo is the verify gate — `scripts\verify.ps1` / `scripts/verify.sh`, final line `VERIFY: PASS|FAIL` — governed by the project skill `verify-rag-change`. Use that skill before claiming any code change done, in or out of a loop.
