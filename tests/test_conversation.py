@@ -238,3 +238,30 @@ def test_no_history_is_single_turn_query():
     assert compiled.carried_timeframe is None
     assert compiled.topic_reset is False
     assert "NVDA" in compiled.retrieval_query
+
+
+def test_inventory_followup_does_not_cross_session_or_expand_past_cap():
+    history = [
+        ChatTurn(role="user", content="Which companies do you cover?"),
+        ChatTurn(
+            role="assistant",
+            content="AAPL, AMD, INTC, NVDA.",
+            context={
+                "grounding": "grounded",
+                "coverage_metadata": {
+                    "complete": True,
+                    "total_matching": 4,
+                    "securities": ["AAPL", "AMD", "INTC", "NVDA"],
+                },
+            },
+        ),
+    ]
+    bounded = compile_question("Which of those have transcripts?", history)
+    fresh_session = compile_question("Which of those have transcripts?", [])
+
+    assert bounded.inventory_scope == []
+    assert bounded.inventory_size == 4
+    assert "universe_scope" in bounded.ambiguous_slots
+    assert fresh_session.inventory_scope == []
+    assert fresh_session.inventory_size == 0
+    assert "AAPL" not in fresh_session.retrieval_query

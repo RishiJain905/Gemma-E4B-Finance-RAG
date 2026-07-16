@@ -103,6 +103,7 @@ RESULT_KEYS = (
     "history_sent", "expected_tickers", "expected_metrics", "expected_timeframe",
     "expected_carryover", "resolved_tickers", "resolved_metrics",
     "resolved_timeframe", "subquestion_ids", "subquestion_coverage",
+    "coverage_metadata",
 )
 
 # Cached in-process Store/config (built once, reused across cases).
@@ -189,6 +190,7 @@ def _row(case: dict, *, answer: str, detected_ticker, detected_intent,
          evidence_sufficiency: Optional[dict] = None,
          decomposition: Optional[dict] = None,
          answer_validation: Optional[dict] = None,
+         coverage_metadata: Optional[dict] = None,
          config_label: Optional[str] = None) -> dict:
     """Assemble a well-formed result row (always has every RESULT_KEY)."""
     ans = answer or ""
@@ -229,6 +231,9 @@ def _row(case: dict, *, answer: str, detected_ticker, detected_intent,
         "resolved_timeframe": resolved_timeframe,
         "subquestion_ids": sq_ids,
         "subquestion_coverage": sq_cov,
+        "coverage_metadata": (
+            coverage_metadata if isinstance(coverage_metadata, dict) else None
+        ),
         # ── Adaptive orchestration fields (2.2.3.4) ──
         # The full response.orchestration block plus the two most-queried
         # scalars promoted to top-level so per-lane metrics and the config
@@ -474,6 +479,7 @@ def _row_from_endpoint(case: dict, data: dict, latency_s: float,
         evidence_sufficiency=data.get("evidence_sufficiency"),
         decomposition=data.get("decomposition"),
         answer_validation=data.get("answer_validation"),
+        coverage_metadata=data.get("coverage_metadata"),
         **_ctx_kwargs(ctx, data, trace),
     )
 
@@ -582,7 +588,11 @@ def call_live_endpoint(question: str, *, query_url: str = DEFAULT_QUERY_URL,
             if q:
                 turns.append({"role": "user", "content": h.get("question", "")})
             if a:
-                turns.append({"role": "assistant", "content": h.get("answer", "")})
+                assistant = {"role": "assistant", "content": h.get("answer", "")}
+                context = h.get("context")
+                if isinstance(context, dict) and context:
+                    assistant["context"] = context
+                turns.append(assistant)
         if turns:
             body["history"] = turns
     try:
@@ -789,6 +799,7 @@ def _row_from_direct(case: dict, data: dict, latency_s: float,
         latency_ms=latency_s * 1000,
         model_available=model_available,
         error=error,
+        coverage_metadata=data.get("coverage_metadata"),
         **_ctx_kwargs(ctx, data, trace),
     )
 
@@ -919,8 +930,16 @@ def run_conversation(conv: dict, *, query_fn: Optional[Callable] = None,
                        dataset_digest=dataset_digest, history=list(history),
                        conversation_id=conv_id, turn_index=i)
         rows.append(row)
-        history.append({"question": turn.get("question", ""),
-                        "answer": row.get("answer", "")})
+        context = {
+            "grounding": row.get("grounding"),
+            "coverage_metadata": row.get("coverage_metadata"),
+        }
+        context = {key: value for key, value in context.items() if value is not None}
+        history.append({
+            "question": turn.get("question", ""),
+            "answer": row.get("answer", ""),
+            "context": context or None,
+        })
     return rows
 
 

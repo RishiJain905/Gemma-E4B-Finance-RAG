@@ -68,8 +68,9 @@ logger = logging.getLogger(__name__)
 
 
 class Lane(str, Enum):
-    """The three adaptive cost tiers. ``str`` mixin keeps values log-friendly."""
+    """Catalog-first routing plus the three adaptive RAG cost tiers."""
 
+    CATALOG = "catalog"
     FAST = "fast"
     STANDARD = "standard"
     COMPLEX = "complex"
@@ -169,6 +170,7 @@ class ExecutionBudget:
 
 # Char caps per lane; the effective cap is min(lane cap, adaptive_max_context_chars).
 _LANE_CONTEXT_CAPS = {
+    Lane.CATALOG: 4000,
     Lane.FAST: 4000,
     Lane.STANDARD: 12000,
     Lane.COMPLEX: 18000,
@@ -518,6 +520,8 @@ class OrchestrationResult:
     derived_subqueries: list[str] = field(default_factory=list)
     drift_reason_codes: list[str] = field(default_factory=list)
     proposed_subqueries: int = 0
+    set_complete: Optional[bool] = None
+    result_set_size: Optional[int] = None
 
     def add_reason(self, code: str) -> None:
         if code not in self.reason_codes:
@@ -667,7 +671,13 @@ def _run_adaptive(
         result.add_reason("retrieval_cache_miss")
 
     try:
-        if lane is Lane.FAST:
+        if lane is Lane.CATALOG:
+            fell_back = _execute_catalog(
+                result, plan, decision, store, config, budget, execute_fn, retriever
+            )
+            if fell_back is not None:
+                return fell_back
+        elif lane is Lane.FAST:
             fell_back = _execute_fast(
                 result, plan, decision, store, config, budget, execute_fn, retriever
             )
@@ -711,6 +721,15 @@ def _select_lane(
 ) -> tuple[Lane, list[str]]:
     """Pick the cheapest sufficient lane; return (lane, stable reason codes)."""
     complex_reasons = _complex_reasons(plan)
+    catalog_route = bool(
+        decision.matched
+        and decision.tool_invocations
+        and decision.tool_invocations[0].reason_code == dr.REASON_COVERAGE
+    )
+
+    if catalog_route and set(plan.obligations.evidence_modes) <= {"catalog"}:
+        reasons = ["lane_catalog", "catalog_route", *decision.reason_codes]
+        return Lane.CATALOG, _dedup(reasons)
 
     # Fast: a complete deterministic route with no qualitative doc obligation AND
     # no independent multi-obligation signal in the plan. The `not complex_reasons`
@@ -758,6 +777,22 @@ def _dedup(items: Iterable[str]) -> list[str]:
 # ── Fast lane ─────────────────────────────────────────────
 
 
+def _execute_catalog(
+    result: OrchestrationResult,
+    plan: QueryPlan,
+    decision: "RouteDecision",
+    store: Any,
+    config: "MiddlewareConfig",
+    budget: ExecutionBudget,
+    execute_fn: ExecuteFn,
+    retriever: Optional["Retriever"] = None,
+) -> Optional[OrchestrationResult]:
+    """Execute only the read-only coverage catalog; never create a retriever."""
+    return _execute_fast(
+        result, plan, decision, store, config, budget, execute_fn, retriever
+    )
+
+
 def _execute_fast(
     result: OrchestrationResult,
     plan: QueryPlan,
@@ -792,6 +827,15 @@ def _execute_fast(
     )
     result.tool_execution = execution
     result.calculations = list(execution.calculations)
+    for code in execution.incomplete_reason_codes:
+        result.add_reason(code)
+    if decision.tool_invocations and decision.tool_invocations[0].reason_code == dr.REASON_COVERAGE:
+        if execution.invocations:
+            payload = execution.answer_metadata or execution.invocations[0].result
+            result.set_complete = bool(payload.get("complete", False))
+            result.result_set_size = int(
+                payload.get("total_matching") or payload.get("result_count") or 0
+            )
 
     if execution.error:
         result.add_reason("deterministic_route_error")
@@ -828,8 +872,8 @@ def _execute_standard(
     retriever: Optional["Retriever"],
 ) -> None:
     """One coherent topic: existing hybrid retrieve() once, plus safe tool facts."""
-    tool_facts = _partial_route_facts(
-        result, decision, store, config, budget, execute_fn
+    tool_facts = _catalog_or_partial_route_facts(
+        result, plan, decision, store, config, budget, execute_fn
     )
 
     r = _get_retriever(retriever, store, config)
@@ -883,8 +927,8 @@ def _execute_complex(
         else:
             result.add_reason("planning_budget_exhausted")
 
-    tool_facts = _partial_route_facts(
-        result, decision, store, config, budget, execute_fn
+    tool_facts = _catalog_or_partial_route_facts(
+        result, active_plan, decision, store, config, budget, execute_fn
     )
 
     # Selective decomposition (2.2.4.2): when enabled, a genuinely compound plan
@@ -1262,6 +1306,134 @@ def _run_derived_subqueries(
 # ── Shared retrieval + conditional rerank ─────────────────
 
 
+def _catalog_or_partial_route_facts(
+    result: OrchestrationResult,
+    plan: QueryPlan,
+    decision: "RouteDecision",
+    store: Any,
+    config: "MiddlewareConfig",
+    budget: ExecutionBudget,
+    execute_fn: ExecuteFn,
+) -> list[dict]:
+    """Resolve a catalog universe before one bounded structured comparison."""
+    is_catalog = bool(
+        decision.matched
+        and decision.tool_invocations
+        and decision.tool_invocations[0].reason_code == dr.REASON_COVERAGE
+    )
+    if not is_catalog or "facts" not in plan.obligations.evidence_modes:
+        return _partial_route_facts(
+            result, decision, store, config, budget, execute_fn
+        )
+
+    if not budget.consume(DETERMINISTIC_TOOL):
+        result.add_reason("deterministic_tool_budget_exhausted")
+        return []
+    catalog = execute_fn(decision, store, max_tools=1, build_answer=False)
+    result.tool_execution = catalog
+    for code in catalog.incomplete_reason_codes:
+        if code != dr.INCOMPLETE_MISSING_METRIC_COVERAGE:
+            result.add_reason(code)
+    if catalog.error or not catalog.invocations:
+        result.add_reason("partial_route_error_ignored")
+        return []
+
+    facts = _normalize_tool_facts(catalog)
+    payload = catalog.invocations[0].result
+    tickers = [
+        str(row.get("ticker"))
+        for row in payload.get("securities") or []
+        if isinstance(row, dict) and row.get("ticker")
+    ]
+    total = int(payload.get("total_matching") or len(tickers))
+    result.result_set_size = total
+    result.set_complete = bool(payload.get("complete", False))
+    result.add_reason("includes_deterministic_tool_evidence")
+
+    blocking_codes = {
+        dr.INCOMPLETE_PARTIAL_CATALOG_PAGE,
+        dr.INCOMPLETE_MISSING_COVERAGE_DIMENSION,
+        dr.INCOMPLETE_UNRESOLVED_UNIVERSE_SCOPE,
+        dr.INCOMPLETE_QUALITATIVE_EVIDENCE_REQUIRED,
+    }
+    if not result.set_complete or blocking_codes & set(catalog.incomplete_reason_codes):
+        return facts
+
+    cap = max(1, min(int(getattr(config, "top_k_facts", 10)), 100))
+    if total > cap or len(tickers) > cap:
+        result.set_complete = False
+        result.add_reason(dr.INCOMPLETE_RESULT_SET_TOO_LARGE)
+        facts.append({
+            "metric": "coverage_request_to_narrow",
+            "value": (
+                f"The catalog matched {total} securities, above the {cap}-security "
+                "comparison cap. Narrow by sector, index, coverage tier, or ticker."
+            ),
+            "ticker": "CATALOG",
+            "source_type": "catalog",
+            "kind": "tool_result",
+            "complete": False,
+            "total_matching": total,
+        })
+        return facts
+
+    metrics = list(plan.obligations.metrics or plan.metrics)
+    if len(metrics) != 1 or not tickers:
+        result.set_complete = False
+        result.add_reason(dr.INCOMPLETE_MISSING_METRIC_COVERAGE)
+        return facts
+    if not budget.consume(DETERMINISTIC_TOOL):
+        result.set_complete = False
+        result.add_reason("deterministic_tool_budget_exhausted")
+        result.add_reason(dr.INCOMPLETE_RESULT_SET_TOO_LARGE)
+        return facts
+
+    arguments = {
+        "metric": metrics[0],
+        "tickers": tickers,
+        "latest_only": plan.obligations.as_of in {None, "latest"},
+        "limit": len(tickers),
+    }
+    if plan.obligations.completeness == "top_n":
+        arguments.update(order="desc", limit=plan.obligations.limit or len(tickers))
+    elif plan.obligations.completeness == "bottom_n":
+        arguments.update(order="asc", limit=plan.obligations.limit or len(tickers))
+    invocation = dr.ToolInvocation(
+        "query_facts", arguments,
+        plan.subqueries[0].id if plan.subqueries else "sq0",
+        dr.REASON_COMPARE,
+    )
+    structured_decision = dr.RouteDecision(
+        matched=True,
+        complete=True,
+        tool_invocations=[invocation],
+        reason_codes=[dr.REASON_COMPARE],
+    )
+    structured = execute_fn(
+        structured_decision, store, max_tools=1, build_answer=False
+    )
+    catalog.invocations.extend(structured.invocations)
+    catalog.calculations.extend(structured.calculations)
+    catalog.error = catalog.error or structured.error
+    catalog.complete = catalog.complete and structured.complete
+    catalog.incomplete_reason_codes.extend(
+        code for code in structured.incomplete_reason_codes
+        if code not in catalog.incomplete_reason_codes
+    )
+    result.tool_execution = catalog
+    if structured.error:
+        result.set_complete = False
+        result.add_reason("partial_route_error_ignored")
+        return facts
+
+    structured_facts = _normalize_tool_facts(structured)
+    covered = {str(fact.get("ticker")) for fact in structured_facts if fact.get("ticker")}
+    if not set(tickers) <= covered:
+        result.set_complete = False
+        result.add_reason(dr.INCOMPLETE_MISSING_METRIC_COVERAGE)
+    return [*facts, *structured_facts]
+
+
 def _partial_route_facts(
     result: OrchestrationResult,
     decision: "RouteDecision",
@@ -1287,6 +1459,8 @@ def _partial_route_facts(
     if execution.error:
         result.add_reason("partial_route_error_ignored")
         return []
+    for code in execution.incomplete_reason_codes:
+        result.add_reason(code)
     result.tool_execution = execution
     result.calculations = list(execution.calculations)
     result.add_reason("includes_deterministic_tool_evidence")
@@ -1489,6 +1663,9 @@ def _plan_from_json(data: dict, base: QueryPlan) -> QueryPlan:
         periods=periods,
         subqueries=[sq0],
         primary_intent=intents[0],
+        evidence_topic=base.evidence_topic,
+        evidence_filters=dict(base.evidence_filters),
+        obligations=base.obligations,
         reason_codes=["planner"],
     )
 
@@ -1680,6 +1857,38 @@ def _normalize_tool_facts(execution: "ExecutionResult") -> list[dict]:
     for inv in execution.invocations:
         res = inv.result if isinstance(inv.result, dict) else {}
         if inv.error:
+            continue
+
+        if inv.name == "describe_coverage":
+            operation = str(inv.arguments.get("operation") or "summary")
+            values: list[str] = []
+            for key in ("securities", "sources", "item_types", "metrics"):
+                for value in res.get(key) or []:
+                    if isinstance(value, dict):
+                        label = value.get("ticker") or value.get("source")
+                    else:
+                        label = value
+                    if label is not None and str(label) not in values:
+                        values.append(str(label))
+            display = ", ".join(values) if values else str(
+                res.get("message") or res.get("total_matching") or 0
+            )
+            if res.get("complete") is False and res.get("status") != "unavailable":
+                display = (
+                    f"{display}. Returned {res.get('result_count', len(values))} of "
+                    f"{res.get('total_matching', len(values))}; narrow with a sector, "
+                    "index, coverage tier, source, item type, or ticker filter."
+                )
+            facts.append({
+                "metric": f"coverage_{operation}",
+                "value": display,
+                "ticker": "CATALOG",
+                "period": res.get("universe_snapshot_at"),
+                "source_type": "catalog",
+                "kind": "tool_result",
+                "complete": bool(res.get("complete", False)),
+                "total_matching": res.get("total_matching"),
+            })
             continue
 
         fundamentals = res.get("fundamentals")

@@ -142,6 +142,51 @@ def test_deterministic_turn_makes_no_model_request():
     assert should_use_llm_fallback(compiled, _config()) is False
 
 
+def test_complete_inventory_followup_stays_deterministic_and_bounded():
+    history = [
+        ChatTurn(role="user", content="Which semiconductor companies do you cover?"),
+        ChatTurn(
+            role="assistant",
+            content="AMD and NVDA.",
+            context={
+                "grounding": "grounded",
+                "coverage_metadata": {
+                    "complete": True,
+                    "total_matching": 2,
+                    "securities": ["AMD", "NVDA"],
+                },
+            },
+        ),
+    ]
+    compiled = compile_question("Which of those also have transcripts?", history)
+
+    assert compiled.inventory_scope == ["AMD", "NVDA"]
+    assert compiled.ambiguous_slots == []
+    assert should_use_llm_fallback(compiled, _config()) is False
+
+
+def test_inventory_rewrite_failure_keeps_unresolved_deterministic_plan():
+    compiled = compile_question("Which of those also have transcripts?", [])
+    calls = []
+
+    def fail(prompt):
+        calls.append(prompt)
+        raise TimeoutError("planner unavailable")
+
+    out = rewrite_query(
+        compiled.raw_question,
+        [],
+        compiled,
+        config=_config(),
+        call_model=fail,
+    )
+
+    assert len(calls) == 1
+    assert out is compiled
+    assert out.inventory_scope == []
+    assert "universe_scope" in out.ambiguous_slots
+
+
 def test_fallback_disabled_by_default():
     _history_, compiled = _ambiguous()
     # Even with an ambiguous slot, both flags default off -> no call.

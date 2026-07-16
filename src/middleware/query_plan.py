@@ -29,6 +29,10 @@ from typing import Iterable, Optional
 
 # Retrieval modes a subquery may request (advisory hint for the 2.2.3.2 router).
 RETRIEVAL_MODES = frozenset({"facts", "documents", "macro", "tools"})
+COMPLETENESS_REQUIREMENTS = frozenset(
+    {"all", "count", "top_n", "bottom_n", "existence", "sample"}
+)
+EVIDENCE_MODES = frozenset({"catalog", "facts", "documents"})
 
 
 class QueryPlanError(ValueError):
@@ -58,6 +62,23 @@ class QueryEntity:
     source: str
     mention: str
     start: int
+
+
+@dataclass(frozen=True)
+class AnswerObligations:
+    """Normalized requirements that determine whether a route is complete."""
+
+    entity_set: tuple[str, ...] = ()
+    universe_scope: Optional[str] = None
+    operation: Optional[str] = None
+    metrics: tuple[str, ...] = ()
+    item_types: tuple[str, ...] = ()
+    sources: tuple[str, ...] = ()
+    completeness: str = "sample"
+    limit: Optional[int] = None
+    as_of: Optional[str] = None
+    qualitative: bool = False
+    evidence_modes: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -118,6 +139,7 @@ class QueryPlan:
     primary_period_type: Optional[str] = None
     evidence_topic: Optional[str] = None
     evidence_filters: dict = field(default_factory=dict)
+    obligations: AnswerObligations = field(default_factory=AnswerObligations)
     reason_codes: list[str] = field(default_factory=list)
 
     # ── Ordered accessors ──────────────────────────────
@@ -169,6 +191,21 @@ class QueryPlan:
             reasons.append("metric_duplicate")
         if len(self.periods) != len(set(self.periods)):
             reasons.append("period_duplicate")
+
+        obligation_entities = list(self.obligations.entity_set)
+        if any(
+            not isinstance(ticker, str) or ticker != ticker.upper()
+            for ticker in obligation_entities
+        ):
+            reasons.append("obligation_entity_not_uppercase")
+        if len(obligation_entities) != len(set(obligation_entities)):
+            reasons.append("obligation_entity_duplicate")
+        if self.obligations.completeness not in COMPLETENESS_REQUIREMENTS:
+            reasons.append("invalid_completeness_requirement")
+        if any(mode not in EVIDENCE_MODES for mode in self.obligations.evidence_modes):
+            reasons.append("invalid_evidence_mode")
+        if self.obligations.limit is not None and self.obligations.limit < 1:
+            reasons.append("invalid_obligation_limit")
 
         if not (1 <= len(self.subqueries) <= 3):
             reasons.append("subquery_count_out_of_bounds")
@@ -600,6 +637,9 @@ def attach_derived_subqueries(
         primary_intent=plan.primary_intent,
         primary_period=plan.primary_period,
         primary_period_type=plan.primary_period_type,
+        evidence_topic=plan.evidence_topic,
+        evidence_filters=dict(plan.evidence_filters),
+        obligations=plan.obligations,
         reason_codes=list(plan.reason_codes),
     )
     try:

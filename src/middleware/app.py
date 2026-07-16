@@ -1599,9 +1599,13 @@ def _orchestration_metadata(result) -> dict:
         "planning_calls": 1 if result.planning_ran else 0,
         "reranker_calls": 1 if result.rerank_ran else 0,
         "deterministic_tools": tools,
+        "set_complete": result.set_complete,
+        "result_set_size": result.result_set_size,
+        "model_calls": 0,
         "context_chars": int(result.context_size),
         "evidence_dropped": dropped,
         "fallback_reason": result.fallback_reason,
+        "query_plan": _plan_trace(result.plan),
     }
 
 
@@ -1631,6 +1635,7 @@ def _doc_trace_id(doc: dict):
 
 
 def _plan_trace(plan) -> dict:
+    obligations = plan.obligations
     return {
         "retrieval_query": plan.retrieval_query,
         "entities": list(plan.tickers),
@@ -1640,6 +1645,19 @@ def _plan_trace(plan) -> dict:
         "primary_intent": plan.primary_intent,
         "subqueries": [sq.id for sq in plan.subqueries],
         "reason_codes": list(plan.reason_codes),
+        "obligations": {
+            "entity_set": list(obligations.entity_set),
+            "universe_scope": obligations.universe_scope,
+            "operation": obligations.operation,
+            "metrics": list(obligations.metrics),
+            "item_types": list(obligations.item_types),
+            "sources": list(obligations.sources),
+            "completeness": obligations.completeness,
+            "limit": obligations.limit,
+            "as_of": obligations.as_of,
+            "qualitative": obligations.qualitative,
+            "evidence_modes": list(obligations.evidence_modes),
+        },
     }
 
 
@@ -2054,9 +2072,19 @@ async def _answer_query_context(request: QueryRequest, context: dict) -> QueryRe
         citations = []
         validation = None
         evidence_citations = None
+        if (
+            isinstance(context.get("orchestration"), dict)
+            and "model_calls" in context["orchestration"]
+        ):
+            context["orchestration"]["model_calls"] = 0
     else:
         model_available = await _check_model_health()
         if model_available:
+            if (
+                isinstance(context.get("orchestration"), dict)
+                and "model_calls" in context["orchestration"]
+            ):
+                context["orchestration"]["model_calls"] = 1
             temperature, max_tokens = _task_settings(request, intent)
             answer_text, citations = await _invoke_model(
                 prompt=context["augmented_prompt"],

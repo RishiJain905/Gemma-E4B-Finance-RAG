@@ -47,7 +47,7 @@ DEFAULT_MODEL_ENDPOINT = "http://127.0.0.1:8087/v1/chat/completions"
 
 # Bump when the shape of score_all()'s summary changes in a way that would
 # invalidate a naive comparison against an older baseline (2.2.1.2 Step 5).
-SCORE_SCHEMA_VERSION = 1
+SCORE_SCHEMA_VERSION = 2
 
 # Grounding modes eligible for grounded_faithfulness (they claim grounding).
 GROUNDED_MODES = ("grounded", "partial")
@@ -1275,6 +1275,100 @@ def long_document_gate(summary: dict, *, flat="flat", hierarchical="hierarchical
 
 # ── Aggregator ─────────────────────────────────────────────────────────
 
+def _ratio_block(passed: int, eligible: int) -> dict:
+    return {
+        "score": round(passed / eligible, 4) if eligible else None,
+        "n_eligible": eligible,
+        "n_pass": passed,
+    }
+
+
+def _query_plan_block(row: dict) -> dict:
+    direct = row.get("query_plan")
+    if isinstance(direct, dict):
+        return direct
+    nested = (_orch(row) or {}).get("query_plan")
+    return nested if isinstance(nested, dict) else {}
+
+
+def _normalized_values(value) -> set[str]:
+    if isinstance(value, dict):
+        return {f"{key}:{item}" for key, item in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return {str(item) for item in value}
+    return {str(value)} if value not in (None, "") else set()
+
+
+def indirect_query_metrics(rows: list[dict]) -> dict:
+    """Record Phase 2.3.7.2 plan, route, completeness, and call efficiency."""
+    plan_pass = plan_eligible = 0
+    route_pass = route_eligible = 0
+    obligation_hits = obligation_expected = 0
+    set_pass = set_eligible = 0
+    unnecessary_planner_calls = 0
+    model_call_count = 0
+
+    for row in rows:
+        case = _case(row)
+        actual_plan = _query_plan_block(row)
+        orchestration = _orch(row) or {}
+        expected_plan = case.get("expected_plan")
+        if isinstance(expected_plan, dict):
+            plan_eligible += 1
+            if all(
+                _normalized_values(actual_plan.get(key)) == _normalized_values(value)
+                for key, value in expected_plan.items()
+            ):
+                plan_pass += 1
+
+        expected_lane = case.get("expected_lane")
+        if expected_lane is not None:
+            route_eligible += 1
+            if str(orchestration.get("lane") or row.get("lane")) == str(expected_lane):
+                route_pass += 1
+
+        expected_obligations = _normalized_values(case.get("expected_obligations"))
+        actual_obligations = _normalized_values(actual_plan.get("obligations"))
+        obligation_hits += len(expected_obligations & actual_obligations)
+        obligation_expected += len(expected_obligations)
+
+        expected_set = _normalized_values(case.get("expected_set"))
+        if expected_set:
+            set_eligible += 1
+            actual = row.get("result_set")
+            if actual is None and isinstance(row.get("coverage_metadata"), dict):
+                actual = row["coverage_metadata"].get("securities")
+            actual_set = _normalized_values(actual)
+            if actual_set == expected_set and orchestration.get("set_complete") is True:
+                set_pass += 1
+
+        planning_calls = int(orchestration.get("planning_calls") or 0)
+        if expected_plan is not None and not case.get("planner_required", False):
+            unnecessary_planner_calls += planning_calls
+        model_call_count += int(
+            orchestration.get("model_calls") or row.get("model_calls") or 0
+        )
+
+    return {
+        "plan_accuracy": _ratio_block(plan_pass, plan_eligible),
+        "router_accuracy": _ratio_block(route_pass, route_eligible),
+        "obligation_coverage": _ratio_block(obligation_hits, obligation_expected),
+        "set_completeness": _ratio_block(set_pass, set_eligible),
+        "unnecessary_planner_calls": unnecessary_planner_calls,
+        "model_call_count": model_call_count,
+    }
+
+
+def has_indirect_query_rows(rows: list[dict]) -> bool:
+    return any(
+        any(
+            key in _case(row)
+            for key in ("expected_plan", "expected_lane", "expected_obligations", "expected_set")
+        )
+        for row in rows
+    )
+
+
 def _run_field(rows: list[dict], key: str) -> Optional[str]:
     """A stable per-run value denormalized onto every row (e.g. answer_policy,
     dataset_digest) — returns it if every row agrees, else None."""
@@ -1360,6 +1454,9 @@ def score_all(rows: list[dict], *, judge: Optional[Callable] = None,
 
     if has_citation_validation_rows(rows):
         summary["citation_validation"] = citation_validation_metrics(rows)
+
+    if has_indirect_query_rows(rows):
+        summary["indirect_query"] = indirect_query_metrics(rows)
 
     summary["per_category"] = _per_category(rows)
     return summary

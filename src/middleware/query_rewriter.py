@@ -253,6 +253,10 @@ def _validate(
         entity=(validated_entities[0] if validated_entities else deterministic.entity),
         metrics=validated_metrics or deterministic.metrics,
         timeframe=validated_timeframe if validated_timeframe is not None else deterministic.timeframe,
+        inventory_scope=(
+            validated_entities or deterministic.inventory_scope
+        ),
+        inventory_size=deterministic.inventory_size,
     )
 
 
