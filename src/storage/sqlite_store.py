@@ -905,6 +905,19 @@ CREATE INDEX IF NOT EXISTS idx_securities_industry ON securities(industry);
             ).fetchone()
         return str(row[0]) if row else None
 
+    def mark_sec_daily_index_absent(self, index_date: str, source_url: str) -> None:
+        """Record a date whose daily index EDGAR will never publish.
+
+        Market holidays have no master.idx; EDGAR's S3 answers 403 for the
+        missing key forever, which must not be retried as a rate limit.
+        """
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT OR IGNORE INTO sec_daily_indexes "
+                "(index_date, source_url, status, registered_count) VALUES (?, ?, 'absent', 0)",
+                (index_date, source_url),
+            )
+
     def get_sec_daily_index_cursor(self) -> Optional[str]:
         """Return the latest completely registered SEC daily-index date."""
         with self._connect() as conn:

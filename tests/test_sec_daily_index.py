@@ -215,3 +215,74 @@ def test_bulk_submissions_bootstrap_downloads_once_and_filters_locally(store: St
         "0001193125-26-188101": "broad",
         "0001193125-26-188102": "broad",
     }
+
+
+def _discovery_with(store: Store, get) -> SECDailyIndexDiscovery:
+    return SECDailyIndexDiscovery(
+        store=store,
+        coverage_resolver=CoverageResolver(store),
+        sec_config=_config(),
+        user_agent="Researcher test@example.com",
+        request_delay=0,
+        http_get=get,
+    )
+
+
+def _http_403() -> MagicMock:
+    """EDGAR's S3 answers 403 AccessDenied for daily indexes it never published."""
+    response = MagicMock(status_code=403, text="<Error><Code>AccessDenied</Code></Error>")
+    error = Exception("403 Client Error: Forbidden")
+    error.response = response
+    response.raise_for_status.side_effect = error
+    return response
+
+
+def test_holiday_403_is_marked_absent_when_a_later_date_succeeds(store: Store) -> None:
+    """A 403 date older than a same-pass success is a holiday, not a rate limit
+    (found live 2026-07-17: Juneteenth 2026-06-19 pinned the cursor for days)."""
+    _seed_broad_universe(store)
+    ok = MagicMock(text=FIXTURE.read_text())
+    ok.raise_for_status.return_value = None
+    get = MagicMock(side_effect=[_http_403(), ok])
+    discovery = _discovery_with(store, get)
+
+    result = discovery.discover_dates(["2026-06-19", "2026-07-10"])
+
+    assert result["absent"] == ["2026-06-19"]
+    assert result["failed"] == 0
+    assert "error_class" not in result
+    assert store.get_sec_daily_index_status("2026-06-19") == "absent"
+    # The absent date is never re-fetched.
+    discovery.discover_dates(["2026-06-19"])
+    assert get.call_count == 2
+
+
+def test_provider_wide_403_block_is_not_marked_absent(store: Store) -> None:
+    """When every date 403s (a real EDGAR block) nothing is absent-marked and
+    the normal retry/backoff classification stays in charge."""
+    _seed_broad_universe(store)
+    get = MagicMock(side_effect=[_http_403(), _http_403()])
+    discovery = _discovery_with(store, get)
+
+    result = discovery.discover_dates(["2026-06-19", "2026-07-10"])
+
+    assert "absent" not in result
+    assert result["failed"] == 2
+    assert store.get_sec_daily_index_status("2026-06-19") is None
+    assert store.get_sec_daily_index_status("2026-07-10") is None
+
+
+def test_403_newer_than_every_success_is_retried_not_absent(store: Store) -> None:
+    """A 403 on the newest date may be publication lag; only dates older than
+    a same-pass success are provably unpublished."""
+    _seed_broad_universe(store)
+    ok = MagicMock(text=FIXTURE.read_text())
+    ok.raise_for_status.return_value = None
+    get = MagicMock(side_effect=[ok, _http_403()])
+    discovery = _discovery_with(store, get)
+
+    result = discovery.discover_dates(["2026-07-10", "2026-07-13"])
+
+    assert "absent" not in result
+    assert result["failed"] == 1
+    assert store.get_sec_daily_index_status("2026-07-13") is None

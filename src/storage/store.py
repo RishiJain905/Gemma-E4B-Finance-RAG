@@ -1909,6 +1909,10 @@ class Store:
         """Return the processed status for one SEC daily index date."""
         return self.sqlite.get_sec_daily_index_status(index_date)
 
+    def mark_sec_daily_index_absent(self, index_date: str, source_url: str) -> None:
+        """Record a daily-index date EDGAR will never publish (market holiday)."""
+        self.sqlite.mark_sec_daily_index_absent(index_date, source_url)
+
     def get_sec_daily_index_cursor(self) -> Optional[str]:
         """Return the latest fully committed SEC daily-index date."""
         return self.sqlite.get_sec_daily_index_cursor()
