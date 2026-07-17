@@ -120,7 +120,7 @@ Codex or Claude, background or detached:
   and hand back from the artifacts. Don't wait for it, and don't re-dispatch
   work that already exists.
 - **Time-box phases at dispatch.** State the expected duration in the
-  dispatch note (implementation 30–60 min, verify ≤10 min per pass). One
+  dispatch note (implementation 20 - 30 min (not a minimum nor a hard limit), verify ≤10 min per pass). One
   phase exceeding its box with zero new writes → inspect the job log
   immediately; a dead child process under a live job is the default suspect.
 

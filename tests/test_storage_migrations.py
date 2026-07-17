@@ -93,7 +93,9 @@ def test_phase22_database_migrates_additively_and_twice_is_a_noop(tmp_path):
         assert "security_id" in {
             row[1] for row in conn.execute("PRAGMA table_info(fundamentals)")
         }
-        assert conn.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0] == 6
+        assert conn.execute(
+            "SELECT COUNT(*) FROM schema_migrations"
+        ).fetchone()[0] == LATEST_SCHEMA_VERSION
 
 
 def test_canonical_and_inline_new_database_schemas_converge(tmp_path, monkeypatch):
@@ -106,8 +108,8 @@ def test_canonical_and_inline_new_database_schemas_converge(tmp_path, monkeypatc
 
     with sqlite3.connect(canonical_path) as canonical, sqlite3.connect(inline_path) as inline:
         assert schema_signature(canonical) == schema_signature(inline)
-    assert _migration_versions(canonical_path) == list(range(1, 7))
-    assert _migration_versions(inline_path) == list(range(1, 7))
+    assert _migration_versions(canonical_path) == list(range(1, LATEST_SCHEMA_VERSION + 1))
+    assert _migration_versions(inline_path) == list(range(1, LATEST_SCHEMA_VERSION + 1))
 
 
 def test_store_reopens_migrated_database_without_schema_changes(tmp_path):
@@ -149,7 +151,9 @@ def test_store_reset_recreates_migrated_tables(tmp_path):
         store.reset()
 
     with store.sqlite._connect() as conn:
-        assert conn.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0] == 6
+        assert conn.execute(
+            "SELECT COUNT(*) FROM schema_migrations"
+        ).fetchone()[0] == LATEST_SCHEMA_VERSION
         assert conn.execute(
             "SELECT 1 FROM sqlite_master WHERE type='table' AND name='securities'"
         ).fetchone() is not None

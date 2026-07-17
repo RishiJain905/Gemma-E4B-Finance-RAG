@@ -61,6 +61,12 @@ the network boundary and makes refresh, retrieval, and visualization consistent.
   benchmark. A replacement pilot starts only after a hard gate still fails after
   one bounded optimization pass or a new approved operational requirement cannot
   be met.
+- **Decided 2026-07-16: KEEP SQLite + Chroma.** The 100k benchmark passed all
+  nine hard gates after the one bounded optimization pass (ledger-backed
+  inventory counts, deduplicated batched hybrid hydration, FTS5 optimize/rank
+  tuning). No replacement pilot is triggered. Raw tables, limits, and the next
+  review trigger:
+  `2.3.7-rag-quality-speed-and-storage/STORAGE-BENCHMARK-RESULTS.md`.
 
 If a replacement pilot is triggered, LanceDB is the first embedded/local-first
 candidate and Qdrant is considered only when operating a separate service is an

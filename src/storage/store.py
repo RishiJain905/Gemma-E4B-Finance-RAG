@@ -386,6 +386,10 @@ class Store:
             self._mark_chroma_revision(revision)
         return result
 
+    def optimize_lexical_index(self) -> None:
+        """Merge FTS5 segments after a bulk narrative load (fail-soft, no-op sans FTS5)."""
+        self.sqlite.optimize_lexical_index()
+
     def reconcile_lexical_index(
         self,
         *,
@@ -1509,19 +1513,42 @@ class Store:
             raise ValueError(
                 f"offset must be between 0 and {cls.MAX_CORPUS_OFFSET}")
 
+    def _narrative_source_counts(self) -> list[dict]:
+        """Narrative source counts from the SQLite lexical ledger, Chroma-fallback.
+
+        The narrow ``lexical_chunk_meta`` table mirrors the count dimensions of
+        the persistent narrative lexical index, so an indexed ``GROUP BY`` there
+        replaces the previous O(corpus) scan of every Chroma metadata row. The
+        Chroma scan is retained only as an explicit fallback for a runtime whose
+        lexical index is absent (e.g. FTS5 unavailable), preserving the legacy
+        count basis.
+        """
+        if self.sqlite.lexical_counts_available():
+            return self.sqlite.get_lexical_source_counts(
+                limit=self.MAX_CORPUS_PAGE_LIMIT, offset=0,
+            )
+        return self.chroma.get_source_counts(
+            limit=self.MAX_CORPUS_PAGE_LIMIT, offset=0,
+        )
+
+    def _narrative_ticker_counts(self) -> list[dict]:
+        """Narrative ticker coverage from the SQLite lexical ledger, Chroma-fallback."""
+        if self.sqlite.lexical_counts_available():
+            return self.sqlite.get_lexical_ticker_counts(
+                limit=self.MAX_CORPUS_PAGE_LIMIT, offset=0,
+            )
+        return self.chroma.get_ticker_counts(
+            limit=self.MAX_CORPUS_PAGE_LIMIT, offset=0,
+        )
+
     def get_source_counts(self, *, limit: int = 100, offset: int = 0) -> list[dict]:
-        """Merge bounded SQLite and Chroma source counts without reading bodies."""
+        """Merge bounded structured and narrative source counts without reading bodies."""
         self._validate_corpus_page(limit, offset)
         counts: dict[str, int] = {}
-        for row in self.sqlite.get_source_counts(
+        structured = self.sqlite.get_source_counts(
             limit=self.MAX_CORPUS_PAGE_LIMIT, offset=0,
-        ):
-            source = str(row.get("source") or "")
-            if source:
-                counts[source] = counts.get(source, 0) + int(row.get("count") or 0)
-        for row in self.chroma.get_source_counts(
-            limit=self.MAX_CORPUS_PAGE_LIMIT, offset=0,
-        ):
+        )
+        for row in list(structured) + self._narrative_source_counts():
             source = str(row.get("source") or "")
             if source:
                 counts[source] = counts.get(source, 0) + int(row.get("count") or 0)
@@ -1532,28 +1559,28 @@ class Store:
         return rows[offset:offset + limit]
 
     def get_ticker_counts(self, *, limit: int = 100, offset: int = 0) -> list[dict]:
-        """Merge bounded SQLite and Chroma ticker coverage summaries."""
+        """Merge bounded structured and narrative ticker coverage summaries."""
         self._validate_corpus_page(limit, offset)
         grouped: dict[str, dict] = {}
-        for backend in (self.sqlite, self.chroma):
-            for row in backend.get_ticker_counts(
-                limit=self.MAX_CORPUS_PAGE_LIMIT, offset=0,
-            ):
-                ticker = str(row.get("ticker") or "").upper()
-                if not ticker:
-                    continue
-                item = grouped.setdefault(
-                    ticker,
-                    {"ticker": ticker, "record_count": 0, "sources": set(),
-                     "source_counts": {}, "company_name": None},
+        structured = self.sqlite.get_ticker_counts(
+            limit=self.MAX_CORPUS_PAGE_LIMIT, offset=0,
+        )
+        for row in list(structured) + self._narrative_ticker_counts():
+            ticker = str(row.get("ticker") or "").upper()
+            if not ticker:
+                continue
+            item = grouped.setdefault(
+                ticker,
+                {"ticker": ticker, "record_count": 0, "sources": set(),
+                 "source_counts": {}, "company_name": None},
+            )
+            item["record_count"] += int(row.get("record_count") or 0)
+            item["sources"].update(str(source) for source in row.get("sources", []))
+            item["company_name"] = item["company_name"] or row.get("company_name")
+            for source, count in (row.get("source_counts") or {}).items():
+                item["source_counts"][str(source)] = (
+                    item["source_counts"].get(str(source), 0) + int(count or 0)
                 )
-                item["record_count"] += int(row.get("record_count") or 0)
-                item["sources"].update(str(source) for source in row.get("sources", []))
-                item["company_name"] = item["company_name"] or row.get("company_name")
-                for source, count in (row.get("source_counts") or {}).items():
-                    item["source_counts"][str(source)] = (
-                        item["source_counts"].get(str(source), 0) + int(count or 0)
-                    )
         rows = []
         for ticker, item in sorted(grouped.items()):
             rows.append({
@@ -2230,6 +2257,7 @@ class Store:
         with self.sqlite._connect() as conn:
             conn.executescript("""
                 DROP TABLE IF EXISTS corpus_fts;
+                DROP TABLE IF EXISTS lexical_chunk_meta;
                 DROP TABLE IF EXISTS lexical_index_state;
                 DROP TABLE IF EXISTS bootstrap_partitions;
                 DROP TABLE IF EXISTS scheduler_run_sources;

@@ -608,6 +608,8 @@ class Retriever:
     def _retrieve_facts(self, ticker: Optional[str], metrics: list[str],
                         timeframe: Optional[str], limit: int) -> list[dict]:
         """Retrieve structured facts from SQLite."""
+        if limit <= 0:
+            return []
         if not ticker:
             return []
 
@@ -684,6 +686,8 @@ class Retriever:
 
     def _retrieve_macro_facts(self, limit: int = 15) -> list[dict]:
         """Retrieve macro-economic facts from FRED data in SQLite."""
+        if limit <= 0:
+            return []
         macro_metrics = [
             "GDP", "FEDFUNDS", "CPIAUCSL", "UNRATE",
             "DGS10", "T10Y2Y", "UMCSENT",
@@ -708,6 +712,8 @@ class Retriever:
 
     def _retrieve_all_facts(self, limit: int) -> list[dict]:
         """Retrieve facts across all tickers (broad search fallback)."""
+        if limit <= 0:
+            return []
         # Get the most recent facts from any ticker
         facts = []
         for ticker in self._get_all_tracked_tickers():

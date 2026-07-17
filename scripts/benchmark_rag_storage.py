@@ -444,6 +444,12 @@ def _build_corpus(store: Any, corpus: SyntheticCorpus, batch_size: int) -> dict[
             [row.text for row in batch],
             [row.metadata for row in batch],
         )
+    # Merge FTS5 segments after the bulk load, matching what the production
+    # rebuild path (scripts/rebuild_lexical_index.py) does so ranked lexical
+    # scans over common terms are measured against a compacted index.
+    optimize = getattr(store, "optimize_lexical_index", None)
+    if callable(optimize):
+        optimize()
     elapsed_s = max(time.perf_counter() - started, 1e-9)
     return {
         "chunks": len(corpus.chunks),

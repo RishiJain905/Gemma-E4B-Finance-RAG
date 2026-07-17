@@ -308,6 +308,101 @@ def test_corpus_inventory_rejects_invalid_pages(store: SQLiteStore):
         store.search_corpus_metrics(limit=1, offset=-1)
 
 
+# ── Narrow lexical inventory counts (2.3.7.6) ─────────────────────────────
+
+def _lexical_family(family_id: str, *, source: str, ticker: str,
+                    text: str = "narrative body text") -> dict:
+    return {
+        family_id: [{
+            "id": family_id,
+            "document": text,
+            "metadata": {
+                "document_family_id": family_id,
+                "source": source,
+                "source_name": source,
+                "ticker": ticker,
+                "tickers": ticker,
+                "indexing_status": "indexed",
+            },
+        }]
+    }
+
+
+def test_lexical_counts_group_source_and_ticker(store: SQLiteStore):
+    if not store.fts5_available():
+        pytest.skip("FTS5 unavailable")
+    store.replace_lexical_families(_lexical_family("f1", source="sec", ticker="NVDA"))
+    store.replace_lexical_families(_lexical_family("f2", source="sec", ticker="NVDA"))
+    store.replace_lexical_families(_lexical_family("f3", source="gdelt", ticker="AMD"))
+
+    src = store.get_lexical_source_counts(limit=100)
+    assert {row["source"]: row["count"] for row in src} == {"sec": 2, "gdelt": 1}
+    assert set(src[0]) == {"source", "count"}  # shape parity with the Chroma scan
+
+    tickers = {row["ticker"]: row for row in store.get_lexical_ticker_counts(limit=100)}
+    assert tickers["NVDA"]["record_count"] == 2
+    assert tickers["AMD"]["record_count"] == 1
+    assert set(tickers["NVDA"]) == {"ticker", "record_count", "sources", "company_name"}
+    assert tickers["NVDA"]["sources"] == ["sec"]
+
+
+def test_lexical_ticker_counts_split_multi_ticker(store: SQLiteStore):
+    if not store.fts5_available():
+        pytest.skip("FTS5 unavailable")
+    store.replace_lexical_families(_lexical_family("f1", source="sec", ticker="NVDA,AMD"))
+    tickers = {row["ticker"]: row["record_count"]
+               for row in store.get_lexical_ticker_counts(limit=100)}
+    assert tickers == {"NVDA": 1, "AMD": 1}
+
+
+def test_lexical_meta_stays_consistent_through_delete_and_replace(store: SQLiteStore):
+    if not store.fts5_available():
+        pytest.skip("FTS5 unavailable")
+    store.replace_lexical_families(_lexical_family("f1", source="sec", ticker="NVDA"))
+    store.replace_lexical_families(_lexical_family("f2", source="ir", ticker="AMD"))
+    # Replace f1 with a different source; delete f2 entirely.
+    store.replace_lexical_families(_lexical_family("f1", source="gdelt", ticker="NVDA"))
+    store.delete_lexical_families(["f2"])
+
+    src = {row["source"]: row["count"] for row in store.get_lexical_source_counts(limit=100)}
+    assert src == {"gdelt": 1}
+    with store._connect() as conn:
+        fts = conn.execute("SELECT COUNT(*) FROM corpus_fts").fetchone()[0]
+        meta = conn.execute("SELECT COUNT(*) FROM lexical_chunk_meta").fetchone()[0]
+        joined = conn.execute(
+            "SELECT COUNT(*) FROM corpus_fts f "
+            "LEFT JOIN lexical_chunk_meta m ON f.chunk_id=m.chunk_id "
+            "WHERE m.chunk_id IS NULL "
+            "OR IFNULL(m.source,'')<>IFNULL(f.source,'') "
+            "OR IFNULL(m.ticker,'')<>IFNULL(f.ticker,'')"
+        ).fetchone()[0]
+    assert fts == meta == 1
+    assert joined == 0  # narrow mirror matches the FTS index exactly
+
+
+def test_lexical_meta_cleared_on_full_rebuild(store: SQLiteStore):
+    if not store.fts5_available():
+        pytest.skip("FTS5 unavailable")
+    store.replace_lexical_families(_lexical_family("f1", source="sec", ticker="NVDA"))
+
+    def _page(offset: int, limit: int) -> list:
+        return []  # empty source corpus -> rebuild clears the index
+
+    store.rebuild_lexical_index(
+        _page, batch_size=10, target_revision=store.get_store_revision() + 1,
+        restart=True,
+    )
+    with store._connect() as conn:
+        meta = conn.execute("SELECT COUNT(*) FROM lexical_chunk_meta").fetchone()[0]
+    assert meta == 0
+    assert store.get_lexical_source_counts(limit=100) == []
+
+
+def test_lexical_counts_available_tracks_fts5(store: SQLiteStore):
+    # On an FTS5 runtime the narrow mirror exists and counts are served natively.
+    assert store.lexical_counts_available() == store.fts5_available()
+
+
 # ── Store Revision (2.2.6.2) ──────────────────────
 
 def test_store_revision_starts_at_zero(store: SQLiteStore):
