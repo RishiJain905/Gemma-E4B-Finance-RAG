@@ -139,8 +139,10 @@ class SECDailyIndexDiscovery:
     def discover_dates(self, index_dates: Iterable[str]) -> dict[str, object]:
         """Download and process explicit dates, isolating failures by index date."""
         result: dict[str, object] = {"downloaded": 0, "registered": 0, "failed": 0, "errors": []}
+        forbidden_dates: list[str] = []
+        succeeded_dates: list[str] = []
         for index_date in index_dates:
-            if self.store.get_sec_daily_index_status(index_date) == "processed":
+            if self.store.get_sec_daily_index_status(index_date) in ("processed", "absent"):
                 continue
             url = self.index_url(index_date)
             try:
@@ -153,9 +155,13 @@ class SECDailyIndexDiscovery:
                 result["downloaded"] = int(result["downloaded"]) + 1
                 processed = self.process_index(index_date, response.text, url)
                 result["registered"] = int(result["registered"]) + int(processed["registered"])
+                succeeded_dates.append(index_date)
                 if self.request_delay:
                     time.sleep(self.request_delay)
             except Exception as exc:  # noqa: BLE001 - index dates fail independently
+                status_code = getattr(getattr(exc, "response", None), "status_code", None)
+                if status_code == 403:
+                    forbidden_dates.append(index_date)
                 normalized = (
                     exc
                     if isinstance(exc, ProviderError)
@@ -182,6 +188,25 @@ class SECDailyIndexDiscovery:
                         "provider_wide": normalized.provider_wide,
                         "circuit_open": normalized.circuit_open,
                     })
+        # EDGAR never publishes a daily index for market holidays and its S3
+        # answers 403 for the missing key forever. A 403 date is provably
+        # absent — not rate limiting — only when a LATER date fetched fine in
+        # the same pass (the provider was reachable, yet that key still 403s).
+        # During a real block every date 403s, nothing is marked, and the
+        # normal retry/backoff path stays in charge.
+        if succeeded_dates:
+            newest_success = max(succeeded_dates)
+            absent = [d for d in forbidden_dates if d < newest_success]
+            for index_date in absent:
+                self.store.mark_sec_daily_index_absent(index_date, self.index_url(index_date))
+                logger.info("SEC daily index %s marked absent (holiday/unpublished)", index_date)
+            if absent:
+                result["absent"] = absent
+                result["failed"] = max(int(result["failed"]) - len(absent), 0)
+                if int(result["failed"]) == 0:
+                    for key in ("error_class", "retry_after", "reset_at",
+                                "provider_wide", "circuit_open"):
+                        result.pop(key, None)
         return result
 
     def discover(

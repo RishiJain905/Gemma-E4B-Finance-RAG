@@ -193,11 +193,14 @@ def test_limit_caps_groups(make_store, monkeypatch):
 
 # ── Live re-embed (opt-in) ─────────────────────────────────────────────
 
+@pytest.mark.live
 @pytest.mark.integration
 @pytest.mark.slow
 def test_live_rechunk_smoke():
     """Exercise the real migration against the live chroma corpus on :8087.
 
+    Marked ``live`` because it reaches the embedding endpoint and reads the real
+    ``data/chroma`` corpus; the default offline gate (``-m "not live"``) skips it.
     Skips unless the embedding endpoint is up; --limit 1 to keep it cheap.
     """
     import httpx

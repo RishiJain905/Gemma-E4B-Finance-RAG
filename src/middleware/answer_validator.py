@@ -235,7 +235,6 @@ class AnswerValidation:
             "citations_malformed": self.citations_malformed,
             "mismatch_counts": dict(self.mismatch_counts),
         }
-
     @classmethod
     def unavailable(cls) -> "AnswerValidation":
         """Fail-soft sentinel used when the validator itself errors."""
@@ -249,6 +248,10 @@ class AnswerValidation:
             claims=(),
             mismatch_counts={},
         )
+
+
+class DeterministicValidationError(ValueError):
+    """A typed deterministic answer did not resolve exactly to its evidence."""
 
 
 # ── Internal numeric view ─────────────────────────────────────────────────
@@ -636,6 +639,37 @@ def validate_answer(
             "validate", "completed",
             elapsed_ms=(perf_counter() - started_at) * 1000,
             reason=result.status,
+        )
+    return result
+
+
+def validate_deterministic_answer(
+    answer: str,
+    ledger,
+    *,
+    calculations: Optional[list[dict]] = None,
+) -> AnswerValidation:
+    """Validate a deterministic answer under the strict fast-path contract.
+
+    Unlike report/enforce model validation, any unresolved citation or numeric
+    claim rejects the skip and lets the caller fall back to normal generation.
+    """
+    result = validate_answer(
+        answer,
+        ledger,
+        calculations=calculations,
+        require_evidence_ids=True,
+    )
+    if (
+        result.status not in {"supported", "no_claims"}
+        or result.numeric_claims_unsupported
+        or result.numeric_claims_ambiguous
+        or result.citations_missing
+        or result.citations_malformed
+        or (result.numeric_claims_total and not result.citations_resolved)
+    ):
+        raise DeterministicValidationError(
+            "deterministic answer did not resolve exactly to supplied evidence"
         )
     return result
 

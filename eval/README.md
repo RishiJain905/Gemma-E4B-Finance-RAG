@@ -156,6 +156,33 @@ python eval/gate.py                       # adaptive_safety_checks + baseline ga
 `summary` JSONs and record the per-lane metrics + promotion-gate verdicts in
 `RESULTS.md`.
 
+### Phase 2.3.7.4 promotion arms
+
+Run each live arm from the same corpus/model baseline and change one capability
+group at a time. Select the runtime profile before starting the middleware, and
+label the resulting run explicitly with `--config-label`; the label is retained
+in every row and summary.
+
+```powershell
+# Baseline / rollback
+$env:MIDDLEWARE_PROFILE = "legacy"
+python eval/run_eval.py --config-label legacy
+python eval/score.py
+
+# Evaluation surface plus one measured promotion group
+$env:MIDDLEWARE_PROFILE = "evaluation"
+$env:ENABLE_ADAPTIVE_RAG = "1"
+$env:ENABLE_DETERMINISTIC_TOOL_ROUTING = "1"
+python eval/run_eval.py --config-label eval-deterministic-routing
+python eval/score.py
+python eval/gate.py
+```
+
+Do not enable the full candidate set in one arm. Record quality denominators,
+latency/TTFT, model calls, retrieval rounds, prompt tokens, memory, and failure
+behavior for each label. The structural profile work does not populate these
+results or assign measured dispositions.
+
 ### Citation provenance & numeric validation (2.2.4.3)
 
 When `answer_validation` is `report` or `enforce`, the middleware assigns a

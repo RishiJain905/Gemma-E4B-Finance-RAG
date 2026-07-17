@@ -83,6 +83,11 @@ def create_graph_router(
         nonlocal corpus_projector, corpus_store
         if not is_enabled() or get_store is None:
             raise HTTPException(status_code=404, detail="Graph observer disabled")
+        config = get_config() if get_config is not None else None
+        if config is not None and not bool(
+            getattr(config, "enable_phase2_3_corpus_projection", True)
+        ):
+            raise HTTPException(status_code=404, detail="Corpus projection disabled")
         current_store = get_store()
         if current_store is None:
             raise HTTPException(status_code=404, detail="Graph observer disabled")

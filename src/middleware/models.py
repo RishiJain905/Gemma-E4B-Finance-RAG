@@ -143,7 +143,30 @@ class EvidenceCitation(BaseModel):
 class QueryResponse(BaseModel):
     """Structured response from the middleware."""
 
-    answer: str = Field(..., description="Grounded answer from the model")
+    answer: str = Field(..., description="Grounded final answer")
+    answer_origin: Optional[Literal["deterministic", "model", "degraded"]] = Field(
+        None,
+        description=(
+            "Final-answer producer when the Phase 2.3.7.3 rollout is enabled."
+        ),
+    )
+    generation_skipped: Optional[bool] = Field(
+        None,
+        exclude_if=lambda value: value is None,
+        description="True only when a validated deterministic answer bypassed generation.",
+    )
+    generation_skip_reason: Optional[str] = Field(
+        None,
+        exclude_if=lambda value: value is None,
+        description="Stable reason code for a skipped final-generation call.",
+    )
+    coverage_metadata: Optional[dict] = Field(
+        None,
+        description=(
+            "Coverage answer metadata: Store revision, coverage basis, result "
+            "completeness, pagination cursor, and applied filters."
+        ),
+    )
     citations: list[SourceCitation] = Field(default_factory=list,
                                             description="Sources used in the answer")
     detected_ticker: Optional[str] = None

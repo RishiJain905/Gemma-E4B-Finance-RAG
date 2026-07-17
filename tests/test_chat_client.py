@@ -577,6 +577,22 @@ def test_successful_query_appends_user_and_assistant_turns():
     assert session.history[1]["context"]["grounding"] == "grounded"
 
 
+def test_coverage_inventory_metadata_is_preserved_for_followups():
+    data = _query_data("AMD and NVDA")
+    data["coverage_metadata"] = {
+        "complete": True,
+        "total_matching": 2,
+        "securities": ["AMD", "NVDA"],
+    }
+    session = _bare_session(RecordingClient(data))
+
+    session.query("Which semiconductor companies do you cover?", ticker=None, refresh=False)
+
+    assert session.history[1]["context"]["coverage_metadata"]["securities"] == [
+        "AMD", "NVDA"
+    ]
+
+
 def test_failed_or_cancelled_query_does_not_mutate_history():
     # 1. Transport error (request never accepted).
     class BoomClient:

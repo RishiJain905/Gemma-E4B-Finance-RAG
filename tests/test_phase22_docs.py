@@ -20,11 +20,16 @@ from pathlib import Path
 
 import yaml
 
-from src.middleware.config import MiddlewareConfig
+from src.middleware.config import (
+    MIDDLEWARE_ENV_OVERRIDES,
+    MIDDLEWARE_FEATURE_FLAGS,
+    MiddlewareConfig,
+)
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 PHASE22_DIR = REPO_ROOT / "docs" / "phase2.2"
 CONFIG_MD = REPO_ROOT / "docs" / "CONFIGURATION.md"
+PROFILE_DIR = REPO_ROOT / "configs" / "profiles"
 
 # A numbered task spec, e.g. "2.2.4.1-evidence-sufficiency-and-bounded-retry.md".
 _TASK_FILE_RE = re.compile(r"^2\.2\.\d+\.\d+-.*\.md$")
@@ -178,6 +183,43 @@ def test_middleware_yaml_doc_keys_are_real_attributes():
     assert not problems, (
         "middleware.yaml doc keys with no MiddlewareConfig attribute: "
         f"{problems}")
+
+
+def test_every_middleware_feature_flag_has_code_docs_env_and_profile_coverage():
+    """Keep the flag surface auditable across runtime, docs, and profiles."""
+    config = MiddlewareConfig(config_path=REPO_ROOT / "missing-middleware.yaml")
+    md = _config_md_text()
+    source_files = [
+        path for path in (REPO_ROOT / "src" / "middleware").rglob("*.py")
+        if path.name != "config.py"
+    ]
+    source_text = "\n".join(path.read_text(encoding="utf-8") for path in source_files)
+    test_text = "\n".join(
+        path.read_text(encoding="utf-8")
+        for path in (REPO_ROOT / "tests").rglob("*.py")
+    )
+
+    problems: list[str] = []
+    for flag in MIDDLEWARE_FEATURE_FLAGS:
+        if not hasattr(config, flag):
+            problems.append(f"{flag}: missing MiddlewareConfig attribute")
+        if flag not in source_text:
+            problems.append(f"{flag}: not read by middleware code")
+        env_name = MIDDLEWARE_ENV_OVERRIDES.get(flag)
+        if not env_name:
+            problems.append(f"{flag}: missing env override mapping")
+        elif not _documented(md, flag) or env_name not in md:
+            problems.append(f"{flag}: missing documented default/env pair")
+        if not any(
+            flag in yaml.safe_load(path.read_text(encoding="utf-8"))
+            for path in PROFILE_DIR.glob("*.yaml")
+        ):
+            problems.append(f"{flag}: not assigned to a profile")
+        if flag not in test_text:
+            problems.append(f"{flag}: not covered by an offline test")
+
+    assert set(MIDDLEWARE_ENV_OVERRIDES) >= set(MIDDLEWARE_FEATURE_FLAGS)
+    assert not problems, "middleware feature parity gaps:\n" + "\n".join(problems)
 
 
 # ── 4. New SEC config files: present in YAML AND documented ────────────

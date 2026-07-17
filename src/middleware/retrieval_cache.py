@@ -51,6 +51,7 @@ _FINGERPRINT_ATTRS = (
     "top_k_documents",
     "top_k_facts",
     "enable_lexical",
+    "lexical_backend",
     "rrf_k",
     "enable_reranker",
     "reranker_backend",
@@ -81,6 +82,22 @@ def _plain(value: Any) -> Any:
     return str(value)
 
 
+def _normalized_filters(value: Any) -> dict:
+    """Return one JSON-stable exact-filter mapping for cache identity."""
+    if not isinstance(value, dict):
+        return {}
+    normalized: dict[str, Any] = {}
+    for key in sorted(value):
+        item = value[key]
+        if isinstance(item, (list, tuple, set)):
+            normalized[str(key)] = sorted(str(entry) for entry in item)
+        elif isinstance(item, dict):
+            normalized[str(key)] = _normalized_filters(item)
+        else:
+            normalized[str(key)] = _plain(item)
+    return normalized
+
+
 # ── Cache key ─────────────────────────────────────────────
 
 
@@ -90,6 +107,7 @@ def build_cache_key(
     config: Any,
     lane: Any,
     revision: int,
+    corpus_revision: Optional[int] = None,
     available_metrics: Iterable[str] = (),
     as_of: Optional[str] = None,
 ) -> str:
@@ -116,6 +134,15 @@ def build_cache_key(
         ]
         for sq in getattr(plan, "subqueries", []) or []
     ]
+    normalized_filters = _normalized_filters(
+        getattr(plan, "evidence_filters", None)
+    )
+    if not normalized_filters:
+        normalized_filters = {
+            "securities": sorted(str(value) for value in getattr(plan, "tickers", []) or []),
+            "periods": sorted(str(value) for value in getattr(plan, "periods", []) or []),
+            "as_of": _plain(getattr(plan, "as_of", None)),
+        }
     key_obj = {
         "retrieval_query": getattr(plan, "retrieval_query", ""),
         "tickers": list(getattr(plan, "tickers", []) or []),
@@ -128,13 +155,20 @@ def build_cache_key(
         "top_k_documents": int(getattr(config, "top_k_documents", 5)),
         "top_k_facts": int(getattr(config, "top_k_facts", 10)),
         "enable_lexical": bool(getattr(config, "enable_lexical", True)),
+        "lexical_backend": str(getattr(config, "lexical_backend", "fts5")),
+        "retrieval_profile": str(getattr(config, "profile", None) or lane_value),
+        "normalized_filters": normalized_filters,
         "enable_reranker": bool(getattr(config, "enable_reranker", False)),
         "reranker_backend": str(getattr(config, "reranker_backend", "")),
         "adaptive_conditional_rerank": bool(
             getattr(config, "adaptive_conditional_rerank", True)),
         "rrf_k": int(getattr(config, "rrf_k", 60)),
+        "rerank_candidates": int(getattr(config, "rerank_candidates", 30)),
         "config_fingerprint": config_fingerprint(config),
         "revision": int(revision),
+        "corpus_revision": int(
+            revision if corpus_revision is None else corpus_revision
+        ),
         "as_of": as_of,
         "available_metrics": sorted(str(m) for m in (available_metrics or ())),
     }

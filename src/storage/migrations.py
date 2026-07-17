@@ -99,6 +99,16 @@ def _table_exists(conn: sqlite3.Connection, table: str) -> bool:
     ).fetchone() is not None
 
 
+def fts5_available(conn: sqlite3.Connection) -> bool:
+    """Probe FTS5 without leaving schema objects behind."""
+    try:
+        conn.execute("CREATE VIRTUAL TABLE temp.__fts5_probe USING fts5(value)")
+        conn.execute("DROP TABLE temp.__fts5_probe")
+        return True
+    except sqlite3.DatabaseError:
+        return False
+
+
 def _ensure_columns(conn: sqlite3.Connection, version: int) -> None:
     for table, column, definition in ADDITIVE_COLUMNS.get(version, ()):
         if not _table_exists(conn, table):
@@ -158,7 +168,13 @@ def apply_migrations(
         try:
             conn.execute("BEGIN IMMEDIATE")
             _ensure_columns(conn, migration.version)
+            supports_fts5 = fts5_available(conn)
             for statement in _statements(migration.sql):
+                if "USING fts5" in statement and not supports_fts5:
+                    logger.warning(
+                        "SQLite FTS5 is unavailable; lexical index will run degraded"
+                    )
+                    continue
                 conn.execute(statement)
             conn.execute(
                 "INSERT INTO schema_migrations (version, name, checksum) VALUES (?, ?, ?)",

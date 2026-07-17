@@ -305,6 +305,37 @@ class Store:
             embedding_cache_size=embedding_cache_size,
         )
 
+    def _prepare_lexical_chunks(self, document_id: str, text: str, **kwargs) -> list[dict]:
+        """Prepare stable chunks without embedding; tolerate simple test doubles."""
+        prepare = getattr(self.chroma, "prepare_document", None)
+        if callable(prepare):
+            try:
+                rows = prepare(document_id=document_id, text=text, **kwargs)
+                if isinstance(rows, list):
+                    return rows
+            except Exception:  # noqa: BLE001 - indexing write still owns failure handling
+                logger.debug("Chroma chunk preparation fallback used", exc_info=True)
+        metadata = dict(kwargs.get("metadata") or {})
+        if kwargs.get("ticker"):
+            metadata["ticker"] = str(kwargs["ticker"]).upper()
+        if kwargs.get("source"):
+            metadata["source"] = kwargs["source"]
+        if kwargs.get("date"):
+            metadata["date"] = kwargs["date"]
+        family_id = str(metadata.get("document_family_id") or document_id)
+        chunk_id = f"{family_id}#0" if kwargs.get("replace_family") else document_id
+        return [{"id": chunk_id, "document": text, "metadata": metadata}]
+
+    def _mark_chroma_revision(self, revision: int) -> None:
+        """Expose a generation only after its SQLite and Chroma writes succeeded."""
+        marker = getattr(self.chroma, "mark_corpus_revision", None)
+        if not callable(marker):
+            return
+        try:
+            marker(int(revision))
+        except Exception:  # noqa: BLE001 - mismatch safely disables lexical fusion
+            logger.warning("Failed to publish Chroma corpus revision", exc_info=True)
+
     # ── Health ─────────────────────────────────────────
 
     def heartbeat(self) -> dict:
@@ -327,6 +358,57 @@ class Store:
         return Phase23Backfill(self, batch_size=batch_size).run(
             max_batches=max_batches
         )
+
+    def rebuild_lexical_index(
+        self,
+        *,
+        batch_size: int = 100,
+        max_batches: Optional[int] = None,
+        restart: bool = False,
+    ) -> dict:
+        """Backfill persistent lexical rows from bounded Chroma pages."""
+        revision = self.retrieval_revision()
+
+        def _page(offset: int, limit: int) -> list[dict]:
+            pages = self.chroma.iter_document_batches(
+                batch_size=limit, offset=offset
+            )
+            return next(pages, [])
+
+        result = self.sqlite.rebuild_lexical_index(
+            _page,
+            batch_size=batch_size,
+            target_revision=revision,
+            max_batches=max_batches,
+            restart=restart,
+        )
+        if result.get("status") == "completed":
+            self._mark_chroma_revision(revision)
+        return result
+
+    def optimize_lexical_index(self) -> None:
+        """Merge FTS5 segments after a bulk narrative load (fail-soft, no-op sans FTS5)."""
+        self.sqlite.optimize_lexical_index()
+
+    def reconcile_lexical_index(
+        self,
+        *,
+        repair: bool = False,
+        batch_size: int = 100,
+    ) -> dict:
+        """Stream Chroma chunks and report/repair lexical drift."""
+        revision = self.retrieval_revision()
+
+        def _chunks():
+            for batch in self.chroma.iter_document_batches(batch_size=batch_size):
+                yield from batch
+
+        result = self.sqlite.reconcile_lexical_index(
+            _chunks(), repair=repair, revision=revision
+        )
+        if repair:
+            self._mark_chroma_revision(revision)
+        return result
 
     def _check_sqlite(self) -> bool:
         try:
@@ -353,6 +435,10 @@ class Store:
     def retrieval_revision(self) -> int:
         """Return the current monotonic data revision (0 when never bumped)."""
         return self.sqlite.get_store_revision()
+
+    def corpus_revision(self) -> int:
+        """Return the generation shared by persistent lexical rows and Chroma."""
+        return int(self.sqlite.get_lexical_index_state()["indexed_revision"])
 
     def bump_retrieval_revision(self, reason: str = "") -> int:
         """Advance the data revision and return the new value (documented helper)."""
@@ -494,6 +580,26 @@ class Store:
         """Return one canonical security by ticker or opaque id."""
         return self.sqlite.get_security(ticker_or_id)
 
+    def describe_coverage(
+        self,
+        operation: str = "summary",
+        *,
+        ticker: Optional[str] = None,
+        filters: Optional[dict] = None,
+        limit: Optional[int] = None,
+        cursor: Optional[str] = None,
+        ticker_only: bool = False,
+    ) -> dict:
+        """Return the bounded, read-only capability inventory projection."""
+        return self.sqlite.describe_coverage(
+            operation,
+            ticker=ticker,
+            filters=filters,
+            limit=limit,
+            cursor=cursor,
+            ticker_only=ticker_only,
+        )
+
     def resolve_security(
         self,
         symbol: str,
@@ -582,11 +688,6 @@ class Store:
             raise ValueError(
                 f"{record.item_type!r} is structured-only and cannot use narrative placement"
             )
-        result = self.sqlite.upsert_narrative_record(record)
-        if not result["needs_index"]:
-            return result
-
-        item_id = result["corpus_item_id"]
         security_ids = set(record.security_ids)
         tickers = set(record.tickers)
         index_memberships = set(record.index_codes)
@@ -606,8 +707,6 @@ class Store:
                 index_memberships.add(str(membership["index_code"]))
 
         chroma_metadata = {
-            "corpus_item_id": item_id,
-            "document_family_id": item_id,
             "source_category": record.source_category,
             "source_name": record.source_name,
             "item_type": record.item_type,
@@ -654,6 +753,35 @@ class Store:
                 value for value in (record.title, record.summary) if value
             )
 
+        def _lexical_chunks(item_id: str) -> list[dict]:
+            metadata = {
+                **chroma_metadata,
+                "corpus_item_id": item_id,
+                "document_family_id": item_id,
+                "title": record.title,
+            }
+            return self._prepare_lexical_chunks(
+                item_id,
+                narrative_text,
+                ticker=record.tickers[0] if record.tickers else None,
+                source=record.source_name,
+                date=record.published_at,
+                metadata=metadata,
+                replace_family=True,
+            )
+
+        result = self.sqlite.upsert_narrative_record(
+            record, lexical_chunks=_lexical_chunks
+        )
+        item_id = result["corpus_item_id"]
+        if not result["needs_index"]:
+            self._mark_chroma_revision(result["revision"])
+            return result
+        chroma_metadata.update({
+            "corpus_item_id": item_id,
+            "document_family_id": item_id,
+        })
+
         try:
             self.chroma.add_document(
                 document_id=item_id,
@@ -672,6 +800,7 @@ class Store:
             return result
 
         self.sqlite.set_corpus_index_status(item_id, "indexed")
+        self._mark_chroma_revision(result["revision"])
         result["indexing_status"] = "indexed"
         result["index_error"] = None
         return result
@@ -758,7 +887,12 @@ class Store:
             )
 
         try:
-            self._bump_revision("repair_corpus_item")
+            lexical_chunks = self._prepare_lexical_chunks(
+                item_id, text, ticker=tickers[0] if tickers else None,
+                source=str(item.get("source") or ""), date=item.get("published_at"),
+                metadata=metadata, replace_family=True,
+            )
+            revision = self.sqlite.replace_lexical_family(item_id, lexical_chunks)
             self.chroma.add_document(
                 document_id=item_id,
                 text=text,
@@ -779,6 +913,7 @@ class Store:
             }
 
         self.sqlite.set_corpus_index_status(item_id, "indexed")
+        self._mark_chroma_revision(revision)
         return {"corpus_item_id": item_id, "status": "completed"}
 
     def repair_filing_index(self, accession: str) -> dict:
@@ -924,6 +1059,8 @@ class Store:
             retired_at=retired_at,
             reason=f"company_news_older_than_{active_policy.company_news_months}_months",
         )
+        if result["expired"]:
+            self._mark_chroma_revision(self.retrieval_revision())
         if result["expired"] != len(expired_item_ids):
             result["failed"] += len(expired_item_ids) - result["expired"]
         return result
@@ -1231,7 +1368,12 @@ class Store:
         Returns:
             The document ID (confirmation of storage)
         """
-        self._bump_revision("save_document")
+        lexical_metadata = dict(metadata or {})
+        chunks = self._prepare_lexical_chunks(
+            document_id, text, ticker=ticker, source=source, date=date,
+            metadata=lexical_metadata,
+        )
+        revision = self.sqlite.replace_lexical_family(document_id, chunks)
         self.chroma.add_document(
             document_id=document_id,
             text=text,
@@ -1240,6 +1382,7 @@ class Store:
             date=date,
             metadata=metadata,
         )
+        self._mark_chroma_revision(revision)
         return document_id
 
     def save_documents_batch(self,
@@ -1247,14 +1390,20 @@ class Store:
                              texts: list[str],
                              metadatas: list[dict] = None):
         """Store multiple documents at once."""
-        self._bump_revision("save_documents_batch")
+        metadata_rows = metadatas or [{}] * len(ids)
+        families = {
+            str(document_id): [{
+                "id": str(document_id), "document": texts[index],
+                "metadata": dict(metadata_rows[index] or {}),
+            }]
+            for index, document_id in enumerate(ids)
+        }
+        revision = self.sqlite.replace_lexical_families(families)
         self.chroma.add_documents_batch(ids, texts, metadatas)
+        self._mark_chroma_revision(revision)
 
     def add_filing_sections(self, sections: list) -> dict[str, int]:
         """Replace and index SEC section families through Chroma's chunker."""
-        # Bump before any delete/add: a same-count section replacement changes
-        # the model-visible documents even though Chroma's count is unchanged.
-        self._bump_revision("add_filing_sections")
         counts = {
             "sections_written": 0,
             "chunks_written": 0,
@@ -1307,6 +1456,14 @@ class Store:
                 section_metadata["sectors"] = str(security["sector"])
             if security and security.get("industry"):
                 section_metadata["industries"] = str(security["industry"])
+            lexical_chunks = self._prepare_lexical_chunks(
+                section.document_id, section.text, ticker=section.ticker,
+                source="sec_filing", date=section.filing_date,
+                metadata=section_metadata, replace_family=True,
+            )
+            revision = self.sqlite.replace_lexical_family(
+                section.document_id, lexical_chunks
+            )
             self.chroma.add_document(
                 document_id=section.document_id,
                 text=section.text,
@@ -1316,6 +1473,7 @@ class Store:
                 metadata=section_metadata,
                 replace_family=True,
             )
+            self._mark_chroma_revision(revision)
             stored_count = self.chroma.count_filing_section_chunks(section.document_id)
             if not stored_count:
                 raise RuntimeError(f"No chunks stored for {section.document_id}")
@@ -1355,19 +1513,42 @@ class Store:
             raise ValueError(
                 f"offset must be between 0 and {cls.MAX_CORPUS_OFFSET}")
 
+    def _narrative_source_counts(self) -> list[dict]:
+        """Narrative source counts from the SQLite lexical ledger, Chroma-fallback.
+
+        The narrow ``lexical_chunk_meta`` table mirrors the count dimensions of
+        the persistent narrative lexical index, so an indexed ``GROUP BY`` there
+        replaces the previous O(corpus) scan of every Chroma metadata row. The
+        Chroma scan is retained only as an explicit fallback for a runtime whose
+        lexical index is absent (e.g. FTS5 unavailable), preserving the legacy
+        count basis.
+        """
+        if self.sqlite.lexical_counts_available():
+            return self.sqlite.get_lexical_source_counts(
+                limit=self.MAX_CORPUS_PAGE_LIMIT, offset=0,
+            )
+        return self.chroma.get_source_counts(
+            limit=self.MAX_CORPUS_PAGE_LIMIT, offset=0,
+        )
+
+    def _narrative_ticker_counts(self) -> list[dict]:
+        """Narrative ticker coverage from the SQLite lexical ledger, Chroma-fallback."""
+        if self.sqlite.lexical_counts_available():
+            return self.sqlite.get_lexical_ticker_counts(
+                limit=self.MAX_CORPUS_PAGE_LIMIT, offset=0,
+            )
+        return self.chroma.get_ticker_counts(
+            limit=self.MAX_CORPUS_PAGE_LIMIT, offset=0,
+        )
+
     def get_source_counts(self, *, limit: int = 100, offset: int = 0) -> list[dict]:
-        """Merge bounded SQLite and Chroma source counts without reading bodies."""
+        """Merge bounded structured and narrative source counts without reading bodies."""
         self._validate_corpus_page(limit, offset)
         counts: dict[str, int] = {}
-        for row in self.sqlite.get_source_counts(
+        structured = self.sqlite.get_source_counts(
             limit=self.MAX_CORPUS_PAGE_LIMIT, offset=0,
-        ):
-            source = str(row.get("source") or "")
-            if source:
-                counts[source] = counts.get(source, 0) + int(row.get("count") or 0)
-        for row in self.chroma.get_source_counts(
-            limit=self.MAX_CORPUS_PAGE_LIMIT, offset=0,
-        ):
+        )
+        for row in list(structured) + self._narrative_source_counts():
             source = str(row.get("source") or "")
             if source:
                 counts[source] = counts.get(source, 0) + int(row.get("count") or 0)
@@ -1378,28 +1559,28 @@ class Store:
         return rows[offset:offset + limit]
 
     def get_ticker_counts(self, *, limit: int = 100, offset: int = 0) -> list[dict]:
-        """Merge bounded SQLite and Chroma ticker coverage summaries."""
+        """Merge bounded structured and narrative ticker coverage summaries."""
         self._validate_corpus_page(limit, offset)
         grouped: dict[str, dict] = {}
-        for backend in (self.sqlite, self.chroma):
-            for row in backend.get_ticker_counts(
-                limit=self.MAX_CORPUS_PAGE_LIMIT, offset=0,
-            ):
-                ticker = str(row.get("ticker") or "").upper()
-                if not ticker:
-                    continue
-                item = grouped.setdefault(
-                    ticker,
-                    {"ticker": ticker, "record_count": 0, "sources": set(),
-                     "source_counts": {}, "company_name": None},
+        structured = self.sqlite.get_ticker_counts(
+            limit=self.MAX_CORPUS_PAGE_LIMIT, offset=0,
+        )
+        for row in list(structured) + self._narrative_ticker_counts():
+            ticker = str(row.get("ticker") or "").upper()
+            if not ticker:
+                continue
+            item = grouped.setdefault(
+                ticker,
+                {"ticker": ticker, "record_count": 0, "sources": set(),
+                 "source_counts": {}, "company_name": None},
+            )
+            item["record_count"] += int(row.get("record_count") or 0)
+            item["sources"].update(str(source) for source in row.get("sources", []))
+            item["company_name"] = item["company_name"] or row.get("company_name")
+            for source, count in (row.get("source_counts") or {}).items():
+                item["source_counts"][str(source)] = (
+                    item["source_counts"].get(str(source), 0) + int(count or 0)
                 )
-                item["record_count"] += int(row.get("record_count") or 0)
-                item["sources"].update(str(source) for source in row.get("sources", []))
-                item["company_name"] = item["company_name"] or row.get("company_name")
-                for source, count in (row.get("source_counts") or {}).items():
-                    item["source_counts"][str(source)] = (
-                        item["source_counts"].get(str(source), 0) + int(count or 0)
-                    )
         rows = []
         for ticker, item in sorted(grouped.items()):
             rows.append({
@@ -1580,8 +1761,9 @@ class Store:
     list_filing_section_families = get_filing_section_families
 
     def delete_filing_section_family(self, parent_id: str) -> None:
-        self._bump_revision("delete_filing_section_family")
+        revision = self.sqlite.delete_lexical_families([parent_id])
         self.chroma.delete_filing_section_family(parent_id)
+        self._mark_chroma_revision(revision)
 
     # ── Hybrid Search ─────────────────────────────────
 
@@ -1726,6 +1908,10 @@ class Store:
     def get_sec_daily_index_status(self, index_date: str) -> Optional[str]:
         """Return the processed status for one SEC daily index date."""
         return self.sqlite.get_sec_daily_index_status(index_date)
+
+    def mark_sec_daily_index_absent(self, index_date: str, source_url: str) -> None:
+        """Record a daily-index date EDGAR will never publish (market holiday)."""
+        self.sqlite.mark_sec_daily_index_absent(index_date, source_url)
 
     def get_sec_daily_index_cursor(self) -> Optional[str]:
         """Return the latest fully committed SEC daily-index date."""
@@ -2074,6 +2260,9 @@ class Store:
         # For SQLite, just drop and recreate tables
         with self.sqlite._connect() as conn:
             conn.executescript("""
+                DROP TABLE IF EXISTS corpus_fts;
+                DROP TABLE IF EXISTS lexical_chunk_meta;
+                DROP TABLE IF EXISTS lexical_index_state;
                 DROP TABLE IF EXISTS bootstrap_partitions;
                 DROP TABLE IF EXISTS scheduler_run_sources;
                 DROP TABLE IF EXISTS scheduler_runs;

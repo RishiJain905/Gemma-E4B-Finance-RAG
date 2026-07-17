@@ -3,8 +3,12 @@ src/storage/sqlite_store.py
 SQLite storage layer for structured financial data.
 """
 
+import base64
+import binascii
+import hashlib
 import json
 import logging
+import os
 import sqlite3
 import uuid
 from datetime import datetime, timezone
@@ -18,7 +22,7 @@ from src.ingestion.normalization import (
     syndicated_news_key,
 )
 from src.ingestion.records import EventRecord, NarrativeRecord, ObservationRecord
-from src.storage.migrations import apply_migrations
+from src.storage.migrations import apply_migrations, fts5_available
 
 logger = logging.getLogger(__name__)
 
@@ -29,6 +33,35 @@ class SQLiteStore:
     MAX_INVENTORY_LIMIT = 200
     MAX_INVENTORY_OFFSET = 10_000
     MAX_MAINTENANCE_LIMIT = 10_000
+    MAX_COVERAGE_LIMIT = 200
+    MAX_COVERAGE_TICKER_LIMIT = 1_000
+    MAX_COVERAGE_OFFSET = 10_000
+    MAX_LEXICAL_RESULTS = 200
+    MAX_LEXICAL_TERMS = 32
+    MAX_RECONCILIATION_SAMPLES = 100
+
+    _COVERAGE_OPERATIONS = frozenset({
+        "summary",
+        "list_securities",
+        "contains_security",
+        "security_sources",
+        "list_sources",
+        "list_item_types",
+        "list_metrics",
+    })
+    _COVERAGE_CANONICAL_TABLES = frozenset({
+        "securities",
+        "security_memberships",
+        "corpus_items",
+        "corpus_item_securities",
+        "corpus_observations",
+        "observation_securities",
+        "corpus_events",
+        "event_securities",
+    })
+    _COVERAGE_POLICY_PATH = (
+        Path(__file__).parent.parent.parent / "configs" / "coverage.yaml"
+    )
 
     SCHEMA_SQL = Path(__file__).parent.parent.parent / "docs/phase1.2/schema.sql"
     DEFAULT_DB_PATH = Path(__file__).parent.parent.parent / "data/finance.db"
@@ -63,6 +96,33 @@ class SQLiteStore:
                 conn.executescript(sql)
                 conn.commit()
             apply_migrations(conn)
+            self._backfill_lexical_meta(conn)
+            self._configure_lexical_rank(conn)
+
+    @classmethod
+    def _backfill_lexical_meta(cls, conn: sqlite3.Connection) -> None:
+        """One-time populate the narrow inventory mirror for a pre-existing index.
+
+        The narrow ``lexical_chunk_meta`` table is maintained transactionally for
+        every new lexical write, but a database that already held a populated
+        ``corpus_fts`` before this migration starts with an empty mirror. Seed it
+        once from the FTS index so inventory counts are correct immediately
+        without a full lexical rebuild. A no-op on a fresh or FTS5-less database.
+        """
+        if not (
+            cls._lexical_meta_table_exists(conn)
+            and cls._lexical_table_exists(conn)
+        ):
+            return
+        if conn.execute("SELECT 1 FROM lexical_chunk_meta LIMIT 1").fetchone():
+            return
+        if not conn.execute("SELECT 1 FROM corpus_fts LIMIT 1").fetchone():
+            return
+        conn.execute(
+            "INSERT OR IGNORE INTO lexical_chunk_meta (chunk_id, source, ticker) "
+            "SELECT chunk_id, source, ticker FROM corpus_fts"
+        )
+        conn.commit()
 
     @staticmethod
     def _inline_schema() -> str:
@@ -845,6 +905,19 @@ CREATE INDEX IF NOT EXISTS idx_securities_industry ON securities(industry);
             ).fetchone()
         return str(row[0]) if row else None
 
+    def mark_sec_daily_index_absent(self, index_date: str, source_url: str) -> None:
+        """Record a date whose daily index EDGAR will never publish.
+
+        Market holidays have no master.idx; EDGAR's S3 answers 403 for the
+        missing key forever, which must not be retried as a rate limit.
+        """
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT OR IGNORE INTO sec_daily_indexes "
+                "(index_date, source_url, status, registered_count) VALUES (?, ?, 'absent', 0)",
+                (index_date, source_url),
+            )
+
     def get_sec_daily_index_cursor(self) -> Optional[str]:
         """Return the latest completely registered SEC daily-index date."""
         with self._connect() as conn:
@@ -1359,6 +1432,457 @@ CREATE INDEX IF NOT EXISTS idx_securities_industry ON securities(industry);
         logger.debug("Store revision bumped to %d (%s)", revision, reason or "")
         return revision
 
+    # -- Persistent lexical index (2.3.7.5) ---------------------------------
+
+    @staticmethod
+    def _lexical_table_exists(conn: sqlite3.Connection) -> bool:
+        return conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='corpus_fts'"
+        ).fetchone() is not None
+
+    def fts5_available(self) -> bool:
+        """Return whether this runtime supports FTS5 and the index was created."""
+        with self._connect() as conn:
+            return fts5_available(conn) and self._lexical_table_exists(conn)
+
+    # Weighted bm25 pinned on the FTS5 ``rank`` auxiliary so ``ORDER BY rank``
+    # keeps title=3.0/body=1.0 weighting while using FTS5's internal top-k path.
+    LEXICAL_RANK_CONFIG = "bm25(3.0, 1.0)"
+
+    @classmethod
+    def _configure_lexical_rank(cls, conn: sqlite3.Connection) -> None:
+        """Pin the FTS5 rank auxiliary to the weighted bm25 search uses.
+
+        With this persistent config, ``SELECT ... ORDER BY rank`` applies the
+        same (3.0, 1.0) weights the previous ``bm25()`` function expression did,
+        but takes FTS5's internal top-k rank optimization instead of scoring and
+        sorting every matched row. Idempotent; a no-op without FTS5.
+        """
+        if not (fts5_available(conn) and cls._lexical_table_exists(conn)):
+            return
+        try:
+            conn.execute(
+                "INSERT INTO corpus_fts(corpus_fts, rank) VALUES('rank', ?)",
+                (cls.LEXICAL_RANK_CONFIG,),
+            )
+            conn.commit()
+        except sqlite3.DatabaseError:
+            logger.warning("Could not configure FTS5 rank weights", exc_info=True)
+
+    def optimize_lexical_index(self) -> None:
+        """Merge FTS5 segments after a bulk build so scored scans stay fast.
+
+        A freshly bulk-loaded FTS5 index is spread across many segments; the
+        ``'optimize'`` command merges them into one so ``MATCH`` doclist walks
+        (and therefore ranked scans over common terms) touch fewer b-tree
+        segments. A no-op without FTS5.
+        """
+        with self._connect() as conn:
+            if not (fts5_available(conn) and self._lexical_table_exists(conn)):
+                return
+            try:
+                conn.execute("INSERT INTO corpus_fts(corpus_fts) VALUES('optimize')")
+                conn.commit()
+            except sqlite3.DatabaseError:
+                logger.warning("FTS5 optimize failed", exc_info=True)
+
+    def get_lexical_index_state(self) -> dict:
+        """Return the singleton persistent index state without raising."""
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT schema_version, indexed_revision, indexed_at, row_count, "
+                "rebuild_cursor, rebuild_revision FROM lexical_index_state WHERE id=1"
+            ).fetchone()
+        if row is None:
+            return {
+                "schema_version": 1, "indexed_revision": 0, "indexed_at": None,
+                "row_count": 0, "rebuild_cursor": 0, "rebuild_revision": 0,
+            }
+        return dict(row)
+
+    @staticmethod
+    def _lexical_row(chunk: dict, family_id: Optional[str] = None) -> tuple[str, ...]:
+        metadata = dict(chunk.get("metadata") or {})
+        chunk_id = str(chunk.get("id") or metadata.get("child_chunk_id") or "").strip()
+        if not chunk_id:
+            raise ValueError("lexical chunk id is required")
+        resolved_family = str(
+            family_id
+            or metadata.get("document_family_id")
+            or metadata.get("parent_id")
+            or metadata.get("corpus_item_id")
+            or chunk_id.split("#", 1)[0]
+        )
+        tickers = metadata.get("tickers") or metadata.get("ticker") or ""
+        if isinstance(tickers, (list, tuple, set)):
+            tickers = ",".join(sorted(str(value).upper() for value in tickers if value))
+        else:
+            tickers = ",".join(
+                value.strip().upper() for value in str(tickers).split(",") if value.strip()
+            )
+        return (
+            str(metadata.get("title") or metadata.get("section_heading") or ""),
+            str(chunk.get("document") or chunk.get("text") or ""),
+            str(tickers),
+            str(metadata.get("source_category") or ""),
+            str(metadata.get("item_type") or ""),
+            chunk_id,
+            resolved_family,
+            str(metadata.get("source_name") or metadata.get("source") or ""),
+            str(metadata.get("event_type") or ""),
+            str(metadata.get("form") or ""),
+            str(metadata.get("item") or metadata.get("filing_item") or ""),
+            str(metadata.get("authority_tier") or metadata.get("evidence_authority") or ""),
+            str(metadata.get("indexing_status") or "indexed"),
+            str(metadata.get("published_at") or metadata.get("date") or ""),
+            str(metadata.get("effective_at") or ""),
+            str(metadata.get("as_of_at") or ""),
+        )
+
+    @staticmethod
+    def _insert_lexical_row(conn: sqlite3.Connection, row: tuple[str, ...]) -> None:
+        conn.execute(
+            "INSERT INTO corpus_fts (title, body, ticker, source_category, item_type, "
+            "chunk_id, family_id, source, event_type, form, item, authority_tier, "
+            "indexing_status, published_at, effective_at, as_of_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            row,
+        )
+        # Mirror only the count dimensions into the narrow inventory table so
+        # source/ticker counts never scan the FTS body. row[5]=chunk_id,
+        # row[7]=source, row[2]=ticker (see :meth:`_lexical_row`).
+        conn.execute(
+            "INSERT OR REPLACE INTO lexical_chunk_meta (chunk_id, source, ticker) "
+            "VALUES (?,?,?)",
+            (row[5], row[7], row[2]),
+        )
+
+    @staticmethod
+    def _delete_lexical_chunk(conn: sqlite3.Connection, chunk_id: str) -> None:
+        """Delete one chunk from the FTS index and its narrow inventory mirror."""
+        conn.execute("DELETE FROM corpus_fts WHERE chunk_id=?", (chunk_id,))
+        conn.execute("DELETE FROM lexical_chunk_meta WHERE chunk_id=?", (chunk_id,))
+
+    @classmethod
+    def _replace_lexical_families_conn(
+        cls,
+        conn: sqlite3.Connection,
+        families: dict[str, list[dict]],
+    ) -> bool:
+        changed = False
+        for family_id, chunks in families.items():
+            expected_rows = {
+                row[5]: row for row in (
+                    cls._lexical_row(chunk, str(family_id)) for chunk in chunks
+                )
+            }
+            current_rows = conn.execute(
+                "SELECT rowid, title, body, ticker, source_category, item_type, chunk_id, "
+                "family_id, source, event_type, form, item, authority_tier, indexing_status, "
+                "published_at, effective_at, as_of_at FROM corpus_fts WHERE family_id=?",
+                (str(family_id),),
+            ).fetchall()
+            current_by_id: dict[str, list[sqlite3.Row]] = {}
+            for current in current_rows:
+                current_by_id.setdefault(str(current[6]), []).append(current)
+
+            for chunk_id, rows in current_by_id.items():
+                expected = expected_rows.get(chunk_id)
+                values = tuple(str(value or "") for value in rows[0][1:])
+                if len(rows) == 1 and expected is not None and values == expected:
+                    continue
+                cls._delete_lexical_chunk(conn, chunk_id)
+                changed = True
+                if expected is not None:
+                    cls._insert_lexical_row(conn, expected)
+            for chunk_id, expected in expected_rows.items():
+                if chunk_id not in current_by_id:
+                    cls._insert_lexical_row(conn, expected)
+                    changed = True
+        return changed
+
+    @staticmethod
+    def _update_lexical_state(
+        conn: sqlite3.Connection,
+        revision: int,
+        *,
+        indexed: bool = True,
+    ) -> None:
+        row_count = int(conn.execute("SELECT COUNT(*) FROM corpus_fts").fetchone()[0])
+        if indexed:
+            conn.execute(
+                "UPDATE lexical_index_state SET indexed_revision=?, indexed_at=datetime('now'), "
+                "row_count=?, rebuild_cursor=0, rebuild_revision=0 WHERE id=1",
+                (int(revision), row_count),
+            )
+        else:
+            conn.execute(
+                "UPDATE lexical_index_state SET row_count=? WHERE id=1", (row_count,)
+            )
+
+    def replace_lexical_families(
+        self,
+        families: dict[str, list[dict]],
+        *,
+        revision: Optional[int] = None,
+    ) -> int:
+        """Apply stable-id family deltas and state in one SQLite transaction."""
+        with self._connect() as conn:
+            if revision is None:
+                revision = self._bump_revision_in_transaction(conn)
+            if self._lexical_table_exists(conn):
+                self._replace_lexical_families_conn(conn, families)
+                current = int(conn.execute(
+                    "SELECT revision FROM store_revision WHERE id=1"
+                ).fetchone()[0])
+                self._update_lexical_state(conn, revision, indexed=current == revision)
+            conn.commit()
+        return int(revision)
+
+    def replace_lexical_family(
+        self,
+        family_id: str,
+        chunks: list[dict],
+        *,
+        revision: Optional[int] = None,
+    ) -> int:
+        return self.replace_lexical_families(
+            {str(family_id): list(chunks)}, revision=revision
+        )
+
+    def delete_lexical_families(
+        self,
+        family_ids: list[str],
+        *,
+        revision: Optional[int] = None,
+    ) -> int:
+        families = {str(value): [] for value in dict.fromkeys(family_ids) if value}
+        return self.replace_lexical_families(families, revision=revision)
+
+    def search_lexical(
+        self,
+        match_query: str,
+        *,
+        limit: int,
+        revision: int,
+        where: Optional[dict] = None,
+        filters: Optional[dict] = None,
+    ) -> list[dict]:
+        """Run one parameterized, hard-bounded FTS5 BM25 query."""
+        if limit < 1 or limit > self.MAX_LEXICAL_RESULTS:
+            raise ValueError(f"limit must be between 1 and {self.MAX_LEXICAL_RESULTS}")
+        predicates = ["corpus_fts MATCH ?", "indexing_status='indexed'"]
+        params: list[object] = [match_query]
+        merged = dict(filters or {})
+        merged.update(where or {})
+        ticker = merged.get("security") or merged.get("ticker")
+        if ticker:
+            predicates.append("(',' || ticker || ',') LIKE ('%,' || ? || ',%')")
+            params.append(str(ticker).upper())
+        for facet, column in (
+            ("source_category", "source_category"),
+            ("source", "source"),
+            ("item_type", "item_type"),
+            ("event_type", "event_type"),
+            ("form", "form"),
+            ("item", "item"),
+            ("authority_tier", "authority_tier"),
+            ("indexing_status", "indexing_status"),
+        ):
+            value = merged.get(facet)
+            if value not in (None, ""):
+                predicates.append(f"{column}=?")
+                params.append(str(value))
+        for prefix, column in (
+            ("published", "published_at"),
+            ("effective", "effective_at"),
+            ("as_of", "as_of_at"),
+        ):
+            if merged.get(f"{prefix}_from"):
+                predicates.append(f"{column}>=?")
+                params.append(str(merged[f"{prefix}_from"]))
+            if merged.get(f"{prefix}_to"):
+                predicates.append(f"{column}<=?")
+                params.append(str(merged[f"{prefix}_to"]))
+        params.append(limit)
+        with self._connect() as conn:
+            state = conn.execute(
+                "SELECT indexed_revision FROM lexical_index_state WHERE id=1"
+            ).fetchone()
+            if state is None or int(state[0]) != int(revision):
+                return []
+            # Order by the FTS5 built-in ``rank`` auxiliary (configured to the
+            # weighted bm25(3.0, 1.0) via LEXICAL_RANK_CONFIG) rather than the
+            # bm25() function expression, and without a secondary sort key. Both
+            # the function expression and any tiebreaker defeat FTS5's internal
+            # top-k rank optimization, forcing a full score+sort over every
+            # matched row; the built-in ``rank`` path scores the same weights
+            # ~33% faster at 100k. Ties resolve by the stable internal rowid.
+            rows = conn.execute(
+                "SELECT chunk_id, rank "
+                "FROM corpus_fts WHERE " + " AND ".join(predicates)
+                + " ORDER BY rank LIMIT ?",
+                params,
+            ).fetchall()
+        return [
+            {"chunk_id": str(row[0]), "score": float(-row[1])}
+            for row in rows
+        ]
+
+    def rebuild_lexical_index(
+        self,
+        page_reader,
+        *,
+        batch_size: int,
+        target_revision: int,
+        max_batches: Optional[int] = None,
+        restart: bool = False,
+    ) -> dict:
+        """Backfill FTS in committed batches and persist a resumable cursor."""
+        if batch_size < 1 or batch_size > self.MAX_MAINTENANCE_LIMIT:
+            raise ValueError("invalid lexical rebuild batch_size")
+        state = self.get_lexical_index_state()
+        if (
+            not restart
+            and state["indexed_revision"] == int(target_revision)
+            and state["rebuild_cursor"] == 0
+        ):
+            return {"status": "completed", "processed": 0, "cursor": 0,
+                    "row_count": state["row_count"]}
+        if restart or state["rebuild_revision"] != int(target_revision):
+            with self._connect() as conn:
+                if not self._lexical_table_exists(conn):
+                    return {"status": "degraded", "processed": 0, "cursor": 0}
+                conn.execute("DELETE FROM corpus_fts")
+                conn.execute("DELETE FROM lexical_chunk_meta")
+                conn.execute(
+                    "UPDATE lexical_index_state SET indexed_revision=0, indexed_at=NULL, "
+                    "row_count=0, rebuild_cursor=0, rebuild_revision=? WHERE id=1",
+                    (int(target_revision),),
+                )
+                conn.commit()
+            cursor = 0
+        else:
+            cursor = int(state["rebuild_cursor"])
+
+        processed = 0
+        batches = 0
+        while max_batches is None or batches < max_batches:
+            rows = list(page_reader(cursor, batch_size) or [])
+            if not rows:
+                with self._connect() as conn:
+                    self._update_lexical_state(conn, target_revision)
+                    conn.commit()
+                self.optimize_lexical_index()
+                return {"status": "completed", "processed": processed,
+                        "cursor": 0, "row_count": self.get_lexical_index_state()["row_count"]}
+            with self._connect() as conn:
+                for chunk in rows:
+                    lexical_row = self._lexical_row(chunk)
+                    self._delete_lexical_chunk(conn, lexical_row[5])
+                    self._insert_lexical_row(conn, lexical_row)
+                cursor += len(rows)
+                conn.execute(
+                    "UPDATE lexical_index_state SET rebuild_cursor=?, row_count=(SELECT COUNT(*) "
+                    "FROM corpus_fts) WHERE id=1", (cursor,),
+                )
+                conn.commit()
+            processed += len(rows)
+            batches += 1
+            if len(rows) < batch_size:
+                with self._connect() as conn:
+                    self._update_lexical_state(conn, target_revision)
+                    conn.commit()
+                self.optimize_lexical_index()
+                return {"status": "completed", "processed": processed,
+                        "cursor": 0, "row_count": self.get_lexical_index_state()["row_count"]}
+        return {"status": "in_progress", "processed": processed, "cursor": cursor}
+
+    @staticmethod
+    def _lexical_digest(row: tuple[str, ...]) -> str:
+        payload = json.dumps(row, ensure_ascii=False, separators=(",", ":"))
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+    def reconcile_lexical_index(
+        self,
+        chunks,
+        *,
+        repair: bool,
+        revision: int,
+    ) -> dict:
+        """Stream expected chunks and report/repair identity/content drift."""
+        issues = {name: [] for name in ("missing", "duplicate", "stale", "orphan")}
+        counts = {name: 0 for name in issues}
+        with self._connect() as conn:
+            conn.execute(
+                "CREATE TEMP TABLE lexical_expected (chunk_id TEXT PRIMARY KEY)"
+            )
+            # ``chunk_id`` is an UNINDEXED FTS5 column, so a per-chunk
+            # ``WHERE chunk_id=?`` lookup scans the whole index — O(N) per chunk,
+            # O(N^2) over the stream. Snapshot the current index once, keyed by
+            # chunk_id, so each comparison is an O(1) dict read. Semantics are
+            # identical: each row is reduced to the digest of the same normalized
+            # string tuple the loop compared, so equality (stale) and multiplicity
+            # (duplicate) are preserved while memory stays bounded. Repairs below
+            # only mutate chunk_ids the loop has already read (each streamed
+            # chunk_id is visited once), so the pre-loop snapshot stays valid.
+            current_by_chunk: dict[str, list[str]] = {}
+            for row in conn.execute(
+                "SELECT title, body, ticker, source_category, item_type, chunk_id, "
+                "family_id, source, event_type, form, item, authority_tier, "
+                "indexing_status, published_at, effective_at, as_of_at FROM corpus_fts"
+            ):
+                normalized = tuple(str(value or "") for value in row)
+                current_by_chunk.setdefault(str(row[5]), []).append(
+                    self._lexical_digest(normalized)
+                )
+            for chunk in chunks:
+                expected = self._lexical_row(chunk)
+                chunk_id = expected[5]
+                conn.execute(
+                    "INSERT OR REPLACE INTO lexical_expected (chunk_id) VALUES (?)", (chunk_id,)
+                )
+                current = current_by_chunk.get(chunk_id, [])
+                if not current:
+                    categories = ["missing"]
+                else:
+                    categories = []
+                    if len(current) > 1:
+                        categories.append("duplicate")
+                    if current[0] != self._lexical_digest(expected):
+                        categories.append("stale")
+                for category in categories:
+                    counts[category] += 1
+                    if len(issues[category]) < self.MAX_RECONCILIATION_SAMPLES:
+                        issues[category].append(chunk_id)
+                if repair and categories:
+                    self._delete_lexical_chunk(conn, chunk_id)
+                    self._insert_lexical_row(conn, expected)
+
+            counts["orphan"] = int(conn.execute(
+                "SELECT COUNT(DISTINCT chunk_id) FROM corpus_fts WHERE chunk_id NOT IN "
+                "(SELECT chunk_id FROM lexical_expected)"
+            ).fetchone()[0])
+            orphan_samples = conn.execute(
+                "SELECT DISTINCT chunk_id FROM corpus_fts WHERE chunk_id NOT IN "
+                "(SELECT chunk_id FROM lexical_expected) ORDER BY chunk_id LIMIT ?",
+                (self.MAX_RECONCILIATION_SAMPLES,),
+            ).fetchall()
+            issues["orphan"] = [str(row[0]) for row in orphan_samples]
+            if repair and counts["orphan"]:
+                conn.execute(
+                    "DELETE FROM corpus_fts WHERE chunk_id NOT IN "
+                    "(SELECT chunk_id FROM lexical_expected)"
+                )
+                conn.execute(
+                    "DELETE FROM lexical_chunk_meta WHERE chunk_id NOT IN "
+                    "(SELECT chunk_id FROM lexical_expected)"
+                )
+            if repair:
+                self._update_lexical_state(conn, revision)
+            conn.commit()
+        return {"counts": counts, "samples": issues, "repaired": bool(repair)}
+
     # -- Normalized corpus records (2.3.3.1) ---------------------------------
 
     @staticmethod
@@ -1452,8 +1976,13 @@ CREATE INDEX IF NOT EXISTS idx_securities_industry ON securities(industry);
                 return row, layer
         return None, None
 
-    def upsert_narrative_record(self, record: NarrativeRecord) -> dict:
-        """Atomically upsert narrative metadata, provenance, and security links."""
+    def upsert_narrative_record(
+        self,
+        record: NarrativeRecord,
+        *,
+        lexical_chunks=None,
+    ) -> dict:
+        """Atomically upsert narrative metadata, provenance, and lexical chunks."""
         canonical_url = normalize_canonical_url(record.canonical_url)
         headline = normalize_headline(record.title)
         news_key = (
@@ -1599,12 +2128,23 @@ CREATE INDEX IF NOT EXISTS idx_securities_industry ON securities(industry);
                     "(corpus_item_id, security_id, ticker) VALUES (?, ?, ?)",
                     (item_id, security_id, ticker),
                 )
+            needs_index = initial_status != "not_applicable" and (
+                created or content_changed or authority_promoted
+                or previous_status in {"pending", "error"}
+            )
             revision = self._bump_revision_in_transaction(conn)
+            if self._lexical_table_exists(conn):
+                if needs_index and lexical_chunks is not None:
+                    chunks = (
+                        lexical_chunks(item_id)
+                        if callable(lexical_chunks)
+                        else lexical_chunks
+                    )
+                    self._replace_lexical_families_conn(
+                        conn, {item_id: list(chunks)}
+                    )
+                self._update_lexical_state(conn, revision)
             conn.commit()
-        needs_index = initial_status != "not_applicable" and (
-            created or content_changed or authority_promoted
-            or previous_status in {"pending", "error"}
-        )
         return {
             "corpus_item_id": item_id,
             "created": created,
@@ -1629,6 +2169,11 @@ CREATE INDEX IF NOT EXISTS idx_securities_industry ON securities(industry);
                 "updated_at=datetime('now') WHERE corpus_item_id=?",
                 (status, error[:2_000] if error else None, corpus_item_id),
             )
+            if self._lexical_table_exists(conn):
+                conn.execute(
+                    "UPDATE corpus_fts SET indexing_status=? WHERE family_id=?",
+                    (status, corpus_item_id),
+                )
             conn.commit()
 
     def get_corpus_item(self, corpus_item_id: str) -> Optional[dict]:
@@ -1826,6 +2371,12 @@ CREATE INDEX IF NOT EXISTS idx_securities_industry ON securities(industry);
             raise ValueError("too many corpus items for one retention run")
         placeholders = ",".join("?" for _ in item_ids)
         with self._connect() as conn:
+            eligible = conn.execute(
+                f"SELECT corpus_item_id, document_family_id FROM corpus_items "
+                f"WHERE corpus_item_id IN ({placeholders}) AND item_type='news' "
+                f"AND is_tombstone=0 AND indexing_status='indexed'",
+                item_ids,
+            ).fetchall()
             cursor = conn.execute(
                 f"UPDATE corpus_items SET is_tombstone=1, narrative_bytes=0, "
                 f"indexing_status='not_applicable', index_error=NULL, retired_at=?, "
@@ -1836,7 +2387,14 @@ CREATE INDEX IF NOT EXISTS idx_securities_industry ON securities(industry);
             )
             changed = int(cursor.rowcount)
             if changed:
-                self._bump_revision_in_transaction(conn)
+                revision = self._bump_revision_in_transaction(conn)
+                if self._lexical_table_exists(conn):
+                    families = {
+                        str(row["document_family_id"] or row["corpus_item_id"]): []
+                        for row in eligible
+                    }
+                    self._replace_lexical_families_conn(conn, families)
+                    self._update_lexical_state(conn, revision)
             conn.commit()
         return changed
 
@@ -3672,6 +4230,832 @@ CREATE INDEX IF NOT EXISTS idx_securities_industry ON securities(industry);
                 ).fetchall()
             return [row["ticker"] for row in rows]
 
+    # -- Capability inventory (2.3.7.1) -------------------------------------
+
+    @classmethod
+    def _validate_coverage_page(
+        cls, limit: Optional[int], *, ticker_only: bool = False,
+    ) -> int:
+        """Validate a bounded coverage page and return its effective limit."""
+        maximum = cls.MAX_COVERAGE_TICKER_LIMIT if ticker_only else cls.MAX_COVERAGE_LIMIT
+        if limit is None:
+            return maximum if ticker_only else 100
+        if not isinstance(limit, int) or isinstance(limit, bool):
+            raise ValueError("limit must be an integer")
+        if not 1 <= limit <= maximum:
+            raise ValueError(f"limit must be between 1 and {maximum}")
+        return limit
+
+    @classmethod
+    def _coverage_cursor_offset(cls, cursor: Optional[str], revision: int) -> int:
+        """Decode one opaque, revision-bound coverage cursor."""
+        if not cursor:
+            return 0
+        try:
+            padding = "=" * (-len(cursor) % 4)
+            payload = json.loads(base64.urlsafe_b64decode(
+                (str(cursor) + padding).encode("ascii")
+            ).decode("utf-8"))
+            if payload.get("version") != 1 or int(payload.get("revision")) != revision:
+                raise ValueError
+            offset = int(payload.get("offset"))
+        except (TypeError, ValueError, KeyError, json.JSONDecodeError,
+                UnicodeDecodeError, binascii.Error) as exc:
+            raise ValueError("invalid or expired coverage cursor") from exc
+        if not 0 <= offset <= cls.MAX_COVERAGE_OFFSET:
+            raise ValueError("invalid coverage cursor offset")
+        return offset
+
+    @staticmethod
+    def _coverage_cursor(offset: int, revision: int) -> str:
+        payload = json.dumps(
+            {"version": 1, "offset": int(offset), "revision": int(revision)},
+            separators=(",", ":"),
+        ).encode("utf-8")
+        return base64.urlsafe_b64encode(payload).decode("ascii").rstrip("=")
+
+    @staticmethod
+    def _coverage_filter_values(value: object) -> set[str]:
+        if value is None:
+            return set()
+        values = value if isinstance(value, (list, tuple, set)) else [value]
+        return {str(item).strip() for item in values if str(item).strip()}
+
+    @staticmethod
+    def _coverage_date(value: object, field: str) -> Optional[str]:
+        if value in (None, ""):
+            return None
+        try:
+            return SQLiteStore._validate_as_of(str(value))
+        except ValueError as exc:
+            raise ValueError(f"{field} must be an ISO date in YYYY-MM-DD format") from exc
+
+    def _coverage_policy(self) -> dict:
+        """Load non-secret tier policy used to explain canonical memberships."""
+        cached = getattr(self, "_coverage_policy_cache", None)
+        if cached is not None:
+            return cached
+        policy: dict = {}
+        try:
+            import yaml
+
+            with self._COVERAGE_POLICY_PATH.open(encoding="utf-8") as handle:
+                loaded = yaml.safe_load(handle) or {}
+            if isinstance(loaded, dict):
+                policy = loaded
+        except (OSError, TypeError, ValueError):
+            logger.warning("Could not load coverage policy for inventory", exc_info=True)
+        self._coverage_policy_cache = policy
+        return policy
+
+    def _coverage_tiers(
+        self,
+        security: dict,
+        memberships: list[dict],
+        *,
+        as_of: Optional[str] = None,
+    ) -> list[str]:
+        """Project policy scopes without turning provider capability into evidence."""
+        del as_of  # The caller supplies memberships already evaluated at the date.
+        ticker = self._normalize_universe_symbol(security.get("ticker"))
+        policy = self._coverage_policy()
+        tiers: set[str] = set()
+        if memberships:
+            tiers.add("broad")
+        broad_additions = {
+            self._normalize_universe_symbol(value)
+            for value in ((policy.get("broad") or {}).get("additions") or [])
+        }
+        deep_tickers = {
+            self._normalize_universe_symbol(value)
+            for value in ((policy.get("deep") or {}).get("tickers") or [])
+        }
+        if ticker in broad_additions:
+            tiers.add("broad")
+        if ticker in deep_tickers:
+            tiers.add("deep")
+
+        sector = str(security.get("sector") or "").strip().casefold()
+        rules = ((policy.get("sector") or {}).get("rules") or {})
+        if any(
+            sector == str(value).strip().casefold()
+            for values in rules.values()
+            if isinstance(values, list)
+            for value in values
+        ):
+            tiers.add("sector")
+        return [tier for tier in ("broad", "deep", "sector") if tier in tiers]
+
+    @classmethod
+    def _coverage_tables_exist(cls, conn: sqlite3.Connection) -> bool:
+        rows = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        ).fetchall()
+        return cls._COVERAGE_CANONICAL_TABLES <= {str(row[0]) for row in rows}
+
+    @staticmethod
+    def _coverage_membership_active(row: dict, as_of: Optional[str]) -> bool:
+        if as_of is None:
+            return bool(row.get("active"))
+        effective_from = str(row.get("effective_from") or "")
+        effective_to = str(row.get("effective_to") or "")
+        return bool(
+            effective_from <= as_of
+            and (not effective_to or effective_to >= as_of)
+        )
+
+    @staticmethod
+    def _coverage_evidence_matches(row: dict, filters: dict) -> bool:
+        for key in ("source", "source_category", "item_type"):
+            values = SQLiteStore._coverage_filter_values(filters.get(key))
+            if values and str(row.get(key) or "") not in values:
+                return False
+        for key, comparison in (("date_from", "gte"), ("date_to", "lte")):
+            value = filters.get(key)
+            if not value:
+                continue
+            occurred = str(row.get("occurred_at") or "")
+            if not occurred:
+                return False
+            if comparison == "gte" and occurred[:10] < str(value):
+                return False
+            if comparison == "lte" and occurred[:10] > str(value):
+                return False
+        return True
+
+    @staticmethod
+    def _coverage_envelope(
+        *, basis: str, revision: int, filters: dict,
+        universe_snapshot_at: Optional[str] = None,
+    ) -> dict:
+        return {
+            "status": "ok",
+            "coverage_basis": basis,
+            "total_securities": 0,
+            "active_securities": 0,
+            "coverage_tiers": {"broad": 0, "deep": 0, "sector": 0},
+            "securities": [],
+            "source_categories": [],
+            "sources": [],
+            "item_types": [],
+            "item_type_details": [],
+            "metrics": [],
+            "metric_details": [],
+            "filters_applied": dict(filters),
+            "result_count": 0,
+            "total_matching": 0,
+            "complete": True,
+            "next_cursor": None,
+            "data_revision": int(revision),
+            "universe_snapshot_at": universe_snapshot_at,
+        }
+
+    @staticmethod
+    def _coverage_page(
+        result: dict, key: str, values: list, *, limit: int,
+        offset: int, revision: int,
+    ) -> dict:
+        total = len(values)
+        page = values[offset:offset + limit]
+        complete = offset + len(page) >= total
+        result[key] = page
+        result["result_count"] = len(page)
+        result["total_matching"] = total
+        result["complete"] = complete
+        result["next_cursor"] = (
+            SQLiteStore._coverage_cursor(offset + len(page), revision)
+            if not complete else None
+        )
+        return result
+
+    def _canonical_evidence(self, conn: sqlite3.Connection) -> list[dict]:
+        """Return distinct linked evidence facets, never narrative bodies."""
+        sql = """
+            SELECT DISTINCT security_id, source, source_category, item_type,
+                            occurred_at
+            FROM (
+                SELECT cis.security_id, ci.source, ci.source_category, ci.item_type,
+                       COALESCE(ci.published_at, ci.effective_at, ci.as_of_at,
+                                ci.ingested_at) AS occurred_at
+                FROM corpus_items ci
+                JOIN corpus_item_securities cis
+                  ON cis.corpus_item_id = ci.corpus_item_id
+                UNION ALL
+                SELECT os.security_id, co.source_name, co.source_category,
+                       'observation', COALESCE(co.published_at, co.as_of_at,
+                                              co.period_end, co.ingested_at)
+                FROM corpus_observations co
+                JOIN observation_securities os
+                  ON os.observation_id = co.observation_id
+                UNION ALL
+                SELECT es.security_id, ce.source_name, ce.source_category,
+                       'event', COALESCE(ce.published_at, ce.effective_at,
+                                         ce.announced_at, ce.ingested_at)
+                FROM corpus_events ce
+                JOIN event_securities es ON es.event_id = ce.event_id
+            )
+            ORDER BY security_id, source, item_type, occurred_at
+        """
+        return [dict(row) for row in conn.execute(sql).fetchall()]
+
+    def _legacy_evidence(self, conn: sqlite3.Connection) -> list[dict]:
+        """Project old tables into an explicitly partial evidence inventory."""
+        sql = """
+            SELECT UPPER(REPLACE(ticker, '.', '-')) AS ticker,
+                   source_type AS source, 'legacy' AS source_category,
+                   'fundamental' AS item_type, ingested_at AS occurred_at,
+                   metric AS metric
+            FROM fundamentals
+            WHERE ticker IS NOT NULL AND ticker <> ''
+            UNION ALL
+            SELECT UPPER(REPLACE(ticker, '.', '-')), 'sec_companyfacts',
+                   'legacy', 'observation', ingested_at, concept
+            FROM sec_companyfacts
+            WHERE ticker IS NOT NULL AND ticker <> ''
+            UNION ALL
+            SELECT UPPER(REPLACE(ticker, '.', '-')), 'sec_filings',
+                   'sec_filing', 'sec_filing', filing_date, NULL
+            FROM filings
+            WHERE ticker IS NOT NULL AND ticker <> ''
+            UNION ALL
+            SELECT UPPER(REPLACE(ticker, '.', '-')), source, 'legacy',
+                   'freshness', last_updated, NULL
+            FROM cache_meta
+            WHERE ticker IS NOT NULL AND ticker <> '' AND ticker <> 'SCHEDULER'
+            ORDER BY ticker, source, item_type, occurred_at
+        """
+        return [dict(row) for row in conn.execute(sql).fetchall()]
+
+    def _canonical_security_inventory(
+        self, conn: sqlite3.Connection, filters: dict,
+    ) -> tuple[list[dict], list[dict], Optional[str]]:
+        rows = [dict(row) for row in conn.execute(
+            "SELECT * FROM securities ORDER BY ticker, security_id"
+        ).fetchall()]
+        as_of = filters.get("as_of")
+        memberships_by_security: dict[str, list[dict]] = {}
+        for row in conn.execute(
+            "SELECT * FROM security_memberships ORDER BY security_id, index_code"
+        ).fetchall():
+            membership = dict(row)
+            if self._coverage_membership_active(membership, as_of):
+                memberships_by_security.setdefault(str(row["security_id"]), []).append(membership)
+        evidence = self._canonical_evidence(conn)
+        evidence_by_security: dict[str, list[dict]] = {}
+        for row in evidence:
+            evidence_by_security.setdefault(str(row["security_id"]), []).append(row)
+
+        requested_ticker = self._normalize_universe_symbol(filters.get("ticker"))
+        requested_index = str(filters.get("index") or "").strip()
+        requested_sector = str(filters.get("sector") or "").strip().casefold()
+        requested_industry = str(filters.get("industry") or "").strip().casefold()
+        active_filter = filters.get("active", True)
+        if active_filter is not None and not isinstance(active_filter, bool):
+            active_filter = str(active_filter).strip().lower() in {"1", "true", "yes"}
+        matching: list[dict] = []
+        for security in rows:
+            security_id = str(security["security_id"])
+            memberships = memberships_by_security.get(security_id, [])
+            security_evidence = evidence_by_security.get(security_id, [])
+            if active_filter is not None and bool(security.get("active")) != active_filter:
+                continue
+            if as_of:
+                first_seen = str(security.get("first_seen_at") or "")[:10]
+                last_seen = str(security.get("last_seen_at") or "")[:10]
+                if first_seen and first_seen > as_of:
+                    continue
+                if last_seen and last_seen < as_of:
+                    continue
+            if requested_ticker and self._normalize_universe_symbol(security.get("ticker")) != requested_ticker:
+                continue
+            if requested_index and requested_index not in {m.get("index_code") for m in memberships}:
+                continue
+            if requested_sector and str(security.get("sector") or "").casefold() != requested_sector:
+                continue
+            if requested_industry and str(security.get("industry") or "").casefold() != requested_industry:
+                continue
+            tiers = self._coverage_tiers(security, memberships, as_of=as_of)
+            requested_tiers = self._coverage_filter_values(filters.get("coverage_tier"))
+            if requested_tiers and not requested_tiers.intersection(tiers):
+                continue
+            evidence_filters = any(
+                filters.get(key) not in (None, "", [], ())
+                for key in ("source", "source_category", "item_type", "date_from", "date_to")
+            )
+            if evidence_filters and not any(
+                self._coverage_evidence_matches(row, filters)
+                for row in security_evidence
+            ):
+                continue
+            matching.append({
+                "security_id": security_id,
+                "ticker": security.get("ticker"),
+                "name": security.get("company_name"),
+                "company_name": security.get("company_name"),
+                "active": bool(security.get("active")),
+                "active_memberships": sorted({
+                    str(row.get("index_code")) for row in memberships
+                    if row.get("index_code")
+                }),
+                "coverage_tier": tiers,
+                "sector": security.get("sector"),
+                "industry": security.get("industry"),
+                "evidence_count": len(security_evidence),
+            })
+        snapshot = conn.execute(
+            "SELECT MAX(observed_at) FROM security_memberships"
+        ).fetchone()[0]
+        if snapshot is None:
+            snapshot = conn.execute(
+                "SELECT MAX(updated_at) FROM securities"
+            ).fetchone()[0]
+        return matching, evidence, str(snapshot) if snapshot else None
+
+    def _legacy_security_inventory(
+        self, conn: sqlite3.Connection, filters: dict,
+    ) -> tuple[list[dict], list[dict], Optional[str]]:
+        tickers = [str(row[0]) for row in conn.execute(
+            """
+            SELECT ticker FROM fundamentals
+            UNION SELECT ticker FROM sec_companyfacts
+            UNION SELECT ticker FROM filings
+            UNION SELECT ticker FROM cache_meta WHERE ticker <> 'SCHEDULER'
+            ORDER BY ticker
+            """
+        ).fetchall()]
+        evidence = self._legacy_evidence(conn)
+        evidence_by_ticker: dict[str, list[dict]] = {}
+        for row in evidence:
+            evidence_by_ticker.setdefault(str(row["ticker"]), []).append(row)
+        requested_ticker = self._normalize_universe_symbol(filters.get("ticker"))
+        requested_tiers = self._coverage_filter_values(filters.get("coverage_tier"))
+        matching: list[dict] = []
+        deep_tickers = {
+            self._normalize_universe_symbol(value)
+            for value in ((self._coverage_policy().get("deep") or {}).get("tickers") or [])
+        }
+        for raw_ticker in tickers:
+            ticker = self._normalize_universe_symbol(raw_ticker)
+            if requested_ticker and ticker != requested_ticker:
+                continue
+            security_evidence = evidence_by_ticker.get(ticker, [])
+            if any(filters.get(key) not in (None, "", [], ())
+                   for key in ("index", "sector", "industry")):
+                continue
+            tiers = ["deep"] if ticker in deep_tickers else []
+            if requested_tiers and not requested_tiers.intersection(tiers):
+                continue
+            evidence_filters = any(
+                filters.get(key) not in (None, "", [], ())
+                for key in ("source", "source_category", "item_type", "date_from", "date_to")
+            )
+            if evidence_filters and not any(
+                self._coverage_evidence_matches(row, filters)
+                for row in security_evidence
+            ):
+                continue
+            matching.append({
+                "security_id": f"legacy:{ticker}",
+                "ticker": ticker,
+                "name": ticker,
+                "company_name": ticker,
+                "active": True,
+                "active_memberships": [],
+                "coverage_tier": tiers,
+                "sector": None,
+                "industry": None,
+                "evidence_count": len(security_evidence),
+            })
+        snapshot = max(
+            (str(row.get("occurred_at")) for row in evidence if row.get("occurred_at")),
+            default=None,
+        )
+        return matching, evidence, snapshot
+
+    def _coverage_source_catalog(
+        self, conn: sqlite3.Connection, evidence: list[dict],
+    ) -> list[dict]:
+        """Merge configured source capability with persisted terminal state."""
+        specs: dict = {}
+        try:
+            from src.scheduler.source_registry import SourceRegistry
+
+            registry = SourceRegistry.load(environ=os.environ)
+            specs = registry.sources
+        except Exception:  # noqa: BLE001 - inventory remains useful without config
+            logger.warning("Could not load source registry for coverage", exc_info=True)
+        policy_sources = (self._coverage_policy().get("sources") or {})
+        states: dict[str, dict] = {}
+        try:
+            for row in conn.execute(
+                "SELECT source, status, updated_at FROM source_cursors "
+                "ORDER BY updated_at DESC, source"
+            ).fetchall():
+                states.setdefault(str(row["source"]), {
+                    "last_terminal_status": row["status"],
+                    "last_terminal_at": row["updated_at"],
+                })
+            for row in conn.execute(
+                "SELECT source, status, last_updated FROM cache_meta "
+                "WHERE ticker <> 'SCHEDULER' ORDER BY last_updated DESC"
+            ).fetchall():
+                source = str(row["source"])
+                states.setdefault(source, {
+                    "last_terminal_status": row["status"],
+                    "last_terminal_at": row["last_updated"],
+                })
+        except sqlite3.Error:
+            logger.warning("Could not read source terminal state", exc_info=True)
+
+        evidence_by_source: dict[str, dict] = {}
+        for row in evidence:
+            source = str(row.get("source") or "")
+            if not source:
+                continue
+            item = evidence_by_source.setdefault(source, {
+                "evidence_count": 0, "item_types": set(), "source_category": None,
+            })
+            item["evidence_count"] += 1
+            if row.get("item_type"):
+                item["item_types"].add(str(row["item_type"]))
+            item["source_category"] = item["source_category"] or row.get("source_category")
+
+        names = sorted(set(specs) | set(policy_sources) | set(evidence_by_source))
+        result: list[dict] = []
+        for name in names:
+            spec = specs.get(name)
+            policy = policy_sources.get(name) or {}
+            state = states.get(name, {})
+            configured = bool(spec or name in policy_sources)
+            enabled = bool(spec.enabled) if spec else bool(policy.get("enabled", False))
+            available = bool(spec.is_available) if spec else False
+            category = (
+                evidence_by_source.get(name, {}).get("source_category")
+                or (spec.capability_group if spec else None)
+                or name
+            )
+            evidence_count = int(
+                evidence_by_source.get(name, {}).get("evidence_count", 0)
+            )
+            capability = {
+                "configured": configured,
+                "enabled": enabled,
+                "available": available,
+                "scope": spec.scope if spec else (policy.get("scopes") or []),
+                "capabilities": sorted({
+                    str(value) for value in (policy.get("capabilities") or [])
+                }),
+                "last_terminal_status": state.get("last_terminal_status"),
+                "last_terminal_at": state.get("last_terminal_at"),
+            }
+            result.append({
+                "source": name,
+                "source_category": category,
+                "configured": configured,
+                "enabled": enabled,
+                "available": available,
+                "scope": spec.scope if spec else (policy.get("scopes") or []),
+                "capabilities": capability["capabilities"],
+                "last_terminal_status": state.get("last_terminal_status"),
+                "last_terminal_at": state.get("last_terminal_at"),
+                "evidence_count": evidence_count,
+                "has_evidence": evidence_count > 0,
+                "item_types": sorted(evidence_by_source.get(name, {}).get("item_types", set())),
+                "capability": capability,
+            })
+        return result
+
+    def _coverage_metric_details(
+        self, conn: sqlite3.Connection, filters: dict,
+    ) -> list[dict]:
+        rows: list[dict] = []
+        canonical = self._coverage_tables_exist(conn)
+        ticker = self._normalize_universe_symbol(filters.get("ticker"))
+        security_ids: set[str] = set()
+        if ticker and canonical:
+            security_ids = {
+                str(row[0]) for row in conn.execute(
+                    "SELECT security_id FROM securities WHERE normalized_ticker=?",
+                    (ticker,),
+                ).fetchall()
+            }
+        if canonical:
+            metric_sql = """
+                SELECT co.metric_id AS metric, co.source_name AS source,
+                       co.source_category, co.ingested_at AS occurred_at,
+                       os.security_id, s.ticker
+                FROM corpus_observations co
+                LEFT JOIN observation_securities os
+                  ON os.observation_id = co.observation_id
+                LEFT JOIN securities s ON s.security_id = os.security_id
+                UNION ALL
+                SELECT f.metric, f.source_type AS source,
+                       'legacy' AS source_category, f.ingested_at,
+                       f.security_id, f.ticker
+                FROM fundamentals f
+                UNION ALL
+                SELECT cf.concept AS metric, 'sec_companyfacts' AS source,
+                       'legacy' AS source_category, cf.ingested_at,
+                       cf.security_id, cf.ticker
+                FROM sec_companyfacts cf
+            """
+        else:
+            metric_sql = """
+                SELECT metric, source_type AS source, 'legacy' AS source_category,
+                       ingested_at AS occurred_at, security_id, ticker
+                FROM fundamentals
+                UNION ALL
+                SELECT concept AS metric, 'sec_companyfacts' AS source,
+                       'legacy' AS source_category, ingested_at AS occurred_at,
+                       security_id, ticker
+                FROM sec_companyfacts
+            """
+        for row in conn.execute(metric_sql).fetchall():
+            item = dict(row)
+            if ticker:
+                if canonical:
+                    if security_ids:
+                        in_registry = item.get("security_id") in security_ids
+                        in_legacy_row = (
+                            self._normalize_universe_symbol(item.get("ticker")) == ticker
+                        )
+                        if not in_registry and not in_legacy_row:
+                            continue
+                    elif self._normalize_universe_symbol(item.get("ticker")) != ticker:
+                        continue
+                elif self._normalize_universe_symbol(item.get("ticker")) != ticker:
+                    continue
+            if not self._coverage_evidence_matches(item, filters):
+                continue
+            rows.append(item)
+        grouped: dict[tuple[str, str], dict] = {}
+        for row in rows:
+            metric = str(row.get("metric") or "").strip()
+            source = str(row.get("source") or "").strip()
+            if not metric:
+                continue
+            key = (metric, source)
+            item = grouped.setdefault(key, {
+                "metric": metric,
+                "source": source,
+                "source_category": row.get("source_category"),
+                "observation_count": 0,
+                "tickers": set(),
+            })
+            item["observation_count"] += 1
+            if row.get("ticker"):
+                item["tickers"].add(
+                    self._normalize_universe_symbol(row.get("ticker"))
+                )
+        for item in grouped.values():
+            item["tickers"] = sorted(item["tickers"])
+        return sorted(grouped.values(), key=lambda row: (row["metric"], row["source"]))
+
+    def describe_coverage(
+        self,
+        operation: str = "summary",
+        *,
+        ticker: Optional[str] = None,
+        filters: Optional[dict] = None,
+        limit: Optional[int] = None,
+        cursor: Optional[str] = None,
+        ticker_only: bool = False,
+    ) -> dict:
+        """Return the bounded, read-only Phase 2.3.7.1 coverage projection."""
+        operation = str(operation or "summary").strip().lower()
+        if operation not in self._COVERAGE_OPERATIONS:
+            raise ValueError(f"unsupported coverage operation: {operation}")
+        clean_filters = dict(filters or {})
+        if ticker:
+            clean_filters["ticker"] = self._normalize_universe_symbol(ticker)
+        if ticker_only:
+            clean_filters["ticker_only"] = True
+        for key in ("as_of", "date_from", "date_to"):
+            if clean_filters.get(key):
+                clean_filters[key] = self._coverage_date(clean_filters[key], key)
+        revision = self.get_store_revision()
+        page_limit = self._validate_coverage_page(limit, ticker_only=ticker_only)
+        offset = self._coverage_cursor_offset(cursor, revision)
+
+        try:
+            with self._connect() as conn:
+                canonical = self._coverage_tables_exist(conn)
+                basis = "canonical" if canonical else "legacy_partial"
+                result = self._coverage_envelope(
+                    basis=basis, revision=revision, filters=clean_filters,
+                )
+                inventory_filters = clean_filters
+                if operation in {"contains_security", "security_sources"}:
+                    inventory_filters = dict(clean_filters)
+                    inventory_filters.pop("ticker", None)
+                if canonical:
+                    securities, evidence, snapshot = self._canonical_security_inventory(
+                        conn, inventory_filters,
+                    )
+                else:
+                    securities, evidence, snapshot = self._legacy_security_inventory(
+                        conn, inventory_filters,
+                    )
+                evidence_scope = evidence
+                requested_ticker = clean_filters.get("ticker")
+                if requested_ticker and operation not in {
+                    "contains_security", "security_sources",
+                }:
+                    security_ids = {
+                        str(row.get("security_id")) for row in securities
+                        if row.get("security_id")
+                    }
+                    evidence_scope = [
+                        row for row in evidence
+                        if (
+                            str(row.get("security_id")) in security_ids
+                            or self._normalize_universe_symbol(row.get("ticker"))
+                            == requested_ticker
+                        )
+                    ]
+                result["universe_snapshot_at"] = snapshot
+                if canonical:
+                    all_rows = [dict(row) for row in conn.execute(
+                        "SELECT * FROM securities"
+                    ).fetchall()]
+                    result["total_securities"] = len(all_rows)
+                    result["active_securities"] = sum(bool(row.get("active")) for row in all_rows)
+                    tier_counts = {"broad": 0, "deep": 0, "sector": 0}
+                    for row in all_rows:
+                        memberships = [dict(item) for item in conn.execute(
+                            "SELECT * FROM security_memberships WHERE security_id=? AND active=1",
+                            (row["security_id"],),
+                        ).fetchall()]
+                        for tier in self._coverage_tiers(row, memberships):
+                            tier_counts[tier] += 1
+                    result["coverage_tiers"] = tier_counts
+                else:
+                    result["total_securities"] = len({row["ticker"] for row in securities})
+                    result["active_securities"] = result["total_securities"]
+                    result["coverage_tiers"] = {
+                        "broad": 0,
+                        "deep": sum("deep" in row["coverage_tier"] for row in securities),
+                        "sector": 0,
+                    }
+
+                if operation == "summary":
+                    source_rows = self._coverage_source_catalog(conn, evidence_scope)
+                    item_counts: dict[str, int] = {}
+                    for row in evidence_scope:
+                        if not self._coverage_evidence_matches(row, clean_filters):
+                            continue
+                        item_type = str(row.get("item_type") or "")
+                        if item_type:
+                            item_counts[item_type] = item_counts.get(item_type, 0) + 1
+                    metric_details = self._coverage_metric_details(conn, clean_filters)
+                    result["source_categories"] = source_rows
+                    result["sources"] = source_rows
+                    result["item_types"] = sorted(item_counts)
+                    result["item_type_details"] = [
+                        {"item_type": key, "evidence_count": count}
+                        for key, count in sorted(item_counts.items())
+                    ]
+                    result["metrics"] = sorted({row["metric"] for row in metric_details})
+                    result["metric_details"] = metric_details
+                    result["result_count"] = result["active_securities"]
+                    result["total_matching"] = result["active_securities"]
+                    return result
+
+                if operation == "list_securities":
+                    return self._coverage_page(
+                        result, "securities", securities,
+                        limit=page_limit, offset=offset, revision=revision,
+                    )
+
+                if operation == "contains_security":
+                    requested = clean_filters.get("ticker")
+                    found = next(
+                        (row for row in securities if row["ticker"] == requested), None
+                    )
+                    if found:
+                        result["covered"] = True
+                        result["security"] = found
+                    else:
+                        result["covered"] = False
+                        result["security"] = None
+                        prefix = str(requested or "")[:4]
+                        result["suggestions"] = [
+                            row["ticker"] for row in securities
+                            if prefix and row["ticker"].startswith(prefix)
+                        ][:5]
+                    result["result_count"] = 1 if found else 0
+                    result["total_matching"] = result["result_count"]
+                    return result
+
+                if operation == "security_sources":
+                    requested = clean_filters.get("ticker")
+                    found = next(
+                        (row for row in securities if row["ticker"] == requested), None
+                    )
+                    if not found:
+                        result["covered"] = False
+                        result["security"] = None
+                        result["sources"] = []
+                        result["result_count"] = 0
+                        result["total_matching"] = 0
+                        result["suggestions"] = [
+                            row["ticker"] for row in securities
+                            if str(requested or "")[:4]
+                            and row["ticker"].startswith(str(requested)[:4])
+                        ][:5]
+                        return result
+                    security_id = found["security_id"]
+                    security_evidence = [
+                        row for row in evidence
+                        if (row.get("security_id") == security_id
+                            or row.get("ticker") == requested)
+                    ]
+                    source_rows = self._coverage_source_catalog(conn, security_evidence)
+                    result["covered"] = True
+                    result["security"] = found
+                    result["sources"] = source_rows
+                    result["source_categories"] = source_rows
+                    result["item_types"] = sorted({
+                        str(row["item_type"]) for row in security_evidence
+                        if row.get("item_type")
+                    })
+                    result["result_count"] = len(source_rows)
+                    result["total_matching"] = len(source_rows)
+                    return result
+
+                if operation == "list_sources":
+                    source_rows = self._coverage_source_catalog(conn, evidence_scope)
+                    if clean_filters.get("source"):
+                        source_rows = [row for row in source_rows
+                                       if row["source"] in self._coverage_filter_values(clean_filters["source"])]
+                    if clean_filters.get("source_category"):
+                        source_rows = [row for row in source_rows
+                                       if row["source_category"] in self._coverage_filter_values(clean_filters["source_category"])]
+                    page = self._coverage_page(
+                        result, "sources", source_rows,
+                        limit=page_limit, offset=offset, revision=revision,
+                    )
+                    page["source_categories"] = list(page["sources"])
+                    return page
+
+                if operation == "list_item_types":
+                    details: dict[tuple[str, str], int] = {}
+                    for row in evidence_scope:
+                        if not self._coverage_evidence_matches(row, clean_filters):
+                            continue
+                        key = (str(row.get("item_type") or ""), str(row.get("source_category") or ""))
+                        if key[0]:
+                            details[key] = details.get(key, 0) + 1
+                    detail_rows = [
+                        {"item_type": item_type, "source_category": source_category,
+                         "evidence_count": count}
+                        for (item_type, source_category), count in sorted(details.items())
+                    ]
+                    names = sorted({row["item_type"] for row in detail_rows})
+                    page = self._coverage_page(
+                        result, "item_types", names,
+                        limit=page_limit, offset=offset, revision=revision,
+                    )
+                    page["item_type_details"] = [
+                        row for row in detail_rows if row["item_type"] in page["item_types"]
+                    ]
+                    return page
+
+                metric_details = self._coverage_metric_details(conn, clean_filters)
+                names = sorted({row["metric"] for row in metric_details})
+                page = self._coverage_page(
+                    result, "metrics", names,
+                    limit=page_limit, offset=offset, revision=revision,
+                )
+                page["metric_details"] = [
+                    row for row in metric_details if row["metric"] in page["metrics"]
+                ]
+                ticker_inventory_filters = dict(clean_filters)
+                ticker_inventory_filters.pop("ticker", None)
+                ticker_inventory = self._coverage_metric_details(
+                    conn, ticker_inventory_filters,
+                )
+                page["tickers"] = sorted({
+                    ticker
+                    for row in ticker_inventory
+                    for ticker in row.get("tickers", [])
+                })
+                return page
+        except ValueError:
+            raise
+        except Exception:  # noqa: BLE001 - inventory failures are truthful, not guessed
+            logger.exception("Coverage inventory unavailable")
+            unavailable = self._coverage_envelope(
+                basis="unavailable", revision=revision, filters=clean_filters,
+            )
+            unavailable.update({
+                "status": "unavailable",
+                "complete": False,
+                "answer_origin": "deterministic_coverage",
+                "message": "Coverage inventory is unavailable.",
+            })
+            return unavailable
+
     _ORDER_SQL = {"asc": "ASC", "desc": "DESC"}
     _OP_SQL = {"lt": "<", "lte": "<=", "gt": ">", "gte": ">=", "eq": "=", "ne": "!="}
 
@@ -3797,6 +5181,99 @@ CREATE INDEX IF NOT EXISTS idx_securities_industry ON securities(industry);
         with self._connect() as conn:
             rows = conn.execute(sql, (limit, offset)).fetchall()
         return [{"source": row["source"], "count": int(row["count"])} for row in rows]
+
+    @staticmethod
+    def _lexical_meta_table_exists(conn: sqlite3.Connection) -> bool:
+        return conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' "
+            "AND name='lexical_chunk_meta'"
+        ).fetchone() is not None
+
+    def lexical_counts_available(self) -> bool:
+        """Whether SQLite can serve narrative inventory counts natively.
+
+        True only when FTS5 is the operating lexical backend and the narrow
+        count-mirror table exists; otherwise the Store facade falls back to the
+        legacy Chroma metadata scan (e.g. an FTS5-less runtime whose narratives
+        live only in the vector store).
+        """
+        with self._connect() as conn:
+            return (
+                fts5_available(conn)
+                and self._lexical_table_exists(conn)
+                and self._lexical_meta_table_exists(conn)
+            )
+
+    def get_lexical_source_counts(
+        self, *, limit: int = 100, offset: int = 0,
+    ) -> list[dict]:
+        """Narrative source counts from the narrow lexical inventory table.
+
+        ``lexical_chunk_meta`` mirrors the count dimensions of every indexed
+        narrative chunk (maintained transactionally with ``corpus_fts``), so an
+        indexed ``GROUP BY`` here answers the same chunk-level source inventory
+        the Chroma metadata scan produced, without paginating the vector store or
+        scanning the FTS body. Returns ``[]`` when the table is absent so the
+        Store facade can fall back to Chroma.
+        """
+        self._validate_inventory_page(limit, offset)
+        with self._connect() as conn:
+            if not self._lexical_meta_table_exists(conn):
+                return []
+            rows = conn.execute(
+                "SELECT source, COUNT(*) AS count FROM lexical_chunk_meta "
+                "WHERE source IS NOT NULL AND source <> '' "
+                "GROUP BY source ORDER BY source LIMIT ? OFFSET ?",
+                (limit, offset),
+            ).fetchall()
+        return [{"source": row["source"], "count": int(row["count"])} for row in rows]
+
+    def get_lexical_ticker_counts(
+        self, *, limit: int = 100, offset: int = 0,
+    ) -> list[dict]:
+        """Narrative ticker coverage from the narrow lexical inventory table.
+
+        Mirrors the fields the Chroma metadata scan returned
+        (``ticker``/``record_count``/``sources``/``company_name``) so the Store
+        facade merge is shape-identical. The ``ticker`` column stores the stable
+        comma-joined ticker set, so a multi-ticker chunk contributes to each of
+        its tickers. Returns ``[]`` when the table is absent.
+        """
+        self._validate_inventory_page(limit, offset)
+        with self._connect() as conn:
+            if not self._lexical_meta_table_exists(conn):
+                return []
+            rows = conn.execute(
+                "SELECT ticker, source, COUNT(*) AS count FROM lexical_chunk_meta "
+                "WHERE ticker IS NOT NULL AND ticker <> '' "
+                "GROUP BY ticker, source"
+            ).fetchall()
+        grouped: dict[str, dict] = {}
+        for row in rows:
+            count = int(row["count"] or 0)
+            source = str(row["source"] or "")
+            for raw_ticker in str(row["ticker"]).split(","):
+                ticker = raw_ticker.strip().upper()
+                if not ticker:
+                    continue
+                item = grouped.setdefault(
+                    ticker,
+                    {"ticker": ticker, "record_count": 0, "sources": set(),
+                     "company_name": None},
+                )
+                item["record_count"] += count
+                if source:
+                    item["sources"].add(source)
+        result = [
+            {
+                "ticker": item["ticker"],
+                "record_count": item["record_count"],
+                "sources": sorted(item["sources"]),
+                "company_name": item["company_name"],
+            }
+            for item in sorted(grouped.values(), key=lambda value: value["ticker"])
+        ]
+        return result[offset:offset + limit]
 
     def get_ticker_counts(self, *, limit: int = 100, offset: int = 0) -> list[dict]:
         """Return bounded ticker coverage counts and source memberships."""

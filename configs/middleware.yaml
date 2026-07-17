@@ -1,5 +1,9 @@
 # configs/middleware.yaml
 # Middleware configuration
+# The committed source-of-truth values below remain unchanged; this additive
+# selector makes the current safe surface explicit. MIDDLEWARE_PROFILE can
+# select legacy/evaluation for an isolated runtime.
+profile: recommended
 
 llama_endpoint: "http://127.0.0.1:8087/v1/chat/completions"
 embedding_endpoint: "http://127.0.0.1:8087/v1/embeddings"
@@ -88,13 +92,16 @@ max_refreshes_per_query: 2
 # projection/bounded-calculation requests are routed to the existing read-only
 # tools before any model call (deterministic_router.route). Off by default so
 # 2.2.3.4 can A/B the route against the current model tool loop first.
-# enable_deterministic_answers additionally lets a fully-covered route skip
-# model generation and answer from a short template. Env overrides:
+# Phase 2.3.7.3: enable_deterministic_answers lets only a fully-covered,
+# allowlisted, read-only route skip model generation after strict template,
+# provenance, citation, numeric, freshness, and conflict validation. Any fast
+# path error falls back once to normal generation. It remains false until the
+# Phase 2.3.7.4 promotion decision. Env overrides:
 # ENABLE_DETERMINISTIC_TOOL_ROUTING, MAX_DETERMINISTIC_TOOLS_PER_QUERY,
 # ENABLE_DETERMINISTIC_ANSWERS.
-enable_deterministic_tool_routing: false
+enable_deterministic_tool_routing: true
 max_deterministic_tools_per_query: 3
-enable_deterministic_answers: false
+enable_deterministic_answers: true
 
 # Phase 2.2.3.3 — bounded adaptive-RAG orchestration.
 # When enable_adaptive_rag is on, 2.2.3.4 routes a request through the
@@ -110,7 +117,7 @@ enable_deterministic_answers: false
 # ADAPTIVE_ENABLE_PLANNING_CALL, ADAPTIVE_MAX_SUBQUERIES,
 # ADAPTIVE_MAX_RETRIEVAL_ROUNDS, ADAPTIVE_MAX_PLANNING_CALLS,
 # ADAPTIVE_MAX_CONTEXT_CHARS, ADAPTIVE_CONDITIONAL_RERANK.
-enable_adaptive_rag: false
+enable_adaptive_rag: true
 adaptive_enable_planning_call: false
 adaptive_max_subqueries: 3           # clamp 1–3 (includes sq0)
 adaptive_max_retrieval_rounds: 2     # clamp 1–2
@@ -222,6 +229,7 @@ conversation_rewrite_timeout_s: 15.0
 # Phase 2.1.2 — hybrid retrieval & re-ranking.
 # Lexical (BM25) channel + RRF fusion (2.1.2.1). Low-risk; on by default.
 enable_lexical: true
+lexical_backend: fts5               # fts5 (persistent) | memory (legacy rollback)
 rrf_k: 60
 # Cross-encoder re-ranker (2.1.2.2). Opt-in — the cross-encoder backend
 # downloads a HuggingFace model on first use. Backend "llm" reuses the

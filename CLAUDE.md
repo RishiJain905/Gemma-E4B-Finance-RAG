@@ -91,6 +91,39 @@ When Using Plan mode:
 Built-in agents:
 -Built-in agent types (`Explore`, `general-purpose`) are always spawned with an explicit `model:` — default `model: "sonnet"` — and never on Fable 5. Their definitions otherwise resolve their own model (Explore was observed defaulting to Opus 4.8), and an inheriting built-in in a Fable session would burn Fable tokens on survey work. Built-ins are for cheap search/survey only; anything needing more intelligence routes through the presets above or stays inline with the orchestrator.
 
+### Babysitting delegated work (anti-stall rules)
+
+Two silent stalls cost ~11 hours on 2026-07-16 (a wrapper that never reported a
+finished job; a delegate zombied on its own dead verify subprocess behind a
+change-only monitor). These rules are mandatory for every delegated job —
+Codex or Claude, background or detached:
+
+- **Never trust the messenger.** A wrapper/agent promising to "report when
+  done" is not a completion signal. Poll the underlying job state directly
+  (runtime status, job log file, working-tree writes) and read results from
+  durable artifacts, not from the delegate's mailbox message.
+- **Every watcher needs a stall timeout, not just change detection.** Emit on
+  phase change AND on X minutes with no change (X = 2× the longest healthy
+  phase seen so far; ~15 min default for verify/test phases). A phase that
+  never changes must page the orchestrator, because silence is
+  indistinguishable from progress.
+- **Dual completion signals.** Primary notification plus an independent
+  watcher with a hard deadline. When a watcher expires, re-arm it; never
+  interpret watcher expiry or quiet as success.
+- **Detach long-running work from the harness task system.** Harness
+  background tasks can be killed externally; anything expected to run >15 min
+  (eval sweeps, benchmarks) launches as a detached OS process writing to a log
+  file, with a monitor tailing that file for both success and failure
+  signatures.
+- **Stalled-but-complete → take over.** If a delegate is stuck but its
+  working tree/artifacts look finished, kill it, run the verify gate yourself,
+  and hand back from the artifacts. Don't wait for it, and don't re-dispatch
+  work that already exists.
+- **Time-box phases at dispatch.** State the expected duration in the
+  dispatch note (implementation 20 - 30 min (not a minimum nor a hard limit), verify ≤10 min per pass). One
+  phase exceeding its box with zero new writes → inspect the job log
+  immediately; a dead child process under a live job is the default suspect.
+
 ### Loops: which primitive to trigger
 
 A loop = repeated work cycles until a stop condition. The deterministic stop condition for all code loops in this repo is the verify gate — `scripts\verify.ps1` / `scripts/verify.sh`, final line `VERIFY: PASS|FAIL` — governed by the project skill `verify-rag-change`. Use that skill before claiming any code change done, in or out of a loop.
@@ -104,7 +137,7 @@ Route by task size; never a bigger loop than the task needs:
 
 ## What this is
 
-Hybrid finance RAG system: six data sources (SEC EDGAR, Yahoo Finance, FRED, GDELT, earnings transcripts, IR pages) are ingested into dual stores — SQLite (`data/finance.db`, structured facts/filings/freshness) and ChromaDB (`data/chroma`, document embeddings) — and served through a FastAPI middleware (`:8000`) that does intent parsing → hybrid retrieval → prompt augmentation → a locally-served fine-tuned Gemma model ("TraceAlchemy") on `llama-server` (`:8087`, chat + embeddings from the same server). An optional, **local read-only** live retrieval-graph observer (Phase 2.2.7, disabled by default, loopback-only) visualizes each query's pipeline and the corpus at `/graph`.
+Hybrid finance RAG system: six data sources (SEC EDGAR, Yahoo Finance, FRED, GDELT, earnings transcripts, IR pages) are ingested into dual stores — SQLite (`data/finance.db`, structured facts/filings/freshness) and ChromaDB (`data/chroma`, document embeddings) — and served through a FastAPI middleware (`:8000`) that does intent parsing → adaptive orchestration (fast/standard/complex/catalog lanes, default-on since Phase 2.3.7) → hybrid retrieval → prompt augmentation → a locally-served fine-tuned Gemma model ("TraceAlchemy") on `llama-server` (`:8087`, chat + embeddings from the same server). Two fail-soft fast paths skip the model call when it's safe to: catalog/capability questions answer from an authoritative coverage read model, and fully-covered analytical asks answer from a typed deterministic template; both are recorded on the response via `answer_origin`/`generation_skipped`. An optional, **local read-only** live retrieval-graph observer (Phase 2.2.7, loopback-only) visualizes each query's pipeline and the corpus at `/graph`.
 
 ## Commands
 
@@ -120,6 +153,9 @@ python -m src.scheduler daily --force # run ingestion (modes: daily/hourly/weekl
 python scripts/chat.py                # interactive client (auto-starts middleware)
 uvicorn src.middleware.app:app --port 8000                # middleware directly
 ruff check .                          # lint
+python scripts/rebuild_lexical_index.py --batch-size 100  # (re)build the persistent FTS5 lexical index
+python scripts/rebuild_lexical_index.py --reconcile       # detect missing/duplicate/stale/orphan rows (add --repair to fix)
+python scripts/benchmark_rag_storage.py                   # storage/retrieval hard-gate benchmark (see STORAGE-BENCHMARK-RESULTS.md)
 ```
 
 Windows stack scripts: `scripts/serve_model.ps1 start` (llama-server), `scripts/start_stack.ps1` / `stop_stack.ps1` (middleware). `.sh` equivalents exist for Unix.
@@ -130,18 +166,21 @@ Windows stack scripts: `scripts/serve_model.ps1 start` (llama-server), `scripts/
 
 `docs/ARCHITECTURE.md` is the authoritative reference (components, schema, query flow, failure modes). Key structural points that span multiple files:
 
-- **Storage facade** — `src/storage/store.py` (`Store`) unifies `SQLiteStore` and `ChromaStore`; middleware and ingestors go through it. Freshness/TTL state lives in the `cache_meta` table; scheduler cadence uses the synthetic ticker `"SCHEDULER"`.
-- **Query pipeline** — `src/middleware/app.py` orchestrates `IntentParser` → `Retriever` (strategy chosen from intent: facts_only / hybrid / documents_only / comparison / macro / broad) → `PromptAugmenter` → model call. If the model is down, `/query` returns a **degraded** answer from raw retrieval instead of failing.
-- **Retrieval (Phase 2.1.2)** — optional hybrid pipeline: ChromaDB vector search + BM25 (`src/middleware/lexical_index.py`) → RRF fusion → optional cross-encoder/LLM re-rank (`src/middleware/reranker.py`). Each stage is toggleable in `configs/middleware.yaml` or via env (`ENABLE_LEXICAL`, `ENABLE_RERANKER`, `RERANKER_BACKEND`). Every stage fails soft — a query never errors because a retrieval stage failed.
+- **Storage facade** — `src/storage/store.py` (`Store`) unifies `SQLiteStore` and `ChromaStore`; middleware and ingestors go through it. Freshness/TTL state lives in the `cache_meta` table; scheduler cadence uses the synthetic ticker `"SCHEDULER"`. Phase 2.3.7.6 benchmarked both stores at 100k chunks (`scripts/benchmark_rag_storage.py`) and passed all nine hard latency/consistency gates — the decision is to keep SQLite+Chroma, not add a third store; see `docs/phase2.3/2.3.7-rag-quality-speed-and-storage/STORAGE-BENCHMARK-RESULTS.md`.
+- **Query pipeline** — `src/middleware/app.py` orchestrates `IntentParser` → the adaptive orchestrator (`adaptive_orchestrator.py`, `enable_adaptive_rag`, default-on) which picks a fast/standard/complex/catalog lane and, within it, `Retriever` (facts_only / hybrid / documents_only / comparison / macro / broad) → `PromptAugmenter` → model call. Every adaptive stage falls back to the legacy single-query `Retriever.retrieve()` on failure, and if the model itself is down, `/query` returns a **degraded** answer from raw retrieval instead of failing.
+- **Deterministic fast paths (Phase 2.3.7, default-on)** — two ways a query can skip the model call, both fail soft to normal generation: (1) capability/inventory questions ("what tickers/metrics/sources do you cover") are recognized by `IntentParser` and answered by the read-only `describe_coverage` tool (`src/middleware/tools/coverage_tools.py`) against a Store coverage read model — authoritative metadata, zero embedding or model calls; (2) `enable_deterministic_tool_routing` (`deterministic_router.py`) sends safe analytical/comparison/projection/calculation asks straight to read-only finance tools, and `enable_deterministic_answers` (`deterministic_answers.py`) renders a fully-covered route from one of nine typed templates (`TemplateClass`: coverage/fact/bounded_set/calculation/freshness/estimate/target/guidance/macro) instead of calling the model, with exactly-once model fallback if the contract isn't met. `QueryResponse` records which path answered via `answer_origin`/`generation_skipped`. Measured (`RESULTS.md`): eligible rows answer in ~836 ms vs ~13 s average (≥90% latency-cut gate met), refusal rate 5.3%→0%.
+- **Retrieval (Phase 2.1.2, persistent index since 2.3.7.5)** — optional hybrid pipeline: ChromaDB vector search + a lexical channel (`src/middleware/lexical_index.py`) → RRF fusion → optional cross-encoder/LLM re-rank (`src/middleware/reranker.py`, off by default — retained pending a rerank arm on the new lexical baseline). `lexical_backend: fts5` (default) serves BM25 from a persistent SQLite FTS5 index (`corpus_fts` + `lexical_index_state` + `lexical_chunk_meta`, migrations `006_lexical.sql`/`007_lexical_meta.sql`) instead of materializing the whole Chroma corpus into memory at startup — middleware boot dropped from minutes to seconds; `memory` is the legacy in-process `rank_bm25` rollback. Rebuild/reconcile with `scripts/rebuild_lexical_index.py`; retrieval stays revision-consistent between SQLite and Chroma. Each stage is toggleable in `configs/middleware.yaml` or via env (`ENABLE_LEXICAL`, `LEXICAL_BACKEND`, `ENABLE_RERANKER`, `RERANKER_BACKEND`). Every stage fails soft — a query never errors because a retrieval stage failed.
 - **Ingestion** — `UnifiedScheduler` (`src/scheduler/__init__.py`) drives all sources with TTL gating, staggered execution, and per-source failure isolation (log + mark stale + dead-letter, continue). Resilience primitives (retry/backoff, `CircuitBreaker`, `DeadLetterQueue`) live in `src/utils/resilience.py`.
 - **Embeddings** — `TraceAlchemyEmbeddingFunction` in `chroma_store.py` POSTs to llama-server's `/v1/embeddings` (requires `--embeddings --pooling mean` on the server). Documents >1000 chars are chunked with 150-char overlap and stored as `"{id}#{i}"` with parent metadata.
-- **Live retrieval graph (Phase 2.2.7, optional)** — a read-only *observability* side channel (not GraphRAG; never changes retrieval or the answer). One extra observer subscribes the existing `QueryEvent` emitter (`src/middleware/stream_events.py`) and `graph_observer.py` projects events into a bounded, redacted `TraceHub`; `corpus_graph.py` projects the Store inventory for the explorer; `graph_api.py` + the static UI (`src/middleware/static/graph/`, Cytoscape) serve `/graph`. Disabled by default (`enable_graph_observer`); a single HTTP middleware in `app.py` gates every `/graph*` route to loopback and stamps a strict same-origin CSP. When on, `/query` responses add only an optional `graph_trace_id`.
+- **Live retrieval graph (Phase 2.2.7, optional)** — a read-only *observability* side channel (not GraphRAG; never changes retrieval or the answer). One extra observer subscribes the existing `QueryEvent` emitter (`src/middleware/stream_events.py`) and `graph_observer.py` projects events into a bounded, redacted `TraceHub`; `corpus_graph.py` projects the Store inventory for the explorer; `graph_api.py` + the static UI (`src/middleware/static/graph/`, Cytoscape) serve `/graph`. Gated by `enable_graph_observer`; a single HTTP middleware in `app.py` gates every `/graph*` route to loopback and stamps a strict same-origin CSP. When on, `/query` responses add only an optional `graph_trace_id`.
 
 ## Configuration
 
 - Runtime config is YAML under `configs/` (documented in `docs/CONFIGURATION.md`); secrets go in `.env` (`FRED_API_KEY`, `SEC_EDGAR_USER_AGENT`).
 - Machine-specific model paths go in `configs/model.local.yaml` (gitignored; copy from `configs/model.example.yaml`) or env vars `MAIN_MODEL_PATH` / `LLAMA_BUILD_DIR` / `DRAFT_MODEL_PATH`. Path resolution is in `src/utils/model_config.py` / `scripts/resolve_model_paths.py`.
-- The live graph observer is off by default; enable it locally with `ENABLE_GRAPH_OBSERVER=1` (see `graph_*`/`corpus_*` keys in `docs/CONFIGURATION.md`). It is loopback-only with no bypass flag — never expose `/graph*` remotely or behind a proxy.
+- Three reviewed runtime profiles select the feature-flag surface: `configs/profiles/legacy|recommended|evaluation.yaml`, chosen via the `profile:` key in `configs/middleware.yaml` or the `MIDDLEWARE_PROFILE` env var. `recommended` (the committed default since Phase 2.3.7) mirrors the current enabled set; `legacy` is the tested one-switch rollback to pre-2.2.3 behavior; `evaluation` is `recommended` plus trace/progress metadata for promotion arms, never a production default. `MiddlewareConfig` validates cross-flag dependencies (e.g. `enable_deterministic_answers` requires `enable_deterministic_tool_routing` + `enable_adaptive_rag`, `enable_hierarchical_retrieval` requires `sec.index_filing_text`) — an env/explicit override with a missing prerequisite is clamped off with a warning; the same gap in a profile file is a hard error.
+- `docs/FEATURE-FLAGS.md` is the live inventory of every optional flag — what's enabled, what's deliberately retained off (with owner/prerequisite/expiry), and why; `docs/phase2.3/2.3.7-rag-quality-speed-and-storage/FEATURE-DISPOSITIONS.md` has the measured arm numbers behind each disposition. Several capabilities were measured in 2.3.7 and deliberately kept off — conversation rewrite, LLM rewrite fallback, planning call, evidence sufficiency, corrective retry, `answer_validation: enforce`, retrieval cache, llama prompt reuse, hierarchical retrieval, reranker — each regressed a measured metric or is missing its prerequisite; don't describe them as enabled.
+- The live graph observer is gated by `enable_graph_observer` (see `graph_*`/`corpus_*` keys in `docs/CONFIGURATION.md`). It is loopback-only with no bypass flag — never expose `/graph*` remotely or behind a proxy.
 - Never commit `.env`, `configs/model.local.yaml`, or anything under `data/`.
 
 ## Conventions
@@ -152,3 +191,4 @@ Windows stack scripts: `scripts/serve_model.ps1 start` (llama-server), `scripts/
 - `logger = logging.getLogger(__name__)` in library code; `print` only in `scripts/`.
 - Per-source/per-item failures are swallowed and recorded, not propagated — preserve this isolation pattern in scheduler/refresh paths.
 - Graph observer output is redacted **by construction** (allowlisted node/edge metadata, question digest + bounded preview, bounded excerpts, secret/local-path scrubbing, http(s)-only links) and must never block a query (non-blocking fan-out, fail-soft). Graph tests are offline: `tests/test_graph_observer.py`, `tests/test_graph_api.py`, `tests/test_graph_ui_contract.py`, chat coverage in `tests/test_chat_client.py`, golden fixture `tests/fixtures/graph/query_trace_v1.json`.
+- Phase 2.3.7 quality/latency gates are offline and labeled-fixture-driven: `tests/test_phase2_3_rag_quality_gates.py` scores plan/router accuracy, obligation coverage, inventory set metrics, and fast-path eligibility against `tests/fixtures/evaluation/phase2_3_rag_quality.jsonl` — extend the fixture with new labeled cases rather than asserting against live model output. Any change to adaptive orchestration, deterministic routing/answers, or the coverage tool should keep this gate green; measured, not asserted, wins promotion — see the arm methodology in `docs/phase2.3/2.3.7-rag-quality-speed-and-storage/FEATURE-DISPOSITIONS.md` before flipping a retained-off flag.

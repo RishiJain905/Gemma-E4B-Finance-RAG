@@ -149,6 +149,12 @@ _SAME_PERIOD_RE = re.compile(
 )
 _SUB_RE = re.compile(r"\b(what|how)\s+about\b|\bwhat\s+if\b|\binstead\b", re.IGNORECASE)
 _FOLLOWUP_RE = re.compile(r"^\s*(and|also|then|so|what about|how about)\b", re.IGNORECASE)
+_INVENTORY_FOLLOWUP_RE = re.compile(
+    r"\b(?:which|what)\s+of\s+(?:those|these)\b|\b(?:those|these)\s+(?:also|that)\b"
+    r"|\b(?:that|the)\s+(?:previously\s+)?returned\s+set\b",
+    re.IGNORECASE,
+)
+MAX_CARRIED_INVENTORY = 3
 
 # Entity resolutions the current turn owns outright (a real name/symbol match),
 # as opposed to the low-confidence "fallback" (any stray uppercase word).
@@ -234,6 +240,8 @@ class ConversationState:
     last_grounding: Optional[str] = None
     topic_id: Optional[str] = None
     resolution_sources: list[str] = field(default_factory=list)
+    active_inventory: list[str] = field(default_factory=list)
+    inventory_total: int = 0
 
     @property
     def primary_entity(self) -> Optional[str]:
@@ -283,6 +291,21 @@ class ConversationState:
         metrics = [str(m) for m in (parsed.get("metrics") or [])]
         timeframe = ctx.get("timeframe") or parsed.get("timeframe")
         intent = ctx.get("intent") or parsed.get("question_type")
+        coverage = ctx.get("coverage_metadata")
+        inventory: list[str] = []
+        inventory_total = 0
+        if isinstance(coverage, dict) and coverage.get("complete") is True:
+            raw_inventory = coverage.get("securities") or []
+            for raw in raw_inventory:
+                candidate = raw.get("ticker") if isinstance(raw, dict) else raw
+                norm = _norm_ticker(candidate)
+                if norm and norm not in inventory:
+                    inventory.append(norm)
+            inventory_total = int(
+                coverage.get("total_matching") or len(inventory)
+            )
+            if inventory_total > MAX_CARRIED_INVENTORY:
+                inventory = []
 
         return cls(
             active_tickers=entities,
@@ -293,6 +316,8 @@ class ConversationState:
             last_grounding=str(ctx.get("grounding")) if ctx.get("grounding") else None,
             topic_id=(entities[0] if entities else None),
             resolution_sources=["history"],
+            active_inventory=inventory,
+            inventory_total=inventory_total,
         )
 
 
@@ -322,6 +347,8 @@ class CompiledQuestion:
     entity: Optional[str] = None
     metrics: list[str] = field(default_factory=list)
     timeframe: Optional[str] = None
+    inventory_scope: list[str] = field(default_factory=list)
+    inventory_size: int = 0
 
     def as_metadata(self) -> dict:
         """Render the optional response ``carried_context`` block."""
@@ -332,6 +359,8 @@ class CompiledQuestion:
             "topic_reset": self.topic_reset,
             "ambiguous_slots": list(self.ambiguous_slots),
             "resolution_sources": list(self.resolution_sources),
+            "inventory_scope": list(self.inventory_scope),
+            "inventory_size": self.inventory_size,
         }
 
 
@@ -360,6 +389,7 @@ def compile_question(
     override_norm = _norm_ticker(override_ticker)
 
     has_pronoun = bool(_PRONOUN_RE.search(raw))
+    inventory_followup = bool(_INVENTORY_FOLLOWUP_RE.search(raw))
     same_metric = bool(_SAME_METRIC_RE.search(lower))
     same_period = bool(_SAME_PERIOD_RE.search(lower))
     current_entity_explicit = bool(override_norm) or _is_explicit_entity(current)
@@ -375,10 +405,15 @@ def compile_question(
     carried_timeframe: Optional[str] = None
     ambiguous: list[str] = []
     topic_reset = False
+    inventory_scope: list[str] = []
 
     # ── Entity ──
     entity: Optional[str] = None
-    if override_norm:
+    if inventory_followup and state.active_inventory:
+        inventory_scope = list(state.active_inventory)
+        carried_entities = list(inventory_scope)
+        resolution_sources.append("history_catalog")
+    elif override_norm:
         entity = override_norm
         resolution_sources.append("override")
     elif current_entity_explicit:
@@ -398,6 +433,9 @@ def compile_question(
                 resolution_sources.append("history")
             else:
                 ambiguous.append("entity")  # pronoun with >1 active entity is unsafe
+
+    if inventory_followup and not inventory_scope:
+        ambiguous.append("universe_scope")
 
     # ── Which slots may carry ──
     narrow_metric = same_metric and not same_period and not is_sub
@@ -437,6 +475,13 @@ def compile_question(
             ambiguous.append("timeframe")
 
     retrieval_query = _render_query(entity, metrics, timeframe, raw)
+    if inventory_scope:
+        # Preserve the referential inventory semantics after filler-word
+        # removal so the rule-based intent compiler sees a catalog operation,
+        # while the explicit bounded ticker set fixes the universe.
+        retrieval_query = " ".join(
+            [*inventory_scope, "the previously returned set", retrieval_query]
+        ).strip()
 
     return CompiledQuestion(
         raw_question=raw,
@@ -450,6 +495,8 @@ def compile_question(
         entity=entity,
         metrics=metrics,
         timeframe=timeframe,
+        inventory_scope=inventory_scope,
+        inventory_size=state.inventory_total,
     )
 
 

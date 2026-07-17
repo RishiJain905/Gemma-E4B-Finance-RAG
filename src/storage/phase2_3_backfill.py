@@ -646,10 +646,14 @@ class Phase23Backfill:
 
         with self.sqlite._connect() as conn:
             incomplete = conn.execute(
-                "SELECT COUNT(*) FROM phase2_3_backfill_progress WHERE completed=0"
+                "SELECT COUNT(*) FROM phase2_3_backfill_progress WHERE completed=0 AND stage IN "
+                f"({','.join('?' * len(self.STAGES))})",
+                self.STAGES,
             ).fetchone()[0]
             recorded = conn.execute(
-                "SELECT COUNT(*) FROM phase2_3_backfill_progress"
+                "SELECT COUNT(*) FROM phase2_3_backfill_progress WHERE stage IN "
+                f"({','.join('?' * len(self.STAGES))})",
+                self.STAGES,
             ).fetchone()[0]
             revision = conn.execute(
                 "SELECT revision FROM store_revision WHERE id=1"
@@ -657,3 +661,106 @@ class Phase23Backfill:
         totals["complete"] = recorded == len(self.STAGES) and incomplete == 0
         totals["revision"] = int(revision)
         return totals
+
+    # ── Re-runnable registration of untracked Chroma documents ────────────
+    #
+    # The one-shot ``chroma_documents`` stage above self-marks complete and never
+    # re-scans, so direct-to-Chroma writes accumulated after it ran (yfinance news
+    # via the legacy ``save_document`` path) never get a ``corpus_items`` ledger
+    # row. This stage closes that gap on demand: it rescans every Chroma parent,
+    # synthesizes a ledger row for any family not already tracked (no re-embedding,
+    # no body rewrite — the content already lives in Chroma + FTS), and resets its
+    # cursor once a full pass completes so a later run picks up newly-added docs.
+    # Idempotent: a back-to-back rerun registers nothing new because
+    # ``_ensure_corpus_item`` skips families that already have a ledger row.
+
+    REGISTER_STAGE = "register_untracked"
+
+    def register_untracked_documents(
+        self, *, max_batches: Optional[int] = None,
+    ) -> dict[str, object]:
+        """Register Chroma parents lacking a ``corpus_items`` row, resumably."""
+        if max_batches is not None and (
+            not isinstance(max_batches, int)
+            or isinstance(max_batches, bool)
+            or max_batches < 1
+        ):
+            raise ValueError("max_batches must be a positive integer")
+        totals = {
+            "stage": self.REGISTER_STAGE,
+            "batches": 0,
+            "processed": 0,
+            "inserted": 0,
+            "errors": 0,
+            "pass_complete": False,
+        }
+        while True:
+            if max_batches is not None and totals["batches"] >= max_batches:
+                break
+            with self.sqlite._connect() as conn:
+                cursor, _ = self._progress(conn, self.REGISTER_STAGE)
+                result = self._chroma_batch(conn, cursor)
+                pass_complete = bool(result["completed"])
+                # Reset the cursor after a full pass so the next invocation
+                # rescans from the top; never mark this stage permanently
+                # complete — it is a recurring reconciliation, not a migration.
+                next_cursor = "0" if pass_complete else str(result["cursor"])
+                self._finish_batch(
+                    conn,
+                    self.REGISTER_STAGE,
+                    next_cursor,
+                    int(result["processed"]),
+                    False,
+                )
+                conn.commit()
+            totals["batches"] = int(totals["batches"]) + 1
+            totals["processed"] = int(totals["processed"]) + int(result["processed"])
+            totals["inserted"] = int(totals["inserted"]) + int(result["inserted"])
+            totals["errors"] = int(totals["errors"]) + int(result["errors"])
+            if pass_complete:
+                totals["pass_complete"] = True
+                break
+        with self.sqlite._connect() as conn:
+            revision = conn.execute(
+                "SELECT revision FROM store_revision WHERE id=1"
+            ).fetchone()[0]
+        totals["revision"] = int(revision)
+        return totals
+
+
+def main() -> None:
+    """CLI: run the Phase 2.3 metadata backfill or the untracked-doc registration."""
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        description="Phase 2.3 metadata backfill and corpus-ledger reconciliation",
+    )
+    parser.add_argument(
+        "--register-untracked",
+        action="store_true",
+        help=(
+            "Register Chroma parents lacking a corpus_items row (re-runnable, "
+            "idempotent; no re-embedding). Default: run the staged backfill."
+        ),
+    )
+    parser.add_argument("--batch-size", type=int, default=100, help="Rows per bounded batch")
+    parser.add_argument(
+        "--max-batches", type=int, default=None, help="Stop cleanly after N batches"
+    )
+    args = parser.parse_args()
+
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+
+    from src.storage.store import Store
+
+    store = Store()
+    backfill = Phase23Backfill(store, batch_size=args.batch_size)
+    if args.register_untracked:
+        result = backfill.register_untracked_documents(max_batches=args.max_batches)
+    else:
+        result = backfill.run(max_batches=args.max_batches)
+    print(json.dumps(result, indent=2, default=str))
+
+
+if __name__ == "__main__":
+    main()

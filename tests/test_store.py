@@ -537,3 +537,53 @@ def test_corpus_accounting_delegates_to_sqlite_only(fully_mocked_store):
         limit=10, offset=2,
     )
     chroma.iter_documents.assert_not_called()
+
+
+# ── Narrative inventory counts: SQLite lexical ledger + Chroma fallback (2.3.7.6) ──
+
+def test_store_source_counts_use_sqlite_lexical_ledger(store, mock_chroma):
+    """Narrative source/ticker counts come from the indexed SQLite lexical
+    ledger, never a full Chroma metadata scan, when FTS5 is available."""
+    if not store.sqlite.fts5_available():
+        pytest.skip("FTS5 unavailable")
+    store.save_documents_batch(
+        ["d1", "d2", "d3"],
+        ["alpha body", "beta body", "gamma body"],
+        [
+            {"source": "sec", "ticker": "NVDA"},
+            {"source": "sec", "ticker": "NVDA"},
+            {"source": "gdelt", "ticker": "AMD"},
+        ],
+    )
+    # The Chroma scan must not be consulted when the ledger can answer.
+    mock_chroma.get_source_counts.side_effect = AssertionError("scanned Chroma")
+    mock_chroma.get_ticker_counts.side_effect = AssertionError("scanned Chroma")
+
+    src = {row["source"]: row["count"] for row in store.get_source_counts(limit=100)}
+    assert src == {"sec": 2, "gdelt": 1}
+
+    tickers = {row["ticker"]: row for row in store.get_ticker_counts(limit=100)}
+    assert tickers["NVDA"]["record_count"] == 2
+    assert tickers["AMD"]["record_count"] == 1
+    # Response shape is unchanged from the legacy Chroma-scan merge.
+    assert set(tickers["NVDA"]) == {
+        "ticker", "record_count", "sources", "source_counts", "company_name",
+    }
+
+
+def test_store_source_counts_fall_back_to_chroma_without_lexical_ledger(
+    store, mock_chroma, monkeypatch,
+):
+    """An FTS5-less runtime keeps the legacy Chroma metadata-scan count basis."""
+    monkeypatch.setattr(store.sqlite, "lexical_counts_available", lambda: False)
+    mock_chroma.get_source_counts.return_value = [{"source": "legacy", "count": 5}]
+    mock_chroma.get_ticker_counts.return_value = [
+        {"ticker": "NVDA", "record_count": 7, "sources": ["legacy"],
+         "company_name": None},
+    ]
+
+    src = {row["source"]: row["count"] for row in store.get_source_counts(limit=100)}
+    assert src.get("legacy") == 5
+
+    tickers = {row["ticker"]: row for row in store.get_ticker_counts(limit=100)}
+    assert tickers["NVDA"]["record_count"] == 7

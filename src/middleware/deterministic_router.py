@@ -55,7 +55,9 @@ REASON_ESTIMATES = "route_get_estimates"
 REASON_PRICE_TARGETS = "route_get_price_targets"
 REASON_GUIDANCE = "route_get_guidance"
 REASON_MACRO = "route_get_macro_snapshot"
+REASON_FRESHNESS = "route_check_freshness"
 REASON_SENTIMENT = "route_get_sentiment"
+REASON_COVERAGE = "route_describe_coverage"
 
 ABSTAIN_AMBIGUOUS_ENTITY = "ambiguous_entity"
 ABSTAIN_AMBIGUOUS_METRIC = "ambiguous_metric"
@@ -72,6 +74,23 @@ ABSTAIN_UNROUTABLE = "unroutable"
 # caller must NOT treat the route as a complete answer (2.2.3.4 review finding 2).
 INCOMPLETE_METRIC_COVERAGE = "partial_metric_coverage"
 INCOMPLETE_INTENT_COVERAGE = "partial_intent_coverage"
+INCOMPLETE_PARTIAL_CATALOG_PAGE = "partial_catalog_page"
+INCOMPLETE_MISSING_COVERAGE_DIMENSION = "missing_coverage_dimension"
+INCOMPLETE_UNRESOLVED_UNIVERSE_SCOPE = "unresolved_universe_scope"
+INCOMPLETE_MISSING_METRIC_COVERAGE = "missing_metric_coverage"
+INCOMPLETE_QUALITATIVE_EVIDENCE_REQUIRED = "qualitative_evidence_required"
+INCOMPLETE_RESULT_SET_TOO_LARGE = "result_set_too_large"
+
+_STABLE_INCOMPLETE_CODES = frozenset({
+    INCOMPLETE_PARTIAL_CATALOG_PAGE,
+    INCOMPLETE_MISSING_COVERAGE_DIMENSION,
+    INCOMPLETE_UNRESOLVED_UNIVERSE_SCOPE,
+    INCOMPLETE_MISSING_METRIC_COVERAGE,
+    INCOMPLETE_QUALITATIVE_EVIDENCE_REQUIRED,
+    INCOMPLETE_RESULT_SET_TOO_LARGE,
+})
+
+_MAX_SCOPED_CATALOG_ENTITIES = 3
 
 # Intents whose evidence lives in documents (why / risk / news / filings), plus
 # trend which needs a time series the read tools do not return. When one of
@@ -168,6 +187,31 @@ _LIMIT_NEAR_RANK_RE = re.compile(r"\b(?:top|bottom)\s+(\d{1,3})\b", re.IGNORECAS
 
 _DEFAULT_RANK_LIMIT = 5
 _DEFAULT_SENTIMENT_DAYS = 7
+
+_COVERAGE_SIGNAL_RE = re.compile(
+    r"\b(?:cover(?:age|ed)?|know about|answer questions about|available "
+    r"sources?|sources?|data types?|item types?|metric families?|all tickers?|"
+    r"every ticker|which companies|which securities)\b",
+    re.IGNORECASE,
+)
+
+_FRESHNESS_STATUS_RE = re.compile(
+    r"\b(?:freshness|data freshness|source status|sources? stale|sources? fresh|"
+    r"how (?:fresh|current|recent)|when (?:was|were).*(?:updated|fetched))\b",
+    re.IGNORECASE,
+)
+_ALL_TICKERS_RE = re.compile(
+    r"\b(?:all|every)\s+(?:active\s+)?tickers?\b|\bwhat tickers\b|"
+    r"\bwhich companies can you answer questions about\b",
+    re.IGNORECASE,
+)
+_COVERAGE_SOURCE_RE = re.compile(r"\b(?:source|sources|data types?)\b", re.IGNORECASE)
+_COVERAGE_ITEM_TYPE_RE = re.compile(r"\bitem types?\b", re.IGNORECASE)
+_COVERAGE_METRIC_RE = re.compile(r"\b(?:metrics?|metric families?)\b", re.IGNORECASE)
+_COVERAGE_CONTAINS_RE = re.compile(
+    r"\b(?:do you cover|is .* covered|covered .*|coverage for)\b",
+    re.IGNORECASE,
+)
 
 
 # ── Route data structures ─────────────────────────────────
@@ -341,6 +385,182 @@ def _abstain(reason: str, reason_codes: list[str]) -> RouteDecision:
     )
 
 
+def _coverage_filters(text: str) -> dict:
+    """Extract only explicit, lossless coverage filters from a safe question."""
+    lowered = text.lower()
+    filters: dict[str, str] = {}
+    if re.search(r"\bs\s*&\s*p\s*500\b|\bsp500\b|\bs&p500\b", lowered):
+        filters["index"] = "sp500"
+    elif re.search(r"\bnasdaq\s*100\b|\bnasdaq100\b", lowered):
+        filters["index"] = "nasdaq100"
+
+    sector_aliases = (
+        ("health care", "Health Care"),
+        ("healthcare", "Health Care"),
+        ("technology", "Information Technology"),
+        ("information technology", "Information Technology"),
+        ("automotive", "Automotive"),
+        ("industrials", "Industrials"),
+    )
+    for alias, sector in sector_aliases:
+        if alias in lowered:
+            filters["sector"] = sector
+            break
+    for tier in ("broad", "deep", "sector"):
+        if re.search(rf"\b{tier}\s+coverage\b|\b{tier}\s+securities\b", lowered):
+            filters["coverage_tier"] = tier
+            break
+    if re.search(r"\bsemiconductors?\b", lowered):
+        filters["industry"] = "Semiconductors"
+    if re.search(r"\bsec\b|\bsec filings?\b|\b10-[kq]\b", lowered):
+        filters["source_category"] = "sec_filing"
+    if re.search(r"\bnews\b", lowered):
+        filters["item_type"] = "news"
+    elif re.search(r"\btranscripts?\b", lowered):
+        filters["item_type"] = "transcript"
+    elif re.search(r"\bmarket data\b|\bmarket bars?\b", lowered):
+        filters["item_type"] = "market_bar"
+    return filters
+
+
+def _coverage_invocation(plan: "QueryPlan") -> Optional[ToolInvocation]:
+    """Map an explicit capability question to the read-only coverage tool."""
+    text = plan.retrieval_query or plan.original_question or ""
+    obligations = plan.obligations
+    if (
+        "catalog" not in obligations.evidence_modes
+        and not _COVERAGE_SIGNAL_RE.search(text)
+    ):
+        return None
+    # A referential follow-up without a resolved prior set must not silently
+    # broaden into the global catalog. A summary is safe supporting evidence;
+    # the unresolved-universe reason below prevents it becoming a final answer.
+    if obligations.universe_scope == "unresolved":
+        subquery_id = plan.subqueries[0].id if plan.subqueries else "sq0"
+        return ToolInvocation(
+            "describe_coverage", {"operation": "summary"}, subquery_id, REASON_COVERAGE
+        )
+    lowered = text.lower()
+    ticker = plan.tickers[0] if len(plan.tickers) == 1 else None
+    filters = _coverage_filters(text)
+    subquery_id = plan.subqueries[0].id if plan.subqueries else "sq0"
+
+    if obligations.operation == "summary":
+        return ToolInvocation(
+            "describe_coverage", {"operation": "summary"}, subquery_id, REASON_COVERAGE
+        )
+    if obligations.operation == "list_sources":
+        args = {"operation": "list_sources"}
+        if filters:
+            args["filters"] = filters
+        return ToolInvocation("describe_coverage", args, subquery_id, REASON_COVERAGE)
+    if obligations.operation == "list_metrics":
+        args = {"operation": "list_metrics"}
+        if ticker:
+            args["ticker"] = ticker
+        if filters:
+            args["filters"] = filters
+        return ToolInvocation("describe_coverage", args, subquery_id, REASON_COVERAGE)
+    if obligations.operation == "contains_security" and ticker:
+        return ToolInvocation(
+            "describe_coverage",
+            {"operation": "contains_security", "ticker": ticker},
+            subquery_id,
+            REASON_COVERAGE,
+        )
+    if _ALL_TICKERS_RE.search(text) or obligations.operation in {"list_securities", "compare"}:
+        args: dict[str, Any] = {
+            "operation": "list_securities",
+            "ticker_only": obligations.completeness in {"all", "count"},
+        }
+        if filters:
+            args["filters"] = filters
+        return ToolInvocation(
+            "describe_coverage",
+            args,
+            subquery_id,
+            REASON_COVERAGE,
+        )
+    if ticker and _COVERAGE_CONTAINS_RE.search(text):
+        return ToolInvocation(
+            "describe_coverage",
+            {"operation": "contains_security", "ticker": ticker},
+            subquery_id,
+            REASON_COVERAGE,
+        )
+    if ticker and _COVERAGE_SOURCE_RE.search(text):
+        return ToolInvocation(
+            "describe_coverage",
+            {"operation": "security_sources", "ticker": ticker},
+            subquery_id,
+            REASON_COVERAGE,
+        )
+    if _COVERAGE_ITEM_TYPE_RE.search(text):
+        args = {"operation": "list_item_types"}
+        if ticker:
+            args["ticker"] = ticker
+        if filters:
+            args["filters"] = filters
+        return ToolInvocation("describe_coverage", args, subquery_id, REASON_COVERAGE)
+    if _COVERAGE_METRIC_RE.search(text):
+        args = {"operation": "list_metrics"}
+        if ticker:
+            args["ticker"] = ticker
+        if filters:
+            args["filters"] = filters
+        return ToolInvocation("describe_coverage", args, subquery_id, REASON_COVERAGE)
+    if _COVERAGE_SOURCE_RE.search(text):
+        args = {"operation": "list_sources"}
+        if filters:
+            args["filters"] = filters
+        return ToolInvocation("describe_coverage", args, subquery_id, REASON_COVERAGE)
+    if filters or "securities" in lowered or "companies" in lowered:
+        args = {"operation": "list_securities"}
+        if filters:
+            args["filters"] = filters
+        return ToolInvocation("describe_coverage", args, subquery_id, REASON_COVERAGE)
+    return ToolInvocation(
+        "describe_coverage", {"operation": "summary"}, subquery_id, REASON_COVERAGE
+    )
+
+
+def _scoped_coverage_invocations(
+    plan: "QueryPlan", fallback: ToolInvocation
+) -> tuple[list[ToolInvocation], list[str]]:
+    """Compile a bounded prior/explicit entity set into exact catalog checks."""
+    obligations = plan.obligations
+    entities = list(obligations.entity_set)
+    dimensions_requested = bool(obligations.item_types or obligations.sources)
+    if obligations.universe_scope != "explicit_entities" or not dimensions_requested:
+        return [fallback], []
+    if not entities:
+        return [fallback], [INCOMPLETE_UNRESOLVED_UNIVERSE_SCOPE]
+    if len(entities) > _MAX_SCOPED_CATALOG_ENTITIES:
+        summary = ToolInvocation(
+            "describe_coverage",
+            {"operation": "summary"},
+            fallback.subquery_id,
+            REASON_COVERAGE,
+        )
+        return [summary], [INCOMPLETE_RESULT_SET_TOO_LARGE]
+
+    filters = _coverage_filters(plan.retrieval_query or plan.original_question or "")
+    invocations = []
+    for ticker in entities:
+        args: dict[str, Any] = {"operation": "security_sources", "ticker": ticker}
+        if filters:
+            args["filters"] = filters
+        invocations.append(
+            ToolInvocation(
+                "describe_coverage",
+                args,
+                fallback.subquery_id,
+                REASON_COVERAGE,
+            )
+        )
+    return invocations, []
+
+
 def route(plan: "QueryPlan", available_metrics: Iterable[str]) -> RouteDecision:
     """Deterministically route a query plan onto safe read-only finance tools.
 
@@ -367,6 +587,51 @@ def route(plan: "QueryPlan", available_metrics: Iterable[str]) -> RouteDecision:
         return _abstain(ABSTAIN_REFRESH_REQUESTED, [ABSTAIN_REFRESH_REQUESTED])
 
     # Guard: a requested metric that does not exist → abstain, no tool call.
+    # A freshness/source-status lookup is read-only and reports the cached
+    # status itself. It is distinct from an imperative refresh request above.
+    if _FRESHNESS_STATUS_RE.search(text):
+        if len(entities) != 1:
+            return _abstain(ABSTAIN_AMBIGUOUS_ENTITY, [ABSTAIN_AMBIGUOUS_ENTITY])
+        subquery_id = plan.subqueries[0].id if plan.subqueries else "sq0"
+        return RouteDecision(
+            matched=True,
+            complete=True,
+            tool_invocations=[ToolInvocation(
+                "check_freshness",
+                {"ticker": entities[0]},
+                subquery_id,
+                REASON_FRESHNESS,
+            )],
+            reason_codes=[REASON_FRESHNESS],
+        )
+
+    coverage = _coverage_invocation(plan)
+    if coverage is not None:
+        incomplete: list[str] = []
+        coverage_invocations, scoped_incomplete = _scoped_coverage_invocations(
+            plan, coverage
+        )
+        incomplete.extend(scoped_incomplete)
+        modes = set(plan.obligations.evidence_modes)
+        if plan.obligations.universe_scope == "unresolved":
+            incomplete.append(INCOMPLETE_UNRESOLVED_UNIVERSE_SCOPE)
+        if "facts" in modes:
+            incomplete.append(INCOMPLETE_MISSING_METRIC_COVERAGE)
+        if "documents" in modes or plan.obligations.qualitative:
+            incomplete.append(INCOMPLETE_QUALITATIVE_EVIDENCE_REQUIRED)
+        if plan.obligations.item_types and not (
+            coverage_invocations[0].arguments.get("filters", {}).get("item_type")
+            or coverage_invocations[0].arguments.get("operation") == "security_sources"
+        ):
+            incomplete.append(INCOMPLETE_MISSING_COVERAGE_DIMENSION)
+        return RouteDecision(
+            matched=True,
+            complete=not incomplete,
+            requires_documents="documents" in modes,
+            tool_invocations=coverage_invocations,
+            reason_codes=[REASON_COVERAGE, *incomplete],
+        )
+
     unknown = [m for m in metrics if m not in known]
     if unknown:
         return _abstain(
@@ -821,6 +1086,10 @@ class ExecutionResult:
     calculations: list[dict] = field(default_factory=list)
     error: bool = False
     answer: Optional[str] = None
+    answer_origin: Optional[str] = None
+    answer_metadata: Optional[dict] = None
+    complete: bool = True
+    incomplete_reason_codes: list[str] = field(default_factory=list)
 
 
 def _make_readonly_context() -> "ToolContext":
@@ -882,11 +1151,16 @@ def execute_route(
     if not decision.matched or not decision.tool_invocations:
         result.error = True
         return result
+    result.complete = bool(decision.complete)
+    result.incomplete_reason_codes = [
+        code for code in decision.reason_codes if code in _STABLE_INCOMPLETE_CODES
+    ]
 
     ctx = _make_readonly_context()
     raw_results: list[dict] = []
     try:
-        for inv in decision.tool_invocations[: max(0, int(max_tools))]:
+        tool_limit = max(0, int(max_tools))
+        for inv in decision.tool_invocations[:tool_limit]:
             tool_result, name, args = dispatch_named_tool(
                 inv.name, dict(inv.arguments), store, ctx,
                 subquery_id=inv.subquery_id,
@@ -905,6 +1179,27 @@ def execute_route(
                     error=err,
                 )
             )
+
+        if len(decision.tool_invocations) > tool_limit:
+            result.complete = False
+            if INCOMPLETE_RESULT_SET_TOO_LARGE not in result.incomplete_reason_codes:
+                result.incomplete_reason_codes.append(INCOMPLETE_RESULT_SET_TOO_LARGE)
+
+        for inv, raw in zip(decision.tool_invocations, raw_results):
+            if inv.name != "describe_coverage" or not isinstance(raw, dict):
+                continue
+            if raw.get("status") == "unavailable":
+                continue  # 2.3.7.1 structured unavailable answer is preserved.
+            if raw.get("complete") is False:
+                result.complete = False
+                code = (
+                    INCOMPLETE_PARTIAL_CATALOG_PAGE
+                    if raw.get("next_cursor")
+                    or int(raw.get("total_matching") or 0) > int(raw.get("result_count") or 0)
+                    else INCOMPLETE_MISSING_COVERAGE_DIMENSION
+                )
+                if code not in result.incomplete_reason_codes:
+                    result.incomplete_reason_codes.append(code)
 
         for spec in decision.calculations:
             operands: dict[str, dict] = {}
@@ -935,8 +1230,17 @@ def execute_route(
         result.error = True
         return result
 
-    if build_answer and decision.complete and not result.error:
+    if build_answer and result.complete and not result.error:
         result.answer = build_deterministic_answer(decision, result)
+        if result.answer is not None:
+            result.answer_origin = "deterministic"
+        if decision.tool_invocations and decision.tool_invocations[0].reason_code == REASON_COVERAGE:
+            if _is_filtered_security_source_set(result.invocations):
+                result.answer_metadata = _coverage_set_answer_metadata(result.invocations)
+            else:
+                result.answer_metadata = _coverage_answer_metadata(
+                    result.invocations[0].result if result.invocations else {}
+                )
     return result
 
 
@@ -986,6 +1290,10 @@ def build_deterministic_answer(
             return _answer_macro(result)
         if reason == REASON_SENTIMENT:
             return _answer_sentiment(result, inv.arguments)
+        if reason == REASON_COVERAGE:
+            if _is_filtered_security_source_set(execution.invocations):
+                return _answer_coverage_set(execution.invocations)
+            return _answer_coverage(result, inv.arguments)
     except Exception:  # noqa: BLE001 — a template glitch must not fail /query
         logger.exception("Deterministic answer rendering failed")
         return None
@@ -1077,3 +1385,176 @@ def _answer_sentiment(result: dict, args: dict) -> Optional[str]:
     ticker = args.get("ticker")
     days = args.get("days")
     return f"News sentiment summary for {ticker} over the last {days} days: {result}."
+
+
+def _coverage_answer_metadata(result: dict) -> dict:
+    """Expose the Store revision and truthful page metadata beside the answer."""
+    securities = [
+        str(row.get("ticker"))
+        for row in result.get("securities") or []
+        if isinstance(row, dict) and row.get("ticker")
+    ]
+    return {
+        "coverage_basis": result.get("coverage_basis"),
+        "data_revision": result.get("data_revision"),
+        "universe_snapshot_at": result.get("universe_snapshot_at"),
+        "result_count": result.get("result_count", 0),
+        "total_matching": result.get("total_matching", 0),
+        "complete": bool(result.get("complete", False)),
+        "next_cursor": result.get("next_cursor"),
+        "filters_applied": result.get("filters_applied") or {},
+        "securities": securities,
+    }
+
+
+def _is_filtered_security_source_set(
+    invocations: list[ExecutedInvocation],
+) -> bool:
+    """Return whether invocations are exact per-security dimension checks."""
+    return bool(invocations) and all(
+        invocation.arguments.get("operation") == "security_sources"
+        and bool(invocation.arguments.get("filters"))
+        for invocation in invocations
+    )
+
+
+def _coverage_set_match(invocation: ExecutedInvocation) -> bool:
+    """Evaluate one exact security_sources result against its requested filter."""
+    result = invocation.result
+    if result.get("status") == "unavailable" or not result.get("covered"):
+        return False
+    filters = invocation.arguments.get("filters") or {}
+    item_type = filters.get("item_type")
+    if item_type:
+        return str(item_type) in {
+            str(value) for value in result.get("item_types") or []
+        }
+    source = filters.get("source") or filters.get("source_category")
+    if source:
+        expected = str(source)
+        for row in result.get("sources") or []:
+            if not isinstance(row, dict) or not row.get("has_evidence"):
+                continue
+            values = {
+                str(row.get("source") or ""),
+                str(row.get("source_category") or ""),
+                str(row.get("item_type") or ""),
+            }
+            if expected in values:
+                return True
+        return False
+    return False
+
+
+def _coverage_set_answer_metadata(
+    invocations: list[ExecutedInvocation],
+) -> dict:
+    """Expose a complete, bounded intersection for safe conversation carryover."""
+    matches = [
+        str(invocation.arguments.get("ticker"))
+        for invocation in invocations
+        if _coverage_set_match(invocation)
+    ]
+    unavailable = any(
+        invocation.result.get("status") == "unavailable" for invocation in invocations
+    )
+    first = invocations[0].result if invocations else {}
+    return {
+        "coverage_basis": first.get("coverage_basis"),
+        "data_revision": first.get("data_revision"),
+        "universe_snapshot_at": first.get("universe_snapshot_at"),
+        "result_count": len(matches),
+        "total_matching": len(matches),
+        "complete": not unavailable,
+        "next_cursor": None,
+        "filters_applied": invocations[0].arguments.get("filters") or {},
+        "securities": matches,
+    }
+
+
+def _answer_coverage_set(invocations: list[ExecutedInvocation]) -> str:
+    """Render an exact intersection over a bounded explicit security set."""
+    if any(
+        invocation.result.get("status") == "unavailable" for invocation in invocations
+    ):
+        return (
+            "Coverage metadata is unavailable. I cannot determine which securities "
+            "in the requested set have the requested evidence."
+        )
+    filters = invocations[0].arguments.get("filters") or {}
+    dimension = (
+        filters.get("item_type")
+        or filters.get("source")
+        or filters.get("source_category")
+        or "requested"
+    )
+    matches = [
+        str(invocation.arguments.get("ticker"))
+        for invocation in invocations
+        if _coverage_set_match(invocation)
+    ]
+    listed = ", ".join(matches) if matches else "none"
+    return (
+        f"Within the requested security set, stored {dimension} evidence is present "
+        f"for: {listed}."
+    )
+
+
+def _answer_coverage(result: dict, args: dict) -> str:
+    """Render a deterministic answer without claiming configured data is stored."""
+    if result.get("status") == "unavailable":
+        return (
+            "Coverage metadata is unavailable. I cannot determine security membership, "
+            "stored evidence, or source capability from the current registry."
+        )
+
+    operation = args.get("operation")
+    basis = result.get("coverage_basis") or "unknown"
+    complete = bool(result.get("complete", False))
+    if operation == "list_securities":
+        rows = result.get("securities") or []
+        tickers = ", ".join(str(row.get("ticker")) for row in rows if row.get("ticker"))
+        total = result.get("total_matching", len(rows))
+        if args.get("ticker_only") and complete:
+            return f"The active security registry contains {total} securities: {tickers}."
+        answer = f"Found {len(rows)} of {total} matching securities: {tickers or 'none'}."
+        if not complete:
+            answer += " This is a bounded page; more results are available via the next cursor."
+        return answer
+    if operation == "contains_security":
+        ticker = args.get("ticker") or "the requested security"
+        if result.get("covered"):
+            return f"Yes — {ticker} is in the active security registry (basis: {basis})."
+        suggestions = ", ".join(result.get("suggestions") or [])
+        suffix = f" Possible matches: {suggestions}." if suggestions else ""
+        return f"No — {ticker} is not in the active security registry (basis: {basis}).{suffix}"
+    if operation == "security_sources":
+        ticker = args.get("ticker") or "the requested security"
+        if not result.get("covered"):
+            return f"Coverage for {ticker} is not present in the active security registry."
+        sources = result.get("sources") or []
+        evidence = [row["source"] for row in sources if row.get("has_evidence")]
+        capable = [
+            row["source"] for row in sources
+            if row.get("capability", {}).get("configured")
+            and row.get("capability", {}).get("available")
+        ]
+        answer = f"For {ticker}, stored evidence is present from {', '.join(evidence) or 'no listed source'}"
+        answer += f"; available configured capabilities are {', '.join(capable) or 'none listed'}."
+        answer += " Capability and stored evidence are reported separately."
+        return answer
+    if operation == "list_sources":
+        sources = result.get("sources") or []
+        names = ", ".join(str(row.get("source")) for row in sources)
+        return f"Configured source capabilities: {names or 'none listed'}."
+    if operation == "list_item_types":
+        values = ", ".join(str(value) for value in result.get("item_types") or [])
+        return f"Stored item types: {values or 'none listed'}."
+    if operation == "list_metrics":
+        values = ", ".join(str(value) for value in result.get("metrics") or [])
+        return f"Stored metric families: {values or 'none listed'}."
+    return (
+        f"Coverage summary: {result.get('active_securities', 0)} active securities, "
+        f"{len(result.get('metrics') or [])} metric families, and "
+        f"{len(result.get('item_types') or [])} item types (basis: {basis})."
+    )

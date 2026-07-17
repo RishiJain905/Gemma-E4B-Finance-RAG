@@ -6,7 +6,29 @@ All runtime configuration lives in `configs/*.yaml`. Secrets are supplied via a
 Most config loaders use a tolerant pattern: built-in defaults are applied
 first, then any matching keys present in the YAML file override them. A missing
 config file is therefore not fatal — the code falls back to its hard-coded
-defaults.
+ defaults.
+
+### Middleware profiles
+
+`MiddlewareConfig` supports three reviewed runtime profiles:
+
+| Profile | Purpose | Production default? |
+|---|---|---:|
+| `legacy` | Phase 2.2-compatible rollback with optional Phase 2.2.3+ capabilities off. | No |
+| `recommended` | Current promoted-safe deployment surface; later measured arms may update it. | Yes |
+| `evaluation` | Recommended behavior plus evaluation trace/progress metadata; never a production default. | No |
+
+Select a profile with `MIDDLEWARE_PROFILE=legacy` (or another profile name), or
+put `profile: legacy` in an explicit middleware YAML file. The loader applies
+code defaults, the selected profile, explicit YAML values, and finally
+environment overrides in that order. A direct `MiddlewareConfig` profile file
+is validated as a reviewed bundle. Invalid dependencies in an explicit/env
+override are clamped to `false` with an explicit warning.
+
+Promotion arms should use `evaluation` plus an explicit `--config-label` in the
+evaluation harness. The profile metadata records the intended label and trace
+requirements; the runner still requests `include_evidence_trace: true` on each
+live evaluation request.
 
 ---
 
@@ -230,23 +252,34 @@ top_k_facts: 10
 enable_citations: true
 ```
 
-| Field | Default | Meaning |
-|-------|---------|---------|
-| `llama_endpoint` | `http://127.0.0.1:8087/v1/chat/completions` | Chat-completions endpoint for answer generation. |
-| `embedding_endpoint` | `http://127.0.0.1:8087/v1/embeddings` | Embeddings endpoint passed through to the `Store`. |
-| `model_name` | `tracealchemy` | Model id sent in the chat payload. |
-| `default_temperature` | `0.3` | Temperature when the request does not override it. |
-| `max_tokens` | `2048` | Max response tokens when the request does not override it. |
-| `top_k_documents` | `5` | Max ChromaDB documents retrieved per query. |
-| `top_k_facts` | `10` | Max SQLite facts retrieved per query. |
-| `enable_citations` | `true` | Whether citation extraction is enabled. |
+| Field | Default | Env | Meaning |
+|-------|---------|-----|---------|
+| `llama_endpoint` | `http://127.0.0.1:8087/v1/chat/completions` | - | Chat-completions endpoint for answer generation. |
+| `embedding_endpoint` | `http://127.0.0.1:8087/v1/embeddings` | - | Embeddings endpoint passed through to the `Store`. |
+| `model_name` | `tracealchemy` | - | Model id sent in the chat payload. |
+| `default_temperature` | `0.3` | - | Temperature when the request does not override it. |
+| `max_tokens` | `2048` | - | Max response tokens when the request does not override it. |
+| `top_k_documents` | `5` | - | Max ChromaDB documents retrieved per query. |
+| `top_k_facts` | `10` | - | Max SQLite facts retrieved per query. |
+| `enable_citations` | `true` | `ENABLE_CITATIONS` | Whether citation extraction is enabled. |
 
 The remaining middleware keys are grouped by the phase that introduced them.
-Every Phase 2.2.4–2.2.6 feature ships **disabled by default** (the one exception
-is `answer_validation: report`, which is metadata-only and changes no answer).
-For each, **rollback is to flip the flag back to its default** — none involves a
-schema or storage migration. Any key can also be overridden by the environment
-variable listed in its row (used for A/B evaluation).
+The code fallback defaults preserve the pre-profile behavior; the committed
+source file currently selects the `recommended` surface. The `legacy` profile is
+the tested rollback for every promotion candidate. Any key can also be
+overridden by the environment variable listed in its row (used for A/B
+evaluation).
+
+#### Phase 2.3 retrieval and Corpus Explorer rollout
+
+These two switches are read by the retrieval post-processing and graph corpus
+projection paths. The committed source file currently enables them; the legacy
+profile disables them.
+
+| Field | Current source | Env | Meaning |
+|-------|----------------|-----|---------|
+| `enable_phase2_3_retrieval` | `true` | `ENABLE_PHASE2_3_RETRIEVAL` | Enable the Phase 2.3 evidence-taxonomy/ranking/packing retrieval seam. |
+| `enable_phase2_3_corpus_projection` | `true` | `ENABLE_PHASE2_3_CORPUS_PROJECTION` | Enable the Phase 2.3 aggregation-first Corpus Explorer projection. |
 
 #### Answer policy & grounding (Phase 2.1.7)
 
@@ -264,12 +297,31 @@ a query never errors because a retrieval stage failed.
 | Field | Default | Env | Meaning |
 |-------|---------|-----|---------|
 | `enable_lexical` | `true` | `ENABLE_LEXICAL` | Add the BM25 lexical channel and RRF fusion. |
+| `lexical_backend` | `fts5` | `LEXICAL_BACKEND` | `fts5` uses the persistent SQLite index without loading all Chroma text at startup; `memory` selects the legacy full-corpus `rank_bm25` rollback path. All three profiles assign this key. |
 | `rrf_k` | `60` | — | RRF constant; larger dampens the contribution of top ranks. |
 | `enable_reranker` | `false` | `ENABLE_RERANKER` | Re-rank fused candidates. The `cross-encoder` backend downloads a HuggingFace model on first use. |
 | `reranker_backend` | `cross-encoder` | `RERANKER_BACKEND` | `cross-encoder` (sentence-transformers) or `llm` (reuse TraceAlchemy on `:8087`, no download). |
 | `reranker_model` | `cross-encoder/ms-marco-MiniLM-L-6-v2` | `RERANKER_MODEL` | Cross-encoder model id. |
 | `rerank_candidates` | `30` | `RERANK_CANDIDATES` | Candidate pool retrieved before re-ranking. |
 | `rerank_top_n` | `5` | `RERANK_TOP_N` | Documents kept after re-ranking (= `top_k_documents`). |
+
+The `fts5` backend probes SQLite support at startup. If the module or table is
+unavailable, health reports `lexical_mode: degraded` and queries remain bounded
+vector-only. An FTS query error or SQLite/Chroma corpus-revision mismatch also
+skips lexical fusion for that request and records the reason under
+`retrieval_trace.lexical`.
+
+Rebuild or reconcile the index without embedding or generation calls:
+
+```bash
+python scripts/rebuild_lexical_index.py --batch-size 100
+python scripts/rebuild_lexical_index.py --reconcile
+python scripts/rebuild_lexical_index.py --reconcile --repair
+```
+
+The rebuild cursor commits after every batch and resumes automatically. Use
+`--restart` to discard saved progress; `--db-path` and `--chroma-path` select
+isolated stores for maintenance or tests.
 
 #### Evidence taxonomy, authority ranking & duplicate-coverage packing (Phase 2.3.3.3)
 
@@ -378,12 +430,13 @@ corrective retrieval when borderline. Total retrieval rounds stay capped at two.
 
 Keeps the bounded tool/planning rounds non-streaming, then streams the final
 answer synthesis — so enabling tools no longer disables streaming for the whole
-request. Both feature flags default off (behavior byte-identical to pre-2.2.6).
+request. The committed source file has both capabilities on since 2026-07-15;
+the code fallback and legacy profile keep them off for rollback.
 
 | Field | Default | Env | Meaning |
 |-------|---------|-----|---------|
-| `enable_tool_final_streaming` | `false` | `ENABLE_TOOL_FINAL_STREAMING` | Serve a tools-enabled `/query/stream` by running tool rounds non-streaming, then streaming only the final answer. Off → `/query/stream` 404s while tools are enabled. |
-| `enable_stream_progress_events` | `false` | `ENABLE_STREAM_PROGRESS_EVENTS` | Emit versioned, redacted progress events (`query_started`, `stage`, `tool_started`, `tool_completed`, `error`) on the SSE stream. Off → only the legacy `token`/`metadata` events. |
+| `enable_tool_final_streaming` | `true` in source / `false` in code fallback | `ENABLE_TOOL_FINAL_STREAMING` | Serve a tools-enabled `/query/stream` by running tool rounds non-streaming, then streaming only the final answer. Off → `/query/stream` 404s while tools are enabled. |
+| `enable_stream_progress_events` | `true` in source / `false` in code fallback | `ENABLE_STREAM_PROGRESS_EVENTS` | Emit versioned, redacted progress events (`query_started`, `stage`, `tool_started`, `tool_completed`, `error`) on the SSE stream. Off → only the legacy `token`/`metadata` events. |
 | `stream_progress_include_counts` | `true` | `STREAM_PROGRESS_INCLUDE_COUNTS` | Include row/item counts on retrieve and `tool_completed` progress events. |
 
 #### Versioned retrieval cache & prompt efficiency (Phase 2.2.6.2)
@@ -404,6 +457,10 @@ answers (prices, news, estimates, "latest") are never reused by similarity.
 | `llama_cache_prompt` | `false` | `LLAMA_CACHE_PROMPT` | Send llama-server's `cache_prompt: true` on the final answer request when the backend supports it; on rejection it disables for the process and retries the plain payload once (fail-soft). Off → the request JSON is byte-identical. |
 
 ### Hierarchical retrieval (Phase 2.2.5.3)
+
+The feature switch is `enable_hierarchical_retrieval`; its environment override
+is `ENABLE_HIERARCHICAL_RETRIEVAL`. It requires `sec.index_filing_text`, so an
+invalid profile fails validation and an explicit/env override is clamped off.
 
 Bounded filing → section → child expansion of precise SEC hits. Off by default;
 the corrective `EXPAND_PARENT_SECTION` seam keeps its 2.2.4.1 sibling-only
@@ -430,6 +487,9 @@ enabled, authoritative filed GAAP facts are merged into structured retrieval and
 conflicting values are surfaced as separate evidence, never averaged.
 
 ### Live retrieval-graph observer (Phase 2.2.7)
+
+The committed source file has `enable_graph_observer` enabled since
+2026-07-15; the code fallback and legacy profile keep it disabled for rollback.
 
 A local, **read-only** visualization of the retrieval pipeline and corpus
 inventory. **Disabled by default.** When on, the UI (`/graph`) and its API
@@ -461,7 +521,7 @@ corpus_opaque_id_ttl_s: 300.0     # clamp 1–3600
 
 | Field | Default | Env | Meaning |
 |-------|---------|-----|---------|
-| `enable_graph_observer` | `false` | `ENABLE_GRAPH_OBSERVER` | Enable the loopback-only live retrieval graph UI + API. Off → every `/graph*` route 404s and `/query` responses omit `graph_trace_id`. |
+| `enable_graph_observer` | `true` in source / `false` in code fallback | `ENABLE_GRAPH_OBSERVER` | Enable the loopback-only live retrieval graph UI + API. Off → every `/graph*` route 404s and `/query` responses omit `graph_trace_id`. |
 | `graph_trace_limit` | `100` | `GRAPH_TRACE_LIMIT` | Max concurrent in-memory traces (oldest evicted). |
 | `graph_element_limit` | `5000` | `GRAPH_ELEMENT_LIMIT` | Max total nodes+edges across all traces. |
 | `graph_trace_ttl_s` | `3600` | `GRAPH_TRACE_TTL_S` | Trace time-to-live in seconds. |
@@ -627,8 +687,8 @@ feature_flags:
   sector_feeds: false
 
 # configs/middleware.yaml
-enable_phase2_3_retrieval: false
-enable_phase2_3_corpus_projection: false
+enable_phase2_3_retrieval: true
+enable_phase2_3_corpus_projection: true
 ```
 
 These are the complete set of eight Phase 2.3.6.1 capability switches — one

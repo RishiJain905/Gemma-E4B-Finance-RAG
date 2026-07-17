@@ -103,6 +103,7 @@ RESULT_KEYS = (
     "history_sent", "expected_tickers", "expected_metrics", "expected_timeframe",
     "expected_carryover", "resolved_tickers", "resolved_metrics",
     "resolved_timeframe", "subquestion_ids", "subquestion_coverage",
+    "coverage_metadata",
 )
 
 # Cached in-process Store/config (built once, reused across cases).
@@ -174,6 +175,30 @@ def _subquestion_fields(case: dict, answer: str) -> tuple[list, Optional[float]]
     return ids, round(len(addressed) / len(subs), 4)
 
 
+QUALITY_STAGE_TIMING_FIELDS = (
+    "intent_plan_ms",
+    "catalog_tools_ms",
+    "dense_retrieval_ms",
+    "lexical_retrieval_ms",
+    "fusion_rerank_ms",
+    "prompt_construction_ms",
+    "model_ttft_ms",
+    "model_total_ms",
+    "end_to_end_ms",
+)
+
+
+def _normalize_stage_timings(timings: Optional[dict]) -> dict[str, Optional[float]]:
+    """Return the stable 2.3.7.7 stage schema without inventing measurements."""
+    raw = timings if isinstance(timings, dict) else {}
+    stages = raw.get("stages") if isinstance(raw.get("stages"), dict) else {}
+    normalized: dict[str, Optional[float]] = {}
+    for field in QUALITY_STAGE_TIMING_FIELDS:
+        value = stages.get(field)
+        normalized[field] = round(float(value), 1) if isinstance(value, (int, float)) else None
+    return normalized
+
+
 def _row(case: dict, *, answer: str, detected_ticker, detected_intent,
          facts_used, documents_used, retrieved_sources, context: str = "",
          evidence_trace: Optional[dict] = None, trace_complete: bool = True,
@@ -189,7 +214,13 @@ def _row(case: dict, *, answer: str, detected_ticker, detected_intent,
          evidence_sufficiency: Optional[dict] = None,
          decomposition: Optional[dict] = None,
          answer_validation: Optional[dict] = None,
-         config_label: Optional[str] = None) -> dict:
+         coverage_metadata: Optional[dict] = None,
+         config_label: Optional[str] = None,
+         timings: Optional[dict] = None,
+         answer_origin: Optional[str] = None,
+         generation_skipped: Optional[bool] = None,
+         structured_values: Optional[list] = None,
+         embedding_calls: Optional[int] = None) -> dict:
     """Assemble a well-formed result row (always has every RESULT_KEY)."""
     ans = answer or ""
     sq_ids, sq_cov = _subquestion_fields(case, ans)
@@ -214,6 +245,12 @@ def _row(case: dict, *, answer: str, detected_ticker, detected_intent,
         "model_available": bool(model_available),
         "error": error,
         "case": case,
+        "timings": timings if isinstance(timings, dict) else None,
+        "stage_timings": _normalize_stage_timings(timings),
+        "answer_origin": answer_origin,
+        "generation_skipped": generation_skipped,
+        "structured_values": list(structured_values or []),
+        "embedding_calls": embedding_calls,
         # ── Conversational / compound fields (2.2.1.3) ──
         "conversation_id": conversation_id,
         "turn_index": turn_index,
@@ -229,6 +266,9 @@ def _row(case: dict, *, answer: str, detected_ticker, detected_intent,
         "resolved_timeframe": resolved_timeframe,
         "subquestion_ids": sq_ids,
         "subquestion_coverage": sq_cov,
+        "coverage_metadata": (
+            coverage_metadata if isinstance(coverage_metadata, dict) else None
+        ),
         # ── Adaptive orchestration fields (2.2.3.4) ──
         # The full response.orchestration block plus the two most-queried
         # scalars promoted to top-level so per-lane metrics and the config
@@ -474,6 +514,12 @@ def _row_from_endpoint(case: dict, data: dict, latency_s: float,
         evidence_sufficiency=data.get("evidence_sufficiency"),
         decomposition=data.get("decomposition"),
         answer_validation=data.get("answer_validation"),
+        coverage_metadata=data.get("coverage_metadata"),
+        timings=data.get("timings"),
+        answer_origin=data.get("answer_origin"),
+        generation_skipped=data.get("generation_skipped"),
+        structured_values=data.get("structured_values"),
+        embedding_calls=data.get("embedding_calls"),
         **_ctx_kwargs(ctx, data, trace),
     )
 
@@ -582,7 +628,11 @@ def call_live_endpoint(question: str, *, query_url: str = DEFAULT_QUERY_URL,
             if q:
                 turns.append({"role": "user", "content": h.get("question", "")})
             if a:
-                turns.append({"role": "assistant", "content": h.get("answer", "")})
+                assistant = {"role": "assistant", "content": h.get("answer", "")}
+                context = h.get("context")
+                if isinstance(context, dict) and context:
+                    assistant["context"] = context
+                turns.append(assistant)
         if turns:
             body["history"] = turns
     try:
@@ -789,6 +839,12 @@ def _row_from_direct(case: dict, data: dict, latency_s: float,
         latency_ms=latency_s * 1000,
         model_available=model_available,
         error=error,
+        coverage_metadata=data.get("coverage_metadata"),
+        timings=data.get("timings"),
+        answer_origin=data.get("answer_origin"),
+        generation_skipped=data.get("generation_skipped"),
+        structured_values=data.get("structured_values"),
+        embedding_calls=data.get("embedding_calls"),
         **_ctx_kwargs(ctx, data, trace),
     )
 
@@ -919,8 +975,16 @@ def run_conversation(conv: dict, *, query_fn: Optional[Callable] = None,
                        dataset_digest=dataset_digest, history=list(history),
                        conversation_id=conv_id, turn_index=i)
         rows.append(row)
-        history.append({"question": turn.get("question", ""),
-                        "answer": row.get("answer", "")})
+        context = {
+            "grounding": row.get("grounding"),
+            "coverage_metadata": row.get("coverage_metadata"),
+        }
+        context = {key: value for key, value in context.items() if value is not None}
+        history.append({
+            "question": turn.get("question", ""),
+            "answer": row.get("answer", ""),
+            "context": context or None,
+        })
     return rows
 
 
