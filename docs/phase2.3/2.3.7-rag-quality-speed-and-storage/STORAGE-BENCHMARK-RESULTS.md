@@ -49,9 +49,13 @@ cross-store mutation reconciled to zero drift.
 
 1. **Inventory/count queries** — `Store.get_source_counts`/ticker counts
    previously materialized every Chroma metadata row per call (O(corpus));
-   now served from the SQLite corpus ledger via indexed `GROUP BY`
-   (additive migration `007_lexical_meta.sql`), with the Chroma scan kept
-   only as the legacy fallback when ledger tables are absent. 6,237 → 15 ms.
+   now served by an indexed `GROUP BY` over the new narrow
+   `lexical_chunk_meta` table (additive migration `007_lexical_meta.sql`:
+   chunk_id/source/ticker only, maintained transactionally alongside
+   `corpus_fts` — grouping the content-bearing FTS table directly would
+   force a full body scan). The Chroma scan remains only as the legacy
+   fallback when the table is absent. 6,237 → 15 ms; costs ~15 MB SQLite
+   growth at 100k chunks.
 2. **Hybrid hydration** — fused candidates now hydrate through one bounded,
    deduplicated id batch instead of per-stage fetches with dense/lexical
    overlap fetched twice. 537 → 95 ms.
@@ -59,9 +63,14 @@ cross-store mutation reconciled to zero drift.
    auxiliary instead of per-row `bm25()` recomputation, 200-candidate cap
    enforced before scoring joins. 139 → 92 ms.
 
-No schema rewrites beyond additive indexes, no API shape changes, fail-soft
-and revision-consistency semantics from 2.3.7.5 preserved. Offline gate:
-`VERIFY: PASS` (1,831 passed).
+Additionally the benchmark's reconciliation workload itself was fixed from
+O(N²) (per-chunk scans of the FTS index, ~4,378 s/pass at 100k — the cause
+of the aborted second run) to an O(N) snapshot comparison (14.6 s/pass) with
+identical missing/duplicate/stale/orphan detection.
+
+No schema rewrites beyond additive tables/indexes, no API shape changes,
+fail-soft and revision-consistency semantics from 2.3.7.5 preserved.
+Offline gate: `VERIFY: PASS` (1,831 passed).
 
 ## Rejected alternatives
 
