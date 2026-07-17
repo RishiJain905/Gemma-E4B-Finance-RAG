@@ -16,18 +16,34 @@ and ingestion pipeline are cross-platform (Windows/Linux).
 
 ## What it does
 
-1. **Ingests** financial data from six sources (SEC EDGAR filings, Yahoo
-   Finance, FRED macro indicators, GDELT global news, earnings-call
-   transcripts, and company investor-relations pages).
+1. **Ingests** financial data from six deep-coverage sources (SEC EDGAR
+   filings, Yahoo Finance, FRED macro indicators, GDELT global news,
+   earnings-call transcripts, and company investor-relations pages), plus an
+   optional broad-universe source registry (S&P 500 / Nasdaq-100) — see
+   [Broad-universe ingestion](#broad-universe-ingestion-optional-phase-234236)
+   below.
 2. **Stores** it in two complementary backends:
    - **SQLite** — structured facts, filing index, cache freshness, ingestion
-     audit log, and a dead-letter queue.
+     audit log, a dead-letter queue, and a persistent **FTS5 lexical index**
+     for hybrid search (startup in seconds, not minutes — no more in-memory
+     BM25 materialization of the whole corpus).
    - **ChromaDB** — document embeddings produced by the TraceAlchemy
-     `/v1/embeddings` endpoint (cosine similarity).
-3. **Answers** questions through a FastAPI middleware that parses intent, runs
-   hybrid retrieval (facts + documents), augments a prompt, and calls the model
-   for a grounded, cited answer. When the model is unavailable it returns a
-   **degraded** answer built from the raw retrieved data.
+     `/v1/embeddings` endpoint (cosine similarity). A 100,000-chunk storage
+     benchmark (Phase 2.3.7.6) passed all nine hard latency/correctness gates
+     for this pairing, so no replacement store is planned — see
+     `docs/phase2.3/2.3.7-rag-quality-speed-and-storage/STORAGE-BENCHMARK-RESULTS.md`.
+3. **Answers** questions through a FastAPI middleware that parses intent,
+   adaptively routes the query through one of four lanes (fast / standard /
+   complex / catalog), runs hybrid retrieval (facts + documents), augments a
+   prompt, and calls the model for a grounded, cited answer. Safe analytical
+   questions are routed to read-only tools deterministically, and when a
+   question's answer is fully covered by typed evidence the middleware skips
+   generation entirely and returns a deterministic answer directly — measured
+   ~94–96% faster than a generated answer on eligible queries. Capability
+   questions ("what tickers/sources do you cover?") are answered
+   deterministically from the `describe_coverage` tool rather than guessed by
+   the model. When the model is unavailable, `/query` returns a **degraded**
+   answer built from the raw retrieved data instead of failing.
 
 ---
 
@@ -156,10 +172,11 @@ curl -X POST http://127.0.0.1:8000/query \
 
 For a single, centralized entry point, use the interactive client. It
 **auto-starts the middleware** if it isn't already running, gives you a chat
-loop over `/query` (streamed by default), and surfaces every Phase 2.1/2.2
+loop over `/query` (streamed by default), and surfaces every Phase 2.1–2.3.7
 feature — grounding mode, tool calls, retrieval strategy, fetch-on-miss,
 resolved-ticker confirmation, bounded conversation history, multiline questions,
-and streamed progress events — in one consistent answer renderer:
+streamed progress events, and the deterministic answer fast path — in one
+consistent answer renderer:
 
 ```bash
 python scripts/chat.py
@@ -247,7 +264,7 @@ capability flags, and migration.
 ## Architecture
 
 ```
-                          6 data sources
+                          6 data sources (+ optional broad-universe registry)
    SEC EDGAR · Yahoo Finance · FRED · GDELT · Earnings transcripts · IR pages
                                │
                        Ingestion pipeline
@@ -257,12 +274,14 @@ capability flags, and migration.
                 ▼                              ▼
           SQLite (fundamentals,          ChromaDB
           filings, cache_meta,           (document embeddings,
-          ingestion_log,                  cosine similarity)
-          dead_letter)
+          ingestion_log, dead_letter,    cosine similarity)
+          FTS5 lexical index)
                 └──────────────┬──────────────┘
                                ▼
                    FastAPI middleware (:8000)
-        intent parsing → hybrid retrieval → prompt augmentation
+    intent parsing → adaptive lane routing (fast/standard/complex/catalog)
+    → deterministic tool routing / deterministic answers → hybrid retrieval
+    → prompt augmentation
                                │
                                ▼
               llama-server (:8087) — TraceAlchemy
@@ -280,8 +299,14 @@ components, the storage schema, the query flow, and failure-mode handling.
 Gemma-E4B-Finance-RAG/
 ├── configs/                  # YAML configuration (see docs/CONFIGURATION.md)
 │   ├── storage.yaml          # SQLite + ChromaDB + embedding + SEC settings
-│   ├── middleware.yaml       # Endpoints, model name, retrieval top-k
+│   ├── middleware.yaml       # Endpoints, model name, retrieval top-k, feature flags
+│   ├── profiles/             # legacy / recommended / evaluation runtime profiles
+│   │   ├── legacy.yaml       # Phase 2.2-compatible rollback (MIDDLEWARE_PROFILE=legacy)
+│   │   ├── recommended.yaml  # Promoted-safe production default
+│   │   └── evaluation.yaml   # recommended + eval trace/progress metadata
 │   ├── watchlist.yaml        # Tracked tickers + per-source TTL schedule
+│   ├── sources.yaml          # Broad-universe source registry (optional, off by default)
+│   ├── coverage.yaml         # Security registry / index membership settings
 │   ├── fred.yaml             # FRED indicators + request settings
 │   ├── gdelt.yaml            # GDELT query/domain/topic filters
 │   ├── ir.yaml               # Company IR-page ingestion settings
@@ -303,10 +328,16 @@ Gemma-E4B-Finance-RAG/
 │   │   └── chroma_store.py   # Vector store + TraceAlchemy embedding function
 │   ├── middleware/           # FastAPI query router
 │   │   ├── app.py            # Endpoints + query pipeline
-│   │   ├── config.py         # MiddlewareConfig (from middleware.yaml)
+│   │   ├── config.py         # MiddlewareConfig (flags, profiles, from middleware.yaml)
 │   │   ├── models.py         # Pydantic request/response schemas
 │   │   ├── intent_parser.py  # Ticker / metric / question-type extraction
-│   │   ├── retriever.py      # Hybrid retrieval strategy selection
+│   │   ├── adaptive_orchestrator.py  # Fast/standard/complex/catalog lane routing
+│   │   ├── deterministic_router.py   # Deterministic tool routing (no model call)
+│   │   ├── deterministic_answers.py  # Deterministic answer fast path (skips generation)
+│   │   ├── tools/coverage_tools.py   # describe_coverage — read-only capability inventory
+│   │   ├── lexical_index.py  # BM25 lexical index (persistent SQLite FTS5 or in-memory)
+│   │   ├── retriever.py      # Hybrid retrieval strategy selection + RRF fusion
+│   │   ├── reranker.py       # Optional cross-encoder/LLM re-rank stage
 │   │   └── prompt_augmenter.py
 │   ├── scheduler/            # Unified ingestion orchestrator
 │   │   ├── __init__.py       # UnifiedScheduler (daily/hourly/weekly/all)
@@ -339,6 +370,15 @@ Gemma-E4B-Finance-RAG/
 All runtime configuration lives in `configs/*.yaml`, with secrets supplied via
 `.env` (`FRED_API_KEY`, `SEC_EDGAR_USER_AGENT`). Each config file and every
 field is documented in **[docs/CONFIGURATION.md](docs/CONFIGURATION.md)**.
+
+The middleware selects one of three reviewed runtime profiles
+(`configs/profiles/legacy|recommended|evaluation.yaml`) via `profile:` in
+`middleware.yaml` or the `MIDDLEWARE_PROFILE` env var. `recommended` is the
+production default (adaptive lane routing, deterministic tool routing,
+deterministic answers, and the FTS5 lexical index all on); `legacy` is the
+tested one-switch rollback to Phase 2.2-compatible behavior. See
+[`docs/FEATURE-FLAGS.md`](docs/FEATURE-FLAGS.md) for the live inventory of
+every optional flag, what's on by default, and why.
 
 ---
 
@@ -397,6 +437,28 @@ Sanity-check your environment before running the stack:
 ```bash
 python scripts/validate_setup.py
 ```
+
+Before committing a change, run the verify gate — it wraps `pytest`, lint,
+and this repo's promotion gates, and prints a final `VERIFY: PASS`/`FAIL`
+line:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\verify.ps1   # Windows
+```
+
+```bash
+scripts/verify.sh                                              # macOS/Linux
+```
+
+An offline **eval harness** (`eval/run_eval.py`, `eval/score.py`, `eval/gate.py`)
+scores answers against golden sets (`tests/fixtures/evaluation/`,
+`eval/golden/`) with an LLM judge and deterministic metrics (faithfulness,
+policy compliance, refusal rate, entity/metric carryover, latency), and gates
+feature promotion — see
+`docs/phase2.3/2.3.7-rag-quality-speed-and-storage/RESULTS.md` for the
+measured results behind the current defaults. `python scripts/chat.py` also
+exposes `/eval [N]` and `/eval conversations [N]` to run a quick scored pass
+against a live server.
 
 See **[CONTRIBUTING.md](CONTRIBUTING.md)** for code style, branch, and PR
 conventions.
