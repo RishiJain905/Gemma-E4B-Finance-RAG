@@ -597,3 +597,35 @@ def test_markdown_table_keeps_heading_and_units_in_its_chunk():
     assert len(chunks) == 1
     assert "Revenue (USD millions)" in chunks[0]["text"]
     assert "| Quarter | Revenue |" in chunks[0]["text"]
+
+
+def test_mark_corpus_revision_strips_index_config_keys(chroma_store):
+    """Re-sending hnsw:* keys makes chromadb reject the whole modify call
+    ("Changing the distance function ... is not supported"), which left the
+    Chroma-visible revision permanently stale and silently disabled lexical
+    fusion via the revision-consistency guard (found live 2026-07-17)."""
+    chroma_store.collection.metadata = {"hnsw:space": "cosine", "corpus_revision": 3}
+
+    def _reject_hnsw(metadata):
+        if any(k.startswith("hnsw:") for k in metadata):
+            raise ValueError(
+                "Changing the distance function of a collection once it is "
+                "created is not supported currently.")
+
+    chroma_store.collection.modify.side_effect = (
+        lambda metadata: _reject_hnsw(metadata))
+
+    chroma_store.mark_corpus_revision(7)
+
+    chroma_store.collection.modify.assert_called_once()
+    sent = chroma_store.collection.modify.call_args.kwargs["metadata"]
+    assert sent["corpus_revision"] == 7
+    assert not any(k.startswith("hnsw:") for k in sent)
+
+
+def test_mark_corpus_revision_never_regresses(chroma_store):
+    chroma_store.collection.metadata = {"corpus_revision": 9}
+
+    chroma_store.mark_corpus_revision(7)
+
+    chroma_store.collection.modify.assert_not_called()

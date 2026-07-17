@@ -596,6 +596,11 @@ class ChromaStore:
         if int(revision) < current:
             return
         metadata["corpus_revision"] = int(revision)
+        # Re-sending index-configuration keys makes chromadb reject the whole
+        # modify ("Changing the distance function ... is not supported"), which
+        # left the Chroma-visible revision permanently stale and made the
+        # revision-consistency guard skip lexical fusion on live queries.
+        metadata = {k: v for k, v in metadata.items() if not k.startswith("hnsw:")}
         self.collection.modify(metadata=metadata)
 
     def delete_document(self, document_id: str):
