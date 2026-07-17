@@ -616,30 +616,52 @@ def test_format_news_date_iso_and_unix():
     assert ingestor._format_news_date(1717000000) == "2024-05-29"
 
 
-@patch.object(YFinanceIngestor, "_fetch_ticker")
-def test_ingest_ticker_news_nested_schema(mock_fetch, tmp_path):
-    """Nested-schema article is saved with correct metadata."""
+def _ledger_store(tmp_path):
+    """Store with a mocked ChromaStore (offline) but a real SQLite corpus ledger."""
     from src.storage.store import Store
 
-    store = Store(db_path=tmp_path / "test.db")
+    with patch("src.storage.store.ChromaStore") as chroma_class:
+        chroma = MagicMock()
+        chroma_class.return_value = chroma
+        store = Store(db_path=tmp_path / "yf.db", chroma_path=tmp_path / "chroma")
+    chroma.get_document.return_value = None
+    return store, chroma
+
+
+@patch.object(YFinanceIngestor, "_fetch_ticker")
+def test_ingest_ticker_news_registers_corpus_ledger_row(mock_fetch, tmp_path):
+    """Nested-schema article lands a corpus_items ledger row plus source/security links."""
+    store, chroma = _ledger_store(tmp_path)
     ingestor = YFinanceIngestor(store=store)
+
+    # Seed a resolvable security so the security link is exercised end-to-end.
+    store.upsert_universe_snapshot(
+        "ivv",
+        "2026-05-01T00:00:00Z",
+        [{"symbol": "NVDA", "company_name": "NVIDIA Corp", "index_code": "sp500"}],
+    )
 
     mock_t = MagicMock()
     mock_t.news = [NESTED_ARTICLE]
     mock_fetch.return_value = mock_t
 
-    ingestor.store.chroma.get_document = MagicMock(return_value=None)
-    ingestor.store.save_document = MagicMock(return_value="news/NVDA/a1b2c3d4")
-
     ingestor._ingest_ticker_news("NVDA", mock_t)
 
-    ingestor.store.save_document.assert_called_once()
-    call_kwargs = ingestor.store.save_document.call_args.kwargs
-    assert call_kwargs["ticker"] == "NVDA"
-    assert call_kwargs["source"] == "yfinance_news"
-    assert call_kwargs["metadata"]["title"] == "NVIDIA Hits Record High"
-    assert call_kwargs["metadata"]["publisher"] == "Reuters"
-    assert call_kwargs["date"] == "2026-05-30"
+    doc_id = "news/NVDA/a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+    assert store.sqlite.count_corpus_items() == 1
+    item = store.sqlite.get_corpus_item(doc_id)
+    assert item is not None
+    assert item["source"] == "yfinance_news"
+    assert item["item_type"] == "news"
+    assert item["title"] == "NVIDIA Hits Record High"
+    assert "NVDA" in (item["tickers"] or [])
+    assert store.sqlite.list_corpus_item_sources(doc_id)
+    assert any(
+        row.get("ticker") == "NVDA"
+        for row in store.sqlite.list_corpus_item_securities(doc_id)
+    )
+    # Narrative content is indexed in Chroma in the same call (not save_document).
+    assert chroma.add_document.call_count == 1
 
     cache = store.get_cache_status("NVDA", "yfinance_news")
     assert cache is not None
@@ -647,62 +669,72 @@ def test_ingest_ticker_news_nested_schema(mock_fetch, tmp_path):
 
 
 @patch.object(YFinanceIngestor, "_fetch_ticker")
-def test_ingest_ticker_news_flat_schema(mock_fetch, tmp_path):
-    """Flat-schema article parses and saves correctly."""
-    from src.storage.store import Store
-
-    store = Store(db_path=tmp_path / "test.db")
+def test_ingest_ticker_news_flat_schema_registers_ledger(mock_fetch, tmp_path):
+    """Flat-schema article parses and registers under a stable corpus id."""
+    store, chroma = _ledger_store(tmp_path)
     ingestor = YFinanceIngestor(store=store)
 
     mock_t = MagicMock()
     mock_t.news = [FLAT_ARTICLE]
 
-    ingestor.store.chroma.get_document = MagicMock(return_value=None)
-    ingestor.store.save_document = MagicMock()
-
     ingestor._ingest_ticker_news("AMD", mock_t)
 
-    ingestor.store.save_document.assert_called_once()
-    call_kwargs = ingestor.store.save_document.call_args.kwargs
-    assert call_kwargs["document_id"] == "news/AMD/flat-uuid-001"
-    assert call_kwargs["metadata"]["publisher"] == "Bloomberg"
-    assert call_kwargs["date"] == "2024-05-29"
+    item = store.sqlite.get_corpus_item("news/AMD/flat-uuid-001")
+    assert item is not None
+    assert item["title"] == "AMD Expands Data Center"
+    assert item["original_publisher"] == "Bloomberg"
+    assert item["published_at"] == "2024-05-29"
 
 
 def test_ingest_ticker_news_skips_duplicate(tmp_path):
-    """Existing doc_id in ChromaDB is skipped (idempotent)."""
-    from src.storage.store import Store
-
-    store = Store(db_path=tmp_path / "test.db")
+    """Existing doc_id in ChromaDB is skipped (no ledger write, idempotent)."""
+    store, chroma = _ledger_store(tmp_path)
     ingestor = YFinanceIngestor(store=store)
 
     mock_t = MagicMock()
     mock_t.news = [NESTED_ARTICLE]
 
-    ingestor.store.chroma.get_document = MagicMock(return_value={"id": "existing"})
-    ingestor.store.save_document = MagicMock()
+    chroma.get_document.return_value = {"id": "existing"}
+    store.upsert_narrative = MagicMock()
 
     ingestor._ingest_ticker_news("NVDA", mock_t)
 
-    ingestor.store.save_document.assert_not_called()
+    store.upsert_narrative.assert_not_called()
+    assert store.sqlite.count_corpus_items() == 0
 
 
 def test_ingest_ticker_news_skips_malformed(tmp_path):
-    """Malformed article (no title+summary) is skipped."""
-    from src.storage.store import Store
-
-    store = Store(db_path=tmp_path / "test.db")
+    """Malformed article (no title) is skipped without a ledger write."""
+    store, chroma = _ledger_store(tmp_path)
     ingestor = YFinanceIngestor(store=store)
 
     mock_t = MagicMock()
     mock_t.news = [{"content": {"title": "", "summary": ""}}]
 
-    ingestor.store.chroma.get_document = MagicMock(return_value=None)
-    ingestor.store.save_document = MagicMock()
+    store.upsert_narrative = MagicMock()
 
     ingestor._ingest_ticker_news("NVDA", mock_t)
 
-    ingestor.store.save_document.assert_not_called()
+    store.upsert_narrative.assert_not_called()
+    assert store.sqlite.count_corpus_items() == 0
+
+
+@patch.object(YFinanceIngestor, "_fetch_ticker")
+def test_ingest_ticker_news_is_idempotent_across_runs(mock_fetch, tmp_path):
+    """Re-ingesting the same article does not create a second ledger row."""
+    store, chroma = _ledger_store(tmp_path)
+    ingestor = YFinanceIngestor(store=store)
+
+    mock_t = MagicMock()
+    mock_t.news = [NESTED_ARTICLE]
+
+    ingestor._ingest_ticker_news("NVDA", mock_t)
+    assert store.sqlite.count_corpus_items() == 1
+
+    # Second pass: the article is already in Chroma, so the early skip fires.
+    chroma.get_document.return_value = {"id": "existing"}
+    ingestor._ingest_ticker_news("NVDA", mock_t)
+    assert store.sqlite.count_corpus_items() == 1
 
 
 def test_news_fresh_within_ttl(tmp_path):

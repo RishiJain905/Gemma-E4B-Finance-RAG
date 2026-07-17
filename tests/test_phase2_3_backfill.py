@@ -143,6 +143,131 @@ def test_backfill_interrupts_and_resumes_without_duplicates_or_embedding(legacy_
         ).fetchone()[0] == 1
 
 
+@pytest.fixture
+def untracked_store(tmp_path):
+    """Store whose Chroma holds legacy yfinance-news parents with no ledger row."""
+    documents = [
+        {
+            "id": "news/NVDA/story-1",
+            "metadata": {
+                "ticker": "NVDA",
+                "source": "yfinance_news",
+                "title": "NVDA climbs",
+                "publisher": "Reuters",
+                "link": "https://finance.example/nvda-1",
+                "type": "news",
+            },
+        },
+        {
+            "id": "news/AMD/story-2",
+            "metadata": {
+                "ticker": "AMD",
+                "source": "yfinance_news",
+                "title": "AMD expands",
+                "publisher": "Bloomberg",
+                "link": "https://finance.example/amd-2",
+                "type": "news",
+            },
+        },
+    ]
+    chroma = MagicMock()
+    chroma.iter_document_metadata.side_effect = lambda limit, offset: documents[
+        offset : offset + limit
+    ]
+    chroma.count.return_value = len(documents)
+    with patch("src.storage.store.ChromaStore", return_value=chroma):
+        store = Store(db_path=tmp_path / "untracked.db", chroma_path=tmp_path / "chroma")
+    return store, chroma, documents
+
+
+def test_register_untracked_creates_ledger_rows_without_reembedding(untracked_store):
+    store, chroma, _ = untracked_store
+    assert store.sqlite.count_corpus_items() == 0
+
+    result = Phase23Backfill(store, batch_size=100).register_untracked_documents()
+
+    assert result["pass_complete"] is True
+    assert result["inserted"] == 2
+    assert store.sqlite.count_corpus_items() == 2
+    with store.sqlite._connect() as conn:
+        for family_id in ("news/NVDA/story-1", "news/AMD/story-2"):
+            assert conn.execute(
+                "SELECT COUNT(*) FROM corpus_items WHERE document_family_id=?",
+                (family_id,),
+            ).fetchone()[0] == 1
+        version = conn.execute(
+            "SELECT normalization_version FROM corpus_items "
+            "WHERE document_family_id='news/NVDA/story-1'"
+        ).fetchone()[0]
+        # Every registered orphan is marked as backfilled, and a source row exists
+        # so coverage/completeness accounting (corpus_items input) sees the doc.
+        assert version == "phase2_3_backfill_v1"
+        assert conn.execute(
+            "SELECT COUNT(*) FROM corpus_item_sources cis "
+            "JOIN corpus_items ci ON ci.corpus_item_id=cis.corpus_item_id "
+            "WHERE ci.document_family_id='news/NVDA/story-1'"
+        ).fetchone()[0] >= 1
+    # Registration is metadata-only: never re-embeds or rewrites Chroma content.
+    chroma.add_document.assert_not_called()
+    chroma.add_documents_batch.assert_not_called()
+
+
+def test_register_untracked_second_run_registers_nothing(untracked_store):
+    store, _, _ = untracked_store
+    Phase23Backfill(store, batch_size=100).register_untracked_documents()
+
+    rerun = Phase23Backfill(store, batch_size=100).register_untracked_documents()
+
+    assert rerun["inserted"] == 0
+    assert store.sqlite.count_corpus_items() == 2
+
+
+def test_register_untracked_picks_up_docs_added_after_completed_pass(untracked_store):
+    store, _, documents = untracked_store
+    Phase23Backfill(store, batch_size=100).register_untracked_documents()
+    assert store.sqlite.count_corpus_items() == 2
+
+    documents.append(
+        {
+            "id": "news/TSLA/story-3",
+            "metadata": {"ticker": "TSLA", "source": "yfinance_news", "title": "TSLA"},
+        }
+    )
+    rerun = Phase23Backfill(store, batch_size=100).register_untracked_documents()
+
+    assert rerun["inserted"] == 1
+    assert store.sqlite.count_corpus_items() == 3
+
+
+def test_register_untracked_resumes_across_bounded_batches(untracked_store):
+    store, _, _ = untracked_store
+    first = Phase23Backfill(store, batch_size=1).register_untracked_documents(
+        max_batches=1
+    )
+    assert first["pass_complete"] is False
+    assert store.sqlite.count_corpus_items() == 1
+
+    result = first
+    for _ in range(10):
+        result = Phase23Backfill(store, batch_size=1).register_untracked_documents(
+            max_batches=1
+        )
+        if result["pass_complete"]:
+            break
+    assert result["pass_complete"] is True
+    assert store.sqlite.count_corpus_items() == 2
+
+
+def test_staged_backfill_completion_ignores_register_untracked_stage(untracked_store):
+    """The register-untracked progress row must not perturb run() completion."""
+    store, _, _ = untracked_store
+    Phase23Backfill(store, batch_size=100).register_untracked_documents()
+
+    result = Phase23Backfill(store, batch_size=100).run()
+
+    assert result["complete"] is True
+
+
 def test_backfill_records_ambiguous_cik_instead_of_guessing(tmp_path):
     chroma = MagicMock()
     chroma.iter_document_metadata.return_value = []
