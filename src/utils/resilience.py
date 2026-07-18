@@ -251,13 +251,29 @@ class ProviderRequestPolicy:
                         response, now=self.now_fn()
                     )
                     if self.source.startswith("sec") and status_code in {403, 429}:
-                        response_error = ProviderError(
-                            response_error.safe_message,
-                            error_class=ErrorClass.RATE_LIMITED,
-                            status_code=status_code,
-                            retry_after=response_error.retry_after,
-                            reset_at=response_error.reset_at,
-                        )
+                        # Two very different SEC 403s share one status code. A
+                        # real throttle block serves an HTML block page; a
+                        # request for an object EDGAR never published (e.g. a
+                        # market-holiday daily index) serves raw S3 XML
+                        # AccessDenied. Treating the latter as RATE_LIMITED
+                        # retried a file that will never exist, opened the
+                        # provider circuit, and fail-fasted the whole run
+                        # (live incident 2026-07-17/18).
+                        body = str(getattr(response, "text", "") or "")
+                        if "<Code>AccessDenied</Code>" in body:
+                            response_error = ProviderError(
+                                response_error.safe_message,
+                                error_class=ErrorClass.PERMANENT,
+                                status_code=status_code,
+                            )
+                        else:
+                            response_error = ProviderError(
+                                response_error.safe_message,
+                                error_class=ErrorClass.RATE_LIMITED,
+                                status_code=status_code,
+                                retry_after=response_error.retry_after,
+                                reset_at=response_error.reset_at,
+                            )
                     if response_error.error_class is ErrorClass.PERMANENT:
                         return response
                     raise response_error

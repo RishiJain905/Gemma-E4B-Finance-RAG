@@ -244,3 +244,45 @@ class TestDeadLetterQueue:
         assert pending[0]["first_seen"]
         assert pending[0]["last_seen"]
         assert "secret" not in pending[0]["last_error"]
+
+
+def test_sec_403_s3_accessdenied_is_permanent_and_does_not_trip_circuit():
+    """EDGAR serves raw S3 XML AccessDenied for objects it never published
+    (market-holiday daily indexes). That must return to the caller as a
+    permanent per-item failure - not retry as a rate limit and not open the
+    provider circuit, which fail-fasted entire weekly runs (2026-07-17/18)."""
+    from src.utils.resilience import ProviderRequestPolicy
+
+    policy = ProviderRequestPolicy(source="sec_filings", sleep_fn=lambda _s: None)
+    denied = MagicMock(status_code=403,
+                       text='<?xml version="1.0"?><Error><Code>AccessDenied</Code></Error>',
+                       headers={})
+
+    returned = policy.request(lambda: denied)
+
+    assert returned is denied
+    assert policy.breaker.state != "OPEN"
+    assert policy.attempts == 1  # no retry storm for a file that never exists
+
+    ok = MagicMock(status_code=200, text="Daily Index", headers={})
+    assert policy.request(lambda: ok) is ok  # later dates still reach the network
+
+
+def test_sec_403_html_block_page_stays_rate_limited():
+    """A real SEC throttle block (HTML block page) keeps the existing
+    RATE_LIMITED retry/circuit semantics."""
+    from src.ingestion.errors import ProviderError
+    from src.utils.resilience import ProviderRequestPolicy
+
+    policy = ProviderRequestPolicy(source="sec_filings", max_attempts=2,
+                                   sleep_fn=lambda _s: None)
+    blocked = MagicMock(status_code=403,
+                        text="<!DOCTYPE html><html>Request Rate Threshold Exceeded</html>",
+                        headers={})
+
+    with pytest.raises(ProviderError) as excinfo:
+        policy.request(lambda: blocked)
+
+    assert excinfo.value.error_class.value == "rate_limited"
+    assert policy.attempts == 2
+    assert policy.breaker.state == "OPEN"
