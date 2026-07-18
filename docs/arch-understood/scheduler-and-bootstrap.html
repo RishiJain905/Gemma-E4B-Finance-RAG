@@ -1,0 +1,524 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>UnifiedScheduler &amp; Bootstrap — Gemma-E4B-Finance-RAG</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  :root{
+    --bg:#FAFAF8;
+    --ink:#1F2430;
+    --muted:#666f80;
+    --faint:#9aa3b2;
+    --card-line:#E6E3DA;
+    --card-bg:#FFFFFF;
+
+    --mint-fill:#E3F5EC;   --mint-line:#7CC3A2;   --mint-ink:#1E5A41;
+    --peach-fill:#FDEAD3;  --peach-line:#E2A868;  --peach-ink:#7A4A12;
+    --lav-fill:#EBE5FB;    --lav-line:#A996E8;    --lav-ink:#4B3480;
+    --sky-fill:#DFEDFB;    --sky-line:#6FA3D8;    --sky-ink:#204B76;
+    --rose-fill:#FBE4E4;   --rose-line:#D97A72;   --rose-ink:#7A2A22;
+
+    --gate-fill-1:#EEF1FF; --gate-fill-2:#E2E9FF; --gate-line:#4C5FD6; --gate-ink:#26307A;
+    --arrow:#9AA5B8;
+
+    --mono: ui-monospace, 'Cascadia Mono', 'Consolas', 'SFMono-Regular', Menlo, monospace;
+    --sans: -apple-system, 'Segoe UI', 'Segoe UI Variable', system-ui, Roboto, Helvetica, Arial, sans-serif;
+  }
+  *{box-sizing:border-box;}
+  html,body{margin:0;padding:0;}
+  body{
+    background:
+      radial-gradient(1200px 500px at 15% -10%, #F3F6FF 0%, transparent 60%),
+      radial-gradient(1000px 500px at 100% 0%, #FFF4EA 0%, transparent 55%),
+      var(--bg);
+    color:var(--ink);
+    font-family:var(--sans);
+    line-height:1.45;
+    padding: 40px 28px 90px;
+  }
+  .wrap{max-width:1560px;margin:0 auto;}
+
+  /* ---------- Header ---------- */
+  header.page{ max-width:920px; margin: 0 0 34px; }
+  .eyebrow{
+    font-family:var(--mono); font-size:12px; letter-spacing:.08em; text-transform:uppercase;
+    color:var(--gate-ink); background:var(--gate-fill-1); border:1px solid #C9D2FA;
+    display:inline-block; padding:4px 10px; border-radius:999px; margin-bottom:14px;
+  }
+  h1{
+    font-size:clamp(28px,3.4vw,40px); line-height:1.08; margin:0 0 12px; letter-spacing:-0.01em;
+    font-weight:700;
+  }
+  header.page p{ font-size:16px; color:var(--muted); margin:0; max-width:720px; }
+  header.page code{font-family:var(--mono); font-size:.92em; background:#F0EEE6; padding:1px 6px; border-radius:5px;}
+
+  /* ---------- Diagram card ---------- */
+  .diagram-card{
+    background:var(--card-bg); border:1px solid var(--card-line); border-radius:20px;
+    padding:26px 26px 18px; margin-bottom:30px;
+    box-shadow: 0 1px 2px rgba(20,20,30,.03), 0 12px 28px -18px rgba(20,20,30,.18);
+  }
+  .diagram-card h2{ margin:0 0 2px; font-size:15px; letter-spacing:.02em; }
+  .diagram-card .sub{ margin:0 0 18px; font-size:13px; color:var(--muted); }
+  .stage-scroll{ overflow-x:auto; padding-bottom:6px; }
+  .stage{ position:relative; width:1520px; height:820px; }
+  .stage svg{ position:absolute; inset:0; width:1520px; height:820px; pointer-events:none; }
+
+  .node{
+    position:absolute; border-radius:14px; border:1.5px solid var(--l);
+    background:var(--f); padding:10px 14px; overflow:hidden;
+  }
+  .node .label{ font-weight:700; font-size:13px; color:var(--i); margin:0 0 2px; letter-spacing:-.005em;}
+  .node .sub{ font-size:11px; color:var(--i); opacity:.72; margin:0 0 6px; }
+  .node .rows{ font-size:11.5px; color:var(--i); display:flex; flex-direction:column; gap:3px; }
+  .node .rows .r{ display:flex; align-items:baseline; gap:6px; }
+  .node .rows .r .name{ font-weight:600; white-space:nowrap; }
+  .node .rows .r .meta{ font-family:var(--mono); font-size:10px; opacity:.72; white-space:nowrap;}
+
+  .node--trigger{ --f:var(--sky-fill); --l:var(--sky-line); --i:var(--sky-ink); display:flex; flex-direction:column; justify-content:center; }
+  .node--trigger .cmd{ font-family:var(--mono); font-size:10.5px; opacity:.85; margin-top:2px; }
+
+  .node--source{ --f:var(--peach-fill); --l:var(--peach-line); --i:var(--peach-ink); }
+  .node--source.alt{ --f:var(--lav-fill); --l:var(--lav-line); --i:var(--lav-ink); }
+  .node--source.alt2{ --f:var(--mint-fill); --l:var(--mint-line); --i:var(--mint-ink); }
+
+  .node--facade{
+    --f:linear-gradient(135deg,#F3F6FF,#EAF0FF); --l:var(--gate-line); --i:var(--gate-ink);
+    background:linear-gradient(135deg,#F3F6FF,#EAF0FF); border-color:var(--gate-line);
+    display:flex; flex-direction:column; justify-content:center; text-align:left;
+  }
+
+  /* Gateway — the signature element */
+  .gateway{
+    position:absolute; left:320px; top:30px; width:380px; height:740px;
+    border-radius:20px; border:2px solid var(--gate-line);
+    background:linear-gradient(180deg,var(--gate-fill-1) 0%, var(--gate-fill-2) 100%);
+    box-shadow: 0 18px 40px -22px rgba(60,80,220,.45), inset 0 0 0 1px rgba(255,255,255,.5);
+    padding:20px 20px 22px;
+    display:flex; flex-direction:column;
+  }
+  .gateway .gw-eyebrow{ font-family:var(--mono); font-size:10.5px; letter-spacing:.08em; text-transform:uppercase; color:var(--gate-ink); opacity:.65; }
+  .gateway h3{ margin:2px 0 2px; font-size:20px; color:var(--gate-ink); letter-spacing:-.01em; }
+  .gateway .gw-path{ font-family:var(--mono); font-size:11px; color:var(--gate-ink); opacity:.7; margin-bottom:16px; }
+  .gw-chip{
+    background:rgba(255,255,255,.66); border:1px solid #C9D2FA; border-radius:12px;
+    padding:11px 13px; margin-bottom:10px;
+  }
+  .gw-chip .t{ font-weight:700; font-size:12.5px; color:var(--gate-ink); margin-bottom:2px; }
+  .gw-chip .d{ font-size:11.5px; color:var(--gate-ink); opacity:.78; }
+  .gw-chip .d code{ font-family:var(--mono); font-size:10.5px; background:rgba(76,95,214,.1); padding:1px 4px; border-radius:4px; }
+  .gw-footer{ margin-top:auto; padding-top:6px; font-size:10.5px; color:var(--gate-ink); opacity:.55; font-family:var(--mono); }
+
+  /* Cylinders */
+  .cylinder{
+    position:absolute; width:160px; height:190px;
+    border-radius: 50% 50% 10px 10px / 26px 26px 10px 10px;
+    border:1.6px solid var(--l); background:var(--f);
+    padding-top:34px; text-align:center;
+  }
+  .cylinder::before{
+    content:''; position:absolute; left:-1.6px; right:-1.6px; top:-13px; height:26px;
+    border-radius:50%; background:var(--fcap); border:1.6px solid var(--l);
+  }
+  .cylinder .label{ font-weight:700; font-size:13px; color:var(--i); }
+  .cylinder .sub{ font-family:var(--mono); font-size:10px; color:var(--i); opacity:.7; margin:2px 0 8px; }
+  .cylinder .desc{ font-size:11px; color:var(--i); opacity:.85; padding:0 14px; }
+  .cyl--sqlite{ --f:var(--mint-fill); --fcap:#EFFAF4; --l:var(--mint-line); --i:var(--mint-ink); left:1140px; top:500px; }
+  .cyl--chroma{ --f:var(--sky-fill); --fcap:#EAF3FD; --l:var(--sky-line); --i:var(--sky-ink); left:1320px; top:500px; }
+
+  .flow-path{ fill:none; stroke:var(--arrow); stroke-width:1.6; }
+  @media (prefers-reduced-motion: no-preference){
+    .flow-path{ stroke-dasharray:1; stroke-dashoffset:1; animation:draw 1.4s ease forwards; }
+  }
+  @keyframes draw{ to{ stroke-dashoffset:0; } }
+
+  /* Legend */
+  .legend{ display:flex; flex-wrap:wrap; gap:18px; margin-top:14px; padding-top:14px; border-top:1px dashed var(--card-line); }
+  .legend .item{ display:flex; align-items:center; gap:7px; font-size:12px; color:var(--muted); }
+  .legend .sw{ width:13px; height:13px; border-radius:4px; border:1.5px solid; }
+
+  /* ---------- Content grid ---------- */
+  .grid2{ display:grid; grid-template-columns: 1fr 1fr; gap:22px; margin-bottom:22px; }
+  @media (max-width:980px){ .grid2{ grid-template-columns:1fr; } }
+
+  .card{
+    background:var(--card-bg); border:1px solid var(--card-line); border-radius:18px;
+    padding:22px 24px; box-shadow: 0 1px 2px rgba(20,20,30,.03), 0 10px 24px -18px rgba(20,20,30,.15);
+  }
+  .card h2{ font-size:16px; margin:0 0 4px; letter-spacing:-.005em; }
+  .card .card-sub{ font-size:12.5px; color:var(--muted); margin:0 0 16px; }
+
+  /* Mode cards */
+  .modes{ display:grid; grid-template-columns:repeat(4,1fr); gap:12px; }
+  @media (max-width:1400px){ .modes{ grid-template-columns:repeat(2,1fr);} }
+  .mode{ border-radius:14px; border:1.5px solid var(--l); background:var(--f); padding:14px 14px 12px; }
+  .mode .m-name{ font-family:var(--mono); font-weight:700; font-size:13.5px; color:var(--i); }
+  .mode .m-cadence{ font-size:11px; color:var(--i); opacity:.75; margin:2px 0 10px; }
+  .mode ul{ margin:0; padding-left:16px; font-size:11.5px; color:var(--i); opacity:.9; }
+  .mode ul li{ margin-bottom:5px; }
+  .mode.m-hourly{ --f:var(--sky-fill); --l:var(--sky-line); --i:var(--sky-ink); }
+  .mode.m-daily{ --f:var(--peach-fill); --l:var(--peach-line); --i:var(--peach-ink); }
+  .mode.m-weekly{ --f:var(--lav-fill); --l:var(--lav-line); --i:var(--lav-ink); }
+  .mode.m-all{ --f:var(--mint-fill); --l:var(--mint-line); --i:var(--mint-ink); }
+  .force-note{
+    margin-top:14px; font-size:12px; color:var(--muted); border-top:1px dashed var(--card-line); padding-top:12px;
+  }
+  .force-note code{ font-family:var(--mono); background:#F0EEE6; padding:1px 6px; border-radius:5px; }
+
+  /* Gotcha callout */
+  .gotcha{
+    margin-top:14px; background:var(--rose-fill); border:1.5px solid var(--rose-line); color:var(--rose-ink);
+    border-radius:12px; padding:12px 14px; font-size:12.5px;
+  }
+  .gotcha .g-tag{ font-family:var(--mono); font-size:10.5px; text-transform:uppercase; letter-spacing:.06em; font-weight:700; margin-bottom:4px; opacity:.85; }
+
+  /* TTL timeline */
+  .ttl-timeline{ margin:6px 0 16px; }
+  .ttl-track{ position:relative; height:10px; border-radius:6px; background:linear-gradient(90deg,#8FD6AE 0%, #8FD6AE 32%, #F3C77B 32%, #F3C77B 66%, #8FB8EE 66%, #8FB8EE 100%); }
+  .ttl-labels{ display:flex; justify-content:space-between; font-family:var(--mono); font-size:10.5px; color:var(--muted); margin-top:6px; }
+  .ttl-labels span:nth-child(2){ text-align:center; flex:1; }
+  .ttl-chips{ display:flex; gap:8px; margin-top:12px; flex-wrap:wrap; }
+  .ttl-chip{ font-family:var(--mono); font-size:11px; border:1px solid var(--card-line); border-radius:999px; padding:3px 10px; color:var(--muted); background:#FBFAF6; }
+
+  /* Bootstrap sequence */
+  .seq{ counter-reset:step; }
+  .seq li{ list-style:none; position:relative; padding-left:34px; margin-bottom:14px; font-size:13px; }
+  .seq li::before{
+    counter-increment:step; content:counter(step);
+    position:absolute; left:0; top:-1px; width:24px; height:24px; border-radius:50%;
+    background:var(--gate-fill-1); border:1.5px solid var(--gate-line); color:var(--gate-ink);
+    font-family:var(--mono); font-weight:700; font-size:12px; display:flex; align-items:center; justify-content:center;
+  }
+  .seq li b{ display:block; margin-bottom:2px; }
+  .seq li .d{ color:var(--muted); font-size:12.5px; }
+  .seq li code{ font-family:var(--mono); font-size:.92em; background:#F0EEE6; padding:1px 5px; border-radius:4px; }
+  .bootstrap-note{
+    margin-top:6px; font-size:12px; color:var(--muted); background:#FAF9F4; border:1px solid var(--card-line);
+    border-radius:12px; padding:12px 14px;
+  }
+
+  /* Footer driver */
+  .driver{
+    background:var(--card-bg); border:1px solid var(--card-line); border-radius:18px;
+    padding:22px 24px; box-shadow: 0 1px 2px rgba(20,20,30,.03), 0 10px 24px -18px rgba(20,20,30,.15);
+  }
+  .driver h2{ font-size:16px; margin:0 0 14px; }
+  .driver pre{
+    margin:0; background:#161A22; color:#E5E9F0; border-radius:12px; padding:16px 18px;
+    font-family:var(--mono); font-size:12.5px; line-height:1.7; overflow-x:auto;
+  }
+  .driver pre .c{ color:#7C8AA5; }
+  .driver pre .cmd{ color:#9FD9B4; }
+  .driver .weekly-flag{ color:#F3C77B; }
+
+  footer.credit{ text-align:center; font-size:11.5px; color:var(--faint); margin-top:36px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <header class="page">
+    <span class="eyebrow">Gemma-E4B-Finance-RAG — internal architecture note</span>
+    <h1>How ingestion works: UnifiedScheduler &amp; bootstrap</h1>
+    <p>
+      Six data sources — SEC EDGAR, Yahoo Finance, FRED, GDELT, earnings transcripts, and IR pages —
+      are ingested into <code>data/finance.db</code> (SQLite) and <code>data/chroma</code> (ChromaDB)
+      by one orchestrator: <code>UnifiedScheduler</code>. It runs in four modes, gates every source by
+      freshness, and isolates one source's failure from the rest.
+    </p>
+  </header>
+
+  <!-- ================= DIAGRAM ================= -->
+  <div class="diagram-card">
+    <h2>Trigger → orchestrator → sources → storage</h2>
+    <p class="sub">src/scheduler/__init__.py · src/scheduler/source_registry.py · src/utils/resilience.py · src/storage/store.py</p>
+
+    <div class="stage-scroll">
+    <div class="stage">
+      <svg viewBox="0 0 1520 820" xmlns="http://www.w3.org/2000/svg">
+        <defs>
+          <marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+            <path d="M0,0 L10,5 L0,10 z" fill="#9AA5B8"></path>
+          </marker>
+        </defs>
+        <!-- triggers -> gateway -->
+        <path class="flow-path" pathLength="1" marker-end="url(#arrow)" d="M256,62 C288,62 288,340 320,340" style="animation-delay:.02s"></path>
+        <path class="flow-path" pathLength="1" marker-end="url(#arrow)" d="M256,138 C288,138 288,360 320,360" style="animation-delay:.06s"></path>
+        <path class="flow-path" pathLength="1" marker-end="url(#arrow)" d="M256,210 C288,210 288,380 320,380" style="animation-delay:.10s"></path>
+        <path class="flow-path" pathLength="1" marker-end="url(#arrow)" d="M256,282 C288,282 288,400 320,400" style="animation-delay:.14s"></path>
+        <path class="flow-path" pathLength="1" marker-end="url(#arrow)" d="M256,360 C288,360 288,420 320,420" style="animation-delay:.18s"></path>
+        <path class="flow-path" pathLength="1" marker-end="url(#arrow)" d="M256,444 C288,444 288,440 320,440" style="animation-delay:.22s"></path>
+        <!-- gateway -> sources -->
+        <path class="flow-path" pathLength="1" marker-end="url(#arrow)" d="M700,200 C750,200 750,78 800,78" style="animation-delay:.30s"></path>
+        <path class="flow-path" pathLength="1" marker-end="url(#arrow)" d="M700,260 C750,260 750,198 800,198" style="animation-delay:.34s"></path>
+        <path class="flow-path" pathLength="1" marker-end="url(#arrow)" d="M700,320 C750,320 750,326 800,326" style="animation-delay:.38s"></path>
+        <path class="flow-path" pathLength="1" marker-end="url(#arrow)" d="M700,380 C750,380 750,462 800,462" style="animation-delay:.42s"></path>
+        <path class="flow-path" pathLength="1" marker-end="url(#arrow)" d="M700,440 C750,440 750,586 800,586" style="animation-delay:.46s"></path>
+        <path class="flow-path" pathLength="1" marker-end="url(#arrow)" d="M700,500 C750,500 750,708 800,708" style="animation-delay:.50s"></path>
+        <!-- sources -> facade -->
+        <path class="flow-path" pathLength="1" marker-end="url(#arrow)" d="M1060,78 C1100,78 1100,355 1140,355" style="animation-delay:.58s"></path>
+        <path class="flow-path" pathLength="1" marker-end="url(#arrow)" d="M1060,198 C1100,198 1100,365 1140,365" style="animation-delay:.62s"></path>
+        <path class="flow-path" pathLength="1" marker-end="url(#arrow)" d="M1060,326 C1100,326 1100,375 1140,375" style="animation-delay:.66s"></path>
+        <path class="flow-path" pathLength="1" marker-end="url(#arrow)" d="M1060,462 C1100,462 1100,395 1140,395" style="animation-delay:.70s"></path>
+        <path class="flow-path" pathLength="1" marker-end="url(#arrow)" d="M1060,586 C1100,586 1100,405 1140,405" style="animation-delay:.74s"></path>
+        <path class="flow-path" pathLength="1" marker-end="url(#arrow)" d="M1060,708 C1100,708 1100,415 1140,415" style="animation-delay:.78s"></path>
+        <!-- facade -> stores -->
+        <path class="flow-path" pathLength="1" marker-end="url(#arrow)" d="M1220,430 C1210,465 1230,465 1220,500" style="animation-delay:.90s"></path>
+        <path class="flow-path" pathLength="1" marker-end="url(#arrow)" d="M1400,430 C1390,465 1410,465 1400,500" style="animation-delay:.94s"></path>
+      </svg>
+
+      <!-- Triggers -->
+      <div class="node node--trigger" style="left:24px; top:30px; width:232px; height:64px;">
+        <div class="label">Manual CLI</div>
+        <div class="cmd">python -m src.scheduler &lt;mode&gt;</div>
+      </div>
+      <div class="node node--trigger" style="left:24px; top:110px; width:232px; height:56px;">
+        <div class="label">Hourly cadence</div>
+        <div class="cmd">python -m src.scheduler hourly</div>
+      </div>
+      <div class="node node--trigger" style="left:24px; top:182px; width:232px; height:56px;">
+        <div class="label">Daily cadence</div>
+        <div class="cmd">python -m src.scheduler daily</div>
+      </div>
+      <div class="node node--trigger" style="left:24px; top:254px; width:232px; height:56px;">
+        <div class="label">Weekly cadence</div>
+        <div class="cmd">python -m src.scheduler weekly</div>
+      </div>
+      <div class="node node--trigger" style="left:24px; top:326px; width:232px; height:68px;">
+        <div class="label">Force refresh</div>
+        <div class="cmd">... all --force</div>
+        <div class="sub" style="margin-top:2px;">ignores TTLs, not partitioned</div>
+      </div>
+      <div class="node node--trigger" style="left:24px; top:410px; width:232px; height:68px;">
+        <div class="label">Cold-start bootstrap</div>
+        <div class="cmd">... bootstrap --resume</div>
+        <div class="sub" style="margin-top:2px;">checkpointed, resumable</div>
+      </div>
+
+      <!-- Gateway (signature) -->
+      <div class="gateway">
+        <div class="gw-eyebrow">Orchestrator</div>
+        <h3>UnifiedScheduler</h3>
+        <div class="gw-path">src/scheduler/__init__.py</div>
+
+        <div class="gw-chip">
+          <div class="t">TTL gating</div>
+          <div class="d">per-source freshness in <code>cache_meta</code>, ticker <code>SCHEDULER</code> — 6h to 168h depending on source</div>
+        </div>
+        <div class="gw-chip">
+          <div class="t">Staggered execution</div>
+          <div class="d">sources run sequentially, <code>inter_source_delay</code> = 2s between each</div>
+        </div>
+        <div class="gw-chip">
+          <div class="t">Per-source budgets</div>
+          <div class="d"><code>RunBudget</code> caps requests/min, /day, /run and work items before any HTTP call fires</div>
+        </div>
+        <div class="gw-chip">
+          <div class="t">Circuit breaker + retry</div>
+          <div class="d"><code>ProviderRequestPolicy</code> backs off, then opens the circuit on provider-wide errors (auth, quota, rate limit)</div>
+        </div>
+        <div class="gw-chip">
+          <div class="t">Failure isolation</div>
+          <div class="d">one source's exception is logged + the source marked stale — every other source still runs → <code>dead_letter</code> table</div>
+        </div>
+        <div class="gw-footer">src/scheduler/budget.py · src/utils/resilience.py</div>
+      </div>
+
+      <!-- Source category nodes -->
+      <div class="node node--source alt2" style="left:800px; top:30px; width:260px; height:96px;">
+        <div class="label">Universe snapshots</div>
+        <div class="sub">ticker membership, not facts</div>
+        <div class="rows">
+          <div class="r"><span class="name">nasdaq100 · ivv · sec</span><span class="meta">daily · 24h</span></div>
+        </div>
+      </div>
+
+      <div class="node node--source" style="left:800px; top:142px; width:260px; height:112px;">
+        <div class="label">SEC EDGAR</div>
+        <div class="rows">
+          <div class="r"><span class="name">sec_filings</span><span class="meta">daily · 12h</span></div>
+          <div class="r"><span class="name">sec_companyfacts</span><span class="meta">daily · 24h</span></div>
+        </div>
+        <div class="sub" style="margin-top:6px;">filing text parsing is weekly-only →</div>
+      </div>
+
+      <div class="node node--source" style="left:800px; top:270px; width:260px; height:112px;">
+        <div class="label">Market data</div>
+        <div class="rows">
+          <div class="r"><span class="name">yfinance</span><span class="meta">daily · 24h</span></div>
+          <div class="r"><span class="name">finnhub*</span><span class="meta">daily · 6h</span></div>
+          <div class="r"><span class="name">massive*</span><span class="meta">daily · 24h</span></div>
+        </div>
+      </div>
+
+      <div class="node node--source alt" style="left:800px; top:398px; width:260px; height:128px;">
+        <div class="label">Macro &amp; official feeds</div>
+        <div class="rows">
+          <div class="r"><span class="name">fred</span><span class="meta">daily · 24h</span></div>
+          <div class="r"><span class="name">9 official feeds</span><span class="meta">daily · ~24h</span></div>
+          <div class="r"><span class="name">cftc</span><span class="meta">weekly · 168h</span></div>
+        </div>
+        <div class="sub" style="margin-top:4px;">treasury, bls*, bea*, eia*, ny_fed, openfda*, nhtsa, usaspending (* needs an API key)</div>
+      </div>
+
+      <div class="node node--source" style="left:800px; top:542px; width:260px; height:88px;">
+        <div class="label">GDELT news</div>
+        <div class="rows">
+          <div class="r"><span class="name">gdelt</span><span class="meta">hourly · 6h</span></div>
+        </div>
+      </div>
+
+      <div class="node node--source alt" style="left:800px; top:646px; width:260px; height:124px;">
+        <div class="label">Deep documents &amp; estimates</div>
+        <div class="rows">
+          <div class="r"><span class="name">earnings_transcripts</span><span class="meta">weekly · 168h</span></div>
+          <div class="r"><span class="name">ir_pages</span><span class="meta">daily · 24h</span></div>
+          <div class="r"><span class="name">estimates</span><span class="meta">daily · 24h</span></div>
+        </div>
+      </div>
+
+      <!-- Store facade -->
+      <div class="node node--facade" style="left:1140px; top:340px; width:340px; height:90px;">
+        <div class="label">Store facade</div>
+        <div class="sub" style="opacity:.75;">src/storage/store.py — every ingestor writes through this, never the stores directly</div>
+      </div>
+
+      <!-- Cylinders -->
+      <div class="cylinder cyl--sqlite">
+        <div class="label">SQLite</div>
+        <div class="sub">data/finance.db</div>
+        <div class="desc">facts · filings ledger · cache_meta · FTS5 lexical index</div>
+      </div>
+      <div class="cylinder cyl--chroma">
+        <div class="label">ChromaDB</div>
+        <div class="sub">data/chroma</div>
+        <div class="desc">document embeddings, via llama-server :8087</div>
+      </div>
+    </div>
+    </div>
+
+    <div class="legend">
+      <div class="item"><span class="sw" style="background:var(--sky-fill); border-color:var(--sky-line);"></span> Trigger / entry point</div>
+      <div class="item"><span class="sw" style="background:var(--gate-fill-1); border-color:var(--gate-line);"></span> Orchestrator</div>
+      <div class="item"><span class="sw" style="background:var(--peach-fill); border-color:var(--peach-line);"></span> Source category</div>
+      <div class="item"><span class="sw" style="background:var(--mint-fill); border-color:var(--mint-line);"></span> Storage</div>
+    </div>
+  </div>
+
+  <!-- ================= FOUR MODES ================= -->
+  <div class="card" style="margin-bottom:22px;">
+    <h2>The four modes + <code style="font-family:var(--mono); background:#F0EEE6; padding:1px 6px; border-radius:5px;">--force</code></h2>
+    <p class="card-sub">Each mode selects a different set of sources from <code style="font-family:var(--mono);">configs/sources.yaml</code> by matching its <code style="font-family:var(--mono);">cadence</code>/<code style="font-family:var(--mono);">run_modes</code>.</p>
+
+    <div class="modes">
+      <div class="mode m-hourly">
+        <div class="m-name">hourly</div>
+        <div class="m-cadence">fast-moving sources only</div>
+        <ul>
+          <li>1 of 23 sources: <b>gdelt</b></li>
+          <li>only source whose 6h TTL needs sub-daily refresh</li>
+        </ul>
+      </div>
+      <div class="mode m-daily">
+        <div class="m-name">daily</div>
+        <div class="m-cadence">TTL-expired refresh</div>
+        <ul>
+          <li>20 of 23 sources</li>
+          <li>universe, SEC discovery + companyfacts, market data, macro, IR pages, estimates</li>
+          <li>SEC filings: discovery only (queued, not parsed)</li>
+        </ul>
+      </div>
+      <div class="mode m-weekly">
+        <div class="m-name">weekly</div>
+        <div class="m-cadence">the deep-processing pass</div>
+        <ul>
+          <li>3 of 23 sources: <b>sec_filings</b> (full pipeline), <b>cftc</b>, <b>earnings_transcripts</b></li>
+          <li>only mode that parses queued SEC filing text into facts + embeddings</li>
+        </ul>
+      </div>
+      <div class="mode m-all">
+        <div class="m-name">all --force</div>
+        <div class="m-cadence">manual, ad hoc</div>
+        <ul>
+          <li>all 23 sources, TTL freshness ignored</li>
+          <li>request budgets still apply</li>
+          <li>still discovery-only for sec_filings — see note below</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="gotcha">
+      <div class="g-tag">Audit finding · 2026-07-17</div>
+      147 SEC filings sat <code style="font-family:var(--mono);">unprocessed</code> because <code style="font-family:var(--mono);">deep_sec</code> — which enables the full parse-and-embed pipeline — is only set when <code style="font-family:var(--mono);">mode == "weekly"</code>
+      (<code style="font-family:var(--mono);">src/scheduler/__init__.py</code>). <b>daily, hourly, all, and even the dedicated bootstrap mode only discover filings into the queue; none of them process the queue.</b>
+      Run <code style="font-family:var(--mono);">weekly --force</code> to drain a backlog.
+    </div>
+
+    <div class="force-note">
+      <code>--force</code> skips the per-source TTL freshness check (<code>_is_stale</code>) — it does not skip request budgets, retry policy, or the circuit breaker. It composes with any of the three cadence modes, not just <code>all</code>.
+    </div>
+  </div>
+
+  <!-- ================= TTL + BOOTSTRAP ================= -->
+  <div class="grid2">
+    <div class="card">
+      <h2>What is TTL?</h2>
+      <p class="card-sub">One freshness clock per source, stamped on every successful run.</p>
+      <p style="font-size:13px; color:var(--ink); margin:0 0 14px;">
+        Each source's last success is written to <code style="font-family:var(--mono);">cache_meta</code> under a synthetic
+        <code style="font-family:var(--mono);">SCHEDULER</code> ticker (<code style="font-family:var(--mono);">unified:&lt;source&gt;</code>).
+        It stays <b>fresh</b> until its age passes <code style="font-family:var(--mono);">ttl_hours</code>, then it's <b>stale</b> and the
+        next matching-mode run refreshes it.
+      </p>
+      <div class="ttl-timeline">
+        <div class="ttl-track"></div>
+        <div class="ttl-labels"><span>0h — fresh</span><span>ttl_hours — stale</span><span>next run — refreshed</span></div>
+      </div>
+      <div class="ttl-chips">
+        <span class="ttl-chip">gdelt / finnhub — 6h</span>
+        <span class="ttl-chip">sec_filings — 12h</span>
+        <span class="ttl-chip">most sources — 24h</span>
+        <span class="ttl-chip">cftc / transcripts — 168h (7d)</span>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>Bootstrap flow</h2>
+      <p class="card-sub">The dedicated cold-start command — <code style="font-family:var(--mono);">python -m src.scheduler bootstrap [--source] [--since] [--resume]</code>.</p>
+      <ol class="seq">
+        <li><b>Universe snapshot</b><span class="d">refresh ticker membership (NASDAQ-100, IVV, SEC) before anything else needs a ticker list.</span></li>
+        <li><b>Per-source partitioned ingestion</b><span class="d">each source's work splits into checkpointed partitions (SEC: one per calendar day) recorded in a resumable partition ledger, bounded to 30d SEC/market/news lookback, 5 macro observations.</span></li>
+        <li><b>Budget-gated requests</b><span class="d">every partition reserves capacity against that source's per-minute/day/run <code>RunBudget</code> before any HTTP call.</span></li>
+        <li><b>Normalization</b><span class="d">raw provider payloads become typed records (<code>ObservationRecord</code> / <code>NarrativeRecord</code> / <code>EventRecord</code>).</span></li>
+        <li><b>One committed revision</b><span class="d">the Store facade writes the SQLite ledger row, FTS5 lexical row, and Chroma embedding together, then stamps the source fresh in <code>cache_meta</code>.</span></li>
+        <li><b>SEC filing text still waits</b><span class="d">bootstrap's SEC partition is discovery-only, same as daily/hourly/all — parsing is weekly-only, no exceptions.</span></li>
+      </ol>
+      <div class="bootstrap-note">
+        <code style="font-family:var(--mono);">bootstrap</code> seeds 17 of 23 sources through checkpointed partitions (universe, SEC discovery, market/news vendors, FRED, official feeds).
+        Sources with their own incremental cursor — yfinance, sec_companyfacts, gdelt, earnings_transcripts, ir_pages, estimates — aren't in that list; ordinary daily/hourly/weekly runs catch those up instead.
+        <code style="font-family:var(--mono);">all --force</code> is the simpler lever: re-run every registered source right now, ignoring TTLs, with no partitioning or resume.
+      </div>
+    </div>
+  </div>
+
+  <!-- ================= DAILY DRIVER ================= -->
+  <div class="driver">
+    <h2>Daily driver</h2>
+    <pre><span class="c"># start the model server once</span>
+<span class="cmd">scripts\serve_model.ps1</span> start
+
+<span class="c"># every morning</span>
+python -m src.scheduler <span class="cmd">daily</span>
+
+<span class="c"># once a week — the only run that drains the SEC filing queue</span>
+python -m src.scheduler <span class="cmd">weekly</span> <span class="weekly-flag">--force</span>
+
+<span class="c"># talk to it</span>
+python <span class="cmd">scripts\chat.py</span></pre>
+  </div>
+
+  <footer class="credit">UnifiedScheduler &amp; bootstrap — read from src/scheduler, configs/sources.yaml, src/utils/resilience.py, and the 2026-07-17 DB completeness audit.</footer>
+</div>
+</body>
+</html>
