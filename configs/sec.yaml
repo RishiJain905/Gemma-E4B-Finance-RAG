@@ -7,6 +7,11 @@ sec:
   index_forms: [10-K, 10-Q, 8-K]
   daily_index_overlap_days: 3
   daily_index_bootstrap_days: 7
+  # Max queued filings parsed per weekly pipeline run. Raised from the
+  # hardcoded 50 on 2026-07-18 to drain the ~4.4k backlog discovered once
+  # the holiday-pinned cursor was unstuck; harmless once the queue is empty
+  # (processes only what is pending).
+  processing_batch_limit: 400
   submissions_bulk_url: https://www.sec.gov/Archives/edgar/daily-index/bulkdata/submissions.zip
 
   # Discovery selection is grouped by the event capability each form enables.

@@ -219,17 +219,22 @@ class FilingScheduler:
             else self.run_discovery(force=force, allow_bootstrap=False)
         )
 
+        sec_config = getattr(self.processor, "sec_config", None)
+        batch_limit = 50
+        if isinstance(sec_config, dict):
+            batch_limit = max(int(sec_config.get("processing_batch_limit", 50) or 50), 1)
+
         if discovery_result.get("mode") == "daily_index":
-            processing_result = self.processor.process_pending_filings(limit=50)
+            processing_result = self.processor.process_pending_filings(limit=batch_limit)
         else:
             broad_tickers = set(self._tickers_for("sec_filings"))
             deep_tickers = self._tickers_for("sec_filing_text")
             if broad_tickers == set(deep_tickers):
-                processing_result = self.processor.process_pending_filings(limit=50)
+                processing_result = self.processor.process_pending_filings(limit=batch_limit)
             else:
                 processing_result = {"processed": 0, "failed": 0, "errors": []}
                 for ticker in deep_tickers:
-                    ticker_result = self.processor.process_ticker(ticker, limit=50)
+                    ticker_result = self.processor.process_ticker(ticker, limit=batch_limit)
                     processing_result["processed"] += int(ticker_result.get("processed", 0))
                     processing_result["failed"] += int(ticker_result.get("failed", 0))
                     processing_result["errors"].extend(ticker_result.get("errors", []) or [])
