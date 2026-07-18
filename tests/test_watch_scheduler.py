@@ -199,16 +199,60 @@ def test_freshness_staleness_math(store):
     assert states.index("stale") < states.index("never") < states.index("fresh")
 
 
-def test_revision_mismatch_flags_red(store, capsys):
+def _write_fake_chroma(db_path, revision):
+    """Create a minimal chroma.sqlite3 publishing one corpus_revision."""
+    import sqlite3 as _sq
+
+    chroma_dir = db_path.parent / "chroma"
+    chroma_dir.mkdir(exist_ok=True)
+    conn = _sq.connect(chroma_dir / "chroma.sqlite3")
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS collection_metadata "
+        "(key TEXT, int_value INTEGER, str_value TEXT)"
+    )
+    conn.execute("DELETE FROM collection_metadata WHERE key='corpus_revision'")
+    if revision is not None:
+        conn.execute(
+            "INSERT INTO collection_metadata (key, int_value) VALUES ('corpus_revision', ?)",
+            (int(revision),),
+        )
+    conn.commit()
+    conn.close()
+
+
+def test_store_revision_ahead_is_not_a_fusion_failure(store, capsys):
+    """Structured-only writes advance store_revision without touching the
+    index; fusion health is indexed vs the CHROMA-published revision."""
     store.bump_store_revision("test")
     store.bump_store_revision("test")
-    # indexed_revision stays at its migration-seeded 0 -> mismatch vs revision=2
+    _write_fake_chroma(store.db_path, 0)  # matches indexed_revision=0
 
     ws.main(["--db", str(store.db_path), "--once"])
     out = capsys.readouterr().out
 
-    assert "MISMATCH" in out
     assert "rev 0/2" in out
+    assert "chroma rev 0 ok" in out
+    assert "fusion OFF" not in out
+
+
+def test_chroma_revision_drift_flags_fusion_off(store, capsys):
+    _write_fake_chroma(store.db_path, 7)  # indexed_revision is 0 -> drift
+
+    ws.main(["--db", str(store.db_path), "--once"])
+    out = capsys.readouterr().out
+
+    assert "chroma rev 7 DRIFT" in out
+    assert "BM25 fusion OFF" in out
+
+
+def test_unpublished_chroma_revision_flags_fusion_off(store, capsys):
+    """The 2026-07-17 live bug: revision never published to Chroma silently
+    disabled BM25 fusion. The monitor must make that state loud."""
+    ws.main(["--db", str(store.db_path), "--once"])
+    out = capsys.readouterr().out
+
+    assert "UNPUBLISHED" in out
+    assert "BM25 fusion OFF" in out
 
 
 def test_revision_match_is_not_flagged(store, capsys):

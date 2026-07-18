@@ -293,7 +293,47 @@ def _collect_queues(conn: sqlite3.Connection) -> dict:
 
     rev = conn.execute("SELECT revision FROM store_revision WHERE id=1").fetchone()
     queues["store_revision"] = int(rev[0]) if rev else 0
+    queues["chroma_revision"] = _read_chroma_revision(conn)
     return queues
+
+
+def _read_chroma_revision(conn: sqlite3.Connection) -> Optional[int]:
+    """Read the corpus revision Chroma publishes in its collection metadata.
+
+    The lexical-fusion gate compares indexed_revision against the
+    CHROMA-published revision (not the store_revision counter, which
+    structured-only writes advance without touching the index). Reading
+    chroma.sqlite3 directly keeps the monitor honest about the comparison
+    that actually decides whether BM25 fusion runs.
+    """
+    db_dir = None
+    for _, _, filename in conn.execute("PRAGMA database_list"):
+        if filename:
+            db_dir = Path(filename).resolve().parent
+            break
+    if db_dir is None:
+        return None
+    chroma_db = db_dir / "chroma" / "chroma.sqlite3"
+    if not chroma_db.exists():
+        return None
+    try:
+        cconn = connect_readonly(chroma_db)
+        try:
+            for (value,) in cconn.execute(
+                "SELECT int_value FROM collection_metadata WHERE key='corpus_revision'"
+            ):
+                if value is not None:
+                    return int(value)
+            for (value,) in cconn.execute(
+                "SELECT str_value FROM collection_metadata WHERE key='corpus_revision'"
+            ):
+                if value is not None:
+                    return int(float(value))
+        finally:
+            cconn.close()
+    except sqlite3.Error:
+        return None
+    return None
 
 
 def collect_snapshot(db_path: Path) -> Snapshot:
@@ -435,14 +475,22 @@ def render_queues(snapshot: Snapshot, dead_letter_baseline: Optional[int] = None
 
     indexed_revision = queues.get("indexed_revision", 0)
     store_revision = queues.get("store_revision", 0)
+    chroma_revision = queues.get("chroma_revision")
     fts_text = (
         f"fts={queues.get('fts_row_count', 0)} rows "
         f"@ rev {indexed_revision}/{store_revision}"
     )
-    if indexed_revision != store_revision:
-        fts_text = red(fts_text + " MISMATCH")
+    # BM25 fusion runs only while indexed_revision == the Chroma-published
+    # revision; store_revision may legitimately run ahead after
+    # structured-only writes, so it is informational, not the health check.
+    if chroma_revision is None:
+        fts_text = red(fts_text + " | chroma rev UNPUBLISHED - BM25 fusion OFF")
+    elif chroma_revision != indexed_revision:
+        fts_text = red(
+            fts_text + f" | chroma rev {chroma_revision} DRIFT - BM25 fusion OFF"
+        )
     else:
-        fts_text = dim(fts_text)
+        fts_text = dim(fts_text + f" | chroma rev {chroma_revision} ok")
 
     parts = [
         f"filings: {queues.get('filings_parsed', 0)} parsed / "
