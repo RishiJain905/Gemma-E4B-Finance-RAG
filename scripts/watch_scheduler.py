@@ -23,6 +23,7 @@ import argparse
 import json
 import os
 import sqlite3
+import sys
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -503,6 +504,10 @@ def parse_args(argv: Optional[list] = None) -> argparse.Namespace:
 
 def main(argv: Optional[list] = None) -> int:
     os.system("")  # enable ANSI/VT processing on legacy Windows consoles
+    # Piped/redirected stdout on Windows falls back to cp1252, which cannot
+    # encode the verdict glyphs (U+2713) and crashed --once in pipelines.
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     args = parse_args(argv)
     db_path = Path(args.db)
     dead_letter_baseline: Optional[int] = None
