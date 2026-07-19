@@ -1,10 +1,11 @@
 # Gemma-E4B-Finance-RAG
 
 A hybrid Retrieval-Augmented Generation (RAG) system for financial research. It
-ingests data from six sources, stores structured facts and document embeddings
-in dual backends, and answers natural-language financial questions using a
-fine-tuned **Gemma 4 E4B** model (codename *TraceAlchemy*) served locally by
-`llama-server`.
+uses a registry-driven ingestion pipeline spanning company, market, macro,
+regulatory, sector, and deep-research sources; stores structured facts and
+document embeddings in dual backends; and answers natural-language financial
+questions using a fine-tuned **Gemma 4 E4B** model (codename *TraceAlchemy*)
+served locally by `llama-server`.
 
 Built on top of
 [trjxter/TraceAlchemy-Gemma-4-E4B-Finance-IT-gguf](https://huggingface.co/trjxter/TraceAlchemy-Gemma-4-E4B-Finance-IT-gguf),
@@ -16,12 +17,14 @@ and ingestion pipeline are cross-platform (Windows/Linux).
 
 ## What it does
 
-1. **Ingests** financial data from six deep-coverage sources (SEC EDGAR
-   filings, Yahoo Finance, FRED macro indicators, GDELT global news,
-   earnings-call transcripts, and company investor-relations pages), plus an
-   optional broad-universe source registry (S&P 500 / Nasdaq-100) — see
-   [Broad-universe ingestion](#broad-universe-ingestion-optional-phase-234236)
-   below.
+1. **Ingests** a source-aware research corpus for the S&P 500 / Nasdaq-100
+   universe. Registered sources include SEC EDGAR and CompanyFacts, Yahoo
+   Finance, Finnhub, Massive market data and Massive News, FRED, Federal
+   Reserve, Treasury, BLS, BEA, EIA, New York Fed, CFTC, openFDA, NHTSA,
+   USAspending, earnings-call transcripts, estimates, and company IR pages.
+   The GDELT adapter and previously stored GDELT evidence remain supported,
+   but scheduled GDELT ingestion is currently disabled. See
+   [Phase 2.3 ingestion](#phase-23-broad-market-ingestion).
 2. **Stores** it in two complementary backends:
    - **SQLite** — structured facts, filing index, cache freshness, ingestion
      audit log, a dead-letter queue, and a persistent **FTS5 lexical index**
@@ -52,7 +55,7 @@ and ingestion pipeline are cross-platform (Windows/Linux).
 ### 1. Clone and create a virtual environment
 
 ```bash
-git clone <repo-url> Gemma-E4B-Finance-RAG
+git clone https://github.com/RishiJain905/Gemma-E4B-Finance-RAG.git
 cd Gemma-E4B-Finance-RAG
 python -m venv .venv
 ```
@@ -79,9 +82,17 @@ pip install -r requirements.txt
 
 Create a `.env` file in the project root with:
 
-```
+```dotenv
 FRED_API_KEY=your_fred_api_key_here
 SEC_EDGAR_USER_AGENT=Your Name your.email@example.com
+
+# Optional Phase 2.3 providers — each missing key disables only its source
+FINNHUB_API_KEY=your_finnhub_api_key_here
+MASSIVE_API_KEY=your_massive_api_key_here
+BLS_API_KEY=your_bls_api_key_here
+BEA_API_KEY=your_bea_api_key_here
+EIA_API_KEY=your_eia_api_key_here
+OPENFDA_API_KEY=your_openfda_api_key_here
 ```
 
 - `FRED_API_KEY` — required for FRED macro ingestion. Get one free at
@@ -89,6 +100,9 @@ SEC_EDGAR_USER_AGENT=Your Name your.email@example.com
 - `SEC_EDGAR_USER_AGENT` — SEC EDGAR requires a descriptive User-Agent that
   identifies the requester (name + contact email). See
   [docs/CONFIGURATION.md](docs/CONFIGURATION.md) for the full resolution order.
+- The Phase 2.3 provider keys are optional. A missing key produces a truthful
+  `disabled_missing_key` status for that adapter without blocking any other
+  source.
 
 ### 4. Configure model paths (for `serve_model` scripts)
 
@@ -150,15 +164,35 @@ Interactive API docs are then available at <http://127.0.0.1:8000/docs>.
 
 ### 7. Ingest data
 
-Run the unified scheduler to populate the stores. `daily` runs Yahoo Finance,
-FRED, SEC filing discovery, and IR pages; `--force` skips the freshness checks:
+For a new database, run the explicit bootstrap once to populate enabled sources,
+then inspect the source-by-source result:
 
 ```bash
-python -m src.scheduler daily --force
+python -m src.scheduler bootstrap
+python -m src.scheduler status
 ```
 
-Other modes: `hourly` (GDELT news), `weekly` (earnings transcripts + full SEC
-pipeline), `all` (everything that is stale), and `status` (freshness report).
+After bootstrap, use incremental refreshes. Cadence, TTLs, overlap windows,
+request budgets, and cursors come from `configs/sources.yaml`:
+
+```bash
+python -m src.scheduler daily
+python -m src.scheduler hourly
+python -m src.scheduler weekly
+```
+
+| Mode | Current responsibility |
+|---|---|
+| `daily` | Universe membership, Yahoo Finance, SEC discovery/CompanyFacts, Finnhub, Massive market data/actions, official macro and sector feeds, IR pages, and estimates. |
+| `hourly` | Massive News. GDELT is registered but intentionally reports `disabled`. |
+| `weekly` | Full SEC pipeline, earnings transcripts, and CFTC. |
+| `all` | Every enabled registered source that is due; disabled or unavailable sources skip independently. |
+| `status` | Read-only freshness, run history, quotas, circuits, and denominator-explicit coverage health. |
+
+`--force` bypasses freshness checks only; it still honors provider quotas and
+circuit cooldowns. Use `bootstrap --resume` after an interrupted initial load,
+or `repair` to re-index stored error/pending records without downloading them
+again. See [Scheduler operations](#scheduler-operations) below.
 
 ### 8. Ask a question
 
@@ -172,18 +206,20 @@ curl -X POST http://127.0.0.1:8000/query \
 
 For a single, centralized entry point, use the interactive client. It
 **auto-starts the middleware** if it isn't already running, gives you a chat
-loop over `/query` (streamed by default), and surfaces every Phase 2.1–2.3.7
-feature — grounding mode, tool calls, retrieval strategy, fetch-on-miss,
-resolved-ticker confirmation, bounded conversation history, multiline questions,
-streamed progress events, and the deterministic answer fast path — in one
-consistent answer renderer:
+loop over `/query` (streamed by default), and surfaces every promoted
+Phase 2.1–2.3.7 feature — grounding mode, tool calls, retrieval strategy,
+fetch-on-miss, resolved-ticker confirmation, bounded conversation history,
+multiline questions, streamed progress events, and the deterministic answer
+fast path — in one consistent answer renderer:
 
 ```bash
-python scripts/chat.py
+python scripts/chat.py                # auto-start middleware if needed
+python scripts/chat.py --no-start     # connect to an existing middleware
+python scripts/chat.py --no-stream    # use POST /query instead of SSE
 ```
 
 ```
-Capabilities: tools=on streaming=off answer_policy=graded
+Capabilities: tools=on streaming=on answer_policy=graded history=on max_question_chars=16000 graph=on
 
 you> What was BB revenue last quarter?
   interpreting as BlackBerry Limited / BB
@@ -195,53 +231,69 @@ BlackBerry revenue is 143,000,000.00 usd (2026-Q1) [Source: yfinance/BB].
 
 you> /refresh            # run ALL ingestion jobs (scheduler all --force)
 you> /refresh NVDA       # refresh a single ticker via the API
-you> /refresh daily      # run a specific scheduler mode
+you> /refresh hourly     # run a specific scheduler mode
+you> /ask                # compose a multiline research question
 you> /health             # middleware + freshness summary
 you> /tools              # list model-callable tools
+you> /autorefresh on     # refresh stale sources before queries
+you> /verbose on         # show stage timings and diagnostics
 you> /grounding strict   # force the strict answer policy for this session
-you> /eval 10            # run the eval harness (10 cases) against this server
+you> /eval 10            # run 10 single-turn evaluation cases
+you> /eval conversations 10  # score conversation carryover/reset behavior
 you> /ticker NVDA        # pin a ticker for following questions
 you> And how about AMD?  # follow-ups reuse this session's bounded history
 you> /history            # preview this conversation's turns (local, no API call)
 you> /new                # start a fresh conversation (clear history, new session id)
 you> /history off        # run single-turn (stop sending/recording history)
-you> /graph              # open the live retrieval graph (if the observer is enabled)
+you> /graph              # open the local retrieval graph
+you> /graph trace        # deep-link the graph to the latest query trace
 you> /help               # full command list
 you> /quit               # stops the middleware if this script started it
 ```
 
-It still requires `llama-server` on `:8087`; it warns and falls back to
-degraded answers if the model is unreachable. See
+Conversation history is client-owned, bounded, and sent with each request; the
+middleware does not persist it. `/ask` preserves multiline questions and
+validates the advertised 16,000-character limit before sending. The client
+still requires `llama-server` on `:8087`; it warns and falls back to degraded
+answers if the model is unreachable. See
 [`scripts/CHAT.md`](scripts/CHAT.md) for every command and metadata tag the
 renderer can show.
 
-### Live retrieval graph (optional, Phase 2.2.7)
+### Live retrieval graph (local only, Phase 2.2.7 + 2.3.5)
 
 An optional, **local read-only** visualization of the retrieval pipeline (query →
 plan → stages → tools → evidence → answer) plus a corpus explorer. It is
-**disabled by default** and served **loopback-only** with a strict same-origin
-CSP — start the middleware with `ENABLE_GRAPH_OBSERVER=1` to enable it, then open
-`http://127.0.0.1:8000/graph` or run `/graph` in the chat client (`--open-graph`
-opens it at startup). It is an *observability* view and never changes retrieval
-or answers. Remote exposure is intentionally unsupported. See
+enabled by the committed `recommended` profile and served **loopback-only** with
+a strict same-origin CSP. Open `http://127.0.0.1:8000/graph`, run `/graph`, use
+`/graph trace` to focus the latest query, or start chat with `--open-graph`.
+Set `ENABLE_GRAPH_OBSERVER=0` to disable it. It is an *observability* view and
+never changes retrieval or answers; remote exposure is intentionally
+unsupported. See
 [`docs/CONFIGURATION.md`](docs/CONFIGURATION.md) and [`docs/API.md`](docs/API.md).
 
-### Broad-universe ingestion (optional, Phase 2.3.4–2.3.6)
+### Phase 2.3 broad-market ingestion
 
-Beyond the six deep-coverage sources above, ingestion can also run through a
-validated **source registry** (`configs/sources.yaml`) that adds per-source
-cadence, request/day budgets, incremental cursors, and provider circuit
-breakers on top of the same failure-isolation guarantee — one exhausted,
-rate-limited, or failing source never blocks another. It optionally extends
-coverage to broad company events, company news, market data, and official
-macro/regulatory/sector feeds across the wider S&P 500 / Nasdaq-100 universe.
-Every broad-universe capability and the additive schema migration that backs
-it are **disabled by default**; enabling a capability only adds new evidence,
-it never changes the existing schema or query path.
+Phase 2.3 expands the original deep watchlist into a source-aware S&P 500 /
+Nasdaq-100 research corpus. The validated **source registry**
+(`configs/sources.yaml`) owns cadence, request/day budgets, incremental cursors,
+overlap windows, and provider circuits. Its committed capability flags are
+enabled; adapters that lack credentials or entitlement skip independently, so
+one exhausted, rate-limited, or failing source never blocks another.
 
-The scheduler adds explicit `bootstrap` / `repair` / `retention` operational
-modes alongside `daily`/`hourly`/`weekly`/`all`, plus a truthful `status`
-report that never claims a disabled or rate-limited source is fresh:
+| Group | Current sources |
+|---|---|
+| Universe | Nasdaq-100 constituents, IVV holdings, SEC ticker/CIK mapping |
+| Company and market | Yahoo Finance, Finnhub, Massive daily market data/actions, hourly Massive News |
+| Macro and regulatory | FRED, Federal Reserve, Treasury, BLS, BEA, EIA, New York Fed, CFTC |
+| Sector | openFDA, NHTSA, USAspending |
+| Deep research | SEC filing text/CompanyFacts, earnings transcripts, IR pages, estimates |
+| Disabled | GDELT scheduled ingestion; existing GDELT documents and sentiment remain queryable |
+
+#### Scheduler operations
+
+The scheduler provides explicit `bootstrap`, `repair`, and `retention` modes
+alongside `daily`/`hourly`/`weekly`/`all`, plus a truthful `status` report that
+never claims a disabled, rate-limited, or circuit-open source is fresh:
 
 ```bash
 python -m src.scheduler bootstrap --source sec_filings --since 2026-06-01
@@ -249,6 +301,18 @@ python -m src.scheduler status --json
 python -m src.scheduler repair --source ir_pages --limit 50
 python -m src.scheduler retention --preview
 ```
+
+For a continuously updating, read-only terminal view of the same persisted run
+and freshness state:
+
+```bash
+python scripts/watch_scheduler.py
+python scripts/watch_scheduler.py --once
+```
+
+The watcher keeps daily `massive` market data and hourly `massive_news` on
+separate rows and displays GDELT as `disabled`. It reads SQLite only and never
+starts ingestion, calls a provider, or invokes the model.
 
 The optional live graph above also gains an **aggregation-first Corpus
 Explorer** (market universe → index/sector/source groups → bounded on-demand
@@ -264,28 +328,26 @@ capability flags, and migration.
 ## Architecture
 
 ```
-                          6 data sources (+ optional broad-universe registry)
-   SEC EDGAR · Yahoo Finance · FRED · GDELT · Earnings transcripts · IR pages
-                               │
-                       Ingestion pipeline
-                  (UnifiedScheduler, resilience layer)
-                               │
-                ┌──────────────┴──────────────┐
-                ▼                              ▼
-          SQLite (fundamentals,          ChromaDB
-          filings, cache_meta,           (document embeddings,
-          ingestion_log, dead_letter,    cosine similarity)
-          FTS5 lexical index)
-                └──────────────┬──────────────┘
-                               ▼
-                   FastAPI middleware (:8000)
-    intent parsing → adaptive lane routing (fast/standard/complex/catalog)
-    → deterministic tool routing / deterministic answers → hybrid retrieval
-    → prompt augmentation
-                               │
-                               ▼
-              llama-server (:8087) — TraceAlchemy
-              Gemma 4 E4B (chat + embeddings)
+       Universe · company · market · macro · regulatory · sector · deep sources
+                                      │
+                            registry-driven ingestion
+                       (budgets · cursors · circuits · DLQ)
+                                      │
+                       ┌──────────────┴──────────────┐
+                       ▼                              ▼
+                 SQLite                         ChromaDB
+       facts · events · provenance      narratives · document embeddings
+       freshness · run history · FTS5        cosine similarity
+                       └──────────────┬──────────────┘
+                                      ▼
+                          FastAPI middleware (:8000)
+             intent → adaptive lane → deterministic tools/answers
+                    → hybrid retrieval → grounded generation
+                                      │
+                                      ▼
+                         llama-server (:8087)
+                   TraceAlchemy Gemma 4 E4B
+                       (chat + embeddings)
 ```
 
 See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the full breakdown of
@@ -304,22 +366,28 @@ Gemma-E4B-Finance-RAG/
 │   │   ├── legacy.yaml       # Phase 2.2-compatible rollback (MIDDLEWARE_PROFILE=legacy)
 │   │   ├── recommended.yaml  # Promoted-safe production default
 │   │   └── evaluation.yaml   # recommended + eval trace/progress metadata
-│   ├── watchlist.yaml        # Tracked tickers + per-source TTL schedule
-│   ├── sources.yaml          # Broad-universe source registry (optional, off by default)
+│   ├── watchlist.yaml        # Deprecated compatibility watchlist
+│   ├── sources.yaml          # Authoritative source cadence, quotas, cursors, flags
 │   ├── coverage.yaml         # Security registry / index membership settings
+│   ├── universe.yaml         # Constituent providers + universe refresh policy
+│   ├── official_sources.yaml # Official release catalog
 │   ├── fred.yaml             # FRED indicators + request settings
 │   ├── gdelt.yaml            # GDELT query/domain/topic filters
 │   ├── ir.yaml               # Company IR-page ingestion settings
-│   └── model.yaml            # TraceAlchemy model + llama-server settings
+│   ├── model.yaml            # Committed TraceAlchemy + llama-server defaults
+│   └── model.example.yaml    # Template for gitignored model.local.yaml
 ├── docs/                     # Documentation (this README links here)
 │   ├── ARCHITECTURE.md
 │   ├── CONFIGURATION.md
-│   └── API.md
+│   ├── API.md
+│   └── phase2.3/             # Phase specifications, decisions, and measured results
 ├── scripts/                  # Operational + smoke-test scripts
 │   ├── serve_model.ps1 / .sh # Launch llama-server (TraceAlchemy)
 │   ├── start_stack.ps1 / .sh # Launch the middleware (+ model on Unix)
 │   ├── stop_stack.ps1 / .sh
-│   ├── seed_test_data.py     # Seed demo data into the stores
+│   ├── chat.py / CHAT.md     # Interactive client + complete command reference
+│   ├── watch_scheduler.py    # Read-only live scheduler monitor
+│   ├── migrate_phase2_3.py   # Resumable migration for pre-2.3 databases
 │   └── validate_setup.py     # Environment / dependency sanity check
 ├── src/
 │   ├── storage/              # Dual storage layer
@@ -339,11 +407,10 @@ Gemma-E4B-Finance-RAG/
 │   │   ├── retriever.py      # Hybrid retrieval strategy selection + RRF fusion
 │   │   ├── reranker.py       # Optional cross-encoder/LLM re-rank stage
 │   │   └── prompt_augmenter.py
-│   ├── scheduler/            # Unified ingestion orchestrator
-│   │   ├── __init__.py       # UnifiedScheduler (daily/hourly/weekly/all)
+│   ├── scheduler/            # Registry, budgets, cursors, run status, operations
+│   │   ├── __init__.py       # UnifiedScheduler
 │   │   └── __main__.py       # CLI: python -m src.scheduler <mode>
-│   ├── ingestion/
-│   │   └── yfinance_ingestor.py
+│   ├── ingestion/            # Company, market, universe, official + sector adapters
 │   ├── macros/
 │   │   ├── fred_ingestor.py
 │   │   ├── gdelt_ingestor.py
@@ -359,6 +426,7 @@ Gemma-E4B-Finance-RAG/
 │       └── resilience.py     # retry/backoff, CircuitBreaker, DeadLetterQueue
 ├── tests/                    # pytest suite
 ├── data/                     # SQLite DB + ChromaDB persistence (gitignored)
+├── LICENSE                   # MIT license (third-party vendor licenses stay separate)
 ├── requirements.txt
 └── pytest.ini
 ```
@@ -367,9 +435,12 @@ Gemma-E4B-Finance-RAG/
 
 ## Configuration
 
-All runtime configuration lives in `configs/*.yaml`, with secrets supplied via
-`.env` (`FRED_API_KEY`, `SEC_EDGAR_USER_AGENT`). Each config file and every
-field is documented in **[docs/CONFIGURATION.md](docs/CONFIGURATION.md)**.
+All runtime configuration lives in `configs/*.yaml`, with credentials supplied
+through the gitignored `.env`. `configs/sources.yaml` is authoritative for
+scheduler cadence/quotas/cursors; `configs/coverage.yaml` and
+`configs/universe.yaml` own security coverage; and machine-specific model paths
+belong in gitignored `configs/model.local.yaml`. Each file and field is
+documented in **[docs/CONFIGURATION.md](docs/CONFIGURATION.md)**.
 
 The middleware selects one of three reviewed runtime profiles
 (`configs/profiles/legacy|recommended|evaluation.yaml`) via `profile:` in
@@ -397,7 +468,7 @@ The middleware exposes the following endpoints (full schemas and examples in
 | GET    | `/freshness/{ticker}`  | Per-source freshness report for a ticker         |
 | POST   | `/refresh/{ticker}`    | On-demand re-ingestion of stale sources          |
 | GET    | `/macro/snapshot`      | Key macro indicators (cached FRED data)          |
-| GET    | `/sentiment/{ticker}`  | GDELT sentiment summary                          |
+| GET    | `/sentiment/{ticker}`  | Sentiment from preserved GDELT evidence          |
 | GET    | `/guidance/{ticker}`   | Latest earnings guidance                         |
 
 ---
@@ -422,8 +493,9 @@ contractor security and a small macro catalog) through bootstrap, repeated
 refresh, and simulated failure modes with no network or model, scored against
 the Phase 2.3 golden set (`tests/fixtures/evaluation/phase2_3_golden.json`).
 The golden set's `answerable` classes are asserted against the labeled
-evidence ledger; its Phase 2.3.7-dependent classes are explicitly marked
-`deferred` rather than silently omitted.
+evidence ledger. The older harness keeps its Phase 2.3.7-dependent classes
+explicitly labeled `deferred`; those capabilities were subsequently completed
+and measured by the dedicated Phase 2.3.7 gates and result set below.
 
 Tests that hit the live SEC EDGAR network and a running `llama-server` on
 `:8087` are marked `live` (see `pytest.ini`). Skip them with:
@@ -467,4 +539,5 @@ conventions.
 
 ## License
 
-MIT
+[MIT](LICENSE). Bundled third-party graph assets retain their own license files
+under `src/middleware/static/graph/vendor/`.
