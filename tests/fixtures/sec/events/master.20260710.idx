@@ -1,0 +1,14 @@
+Description:           Daily Index of EDGAR Dissemination Feed
+Last Data Received:    July 10, 2026
+Comments:              webmaster@sec.gov
+Anonymous FTP:         ftp://ftp.sec.gov/edgar/
+
+CIK|Company Name|Form Type|Date Filed|Filename
+--------------------------------------------------------------------------------
+1341439|Oracle Corporation|8-K|2026-07-10|edgar/data/1341439/0001193125-26-188001.txt
+1341439|Oracle Corporation|424B5|2026-07-10|edgar/data/1341439/0001193125-26-188002.txt
+1341439|Oracle Corporation|S-3ASR|2026-07-10|edgar/data/1341439/0001193125-26-188003.txt
+789019|Microsoft Corporation|10-Q|2026-07-10|edgar/data/789019/0000950170-26-099001.txt
+789019|Microsoft Corporation|SC 13G/A|2026-07-10|edgar/data/789019/0000950170-26-099002.txt
+9999999|Outside Universe Inc|8-K|2026-07-10|edgar/data/9999999/0000000000-26-000001.txt
+1341439|Oracle Corporation|UPLOAD|2026-07-10|edgar/data/1341439/0001193125-26-188004.txt

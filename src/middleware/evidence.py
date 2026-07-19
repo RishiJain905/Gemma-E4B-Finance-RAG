@@ -223,8 +223,29 @@ class EvidenceItem:
     period: Optional[str] = None
     as_of: Optional[str] = None
     source_type: Optional[str] = None
+    source: Optional[str] = None
     source_url: Optional[str] = None
     freshness: Optional[str] = None
+    item_type: Optional[str] = None
+    event_type: Optional[str] = None
+    authority_tier: Optional[str] = None
+    date_semantics: dict = field(default_factory=dict)
+    canonical_security: Optional[str] = None
+    coverage_tier: Optional[str] = None
+    # 2.3.5.1 source-aware provenance (additive; all fail-soft / optional).
+    source_category: Optional[str] = None
+    provider: Optional[str] = None
+    publisher: Optional[str] = None
+    security_id: Optional[str] = None
+    index_memberships: tuple[str, ...] = ()
+    sector: Optional[str] = None
+    form: Optional[str] = None
+    filing_item: Optional[str] = None
+    exhibit: Optional[str] = None
+    normalization_version: Optional[str] = None
+    corpus_item_id: Optional[str] = None
+    document_family_id: Optional[str] = None
+    evidence_role: Optional[str] = None
     document: str = ""
     parent_id: Optional[str] = None
     section: Optional[str] = None
@@ -237,6 +258,12 @@ class EvidenceItem:
     @classmethod
     def from_row(cls, row: dict, *, kind: str) -> "EvidenceItem":
         """Build an item from a retrieval fact/document row."""
+        try:
+            from .evidence_taxonomy import normalize_evidence
+
+            row = normalize_evidence(row)
+        except Exception:  # noqa: BLE001 - additive metadata is fail-soft
+            logger.warning("Evidence taxonomy normalization failed", exc_info=True)
         metadata = row.get("metadata") or {}
         raw_entities = evidence_field(row, "entities")
         if isinstance(raw_entities, (list, tuple, set)):
@@ -249,6 +276,29 @@ class EvidenceItem:
             for key in ("score", "fusion_score", "rerank_score", "similarity", "distance")
             if row.get(key) is not None
         }
+        # 2.3.5.1: source-aware provenance. Provider is the vendor/aggregator that
+        # supplied the record; publisher is the original outlet when the vendor
+        # syndicates it — kept distinct so a Finnhub-carried Reuters story shows
+        # both. Read via aliases; the normalized metadata preserves original keys.
+        provider = evidence_field(
+            row, "source_name",
+            evidence_field(row, "source", evidence_field(row, "source_type")),
+        )
+        publisher = evidence_field(row, "original_publisher", evidence_field(row, "publisher"))
+        security_id = evidence_field(row, "security_id")
+        if not security_id:
+            security_ids = evidence_field(row, "security_ids")
+            if isinstance(security_ids, (list, tuple)) and security_ids:
+                security_id = str(security_ids[0])
+        index_memberships = evidence_field(
+            row, "index_memberships", evidence_field(row, "index_codes")
+        )
+        if isinstance(index_memberships, (list, tuple, set)):
+            index_memberships = tuple(str(code) for code in index_memberships if code)
+        elif index_memberships:
+            index_memberships = (str(index_memberships),)
+        else:
+            index_memberships = ()
         return cls(
             kind=kind,
             store_id=evidence_id(row),
@@ -260,8 +310,36 @@ class EvidenceItem:
             period=evidence_field(row, "period"),
             as_of=evidence_field(row, "as_of"),
             source_type=evidence_field(row, "source_type", evidence_field(row, "source")),
+            source=evidence_field(row, "source", evidence_field(row, "source_name")),
             source_url=evidence_field(row, "source_url", evidence_field(row, "url")),
             freshness=evidence_field(row, "freshness_status", evidence_field(row, "freshness")),
+            item_type=evidence_field(row, "item_type"),
+            event_type=evidence_field(row, "event_type"),
+            authority_tier=evidence_field(
+                row, "authority_tier", evidence_field(row, "evidence_authority")
+            ),
+            date_semantics=dict(evidence_field(row, "date_semantics", {}) or {}),
+            canonical_security=evidence_field(
+                row, "canonical_security", evidence_field(row, "ticker")
+            ),
+            coverage_tier=evidence_field(
+                row, "coverage_tier", evidence_field(row, "discovery_scope")
+            ),
+            source_category=evidence_field(row, "source_category"),
+            provider=provider,
+            publisher=publisher,
+            security_id=security_id,
+            index_memberships=index_memberships,
+            sector=evidence_field(row, "sector"),
+            form=evidence_field(row, "form", evidence_field(row, "filing_type")),
+            filing_item=evidence_field(row, "filing_item", evidence_field(row, "item")),
+            exhibit=evidence_field(row, "exhibit"),
+            normalization_version=evidence_field(row, "normalization_version"),
+            corpus_item_id=evidence_field(row, "corpus_item_id"),
+            document_family_id=evidence_field(
+                row, "document_family_id", evidence_field(row, "document_family")
+            ),
+            evidence_role=evidence_field(row, "evidence_role"),
             document=document_body(row),
             parent_id=metadata.get("parent_id") or row.get("parent_id"),
             section=metadata.get("section") or metadata.get("section_title"),
@@ -286,8 +364,28 @@ class EvidenceItem:
             "period": self.period,
             "as_of": self.as_of,
             "source_type": self.source_type,
+            "source": self.source,
             "source_url": self.source_url,
             "freshness": self.freshness,
+            "item_type": self.item_type,
+            "event_type": self.event_type,
+            "authority_tier": self.authority_tier,
+            "date_semantics": dict(self.date_semantics),
+            "canonical_security": self.canonical_security,
+            "coverage_tier": self.coverage_tier,
+            "source_category": self.source_category,
+            "provider": self.provider,
+            "publisher": self.publisher,
+            "security_id": self.security_id,
+            "index_memberships": list(self.index_memberships),
+            "sector": self.sector,
+            "form": self.form,
+            "filing_item": self.filing_item,
+            "exhibit": self.exhibit,
+            "normalization_version": self.normalization_version,
+            "corpus_item_id": self.corpus_item_id,
+            "document_family_id": self.document_family_id,
+            "evidence_role": self.evidence_role,
             "parent_id": self.parent_id,
             "section": self.section,
             "chunk_index": self.chunk_index,
@@ -295,6 +393,71 @@ class EvidenceItem:
             "scores": dict(self.scores),
             "operands": list(self.operands),
             "formula": self.formula,
+        }
+
+    def taxonomy_metadata(self) -> dict:
+        """Return the shared prompt/citation taxonomy projection.
+
+        This is the subset mirrored onto resolved citations, so it stays lean:
+        item/event type, authority, source name+category, provider/publisher,
+        date semantics, canonical security, and coverage tier. The richer
+        evidence-graph projection lives in :meth:`graph_evidence_metadata`.
+        """
+        return {
+            "item_type": self.item_type,
+            "event_type": self.event_type,
+            "authority_tier": self.authority_tier,
+            "source": self.source or self.source_type,
+            "date_semantics": dict(self.date_semantics),
+            "canonical_security": self.canonical_security,
+            "coverage_tier": self.coverage_tier,
+            "source_category": self.source_category,
+            "provider": self.provider,
+            "publisher": self.publisher,
+        }
+
+    def graph_evidence_metadata(self) -> dict:
+        """Return the full source-aware provenance for an evidence graph node.
+
+        2.3.5.1: the shared taxonomy plus identity (security id, index
+        memberships, sector), filing coordinates (form/item/exhibit), explicit
+        published/effective/accessed dates, normalization version, opaque corpus
+        ids, and the primary/corroborating role. Every value is an already-safe
+        scalar/date/opaque-id and every key is on the evidence node allowlist.
+        """
+        metadata = self.taxonomy_metadata()
+        metadata.update({
+            "source_name": self.source,
+            "security_id": self.security_id,
+            "index_memberships": list(self.index_memberships),
+            "sector": self.sector,
+            "form": self.form,
+            "filing_item": self.filing_item,
+            "exhibit": self.exhibit,
+            "published_at": self.date_semantics.get("published_at"),
+            "effective_at": self.date_semantics.get("effective_at"),
+            "accessed_at": self.date_semantics.get("ingested_at"),
+            "normalization_version": self.normalization_version,
+            "corpus_item_id": self.corpus_item_id,
+            "document_family_id": self.document_family_id,
+            "evidence_role": self.evidence_role,
+        })
+        return metadata
+
+    def source_node_metadata(self) -> dict:
+        """Return the allowlisted metadata for this item's source node.
+
+        The source node is source-independent (kind stays ``source``); its
+        category, authority tier, and provider/publisher identity live here so
+        the node explains *what kind of source* produced the evidence.
+        """
+        return {
+            "source_type": self.source_type,
+            "source_category": self.source_category,
+            "source_name": self.source,
+            "authority_tier": self.authority_tier,
+            "provider": self.provider,
+            "publisher": self.publisher,
         }
 
 

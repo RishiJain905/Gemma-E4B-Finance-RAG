@@ -1,6 +1,32 @@
-# SEC filing-text indexing rollout controls (Phase 2.2.5.2).
+# SEC discovery, event evidence, and filing-text controls (Phase 2.3.2.1).
 sec:
   index_filing_text: false
+  index_event_filings: true
   max_sections_per_filing: 200
   max_section_chars: 2000000
   index_forms: [10-K, 10-Q, 8-K]
+  daily_index_overlap_days: 3
+  daily_index_bootstrap_days: 7
+  # Max queued filings parsed per weekly pipeline run. Raised from the
+  # hardcoded 50 on 2026-07-18 to drain the ~4.4k backlog discovered once
+  # the holiday-pinned cursor was unstuck; harmless once the queue is empty
+  # (processes only what is pending).
+  processing_batch_limit: 400
+  submissions_bulk_url: https://www.sec.gov/Archives/edgar/daily-index/bulkdata/submissions.zip
+
+  # Discovery selection is grouped by the event capability each form enables.
+  forms:
+    periodic_material:
+      [10-K, 10-K/A, 10-Q, 10-Q/A, 8-K, 8-K/A, 6-K, 6-K/A]
+    capital_markets:
+      [S-1, S-1/A, S-3, S-3/A, S-3ASR, S-3ASR/A, 424B2, 424B3, 424B5, FWP]
+    ownership_governance:
+      [SC 13D, SC 13D/A, SC 13G, SC 13G/A, 3, 3/A, 4, 4/A, 5, 5/A, DEF 14A]
+
+  exhibits:
+    always: [EX-99.1]
+    material_agreement_items: ['1.01', '2.01', '2.03']
+    # Additional exhibits must be explicitly scoped by form or item.
+    allowlist:
+      by_form: {}
+      by_item: {}

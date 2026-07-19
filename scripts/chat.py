@@ -697,6 +697,9 @@ class ChatSession:
         timeframe = metadata.get("timeframe")
         if timeframe:
             ctx["timeframe"] = timeframe
+        coverage = metadata.get("coverage_metadata")
+        if isinstance(coverage, dict) and coverage:
+            ctx["coverage_metadata"] = dict(coverage)
         return ctx or None
 
     def _record_turn(self, question: str, result: dict) -> None:

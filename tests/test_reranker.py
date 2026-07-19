@@ -76,6 +76,23 @@ class TestReranker:
         # scores are floats
         assert isinstance(out[0]["rerank_score"], float)
 
+    def test_equal_relevance_uses_bounded_authority_tie_break(self):
+        r = Reranker()
+        r._score = lambda _query, docs: [0.8 for _ in docs]  # noqa: E731
+        docs = [
+            {"id": "news", "document": "secondary", "metadata": {
+                "source": "finnhub", "source_category": "news_vendor",
+                "item_type": "news", "authority_tier": "provider",
+            }},
+            {"id": "filing", "document": "primary", "metadata": {
+                "source": "sec", "source_category": "regulatory_filing",
+                "item_type": "sec_filing", "authority_tier": "direct_sec",
+            }},
+        ]
+        result = r.rerank("financing", docs, top_n=2)
+        assert [row["id"] for row in result] == ["filing", "news"]
+        assert result[0]["authority_boost"] <= 0.025
+
     def test_rerank_empty_docs(self):
         """rerank on an empty doc list returns [] without calling the model."""
         r = Reranker()

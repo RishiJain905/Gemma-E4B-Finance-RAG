@@ -91,6 +91,27 @@ def test_bm25_filters_by_metadata_where():
     assert [h["id"] for h in hits] == ["b"]
 
 
+def test_bm25_composes_stable_taxonomy_filters():
+    docs = [
+        ("sec", "Oracle notes financing", {
+            "ticker": "ORCL", "source": "sec", "source_category": "regulatory_filing",
+            "item_type": "sec_filing", "event_type": "debt_raise",
+            "published_at": "2026-07-10T13:00:00Z", "authority_tier": "direct_sec",
+        }),
+        ("news", "Oracle notes financing", {
+            "ticker": "ORCL", "source": "finnhub", "source_category": "news_vendor",
+            "item_type": "news", "event_type": "debt_raise",
+            "published_at": "2026-07-10T14:00:00Z", "authority_tier": "provider",
+        }),
+    ]
+    lx = LexicalIndex(FakeStore(docs))
+    hits = lx.search(
+        "Oracle financing", k=10,
+        filters={"security": "ORCL", "source_category": "sec", "item_type": "filing"},
+    )
+    assert [row["id"] for row in hits] == ["sec"]
+
+
 def test_bm25_empty_corpus_returns_empty():
     lx = LexicalIndex(FakeStore([]))
     assert lx.search("anything", k=5) == []
@@ -180,6 +201,7 @@ def test_retriever_hybrid_uses_both_channels(monkeypatch):
 
 @pytest.mark.integration
 @pytest.mark.network
+@pytest.mark.live
 def test_lexical_index_real_corpus():
     """Build the BM25 index over the real chroma corpus (needs :8087 up for
     the Store init). Skips if the embedding endpoint is unreachable."""

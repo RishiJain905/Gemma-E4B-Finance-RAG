@@ -16,6 +16,8 @@ if "chromadb" not in sys.modules:
     sys.modules["chromadb"] = _mock_chroma
     sys.modules["chromadb.api"] = MagicMock()
 
+from src.ingestion.normalization import NORMALIZATION_VERSION, content_hash
+from src.ingestion.records import NarrativeRecord
 from src.storage.store import Store
 from src.sec.filing_sections import FilingSection
 
@@ -125,18 +127,28 @@ def test_add_filing_sections_routes_through_structural_chunker(store, mock_chrom
 
     result = store.add_filing_sections([section])
 
-    mock_chroma.delete_filing_section_family.assert_called_once_with(section.document_id)
+    mock_chroma.delete_filing_section_family.assert_not_called()
     mock_chroma.add_document.assert_called_once()
     call = mock_chroma.add_document.call_args.kwargs
     assert call["document_id"] == section.document_id
     assert call["text"].startswith("Item 2. MD&A")
     assert call["source"] == "sec_filing"
+    assert call["replace_family"] is True
     assert call["metadata"] == {
-        "accession": "ACC-1", "form": "10-Q", "filing_date": "2026-05-15",
-        "report_period": "2026-03-31", "section_key": "item_2",
-        "section_heading": "Item 2. MD&A", "section_index": 0,
-        "parent_id": "sec:ACC-1:item_2", "source_url": "https://sec.example",
-        "parsed_path": "parsed/ACC-1.txt",
+        "accession": "ACC-1", "as_of_at": "2026-03-31",
+        "authority_tier": "direct_sec",
+        "content_hash": content_hash(section.text),
+        "corpus_item_id": "sec:ACC-1:item_2",
+        "document_family_id": "sec:ACC-1:item_2",
+        "evidence_authority": "direct_sec", "filing_date": "2026-05-15",
+        "form": "10-Q", "item": "item_2", "item_type": "sec_filing",
+        "normalization_version": NORMALIZATION_VERSION,
+        "parent_id": "sec:ACC-1:item_2", "parsed_path": "parsed/ACC-1.txt",
+        "provider_record_id": "ACC-1", "published_at": "2026-05-15",
+        "report_period": "2026-03-31", "section_heading": "Item 2. MD&A",
+        "section_index": 0, "section_key": "item_2",
+        "source_category": "regulatory_filing", "source_name": "sec",
+        "source_url": "https://sec.example", "tickers": "NVDA",
     }
     assert result == {
         "sections_written": 1, "chunks_written": 1,
@@ -156,8 +168,9 @@ def test_reprocessing_filing_section_replaces_family_without_duplicate(store, mo
 
     result = store.add_filing_sections([section])
 
-    mock_chroma.delete_filing_section_family.assert_called_once_with(section.document_id)
+    mock_chroma.delete_filing_section_family.assert_not_called()
     assert mock_chroma.add_document.call_args.kwargs["document_id"] == section.document_id
+    assert mock_chroma.add_document.call_args.kwargs["replace_family"] is True
     assert result["replacements"] == 1
     assert result["sections_written"] == 1
 
@@ -341,6 +354,14 @@ def test_bump_failure_never_crashes_mutation(store, monkeypatch):
 
 def test_reset(store, mock_chroma, tmp_path: Path):
     store.save_fundamental("TEST", "metric_a", 1.0, period="2026-Q1")
+    store.upsert_universe_snapshot(
+        "ivv",
+        "2026-07-01T00:00:00Z",
+        [{
+            "symbol": "TEST", "company_name": "Test Incorporated",
+            "source": "ivv", "index_code": "sp500",
+        }],
+    )
     store.register_filing(
         "TEST", "10-K", "2026-01-01", "2026-FY",
         "acc-reset-1", "http://example.com",
@@ -351,4 +372,218 @@ def test_reset(store, mock_chroma, tmp_path: Path):
     mock_chroma.reset_collection.assert_called_once()
     with store.sqlite._connect() as conn:
         count = conn.execute("SELECT COUNT(*) FROM fundamentals").fetchone()[0]
+        security_count = conn.execute("SELECT COUNT(*) FROM securities").fetchone()[0]
     assert count == 0
+    assert security_count == 0
+
+
+def test_universe_facade_methods_delegate_without_extra_revision_bump(fully_mocked_store):
+    store, sqlite, _chroma = fully_mocked_store
+    sqlite.list_securities.return_value = [{"ticker": "AAPL"}]
+    sqlite.get_security.return_value = {"ticker": "AAPL"}
+    sqlite.resolve_security.return_value = {"ticker": "AAPL"}
+    sqlite.list_memberships.return_value = [{"index_code": "sp500"}]
+    sqlite.upsert_universe_snapshot.return_value = {"changed": False}
+    sqlite.list_universe_errors.return_value = []
+
+    assert store.list_securities(index="sp500", limit=5, offset=1) == [{"ticker": "AAPL"}]
+    assert store.get_security("AAPL") == {"ticker": "AAPL"}
+    assert store.resolve_security("AAPL", provider="sec", as_of="2026-01-01") == {
+        "ticker": "AAPL"
+    }
+    assert store.list_memberships(index_code="sp500", active=True) == [
+        {"index_code": "sp500"}
+    ]
+    assert store.upsert_universe_snapshot("ivv", "2026-01-01", []) == {"changed": False}
+    assert store.list_universe_errors("run-1") == []
+
+    sqlite.list_securities.assert_called_once_with(
+        index="sp500", active=True, sector=None, limit=5, offset=1,
+    )
+    sqlite.resolve_security.assert_called_once_with(
+        "AAPL", provider="sec", as_of="2026-01-01",
+    )
+    sqlite.upsert_universe_snapshot.assert_called_once_with("ivv", "2026-01-01", [])
+    sqlite.bump_store_revision.assert_not_called()
+
+
+def test_structured_record_facade_methods_delegate(fully_mocked_store):
+    store, sqlite, _chroma = fully_mocked_store
+    observation = MagicMock()
+    event = MagicMock()
+    sqlite.upsert_observation_record.return_value = {"created": True}
+    sqlite.upsert_event_record.return_value = {"created": True}
+
+    assert store.upsert_observation(observation) == {"created": True}
+    assert store.upsert_event(event) == {"created": True}
+    sqlite.upsert_observation_record.assert_called_once_with(observation)
+    sqlite.upsert_event_record.assert_called_once_with(event)
+
+
+def test_numeric_narrative_is_rejected_before_either_store_is_mutated(store, mock_chroma):
+    body = "ACME close was 42.00 USD."
+    record = NarrativeRecord(
+        corpus_item_id="bad-observation",
+        source_name="massive",
+        source_category="market_data",
+        provider_record_id="bar-1",
+        original_publisher=None,
+        item_type="observation",
+        title="ACME daily close",
+        body=body,
+        published_at="2026-07-14T00:00:00Z",
+        observed_at="2026-07-14T00:00:00Z",
+        accessed_at="2026-07-14T00:00:00Z",
+        ingested_at="2026-07-14T00:00:00Z",
+        source_url="https://example.test/bar/1",
+        canonical_url=None,
+        license_label="provider_entitlement",
+        normalization_version=NORMALIZATION_VERSION,
+        content_hash=content_hash(body),
+        document_family="market_observation",
+    )
+
+    with pytest.raises(ValueError, match="structured-only"):
+        store.upsert_narrative(record)
+
+    assert store.sqlite.count_corpus_items() == 0
+    mock_chroma.add_document.assert_not_called()
+
+
+def test_news_indexing_uses_provider_summary_and_complete_family_facets(store, mock_chroma):
+    store.upsert_universe_snapshot(
+        "ivv", "2026-07-14T00:00:00Z", [{
+            "symbol": "ACME", "company_name": "Acme Corporation",
+            "source": "ivv", "index_code": "sp500", "exchange": "NYSE",
+            "sector": "Industrials", "industry": "Machinery",
+        }],
+    )
+    security = store.resolve_security("ACME")
+    body = "Headline\n\nProvider summary\n\nPublisher name that must not be indexed"
+    record = NarrativeRecord(
+        corpus_item_id="news-1",
+        source_name="finnhub",
+        source_category="news_vendor",
+        provider_record_id="provider-1",
+        original_publisher="Publisher",
+        item_type="news",
+        title="Headline",
+        body=body,
+        summary="Provider summary",
+        published_at="2026-07-14T12:00:00Z",
+        effective_at="2026-07-15T00:00:00Z",
+        as_of_at="2026-07-14T00:00:00Z",
+        observed_at="2026-07-14T12:01:00Z",
+        accessed_at="2026-07-14T12:02:00Z",
+        ingested_at="2026-07-14T12:03:00Z",
+        source_url="https://example.test/news/1",
+        canonical_url="https://publisher.test/news/1",
+        license_label="provider_entitlement",
+        normalization_version=NORMALIZATION_VERSION,
+        content_hash=content_hash(body),
+        document_family="company_news",
+        security_ids=(security["security_id"],),
+        tickers=("ACME",),
+        evidence_authority="provider",
+    )
+
+    store.upsert_narrative(record)
+
+    call = mock_chroma.add_document.call_args.kwargs
+    assert call["text"] == "Headline\n\nProvider summary"
+    assert call["replace_family"] is True
+    assert call["document_id"] == "news-1"
+    assert call["metadata"] == {
+        "authority_tier": "provider",
+        "canonical_url": "https://publisher.test/news/1",
+        "content_hash": record.content_hash,
+        "corpus_item_id": "news-1",
+        "document_family": "company_news",
+        "document_family_id": "news-1",
+        "effective_at": "2026-07-15T00:00:00Z",
+        "evidence_authority": "provider",
+        "index_memberships": "sp500",
+        "industries": "Machinery",
+        "item_type": "news",
+        "license_label": "provider_entitlement",
+        "normalization_version": NORMALIZATION_VERSION,
+        "original_publisher": "Publisher",
+        "provider_record_id": "provider-1",
+        "published_at": "2026-07-14T12:00:00Z",
+        "as_of_at": "2026-07-14T00:00:00Z",
+        "security_ids": security["security_id"],
+        "sectors": "Industrials",
+        "source_category": "news_vendor",
+        "source_name": "finnhub",
+        "tickers": "ACME",
+    }
+
+
+def test_corpus_accounting_delegates_to_sqlite_only(fully_mocked_store):
+    store, sqlite, chroma = fully_mocked_store
+    sqlite.get_corpus_accounting.return_value = [{
+        "key": "news_vendor", "count": 2, "approximate_bytes": 512,
+    }]
+
+    result = store.get_corpus_accounting(
+        "source_category", indexing_state="indexed", limit=10, offset=2,
+    )
+
+    assert result == [{"key": "news_vendor", "count": 2, "approximate_bytes": 512}]
+    sqlite.get_corpus_accounting.assert_called_once_with(
+        "source_category", source_category=None, source=None, item_type=None,
+        event_type=None, security=None, sector=None, industry=None, index=None,
+        coverage_tier=None, year=None, month=None, indexing_state="indexed",
+        limit=10, offset=2,
+    )
+    chroma.iter_documents.assert_not_called()
+
+
+# ── Narrative inventory counts: SQLite lexical ledger + Chroma fallback (2.3.7.6) ──
+
+def test_store_source_counts_use_sqlite_lexical_ledger(store, mock_chroma):
+    """Narrative source/ticker counts come from the indexed SQLite lexical
+    ledger, never a full Chroma metadata scan, when FTS5 is available."""
+    if not store.sqlite.fts5_available():
+        pytest.skip("FTS5 unavailable")
+    store.save_documents_batch(
+        ["d1", "d2", "d3"],
+        ["alpha body", "beta body", "gamma body"],
+        [
+            {"source": "sec", "ticker": "NVDA"},
+            {"source": "sec", "ticker": "NVDA"},
+            {"source": "gdelt", "ticker": "AMD"},
+        ],
+    )
+    # The Chroma scan must not be consulted when the ledger can answer.
+    mock_chroma.get_source_counts.side_effect = AssertionError("scanned Chroma")
+    mock_chroma.get_ticker_counts.side_effect = AssertionError("scanned Chroma")
+
+    src = {row["source"]: row["count"] for row in store.get_source_counts(limit=100)}
+    assert src == {"sec": 2, "gdelt": 1}
+
+    tickers = {row["ticker"]: row for row in store.get_ticker_counts(limit=100)}
+    assert tickers["NVDA"]["record_count"] == 2
+    assert tickers["AMD"]["record_count"] == 1
+    # Response shape is unchanged from the legacy Chroma-scan merge.
+    assert set(tickers["NVDA"]) == {
+        "ticker", "record_count", "sources", "source_counts", "company_name",
+    }
+
+
+def test_store_source_counts_fall_back_to_chroma_without_lexical_ledger(
+    store, mock_chroma, monkeypatch,
+):
+    """An FTS5-less runtime keeps the legacy Chroma metadata-scan count basis."""
+    monkeypatch.setattr(store.sqlite, "lexical_counts_available", lambda: False)
+    mock_chroma.get_source_counts.return_value = [{"source": "legacy", "count": 5}]
+    mock_chroma.get_ticker_counts.return_value = [
+        {"ticker": "NVDA", "record_count": 7, "sources": ["legacy"],
+         "company_name": None},
+    ]
+
+    src = {row["source"]: row["count"] for row in store.get_source_counts(limit=100)}
+    assert src.get("legacy") == 5
+
+    tickers = {row["ticker"]: row for row in store.get_ticker_counts(limit=100)}
+    assert tickers["NVDA"]["record_count"] == 7

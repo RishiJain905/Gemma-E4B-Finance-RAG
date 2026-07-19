@@ -55,9 +55,14 @@ def live_store(tmp_path):
 @pytest.fixture
 def client_with_store(live_store, monkeypatch):
     from src.middleware import app as middleware_app
-    with TestClient(middleware_app.app) as client:
-        monkeypatch.setattr(middleware_app, "store", live_store)
+    monkeypatch.setattr(middleware_app, "store", live_store)
+    monkeypatch.setattr(middleware_app, "config", middleware_app.MiddlewareConfig())
+    monkeypatch.setattr(middleware_app, "retriever", None)
+    client = TestClient(middleware_app.app)
+    try:
         yield client, live_store
+    finally:
+        client.close()
 
 
 def test_query_with_fresh_data(client_with_store):
@@ -93,9 +98,18 @@ def test_search_returns_results(client_with_store):
     assert len(data["documents"]) > 0
 
 
-def test_degraded_mode_when_model_down(client_with_store):
-    """When the model is unavailable, /query degrades to raw retrieved data."""
+def test_degraded_mode_when_model_down(client_with_store, monkeypatch):
+    """When the model is unavailable, /query degrades to raw retrieved data.
+
+    Pinned to the legacy (non-adaptive) path: under the promoted 2.3.7.4
+    defaults a fully-covered fact lookup answers deterministically without
+    the model, so the degraded fallback would never be reached here.
+    """
     client, store = client_with_store
+    from src.middleware import app as middleware_app
+    monkeypatch.setattr(middleware_app.config, "enable_adaptive_rag", False)
+    monkeypatch.setattr(middleware_app.config, "enable_deterministic_tool_routing", False)
+    monkeypatch.setattr(middleware_app.config, "enable_deterministic_answers", False)
     store.save_fundamental("NVDA", "total_revenue", 26.0, "usd", "2026-Q1")
 
     with patch("src.middleware.app._check_model_health", new_callable=AsyncMock,

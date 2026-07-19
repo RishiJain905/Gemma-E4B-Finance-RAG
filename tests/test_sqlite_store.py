@@ -308,6 +308,101 @@ def test_corpus_inventory_rejects_invalid_pages(store: SQLiteStore):
         store.search_corpus_metrics(limit=1, offset=-1)
 
 
+# ── Narrow lexical inventory counts (2.3.7.6) ─────────────────────────────
+
+def _lexical_family(family_id: str, *, source: str, ticker: str,
+                    text: str = "narrative body text") -> dict:
+    return {
+        family_id: [{
+            "id": family_id,
+            "document": text,
+            "metadata": {
+                "document_family_id": family_id,
+                "source": source,
+                "source_name": source,
+                "ticker": ticker,
+                "tickers": ticker,
+                "indexing_status": "indexed",
+            },
+        }]
+    }
+
+
+def test_lexical_counts_group_source_and_ticker(store: SQLiteStore):
+    if not store.fts5_available():
+        pytest.skip("FTS5 unavailable")
+    store.replace_lexical_families(_lexical_family("f1", source="sec", ticker="NVDA"))
+    store.replace_lexical_families(_lexical_family("f2", source="sec", ticker="NVDA"))
+    store.replace_lexical_families(_lexical_family("f3", source="gdelt", ticker="AMD"))
+
+    src = store.get_lexical_source_counts(limit=100)
+    assert {row["source"]: row["count"] for row in src} == {"sec": 2, "gdelt": 1}
+    assert set(src[0]) == {"source", "count"}  # shape parity with the Chroma scan
+
+    tickers = {row["ticker"]: row for row in store.get_lexical_ticker_counts(limit=100)}
+    assert tickers["NVDA"]["record_count"] == 2
+    assert tickers["AMD"]["record_count"] == 1
+    assert set(tickers["NVDA"]) == {"ticker", "record_count", "sources", "company_name"}
+    assert tickers["NVDA"]["sources"] == ["sec"]
+
+
+def test_lexical_ticker_counts_split_multi_ticker(store: SQLiteStore):
+    if not store.fts5_available():
+        pytest.skip("FTS5 unavailable")
+    store.replace_lexical_families(_lexical_family("f1", source="sec", ticker="NVDA,AMD"))
+    tickers = {row["ticker"]: row["record_count"]
+               for row in store.get_lexical_ticker_counts(limit=100)}
+    assert tickers == {"NVDA": 1, "AMD": 1}
+
+
+def test_lexical_meta_stays_consistent_through_delete_and_replace(store: SQLiteStore):
+    if not store.fts5_available():
+        pytest.skip("FTS5 unavailable")
+    store.replace_lexical_families(_lexical_family("f1", source="sec", ticker="NVDA"))
+    store.replace_lexical_families(_lexical_family("f2", source="ir", ticker="AMD"))
+    # Replace f1 with a different source; delete f2 entirely.
+    store.replace_lexical_families(_lexical_family("f1", source="gdelt", ticker="NVDA"))
+    store.delete_lexical_families(["f2"])
+
+    src = {row["source"]: row["count"] for row in store.get_lexical_source_counts(limit=100)}
+    assert src == {"gdelt": 1}
+    with store._connect() as conn:
+        fts = conn.execute("SELECT COUNT(*) FROM corpus_fts").fetchone()[0]
+        meta = conn.execute("SELECT COUNT(*) FROM lexical_chunk_meta").fetchone()[0]
+        joined = conn.execute(
+            "SELECT COUNT(*) FROM corpus_fts f "
+            "LEFT JOIN lexical_chunk_meta m ON f.chunk_id=m.chunk_id "
+            "WHERE m.chunk_id IS NULL "
+            "OR IFNULL(m.source,'')<>IFNULL(f.source,'') "
+            "OR IFNULL(m.ticker,'')<>IFNULL(f.ticker,'')"
+        ).fetchone()[0]
+    assert fts == meta == 1
+    assert joined == 0  # narrow mirror matches the FTS index exactly
+
+
+def test_lexical_meta_cleared_on_full_rebuild(store: SQLiteStore):
+    if not store.fts5_available():
+        pytest.skip("FTS5 unavailable")
+    store.replace_lexical_families(_lexical_family("f1", source="sec", ticker="NVDA"))
+
+    def _page(offset: int, limit: int) -> list:
+        return []  # empty source corpus -> rebuild clears the index
+
+    store.rebuild_lexical_index(
+        _page, batch_size=10, target_revision=store.get_store_revision() + 1,
+        restart=True,
+    )
+    with store._connect() as conn:
+        meta = conn.execute("SELECT COUNT(*) FROM lexical_chunk_meta").fetchone()[0]
+    assert meta == 0
+    assert store.get_lexical_source_counts(limit=100) == []
+
+
+def test_lexical_counts_available_tracks_fts5(store: SQLiteStore):
+    # On an FTS5 runtime the narrow mirror exists and counts are served natively.
+    assert store.lexical_counts_available() == store.fts5_available()
+
+
 # ── Store Revision (2.2.6.2) ──────────────────────
 
 def test_store_revision_starts_at_zero(store: SQLiteStore):
@@ -339,6 +434,14 @@ def test_inline_schema(store: SQLiteStore):
     assert "CREATE TABLE IF NOT EXISTS cache_meta" in schema
     assert "CREATE TABLE IF NOT EXISTS ingestion_log" in schema
     assert "CREATE TABLE IF NOT EXISTS store_revision" in schema
+    assert "CREATE TABLE IF NOT EXISTS securities" in schema
+    assert "CREATE TABLE IF NOT EXISTS security_aliases" in schema
+    assert "CREATE TABLE IF NOT EXISTS security_memberships" in schema
+    assert "CREATE TABLE IF NOT EXISTS corpus_items" in schema
+    assert "CREATE TABLE IF NOT EXISTS corpus_item_sources" in schema
+    assert "CREATE TABLE IF NOT EXISTS corpus_item_securities" in schema
+    assert "CREATE TABLE IF NOT EXISTS corpus_observations" in schema
+    assert "CREATE TABLE IF NOT EXISTS corpus_events" in schema
 
 
 def test_init_creates_store_revision_table(tmp_path: Path):
@@ -349,3 +452,112 @@ def test_init_creates_store_revision_table(tmp_path: Path):
                 "SELECT name FROM sqlite_master WHERE type='table'").fetchall()
         }
     assert "store_revision" in tables
+
+
+# -- Security universe (2.3.1.1) ---------------------------------------------
+
+def test_init_creates_universe_tables_and_indexes(store: SQLiteStore):
+    with store._connect() as conn:
+        tables = {
+            row[0] for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()
+        }
+        indexes = {
+            row[0] for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='index'"
+            ).fetchall()
+        }
+    assert {
+        "securities", "security_aliases", "security_memberships", "universe_errors",
+    } <= tables
+    assert {
+        "idx_securities_active_ticker", "idx_securities_cik",
+        "idx_security_aliases_lookup", "idx_memberships_active_index",
+        "idx_securities_sector", "idx_securities_last_seen",
+    } <= indexes
+
+
+def test_init_creates_corpus_ledger_tables_and_indexes(store: SQLiteStore):
+    with store._connect() as conn:
+        tables = {
+            row[0] for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()
+        }
+        indexes = {
+            row[0] for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='index'"
+            ).fetchall()
+        }
+
+    assert {
+        "corpus_items", "corpus_item_sources", "corpus_item_securities",
+        "corpus_observations", "observation_securities", "corpus_events",
+        "event_securities", "event_corpus_items",
+    } <= tables
+    assert {
+        "idx_corpus_items_provider_identity", "idx_corpus_items_url_identity",
+        "idx_corpus_items_hash_identity", "idx_corpus_items_canonical_url",
+        "idx_corpus_items_content_hash", "idx_corpus_items_headline_window",
+        "idx_corpus_items_indexing_status", "idx_corpus_item_sources_source",
+        "idx_corpus_item_securities_security", "idx_corpus_observations_metric_period",
+        "idx_corpus_events_type_effective",
+    } <= indexes
+
+
+def test_universe_reads_filter_and_resolve_aliases(store: SQLiteStore):
+    result = store.upsert_universe_snapshot(
+        "ivv",
+        "2026-07-01T00:00:00Z",
+        [
+            {
+                "symbol": "BRK.B", "company_name": "Berkshire Hathaway Class B",
+                "source": "ivv", "index_code": "sp500", "exchange": "NYSE",
+                "cik": "0001067983", "sector": "Financials",
+                "source_url": "https://example.test/ivv",
+            },
+            {
+                "symbol": "MSFT", "company_name": "Microsoft Corporation",
+                "source": "ivv", "index_code": "sp500", "exchange": "NASDAQ",
+                "cik": None, "sector": "Technology",
+                "source_url": "https://example.test/ivv",
+            },
+        ],
+    )
+
+    assert result["changed"] is True
+    assert [row["ticker"] for row in store.list_securities(
+        index="sp500", active=True, sector="Financials", limit=10, offset=0,
+    )] == ["BRK-B"]
+    security = store.get_security("BRK.B")
+    assert security["ticker"] == "BRK-B"
+    assert store.get_security(security["security_id"])["security_id"] == security["security_id"]
+    assert store.resolve_security("BRK.B", provider="ivv")["security_id"] == security["security_id"]
+    assert store.list_memberships(security_id=security["security_id"], active=True)
+
+
+def test_list_tickers_uses_canonical_active_symbols_without_aliases(store: SQLiteStore):
+    store.upsert_fundamental("LEGACY", "revenue", 1.0, period="2026-Q1")
+    store.upsert_universe_snapshot(
+        "ivv",
+        "2026-07-01T00:00:00Z",
+        [{
+            "symbol": "BRK.B", "company_name": "Berkshire Hathaway Class B",
+            "source": "ivv", "index_code": "sp500", "exchange": "NYSE",
+            "source_url": "https://example.test/ivv",
+        }],
+    )
+    with store._connect() as conn:
+        security_id = conn.execute(
+            "SELECT security_id FROM securities WHERE ticker='BRK-B'"
+        ).fetchone()[0]
+        conn.execute(
+            "INSERT INTO security_aliases "
+            "(security_id, alias, normalized_alias, alias_type, source, valid_from) "
+            "VALUES (?, 'BF.B', 'BF-B', 'former_ticker', 'ivv', '2020-01-01')",
+            (security_id,),
+        )
+        conn.commit()
+
+    assert store.list_tickers() == ["BRK-B"]

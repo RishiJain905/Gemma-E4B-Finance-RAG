@@ -141,6 +141,34 @@ class TestIntentParser:
         result = parser.parse("What is the outlook for NVDA?")
         assert result["metrics"] == []
 
+    @pytest.mark.parametrize(
+        ("question", "topic", "event_type", "item_type"),
+        [
+            ("How did Oracle finance its latest debt raise?", "financing", "debt_raise", "filing"),
+            ("What corporate actions did Apple announce?", "corporate_action", "buyback", "corporate_action"),
+            ("What did Oracle acquire?", "corporate_action", "acquisition", "corporate_action"),
+            ("Summarize the latest merger and divestiture", "corporate_action", "divestiture", "corporate_action"),
+            ("Show recent beneficial ownership changes for Tesla", "ownership", "beneficial_ownership_change", "filing"),
+            ("Are there new regulatory actions affecting Microsoft?", "regulatory", "enforcement_action", "regulatory_event"),
+            ("What was in the latest inflation release?", "macro_release", "economic_release", "economic_release"),
+            ("What is the latest company news about Nvidia?", "company_news", None, "news"),
+        ],
+    )
+    def test_finance_evidence_intents_do_not_require_provider_names(
+        self, question, topic, event_type, item_type
+    ):
+        from src.middleware.intent_parser import IntentParser
+
+        result = IntentParser().parse(question)
+        assert result["evidence_topic"] == topic
+        assert result["evidence_filters"]["item_type"] == item_type
+        if event_type is not None:
+            assert event_type in result["evidence_filters"]["event_types"]
+        assert not any(
+            provider in str(result["evidence_filters"]).lower()
+            for provider in ("finnhub", "massive", "gdelt")
+        )
+
     # ── Question Type Classification ───────────────────
 
     @pytest.mark.parametrize("question,expected_type", [
@@ -310,7 +338,8 @@ class TestQueryPlanParsing:
         "What is the weather today?",
     ])
     def test_legacy_adapter_matches_existing_parse_contract(self, tmp_path, question):
-        """to_legacy_intent() reproduces parse() exactly for the same parser."""
+        """The legacy adapter preserves its established fields and values."""
         parser = _plan_parser(tmp_path)
         legacy = parser.parse_plan(question).to_legacy_intent()
-        assert legacy == parser.parse(question)
+        parsed = parser.parse(question)
+        assert legacy == {key: parsed[key] for key in legacy}

@@ -10,6 +10,7 @@
 CREATE TABLE IF NOT EXISTS fundamentals (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     ticker TEXT NOT NULL,                            -- 'NVDA', 'AMD', etc.
+    security_id TEXT REFERENCES securities(security_id), -- Phase 2.3 canonical identity
     metric TEXT NOT NULL,                            -- 'revenue_q1_2026', 'pe_ratio_ttm', 'gross_margin'
     value REAL,                                      -- The numeric value
     unit TEXT DEFAULT 'usd',                         -- 'usd', 'percent', 'ratio', 'shares'
@@ -26,6 +27,7 @@ CREATE TABLE IF NOT EXISTS fundamentals (
 CREATE TABLE IF NOT EXISTS sec_companyfacts (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     ticker TEXT NOT NULL,
+    security_id TEXT REFERENCES securities(security_id),
     cik TEXT NOT NULL,
     taxonomy TEXT NOT NULL,
     concept TEXT NOT NULL,
@@ -58,6 +60,7 @@ CREATE TABLE IF NOT EXISTS sec_companyfacts (
 CREATE TABLE IF NOT EXISTS filings (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     ticker TEXT NOT NULL,
+    security_id TEXT REFERENCES securities(security_id),
     filing_type TEXT NOT NULL,                       -- '10-K', '10-Q', '8-K', 'earnings_call', 'press_release'
     filing_date TEXT,                                -- Date of filing
     period TEXT,                                     -- Period covered (for 10-Q: '2026-Q1')
@@ -70,6 +73,11 @@ CREATE TABLE IF NOT EXISTS filings (
     index_error TEXT,                                -- Retryable filing-text index failure reason
     index_section_count INTEGER DEFAULT 0,           -- Verified section parents written
     index_chunk_count INTEGER DEFAULT 0,             -- Verified child chunks written
+    cik TEXT,
+    primary_document TEXT,
+    discovery_scope TEXT DEFAULT 'deep',
+    items_json TEXT DEFAULT '[]',
+    exhibits_json TEXT DEFAULT '[]',
     ingested_at TEXT DEFAULT (datetime('now'))
 );
 
@@ -78,6 +86,7 @@ CREATE TABLE IF NOT EXISTS filings (
 -- The middleware checks this before serving cached data.
 CREATE TABLE IF NOT EXISTS cache_meta (
     ticker TEXT NOT NULL,
+    security_id TEXT REFERENCES securities(security_id),
     source TEXT NOT NULL,                            -- 'sec', 'yfinance', 'fred', 'gdelt'
     metric_scope TEXT DEFAULT 'all',                 -- 'all', 'fundamentals', 'filings', 'news'
     last_updated TEXT,                               -- When we last fetched this
@@ -137,3 +146,435 @@ CREATE INDEX IF NOT EXISTS idx_filings_ticker ON filings(ticker);
 CREATE INDEX IF NOT EXISTS idx_filings_status ON filings(status);
 CREATE INDEX IF NOT EXISTS idx_cache_meta_status ON cache_meta(status);
 CREATE INDEX IF NOT EXISTS idx_ingestion_log_run ON ingestion_log(run_id);
+-- -- Security Universe (2.3.1.1) ---------------------------------------------
+CREATE TABLE IF NOT EXISTS securities (
+    security_id TEXT PRIMARY KEY,
+    ticker TEXT NOT NULL,
+    normalized_ticker TEXT NOT NULL,
+    company_name TEXT NOT NULL,
+    exchange TEXT NOT NULL DEFAULT '',
+    cik TEXT,
+    security_type TEXT NOT NULL DEFAULT 'common_stock',
+    share_class TEXT,
+    sector TEXT,
+    industry TEXT,
+    active INTEGER NOT NULL DEFAULT 1 CHECK (active IN (0, 1)),
+    first_seen_at TEXT NOT NULL,
+    last_seen_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(normalized_ticker, exchange)
+);
+
+CREATE TABLE IF NOT EXISTS security_aliases (
+    alias_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    security_id TEXT NOT NULL REFERENCES securities(security_id),
+    alias TEXT NOT NULL,
+    normalized_alias TEXT NOT NULL,
+    alias_type TEXT NOT NULL CHECK (
+        alias_type IN (
+            'ticker', 'vendor_symbol', 'former_ticker', 'issuer_alias',
+            'manufacturer', 'recipient_uei'
+        )
+    ),
+    provider TEXT,
+    valid_from TEXT,
+    valid_to TEXT,
+    source TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS security_memberships (
+    membership_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    security_id TEXT NOT NULL REFERENCES securities(security_id),
+    index_code TEXT NOT NULL CHECK (index_code IN ('sp500', 'nasdaq100')),
+    effective_from TEXT NOT NULL,
+    effective_to TEXT,
+    active INTEGER NOT NULL DEFAULT 1 CHECK (active IN (0, 1)),
+    source TEXT NOT NULL,
+    source_url TEXT,
+    observed_at TEXT NOT NULL,
+    UNIQUE(security_id, index_code, effective_from)
+);
+
+CREATE TABLE IF NOT EXISTS universe_errors (
+    error_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id TEXT NOT NULL,
+    source TEXT NOT NULL,
+    symbol TEXT,
+    error_code TEXT NOT NULL,
+    message TEXT NOT NULL,
+    payload TEXT,
+    observed_at TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS identity_reconciliation_errors (
+    error_id TEXT PRIMARY KEY,
+    stage TEXT NOT NULL,
+    legacy_table TEXT NOT NULL,
+    legacy_row_id TEXT,
+    identifier TEXT,
+    issue_type TEXT NOT NULL CHECK (issue_type IN ('orphan', 'ambiguous', 'conflict')),
+    candidates_json TEXT NOT NULL DEFAULT '[]',
+    details_json TEXT NOT NULL DEFAULT '{}',
+    status TEXT NOT NULL DEFAULT 'open',
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_securities_active_ticker
+    ON securities(active, normalized_ticker);
+CREATE INDEX IF NOT EXISTS idx_securities_cik ON securities(cik);
+CREATE INDEX IF NOT EXISTS idx_securities_sector ON securities(sector);
+CREATE INDEX IF NOT EXISTS idx_securities_last_seen ON securities(last_seen_at);
+CREATE INDEX IF NOT EXISTS idx_security_aliases_lookup
+    ON security_aliases(normalized_alias, provider, valid_from, valid_to);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_security_aliases_active_global
+    ON security_aliases(normalized_alias)
+    WHERE valid_to IS NULL AND provider IS NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_security_aliases_active_provider
+    ON security_aliases(normalized_alias, provider)
+    WHERE valid_to IS NULL AND provider IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_memberships_active_index
+    ON security_memberships(index_code, active, security_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_memberships_one_active
+    ON security_memberships(security_id, index_code)
+    WHERE active = 1;
+CREATE INDEX IF NOT EXISTS idx_universe_errors_run ON universe_errors(run_id);
+
+-- -- Corpus metadata ledger (2.3.3.1) ----------------------------------------
+CREATE TABLE IF NOT EXISTS corpus_items (
+    corpus_item_id TEXT PRIMARY KEY,
+    source TEXT NOT NULL,
+    source_category TEXT NOT NULL,
+    provider_record_id TEXT,
+    original_publisher TEXT,
+    item_type TEXT NOT NULL,
+    event_type TEXT,
+    title TEXT NOT NULL,
+    normalized_headline TEXT NOT NULL,
+    syndicated_key TEXT,
+    summary TEXT CHECK (summary IS NULL OR length(summary) <= 4000),
+    language TEXT NOT NULL,
+    published_at TEXT,
+    effective_at TEXT,
+    as_of_at TEXT,
+    observed_at TEXT,
+    accessed_at TEXT NOT NULL,
+    ingested_at TEXT NOT NULL,
+    source_url TEXT NOT NULL,
+    canonical_url TEXT,
+    tickers_json TEXT NOT NULL DEFAULT '[]',
+    index_codes_json TEXT NOT NULL DEFAULT '[]',
+    sectors_json TEXT NOT NULL DEFAULT '[]',
+    content_hash TEXT NOT NULL,
+    metadata_json TEXT NOT NULL DEFAULT '{}',
+    document_family TEXT NOT NULL,
+    document_family_id TEXT,
+    indexing_status TEXT NOT NULL CHECK (
+        indexing_status IN ('pending', 'indexed', 'error', 'not_applicable')
+    ),
+    index_error TEXT,
+    license_label TEXT NOT NULL,
+    normalization_version TEXT NOT NULL,
+    evidence_authority TEXT NOT NULL,
+    narrative_bytes INTEGER NOT NULL DEFAULT 0,
+    metadata_bytes INTEGER NOT NULL DEFAULT 0,
+    is_tombstone INTEGER NOT NULL DEFAULT 0,
+    retired_at TEXT,
+    retention_reason TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS corpus_item_sources (
+    corpus_item_id TEXT NOT NULL REFERENCES corpus_items(corpus_item_id) ON DELETE CASCADE,
+    source_key TEXT NOT NULL,
+    source_name TEXT NOT NULL,
+    source_category TEXT NOT NULL,
+    provider_record_id TEXT,
+    original_publisher TEXT,
+    source_url TEXT NOT NULL,
+    canonical_url TEXT,
+    published_at TEXT,
+    observed_at TEXT,
+    accessed_at TEXT NOT NULL,
+    ingested_at TEXT NOT NULL,
+    license_label TEXT NOT NULL,
+    evidence_authority TEXT NOT NULL,
+    metadata_json TEXT NOT NULL DEFAULT '{}',
+    PRIMARY KEY (corpus_item_id, source_key)
+);
+
+CREATE TABLE IF NOT EXISTS corpus_item_securities (
+    corpus_item_id TEXT NOT NULL REFERENCES corpus_items(corpus_item_id) ON DELETE CASCADE,
+    security_id TEXT NOT NULL REFERENCES securities(security_id),
+    ticker TEXT,
+    PRIMARY KEY (corpus_item_id, security_id)
+);
+
+CREATE TABLE IF NOT EXISTS corpus_observations (
+    observation_id TEXT PRIMARY KEY,
+    metric_id TEXT NOT NULL,
+    series_id TEXT,
+    value_text TEXT NOT NULL,
+    value_numeric REAL,
+    unit TEXT NOT NULL,
+    frequency TEXT NOT NULL,
+    period_start TEXT,
+    period_end TEXT NOT NULL,
+    vintage_at TEXT,
+    as_of_at TEXT,
+    scope TEXT NOT NULL CHECK (scope IN ('security', 'sector', 'global')),
+    tickers_json TEXT NOT NULL DEFAULT '[]',
+    sector TEXT,
+    source_name TEXT NOT NULL,
+    source_category TEXT NOT NULL,
+    provider_record_id TEXT,
+    original_publisher TEXT,
+    source_url TEXT NOT NULL,
+    canonical_url TEXT,
+    published_at TEXT,
+    observed_at TEXT,
+    accessed_at TEXT NOT NULL,
+    ingested_at TEXT NOT NULL,
+    license_label TEXT NOT NULL,
+    normalization_version TEXT NOT NULL,
+    evidence_authority TEXT NOT NULL,
+    metadata_json TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS observation_securities (
+    observation_id TEXT NOT NULL REFERENCES corpus_observations(observation_id) ON DELETE CASCADE,
+    security_id TEXT NOT NULL REFERENCES securities(security_id),
+    PRIMARY KEY (observation_id, security_id)
+);
+
+CREATE TABLE IF NOT EXISTS corpus_events (
+    event_id TEXT PRIMARY KEY,
+    event_type TEXT NOT NULL,
+    effective_at TEXT,
+    announced_at TEXT,
+    status TEXT NOT NULL,
+    amount REAL,
+    currency TEXT,
+    rate REAL,
+    ratio REAL,
+    action_date TEXT,
+    classifier_version TEXT,
+    explanation TEXT CHECK (explanation IS NULL OR length(explanation) <= 4000),
+    source_name TEXT NOT NULL,
+    source_category TEXT NOT NULL,
+    provider_record_id TEXT,
+    original_publisher TEXT,
+    source_url TEXT NOT NULL,
+    canonical_url TEXT,
+    published_at TEXT,
+    observed_at TEXT,
+    accessed_at TEXT NOT NULL,
+    ingested_at TEXT NOT NULL,
+    license_label TEXT NOT NULL,
+    normalization_version TEXT NOT NULL,
+    evidence_authority TEXT NOT NULL,
+    metadata_json TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS event_securities (
+    event_id TEXT NOT NULL REFERENCES corpus_events(event_id) ON DELETE CASCADE,
+    security_id TEXT NOT NULL REFERENCES securities(security_id),
+    PRIMARY KEY (event_id, security_id)
+);
+
+CREATE TABLE IF NOT EXISTS event_corpus_items (
+    event_id TEXT NOT NULL REFERENCES corpus_events(event_id) ON DELETE CASCADE,
+    corpus_item_id TEXT NOT NULL REFERENCES corpus_items(corpus_item_id),
+    PRIMARY KEY (event_id, corpus_item_id)
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_corpus_items_provider_identity
+    ON corpus_items(source, provider_record_id)
+    WHERE provider_record_id IS NOT NULL AND provider_record_id <> '';
+CREATE UNIQUE INDEX IF NOT EXISTS idx_corpus_items_url_identity
+    ON corpus_items(source, canonical_url, published_at)
+    WHERE provider_record_id IS NULL AND canonical_url IS NOT NULL
+        AND published_at IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_corpus_items_hash_identity
+    ON corpus_items(source, content_hash)
+    WHERE provider_record_id IS NULL AND canonical_url IS NULL;
+CREATE INDEX IF NOT EXISTS idx_corpus_items_canonical_url
+    ON corpus_items(canonical_url, published_at);
+CREATE INDEX IF NOT EXISTS idx_corpus_items_content_hash
+    ON corpus_items(content_hash);
+CREATE INDEX IF NOT EXISTS idx_corpus_items_headline_window
+    ON corpus_items(syndicated_key)
+    WHERE syndicated_key IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_corpus_items_indexing_status
+    ON corpus_items(indexing_status, updated_at);
+CREATE INDEX IF NOT EXISTS idx_corpus_item_sources_source
+    ON corpus_item_sources(source_name, provider_record_id);
+CREATE INDEX IF NOT EXISTS idx_corpus_item_securities_security
+    ON corpus_item_securities(security_id, corpus_item_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_corpus_observations_provider
+    ON corpus_observations(source_name, metric_id, provider_record_id, vintage_at)
+    WHERE provider_record_id IS NOT NULL AND provider_record_id <> '';
+CREATE INDEX IF NOT EXISTS idx_corpus_observations_metric_period
+    ON corpus_observations(metric_id, period_end, vintage_at);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_corpus_events_provider
+    ON corpus_events(source_name, provider_record_id)
+    WHERE provider_record_id IS NOT NULL AND provider_record_id <> '';
+CREATE INDEX IF NOT EXISTS idx_corpus_events_type_effective
+    ON corpus_events(event_type, effective_at);
+
+-- -- Ordered migration and bounded refresh state (2.3.4 / 2.3.6.1) ---------
+CREATE TABLE IF NOT EXISTS schema_migrations (
+    version INTEGER PRIMARY KEY,
+    name TEXT NOT NULL,
+    checksum TEXT NOT NULL,
+    applied_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS sec_daily_indexes (
+    index_date TEXT PRIMARY KEY,
+    source_url TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('processed')),
+    registered_count INTEGER NOT NULL DEFAULT 0,
+    processed_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS source_cursors (
+    source TEXT NOT NULL,
+    partition_key TEXT NOT NULL,
+    cursor_value TEXT,
+    cursor_type TEXT NOT NULL DEFAULT 'none',
+    overlap_value TEXT,
+    last_successful_run_id TEXT,
+    last_successful_at TEXT,
+    version TEXT NOT NULL DEFAULT '1',
+    status TEXT NOT NULL DEFAULT 'unknown',
+    error_class TEXT,
+    error_message TEXT,
+    retry_after REAL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (source, partition_key)
+);
+
+CREATE TABLE IF NOT EXISTS source_budget_usage (
+    source TEXT NOT NULL,
+    window_kind TEXT NOT NULL CHECK (window_kind IN ('minute', 'day')),
+    window_start TEXT NOT NULL,
+    attempted_requests INTEGER NOT NULL DEFAULT 0,
+    successful_requests INTEGER NOT NULL DEFAULT 0,
+    provider_remaining INTEGER,
+    provider_reset TEXT,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (source, window_kind, window_start)
+);
+
+CREATE TABLE IF NOT EXISTS scheduler_runs (
+    run_id TEXT PRIMARY KEY,
+    mode TEXT NOT NULL,
+    policy_revision TEXT NOT NULL,
+    config_revision TEXT NOT NULL,
+    started_at TEXT NOT NULL,
+    ended_at TEXT,
+    duration_seconds REAL,
+    status TEXT NOT NULL DEFAULT 'running',
+    requested_sources_json TEXT NOT NULL DEFAULT '[]',
+    completed_sources_json TEXT NOT NULL DEFAULT '[]',
+    skipped_sources_json TEXT NOT NULL DEFAULT '[]',
+    failed_sources_json TEXT NOT NULL DEFAULT '[]',
+    terminal_error_class TEXT,
+    terminal_error_message TEXT
+);
+
+CREATE TABLE IF NOT EXISTS scheduler_run_sources (
+    run_id TEXT NOT NULL REFERENCES scheduler_runs(run_id) ON DELETE CASCADE,
+    source TEXT NOT NULL,
+    mode TEXT NOT NULL,
+    policy_revision TEXT NOT NULL,
+    config_revision TEXT NOT NULL,
+    started_at TEXT,
+    ended_at TEXT,
+    duration_seconds REAL,
+    status TEXT NOT NULL,
+    requested INTEGER NOT NULL DEFAULT 1,
+    completed INTEGER NOT NULL DEFAULT 0,
+    skipped INTEGER NOT NULL DEFAULT 0,
+    failed INTEGER NOT NULL DEFAULT 0,
+    partitions INTEGER NOT NULL DEFAULT 0,
+    items INTEGER NOT NULL DEFAULT 0,
+    requests INTEGER NOT NULL DEFAULT 0,
+    new_items INTEGER NOT NULL DEFAULT 0,
+    updated_items INTEGER NOT NULL DEFAULT 0,
+    duplicates INTEGER NOT NULL DEFAULT 0,
+    cursor_before_json TEXT,
+    cursor_after_json TEXT,
+    quota_remaining INTEGER,
+    freshness TEXT,
+    last_success TEXT,
+    next_due TEXT,
+    cooldown_reset TEXT,
+    error_class TEXT,
+    error_message TEXT,
+    details_json TEXT NOT NULL DEFAULT '{}',
+    PRIMARY KEY (run_id, source)
+);
+
+CREATE TABLE IF NOT EXISTS bootstrap_partitions (
+    run_id TEXT NOT NULL REFERENCES scheduler_runs(run_id) ON DELETE CASCADE,
+    source TEXT NOT NULL,
+    partition_key TEXT NOT NULL,
+    status TEXT NOT NULL,
+    started_at TEXT,
+    ended_at TEXT,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    items INTEGER NOT NULL DEFAULT 0,
+    new_items INTEGER NOT NULL DEFAULT 0,
+    updated_items INTEGER NOT NULL DEFAULT 0,
+    duplicates INTEGER NOT NULL DEFAULT 0,
+    error_class TEXT,
+    error_message TEXT,
+    PRIMARY KEY (run_id, source, partition_key)
+);
+
+CREATE TABLE IF NOT EXISTS source_circuit_state (
+    source TEXT PRIMARY KEY,
+    status TEXT NOT NULL DEFAULT 'closed',
+    failure_count INTEGER NOT NULL DEFAULT 0,
+    opened_at TEXT,
+    cooldown_until TEXT,
+    error_class TEXT,
+    error_message TEXT,
+    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS phase2_3_backfill_progress (
+    stage TEXT PRIMARY KEY,
+    cursor_value TEXT,
+    completed INTEGER NOT NULL DEFAULT 0 CHECK (completed IN (0, 1)),
+    rows_processed INTEGER NOT NULL DEFAULT 0,
+    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_fundamentals_security ON fundamentals(security_id);
+CREATE INDEX IF NOT EXISTS idx_sec_companyfacts_security ON sec_companyfacts(security_id);
+CREATE INDEX IF NOT EXISTS idx_filings_security ON filings(security_id);
+CREATE INDEX IF NOT EXISTS idx_cache_meta_security ON cache_meta(security_id);
+CREATE INDEX IF NOT EXISTS idx_identity_errors_status
+    ON identity_reconciliation_errors(status, issue_type, stage);
+CREATE INDEX IF NOT EXISTS idx_source_cursors_status
+    ON source_cursors(source, status, updated_at);
+CREATE INDEX IF NOT EXISTS idx_scheduler_runs_started ON scheduler_runs(started_at DESC);
+CREATE INDEX IF NOT EXISTS idx_scheduler_run_sources_source
+    ON scheduler_run_sources(source, ended_at DESC);
+CREATE INDEX IF NOT EXISTS idx_bootstrap_partitions_status
+    ON bootstrap_partitions(source, status, run_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_corpus_items_document_family
+    ON corpus_items(document_family_id);
+CREATE INDEX IF NOT EXISTS idx_corpus_items_retention
+    ON corpus_items(item_type, is_tombstone, indexing_status, published_at);
+CREATE INDEX IF NOT EXISTS idx_corpus_observations_market_key
+    ON corpus_observations(source_name, metric_id, period_end, tickers_json);

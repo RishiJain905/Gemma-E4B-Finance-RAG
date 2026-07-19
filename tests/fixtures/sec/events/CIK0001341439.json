@@ -1,0 +1,15 @@
+{
+  "cik": "0001341439",
+  "name": "Oracle Corporation",
+  "tickers": ["ORCL"],
+  "filings": {
+    "recent": {
+      "accessionNumber": ["0001193125-26-188101", "0001193125-26-188102", "0001193125-26-188103"],
+      "filingDate": ["2026-07-09", "2026-07-08", "2026-07-07"],
+      "reportDate": ["", "", ""],
+      "form": ["8-K", "424B5", "UPLOAD"],
+      "primaryDocument": ["orcl-8k.htm", "orcl-424b5.htm", "upload.txt"],
+      "items": ["2.02", "", ""]
+    }
+  }
+}

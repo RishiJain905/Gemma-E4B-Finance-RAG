@@ -1,0 +1,6 @@
+{
+  "spending_by_award": [
+    {"Award ID": "AWD-ALPHA-1", "Recipient Name": "Alpha Defense Systems", "Recipient UEI": "UEI-ALPHA", "Award Amount": 12500000.0, "Period of Performance Start Date": "2026-07-01", "Period of Performance Current End Date": "2027-06-30", "Description": "Satellite communications support", "Awarding Agency": "Department of Defense", "Last Modified Date": "2026-07-12", "Link": "https://www.usaspending.gov/award/CONT_AWD_AWD-ALPHA-1"},
+    {"Award ID": "AWD-AMBIG-1", "Recipient Name": "Ambiguous Defense", "Recipient UEI": "UEI-AMBIG", "Award Amount": 500000.0, "Period of Performance Start Date": "2026-07-02", "Period of Performance Current End Date": "2026-12-31", "Description": "Research support", "Awarding Agency": "Department of Defense", "Last Modified Date": "2026-07-12", "Link": "https://www.usaspending.gov/award/CONT_AWD_AWD-AMBIG-1"}
+  ]
+}

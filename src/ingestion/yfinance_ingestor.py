@@ -13,12 +13,22 @@ Usage:
 """
 
 import logging
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional, Any
+from urllib.parse import quote
 import yfinance as yf
 import yaml
 
+from src.ingestion.errors import safe_message
+from src.ingestion.normalization import (
+    NORMALIZATION_VERSION,
+    content_hash,
+    normalize_canonical_url,
+)
+from src.ingestion.records import MAX_SUMMARY_CHARS, MAX_TITLE_CHARS, NarrativeRecord
 from src.storage.store import Store
+from src.universe.coverage import CoverageResolver
 
 logger = logging.getLogger(__name__)
 
@@ -33,10 +43,21 @@ class YFinanceIngestor:
         self,
         store: Optional[Store] = None,
         watchlist_path: Optional[Path] = None,
+        coverage_resolver: Optional[CoverageResolver] = None,
     ):
         self.store = store or Store()
+        custom_watchlist_path = watchlist_path is not None
         self.watchlist_path = watchlist_path or self.DEFAULT_WATCHLIST_PATH
         self.watchlist = self._load_watchlist()
+        legacy_policy_path = (
+            self.watchlist_path
+            if custom_watchlist_path and self.watchlist_path.exists() and "core" in self.watchlist
+            else None
+        )
+        self.coverage = coverage_resolver or CoverageResolver(
+            self.store,
+            config_path=legacy_policy_path,
+        )
 
     # ── Config Loading ────────────────────────────────
 
@@ -55,17 +76,29 @@ class YFinanceIngestor:
 
     @property
     def all_tickers(self) -> list[str]:
-        """All tickers (core + extended + macro) as a flat list."""
-        tickers = []
-        tickers.extend(self.watchlist.get("core", []))
-        tickers.extend(self.watchlist.get("extended", []))
-        tickers.extend(self.watchlist.get("macro_tickers", []))
-        return tickers
+        """All policy-selected Yahoo tickers plus configured market proxies."""
+        if "core" in self.watchlist:
+            values = [
+                *self.watchlist.get("core", []),
+                *self.watchlist.get("extended", []),
+                *self.watchlist.get("macro_tickers", []),
+            ]
+            return list(dict.fromkeys(str(value).upper() for value in values))
+        tickers = self.coverage.tickers_for("yfinance")
+        tickers.extend(str(value).upper() for value in self.watchlist.get("macro_tickers", []))
+        return list(dict.fromkeys(tickers))
 
     @property
     def core_tickers(self) -> list[str]:
-        """Core tickers only (get full ingestion)."""
-        return self.watchlist.get("core", [])
+        """Compatibility alias for the explicit deep research list."""
+        if "core" in self.watchlist:
+            return [str(value).upper() for value in self.watchlist.get("core", [])]
+        return self.coverage.tickers_for("sec_companyfacts")
+
+    @property
+    def broad_tickers(self) -> list[str]:
+        """Canonical broad-universe tickers selected for Yahoo ingestion."""
+        return self.coverage.tickers_for("yfinance")
 
     # ── Ticker Helpers ────────────────────────────────
 
@@ -80,7 +113,7 @@ class YFinanceIngestor:
                 return None
             return t
         except Exception as e:
-            logger.error("Failed to fetch ticker %s: %s", ticker, e)
+            logger.error("Failed to fetch ticker %s: %s", ticker, safe_message(e))
             return None
 
     # ── Fundamentals Ingestion ────────────────────────
@@ -136,12 +169,13 @@ class YFinanceIngestor:
         logger.info("Full ingestion complete.")
 
     def ingest_fundamentals(self):
-        """Ingest fundamentals for all core tickers."""
-        logger.info("Ingesting fundamentals for %d core tickers...", len(self.core_tickers))
+        """Ingest fundamentals for the configured broad coverage scope."""
+        tickers = self.coverage.tickers_for("yfinance_fundamentals")
+        logger.info("Ingesting fundamentals for %d policy tickers...", len(tickers))
         success_count = 0
         skip_count = 0
 
-        for ticker in self.core_tickers:
+        for ticker in tickers:
             # Cache check — skip if fundamentals are still fresh
             if self._fundamentals_fresh(ticker):
                 logger.debug("Ticker %s fundamentals are fresh, skipping", ticker)
@@ -188,12 +222,13 @@ class YFinanceIngestor:
         return False
 
     def ingest_news(self):
-        """Ingest recent news for all core tickers."""
-        logger.info("Ingesting news for %d core tickers...", len(self.core_tickers))
+        """Ingest recent news for the configured broad coverage scope."""
+        tickers = self.coverage.tickers_for("yfinance_news")
+        logger.info("Ingesting news for %d policy tickers...", len(tickers))
         success_count = 0
         skip_count = 0
 
-        for ticker in self.core_tickers:
+        for ticker in tickers:
             if self._news_fresh(ticker):
                 logger.debug("Ticker %s news is fresh, skipping", ticker)
                 skip_count += 1
@@ -326,7 +361,7 @@ class YFinanceIngestor:
             elif source and "news" in source:
                 tickers_needing_news.add(ticker)
 
-        for ticker in self.core_tickers:
+        for ticker in self.broad_tickers:
             if not self._fundamentals_fresh(ticker):
                 tickers_needing_fundamentals.add(ticker)
             if not self._news_fresh(ticker):
@@ -563,12 +598,81 @@ class YFinanceIngestor:
 
         return ""
 
+    @staticmethod
+    def _utc_now_iso() -> str:
+        """Return an ISO-8601 UTC timestamp for narrative provenance fields."""
+        return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+    def _build_news_record(
+        self, ticker: str, doc_id: str, article: dict,
+    ) -> Optional[NarrativeRecord]:
+        """Translate one Yahoo article into a normalized ``NarrativeRecord``.
+
+        Returns ``None`` when the article lacks the title/body a narrative needs;
+        the caller counts that as a skip. Provenance and dedup fields mirror the
+        Finnhub adapter so yfinance news lands in the same corpus ledger schema.
+        """
+        fields = self._extract_news_fields(article)
+        if not fields:
+            return None
+        title = str(fields.get("title") or "").strip()[:MAX_TITLE_CHARS]
+        summary = str(fields.get("summary") or "").strip()[:MAX_SUMMARY_CHARS]
+        if not title:
+            return None
+        publisher = str(fields.get("publisher") or "").strip()
+        link = str(fields.get("link") or "").strip()
+        date_str = self._format_news_date(fields.get("pub_raw"))
+
+        body = "\n\n".join(value for value in (title, summary, publisher) if value)
+        try:
+            canonical_url = normalize_canonical_url(link) if link else None
+        except ValueError:
+            canonical_url = None
+        source_url = link or f"yfinance-news://{ticker}/{quote(doc_id, safe='')}"
+        provider_id = fields.get("id")
+        provider_record_id = str(provider_id).strip() if provider_id else None
+
+        security = self.store.resolve_security(ticker, provider="yfinance")
+        security_id = security.get("security_id") if isinstance(security, dict) else None
+
+        now = self._utc_now_iso()
+        return NarrativeRecord(
+            corpus_item_id=doc_id,
+            source_name="yfinance_news",
+            source_category="news_vendor",
+            provider_record_id=provider_record_id,
+            original_publisher=publisher or None,
+            item_type="news",
+            title=title,
+            body=body,
+            summary=summary or None,
+            published_at=date_str or None,
+            observed_at=None,
+            accessed_at=now,
+            ingested_at=now,
+            source_url=source_url,
+            canonical_url=canonical_url,
+            license_label="provider_entitlement",
+            normalization_version=NORMALIZATION_VERSION,
+            content_hash=content_hash(body),
+            document_family="company_news",
+            security_ids=(str(security_id),) if security_id else (),
+            tickers=(ticker,),
+            evidence_authority="provider",
+        )
+
     def _ingest_ticker_news(self, ticker: str, t: Any):
-        """Ingest recent news for a single ticker and store as ChromaDB docs."""
+        """Ingest recent news for a single ticker into the corpus ledger.
+
+        Each article is registered through ``Store.upsert_narrative`` so it gets a
+        ``corpus_items`` ledger row plus source/security links, Chroma content, and
+        the lexical index in one committed revision. Per-item failures are isolated
+        so one bad article never aborts the rest of the ticker's news.
+        """
         try:
             news_raw = t.news
         except Exception as e:
-            logger.warning("Ticker %s news fetch failed: %s", ticker, e)
+            logger.warning("Ticker %s news fetch failed: %s", ticker, safe_message(e))
             return
 
         if not news_raw:
@@ -579,32 +683,42 @@ class YFinanceIngestor:
         skipped = 0
         for article in news_raw:
             doc_id = self._make_news_doc_id(ticker, article)
-            text = self._format_news_article(article)
-            if text is None:
-                skipped += 1
-                continue
 
             existing = self.store.chroma.get_document(doc_id)
             if existing:
                 skipped += 1
                 continue
 
-            fields = self._extract_news_fields(article)
-            date_str = self._format_news_date(fields.get("pub_raw") if fields else None)
+            try:
+                record = self._build_news_record(ticker, doc_id, article)
+            except (TypeError, ValueError) as e:
+                logger.warning(
+                    "Ticker %s news item %s malformed, skipping: %s",
+                    ticker, doc_id, safe_message(e),
+                )
+                skipped += 1
+                continue
+            if record is None:
+                skipped += 1
+                continue
 
-            self.store.save_document(
-                document_id=doc_id,
-                text=text,
-                ticker=ticker,
-                source="yfinance_news",
-                date=date_str,
-                metadata={
-                    "title": fields.get("title", "") if fields else "",
-                    "publisher": fields.get("publisher", "") if fields else "",
-                    "link": fields.get("link", "") if fields else "",
-                    "type": fields.get("type", "news") if fields else "news",
-                },
-            )
+            try:
+                result = self.store.upsert_narrative(record)
+            except Exception as e:  # noqa: BLE001 - one article cannot abort the ticker
+                logger.warning(
+                    "Ticker %s news item %s failed to store: %s",
+                    ticker, doc_id, safe_message(e),
+                )
+                skipped += 1
+                continue
+
+            if result.get("indexing_status") == "error":
+                logger.warning(
+                    "Ticker %s news item %s indexing failed: %s",
+                    ticker, doc_id, result.get("index_error", "unknown error"),
+                )
+                skipped += 1
+                continue
             saved += 1
 
         ttl_hours = self.watchlist.get("schedule", {}).get("news", 6)

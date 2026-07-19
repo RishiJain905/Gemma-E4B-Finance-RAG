@@ -10,7 +10,8 @@ import time
 import pytest
 
 from src.middleware.config import MiddlewareConfig
-from src.middleware.corpus_graph import CorpusGraph
+from src.middleware.corpus_graph import CorpusGraph, CorpusRevisionChanged
+from tests.fixtures.graph.phase2_3_corpus_scale import build_corpus_scale
 
 
 def _seed_corpus(store):
@@ -222,3 +223,179 @@ def test_offline_latency_and_element_caps_stay_within_gate(offline_store):
     assert p95(graph.overview) < 100
     assert p95(lambda: graph.search(q="NVDA", kinds=["metric"], limit=10)) < 200
     assert p95(lambda: graph.neighbors(section["id"], limit=10)) < 200
+
+
+# ── 2.3.5.3: source-independent aggregate nodes, facets, and leaf drill ───────
+
+
+@pytest.fixture
+def scale_store(offline_store):
+    """A small deterministic slice of the Phase 2.3 corpus scale fixture."""
+    summary = build_corpus_scale(
+        offline_store, securities=120, items=2_400, observations=120,
+        events=120, seed=7,
+    )
+    return offline_store, summary
+
+
+def test_groups_project_registry_dimensions_with_authoritative_counts(scale_store):
+    store, summary = scale_store
+    graph = CorpusGraph(store)
+
+    result = graph.groups("index", limit=10)
+    counts = {n["metadata"]["bucket_value"]: n["metadata"]["count"]
+              for n in result["nodes"]}
+    assert counts == dict(summary.by_index)
+    assert all(n["kind"] == "index" for n in result["nodes"])
+    assert result["applied_filters"] == {}
+    assert result["total_count"] == len(summary.by_index)
+    # Aggregate nodes carry counts + filter payload, never thousands of child ids.
+    assert all("filters" in n["metadata"] for n in result["nodes"])
+    assert not result["edges"]
+
+    sectors = graph.groups("sector", limit=50)
+    sector_counts = {n["metadata"]["bucket_value"]: n["metadata"]["count"]
+                     for n in sectors["nodes"]}
+    assert sector_counts == dict(summary.by_sector)
+
+
+def test_facets_are_cached_by_revision_and_reflect_filters(scale_store):
+    store, summary = scale_store
+    calls = {"n": 0}
+    real = store.get_corpus_accounting
+
+    def counting(*args, **kwargs):
+        calls["n"] += 1
+        return real(*args, **kwargs)
+
+    store.get_corpus_accounting = counting
+    graph = CorpusGraph(store)
+
+    first = graph.facets()
+    assert set(first["facets"]) >= {"source_category", "item_type", "index"}
+    after_first = calls["n"]
+    graph.facets()  # identical filters -> served from the revision cache
+    assert calls["n"] == after_first
+
+    filtered = graph.facets(filters={"index": "sp500"})
+    total = sum(b["count"] for b in filtered["facets"]["source_category"]["buckets"])
+    assert total <= summary.corpus_items + summary.events
+    assert filtered["applied_filters"] == {"index": "sp500"}
+
+    store.bump_retrieval_revision("test")
+    graph.facets()  # revision changed -> recompute
+    assert calls["n"] > after_first
+
+
+def test_aggregate_drill_is_bounded_and_pages_leaf_items(scale_store):
+    store, _ = scale_store
+    graph = CorpusGraph(store, page_limit=25)
+    groups = graph.groups("source_category", limit=20)
+    node = next(n for n in groups["nodes"]
+                if n["metadata"]["bucket_value"] == "company_news")
+
+    page = graph.neighbors(node["id"], limit=10)
+    assert page["nodes"] and all(n["kind"] == "corpus_item" for n in page["nodes"])
+    assert len(page["nodes"]) == 10
+    assert page["next_cursor"]  # oversized branch requires a next page
+    assert all(e["relation"] == "links_item" for e in page["edges"])
+    assert page["applied_filters"] == {"source_category": "company_news"}
+
+    page2 = graph.neighbors(node["id"], cursor=page["next_cursor"], limit=10)
+    first_ids = {n["id"] for n in page["nodes"]}
+    assert first_ids.isdisjoint({n["id"] for n in page2["nodes"]})
+
+
+def test_search_applies_server_side_facets_and_leaf_kind(scale_store):
+    store, _ = scale_store
+    graph = CorpusGraph(store)
+
+    result = graph.search(kinds=["corpus_item"], filters={"item_type": "news"}, limit=15)
+    assert result["nodes"]
+    assert all(n["metadata"]["item_type"] == "news" for n in result["nodes"])
+    assert result["applied_filters"] == {"item_type": "news"}
+
+
+def test_item_detail_is_bounded_and_carries_provenance(scale_store):
+    store, _ = scale_store
+    graph = CorpusGraph(store, excerpt_bytes=200)
+    result = graph.search(kinds=["corpus_item"], limit=1)
+    node = result["nodes"][0]
+
+    detail = graph.item_detail(node["id"])
+    assert detail is not None
+    body = detail["nodes"][0]
+    assert body["kind"] == "corpus_item"
+    assert "provenance" in body["metadata"] and "securities" in body["metadata"]
+    assert len(body.get("excerpt", "")) <= 200
+
+
+def test_groups_reject_bad_dimension_cursor_and_limit(scale_store):
+    store, _ = scale_store
+    graph = CorpusGraph(store)
+    with pytest.raises(ValueError, match="group_by"):
+        graph.groups("not_a_dimension")
+    with pytest.raises(ValueError, match="limit"):
+        graph.groups("index", limit=99_999)
+
+    first = graph.groups("source_category", limit=1)
+    if first["next_cursor"]:
+        store.bump_retrieval_revision("test")
+        with pytest.raises(CorpusRevisionChanged):
+            graph.groups("source_category", limit=1, cursor=first["next_cursor"])
+
+
+def test_explorer_aggregation_never_enumerates_chroma(scale_store, monkeypatch):
+    store, _ = scale_store
+    graph = CorpusGraph(store)
+
+    def forbidden(*_a, **_k):
+        raise AssertionError("aggregation must not scan Chroma bodies")
+
+    for name in ("get_metadata", "search", "add_document", "count"):
+        monkeypatch.setattr(store.chroma, name, forbidden, raising=False)
+
+    graph.groups("index", limit=10)
+    graph.facets(filters={"sector": "Technology"})
+    graph.search(kinds=["corpus_item"], filters={"item_type": "news"}, limit=10)
+
+
+def _insert_canary_item(store):
+    """Insert one corpus item whose fields carry a secret + local path."""
+    now = "2026-06-01T00:00:00Z"
+    with store.sqlite._connect() as conn:
+        conn.execute(
+            "INSERT INTO corpus_items (corpus_item_id, source, source_category, "
+            "item_type, title, normalized_headline, language, published_at, "
+            "accessed_at, ingested_at, source_url, content_hash, document_family, "
+            "document_family_id, indexing_status, license_label, "
+            "normalization_version, evidence_authority, narrative_bytes, "
+            "metadata_bytes) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            ("CI-CANARY", "finnhub", "company_news", "news",
+             r"Secret C:\private\leak.txt", "secret", "en", now, now, now,
+             "https://example.test/x?api_key=CANARYSECRET", "c" * 64, "famc",
+             "CI-CANARY", "indexed", "public", "v1", "provider", 100, 20),
+        )
+        conn.execute(
+            "INSERT INTO corpus_item_sources (corpus_item_id, source_key, "
+            "source_name, source_category, source_url, accessed_at, ingested_at, "
+            "license_label, evidence_authority) VALUES (?,?,?,?,?,?,?,?,?)",
+            ("CI-CANARY", "k1", "finnhub", "company_news",
+             "https://example.test/prov?token=CANARYTOKEN", now, now, "public",
+             "provider"),
+        )
+        conn.commit()
+
+
+def test_new_responses_scrub_secrets_local_paths_and_bound_text(offline_store):
+    _insert_canary_item(offline_store)
+    graph = CorpusGraph(offline_store)
+
+    listing = graph.search(kinds=["corpus_item"], filters={"item_type": "news"}, limit=5)
+    node = next(n for n in listing["nodes"] if "Secret" in n["label"])
+    detail = graph.item_detail(node["id"])
+    payload = str(detail) + str(listing) + str(graph.facets())
+    assert "CANARYSECRET" not in payload
+    assert "CANARYTOKEN" not in payload
+    assert "C:\\private" not in payload
+    assert "api_key" not in payload

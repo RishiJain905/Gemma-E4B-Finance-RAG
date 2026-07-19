@@ -58,7 +58,7 @@ EVENT_GRAPH = "graph_observer"
 STAGE_NAMES = frozenset(
     {"compile", "route", "retrieve", "grade", "correct", "pack", "generate", "validate"}
 )
-STAGE_PHASES = frozenset({"started", "completed", "fallback"})
+STAGE_PHASES = frozenset({"started", "completed", "fallback", "skipped"})
 
 # Tool-completion status values.
 TOOL_STATUS_OK = "ok"
@@ -260,8 +260,15 @@ class QueryEventEmitter:
         rank: Optional[int] = None,
         retrieved_from: Optional[str] = None,
         status: str = "complete",
+        source_metadata: Optional[dict] = None,
     ) -> QueryEvent:
-        """Emit one actual evidence reference and its source relationship."""
+        """Emit one actual evidence reference and its source relationship.
+
+        ``source_metadata`` (2.3.5.1) carries already-safe source-node facets —
+        source category, source name, authority tier, provider/publisher — so
+        the source node explains the kind of source without a provider-specific
+        node kind. The allowlist drops anything outside the ``source`` set.
+        """
         from .graph_observer import _edge_id, _node_id
 
         evidence_ref = str(evidence_id)
@@ -291,12 +298,16 @@ class QueryEventEmitter:
         if source_type:
             source_ref = str(source_type)
             source_node_id = _node_id(self.query_id, "source", source_ref)
+            source_node_meta = {"source_type": source_ref}
+            for key, value in (source_metadata or {}).items():
+                if value not in (None, "", ()):
+                    source_node_meta[key] = value
             nodes.append({
                 "id": source_node_id,
                 "kind": "source",
                 "label": source_ref.replace("_", " ").upper(),
                 "status": "complete",
-                "metadata": {"source_type": source_ref},
+                "metadata": source_node_meta,
             })
             edges.append({
                 "id": _edge_id(self.query_id, evidence_node_id, "from_source", source_node_id),

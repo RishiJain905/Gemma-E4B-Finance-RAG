@@ -1,0 +1,15 @@
+{
+  "cik": "0000789019",
+  "name": "Microsoft Corporation",
+  "tickers": ["MSFT"],
+  "filings": {
+    "recent": {
+      "accessionNumber": ["0000950170-26-099101"],
+      "filingDate": ["2026-07-09"],
+      "reportDate": ["2026-06-30"],
+      "form": ["10-Q"],
+      "primaryDocument": ["msft-10q.htm"],
+      "items": [""]
+    }
+  }
+}

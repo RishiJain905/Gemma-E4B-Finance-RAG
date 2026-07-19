@@ -47,7 +47,7 @@ DEFAULT_MODEL_ENDPOINT = "http://127.0.0.1:8087/v1/chat/completions"
 
 # Bump when the shape of score_all()'s summary changes in a way that would
 # invalidate a naive comparison against an older baseline (2.2.1.2 Step 5).
-SCORE_SCHEMA_VERSION = 1
+SCORE_SCHEMA_VERSION = 3
 
 # Grounding modes eligible for grounded_faithfulness (they claim grounding).
 GROUNDED_MODES = ("grounded", "partial")
@@ -1275,6 +1275,307 @@ def long_document_gate(summary: dict, *, flat="flat", hierarchical="hierarchical
 
 # ── Aggregator ─────────────────────────────────────────────────────────
 
+def _ratio_block(passed: int, eligible: int) -> dict:
+    return {
+        "score": round(passed / eligible, 4) if eligible else None,
+        "n_eligible": eligible,
+        "n_pass": passed,
+    }
+
+
+def _query_plan_block(row: dict) -> dict:
+    direct = row.get("query_plan")
+    if isinstance(direct, dict):
+        return direct
+    nested = (_orch(row) or {}).get("query_plan")
+    return nested if isinstance(nested, dict) else {}
+
+
+def _normalized_values(value) -> set[str]:
+    if isinstance(value, dict):
+        return {f"{key}:{item}" for key, item in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return {str(item) for item in value}
+    return {str(value)} if value not in (None, "") else set()
+
+
+def indirect_query_metrics(rows: list[dict]) -> dict:
+    """Record Phase 2.3.7.2 plan, route, completeness, and call efficiency."""
+    plan_pass = plan_eligible = 0
+    route_pass = route_eligible = 0
+    obligation_hits = obligation_expected = 0
+    set_pass = set_eligible = 0
+    unnecessary_planner_calls = 0
+    model_call_count = 0
+
+    for row in rows:
+        case = _case(row)
+        actual_plan = _query_plan_block(row)
+        orchestration = _orch(row) or {}
+        expected_plan = case.get("expected_plan")
+        if isinstance(expected_plan, dict):
+            plan_eligible += 1
+            if all(
+                _normalized_values(actual_plan.get(key)) == _normalized_values(value)
+                for key, value in expected_plan.items()
+            ):
+                plan_pass += 1
+
+        expected_lane = case.get("expected_lane")
+        if expected_lane is not None:
+            route_eligible += 1
+            if str(orchestration.get("lane") or row.get("lane")) == str(expected_lane):
+                route_pass += 1
+
+        expected_obligations = _normalized_values(case.get("expected_obligations"))
+        actual_obligations = _normalized_values(actual_plan.get("obligations"))
+        obligation_hits += len(expected_obligations & actual_obligations)
+        obligation_expected += len(expected_obligations)
+
+        expected_set = _normalized_values(case.get("expected_set"))
+        if expected_set:
+            set_eligible += 1
+            actual = row.get("result_set")
+            if actual is None and isinstance(row.get("coverage_metadata"), dict):
+                actual = row["coverage_metadata"].get("securities")
+            actual_set = _normalized_values(actual)
+            if actual_set == expected_set and orchestration.get("set_complete") is True:
+                set_pass += 1
+
+        planning_calls = int(orchestration.get("planning_calls") or 0)
+        if expected_plan is not None and not case.get("planner_required", False):
+            unnecessary_planner_calls += planning_calls
+        model_call_count += int(
+            orchestration.get("model_calls") or row.get("model_calls") or 0
+        )
+
+    return {
+        "plan_accuracy": _ratio_block(plan_pass, plan_eligible),
+        "router_accuracy": _ratio_block(route_pass, route_eligible),
+        "obligation_coverage": _ratio_block(obligation_hits, obligation_expected),
+        "set_completeness": _ratio_block(set_pass, set_eligible),
+        "unnecessary_planner_calls": unnecessary_planner_calls,
+        "model_call_count": model_call_count,
+    }
+
+
+def has_indirect_query_rows(rows: list[dict]) -> bool:
+    return any(
+        any(
+            key in _case(row)
+            for key in ("expected_plan", "expected_lane", "expected_obligations", "expected_set")
+        )
+        for row in rows
+    )
+
+
+# ── Phase 2.3.7.7 offline quality / efficiency metrics ─────────────────────
+
+def _metric_ratio(numerator: int, denominator: int) -> dict:
+    return {
+        "score": round(numerator / denominator, 4) if denominator else None,
+        "numerator": numerator,
+        "denominator": denominator,
+    }
+
+
+def _inventory_values(value) -> set[str]:
+    values = value if isinstance(value, (list, tuple, set)) else []
+    out: set[str] = set()
+    for item in values:
+        if isinstance(item, dict):
+            item = item.get("ticker") or item.get("id") or item.get("name")
+        if item is not None and str(item).strip():
+            out.add(str(item).strip().casefold())
+    return out
+
+
+def _actual_inventory(row: dict) -> set[str]:
+    actual = row.get("result_set")
+    if actual is None and isinstance(row.get("coverage_metadata"), dict):
+        metadata = row["coverage_metadata"]
+        actual = metadata.get("securities")
+        if actual is None:
+            actual = metadata.get("items")
+    return _inventory_values(actual)
+
+
+def inventory_set_metrics(rows: list[dict]) -> dict:
+    """Score complete labeled inventories with explicit item denominators."""
+    eligible = true_positive = predicted_total = expected_total = exact_counts = 0
+    invented = 0
+    for row in rows:
+        case = _case(row)
+        expected_raw = case.get("expected_inventory")
+        if expected_raw is None:
+            expected_raw = case.get("expected_set")
+        if not isinstance(expected_raw, (list, tuple, set)):
+            continue
+        eligible += 1
+        expected = _inventory_values(expected_raw)
+        actual = _actual_inventory(row)
+        true_positive += len(expected & actual)
+        expected_total += len(expected)
+        predicted_total += len(actual)
+        invented += len(actual - expected)
+        exact_counts += int(len(actual) == len(expected))
+    return {
+        "n_eligible": eligible,
+        "set_precision": _metric_ratio(true_positive, predicted_total),
+        "set_recall": _metric_ratio(true_positive, expected_total),
+        "exact_count_accuracy": _metric_ratio(exact_counts, eligible),
+        "invented_item_count": {
+            "count": invented,
+            "denominator": predicted_total,
+        },
+    }
+
+
+def _structured_identity(item: dict) -> tuple[str, str]:
+    return (
+        str(item.get("ticker") or item.get("id") or "").strip().casefold(),
+        str(item.get("metric") or item.get("name") or "").strip().casefold(),
+    )
+
+
+def _same_structured_value(expected, actual) -> bool:
+    if isinstance(expected, (int, float)) and isinstance(actual, (int, float)):
+        return abs(float(expected) - float(actual)) <= 1e-9
+    return str(expected).strip().casefold() == str(actual).strip().casefold()
+
+
+def structured_value_metrics(rows: list[dict]) -> dict:
+    """Score labeled structured value, unit, and period fields independently."""
+    passed = {"value": 0, "unit": 0, "period": 0}
+    denominators = {"value": 0, "unit": 0, "period": 0}
+    eligible_cases = 0
+    for row in rows:
+        expected_items = _case(row).get("expected_structured_values")
+        if not expected_items:
+            continue
+        eligible_cases += 1
+        actual_items = [
+            item for item in (row.get("structured_values") or [])
+            if isinstance(item, dict)
+        ]
+        by_identity: dict[tuple[str, str], list[dict]] = {}
+        for item in actual_items:
+            by_identity.setdefault(_structured_identity(item), []).append(item)
+        for expected in expected_items:
+            if not isinstance(expected, dict):
+                continue
+            candidates = by_identity.get(_structured_identity(expected), [])
+            actual = candidates.pop(0) if candidates else {}
+            for field in ("value", "unit", "period"):
+                if field not in expected:
+                    continue
+                denominators[field] += 1
+                passed[field] += int(
+                    field in actual
+                    and _same_structured_value(expected[field], actual[field])
+                )
+    return {
+        "n_eligible": eligible_cases,
+        "value_accuracy": _metric_ratio(passed["value"], denominators["value"]),
+        "unit_accuracy": _metric_ratio(passed["unit"], denominators["unit"]),
+        "period_accuracy": _metric_ratio(passed["period"], denominators["period"]),
+    }
+
+
+def fast_path_eligibility_metrics(rows: list[dict]) -> dict:
+    """Compare labeled skip eligibility with the generation path actually used."""
+    tp = fp = fn = tn = 0
+    for row in rows:
+        case = _case(row)
+        if "generation_may_be_skipped" not in case:
+            continue
+        expected = bool(case["generation_may_be_skipped"])
+        actual = row.get("generation_skipped") is True
+        tp += int(expected and actual)
+        fp += int(not expected and actual)
+        fn += int(expected and not actual)
+        tn += int(not expected and not actual)
+    return {
+        "n_eligible": tp + fp + fn + tn,
+        "precision": _metric_ratio(tp, tp + fp),
+        "recall": _metric_ratio(tp, tp + fn),
+        "confusion": {"tp": tp, "fp": fp, "fn": fn, "tn": tn},
+    }
+
+
+def _nonnegative_count(value) -> int:
+    try:
+        return max(0, int(value or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def call_count_metrics(rows: list[dict]) -> dict:
+    """Aggregate actual model/embedding/planner/retrieval/tool call counts."""
+    totals = {key: 0 for key in ("model", "embedding", "planner", "retrieval_rounds", "tool")}
+    for row in rows:
+        orchestration = _orch(row) or {}
+        explicit = row.get("call_counts") if isinstance(row.get("call_counts"), dict) else {}
+        totals["model"] += _nonnegative_count(
+            explicit.get("model", orchestration.get("model_calls", row.get("model_calls")))
+        )
+        totals["embedding"] += _nonnegative_count(
+            explicit.get("embedding", row.get("embedding_calls"))
+        )
+        totals["planner"] += _nonnegative_count(
+            explicit.get("planner", orchestration.get("planning_calls"))
+        )
+        totals["retrieval_rounds"] += _nonnegative_count(
+            explicit.get("retrieval_rounds", orchestration.get("retrieval_rounds"))
+        )
+        tool_value = explicit.get("tool", orchestration.get("tool_calls"))
+        if tool_value is None:
+            tool_value = len(orchestration.get("deterministic_tools") or [])
+        totals["tool"] += _nonnegative_count(tool_value)
+    denominator = len(rows)
+    return {
+        key: {
+            "total": total,
+            "mean_per_case": round(total / denominator, 4) if denominator else None,
+            "denominator": denominator,
+        }
+        for key, total in totals.items()
+    }
+
+
+def _rag_quality_core(rows: list[dict]) -> dict:
+    return {
+        "n_cases": len(rows),
+        "inventory": inventory_set_metrics(rows),
+        "structured": structured_value_metrics(rows),
+        "fast_path_eligibility": fast_path_eligibility_metrics(rows),
+        "calls": call_count_metrics(rows),
+    }
+
+
+def rag_quality_metrics(rows: list[dict]) -> dict:
+    """Return aggregate and per-family 2.3.7.7 metrics with denominators."""
+    block = _rag_quality_core(rows)
+    by_family: dict[str, list[dict]] = {}
+    for row in rows:
+        by_family.setdefault(str(_case(row).get("family") or "uncategorized"), []).append(row)
+    block["per_family"] = {
+        family: _rag_quality_core(family_rows)
+        for family, family_rows in sorted(by_family.items())
+    }
+    return block
+
+
+def has_rag_quality_rows(rows: list[dict]) -> bool:
+    return any(
+        "family" in _case(row)
+        or "expected_inventory" in _case(row)
+        or "generation_may_be_skipped" in _case(row)
+        or "expected_structured_values" in _case(row)
+        for row in rows
+    )
+
+
 def _run_field(rows: list[dict], key: str) -> Optional[str]:
     """A stable per-run value denormalized onto every row (e.g. answer_policy,
     dataset_digest) — returns it if every row agrees, else None."""
@@ -1360,6 +1661,12 @@ def score_all(rows: list[dict], *, judge: Optional[Callable] = None,
 
     if has_citation_validation_rows(rows):
         summary["citation_validation"] = citation_validation_metrics(rows)
+
+    if has_indirect_query_rows(rows):
+        summary["indirect_query"] = indirect_query_metrics(rows)
+
+    if has_rag_quality_rows(rows):
+        summary["rag_quality"] = rag_quality_metrics(rows)
 
     summary["per_category"] = _per_category(rows)
     return summary

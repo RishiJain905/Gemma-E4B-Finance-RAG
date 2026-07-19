@@ -87,6 +87,7 @@ class SECEdgarFilingFetcher:
         store: Optional[Store] = None,
         request_delay: float = REQUEST_DELAY_SECONDS,
         user_agent: Optional[str] = None,
+        sec_config: Optional[dict] = None,
     ):
         from src.utils.env import load_env
         load_env()  # ensure .env credentials are available in os.environ
@@ -100,6 +101,7 @@ class SECEdgarFilingFetcher:
             or self._load_config_user_agent()
         )
         self._client = EdgarClient(user_agent=self._user_agent)
+        self.sec_config = sec_config or self._load_sec_config()
         # Lazily-populated ticker -> 10-digit CIK map (company_tickers.json).
         self._ticker_cik_cache: Optional[dict] = None
 
@@ -203,6 +205,9 @@ class SECEdgarFilingFetcher:
                 period=filing["period"],
                 accession=filing["accession"],
                 source_url=filing["source_url"],
+                cik=filing.get("cik"),
+                primary_document=filing.get("primary_document"),
+                discovery_scope="deep",
             )
             if success:
                 registered += 1
@@ -267,15 +272,91 @@ class SECEdgarFilingFetcher:
                 )
                 return None
 
-            logger.info(
-                "Downloaded filing %s: %d chars",
-                accession, len(text),
-            )
+            logger.info("Downloaded filing %s: %d chars", accession, len(text))
             return text
 
         except Exception as e:
             logger.error("Failed to download filing %s: %s", accession, e)
             return None
+
+    def download_relevant_documents(self, filing_record: dict) -> list[dict]:
+        """Fetch the primary document and only policy-selected exhibits."""
+        accession = str(filing_record.get("accession") or "").strip()
+        if not accession:
+            logger.error("No accession number in filing record")
+            return []
+
+        rows = self._list_filing_documents(filing_record)
+        form = str(filing_record.get("filing_type") or filing_record.get("form") or "").upper()
+        primary_name = str(filing_record.get("primary_document") or "")
+        primary = next(
+            (
+                row for row in rows
+                if (primary_name and row["name"] == primary_name) or row["document_type"] == form
+            ),
+            rows[0] if rows else None,
+        )
+        if primary is None:
+            url = self._resolve_archive_url(filing_record)
+            if not url:
+                return []
+            if url.split("?", 1)[0].lower().endswith(".txt"):
+                logger.warning(
+                    "Primary document unresolved for %s; refusing complete submission package",
+                    accession,
+                )
+                return []
+            primary = {"name": url.rsplit("/", 1)[-1], "document_type": form, "url": url}
+
+        primary_text = self._download_document(primary["url"], accession)
+        if not primary_text:
+            return []
+        documents = [{
+            "document_type": "PRIMARY",
+            "source_url": primary["url"],
+            "text": primary_text,
+        }]
+        items = set(re.findall(r"(?i)\bitem\s+(\d+\.\d{2})\b", primary_text))
+        configured_items = {
+            str(value) for value in (self.sec_config.get("exhibits", {}).get(
+                "material_agreement_items", ["1.01", "2.01", "2.03"]
+            ) or [])
+        }
+        allowed = {
+            str(value).upper()
+            for value in (self.sec_config.get("exhibits", {}).get("always", ["EX-99.1"]) or [])
+        }
+        if items & configured_items:
+            allowed.add("EX-10")
+        allowlist = self.sec_config.get("exhibits", {}).get("allowlist", {}) or {}
+        if isinstance(allowlist, dict):
+            for value in allowlist.get(form, []) or []:
+                allowed.add(str(value).upper())
+            by_form = allowlist.get("by_form", {}) or {}
+            for value in by_form.get(form, []) or []:
+                allowed.add(str(value).upper())
+            by_item = allowlist.get("by_item", {}) or {}
+            for item in items:
+                for value in by_item.get(item, []) or []:
+                    allowed.add(str(value).upper())
+
+        for row in rows:
+            if row is primary:
+                continue
+            document_type = row["document_type"].upper()
+            selected = document_type in allowed or (
+                "EX-10" in allowed and document_type.startswith("EX-10")
+            )
+            if not selected:
+                continue
+            text = self._download_document(row["url"], accession)
+            if text:
+                documents.append({
+                    "document_type": document_type,
+                    "source_url": row["url"],
+                    "text": text,
+                })
+        return documents
 
     # ── Internal Helpers ───────────────────────────────
 
@@ -394,6 +475,7 @@ class SECEdgarFilingFetcher:
                     "accession": accession,
                     "source_url": self._build_archive_url(cik, accession, primary_document),
                     "cik": cik,
+                    "primary_document": primary_document,
                 }
                 filings.append(filing)
 
@@ -465,6 +547,58 @@ class SECEdgarFilingFetcher:
                 return primary_docs[i] if i < len(primary_docs) else ""
         return ""
 
+    def _list_filing_documents(self, filing_record: dict) -> list[dict]:
+        """Read one filing index page and return document metadata without downloads."""
+        accession = str(filing_record.get("accession") or "")
+        cik = filing_record.get("cik") or self._resolve_cik(str(filing_record.get("ticker") or ""))
+        if not cik or not accession:
+            return []
+        directory = self._build_archive_url(cik, accession, "")
+        index_url = f"{directory}{accession}-index.html"
+        try:
+            response = requests.get(
+                index_url,
+                headers={"User-Agent": self._user_agent},
+                timeout=60,
+            )
+            response.raise_for_status()
+            self._respect_rate_limit()
+        except Exception as exc:  # noqa: BLE001 - primary URL fallback remains available
+            logger.warning("Could not load filing index for %s: %s", accession, exc)
+            return []
+
+        rows: list[dict] = []
+        for table_row in re.findall(r"(?is)<tr\b[^>]*>(.*?)</tr>", response.text):
+            cells = re.findall(r"(?is)<td\b[^>]*>(.*?)</td>", table_row)
+            link = re.search(r"(?is)<a\b[^>]*href=[\"']([^\"']+)[\"'][^>]*>(.*?)</a>", table_row)
+            if len(cells) < 4 or not link:
+                continue
+            href = html_lib.unescape(link.group(1)).strip()
+            name = self._strip_html(link.group(2))
+            document_type = self._strip_html(cells[3]).upper()
+            url = href if href.startswith("http") else f"https://www.sec.gov/{href.lstrip('/')}"
+            rows.append({"name": name, "document_type": document_type, "url": url})
+        return rows
+
+    def _download_document(self, url: str, accession: str) -> Optional[str]:
+        """Download and normalize one already-selected SEC document."""
+        try:
+            response = requests.get(
+                url,
+                headers={"User-Agent": self._user_agent},
+                timeout=60,
+            )
+            response.raise_for_status()
+            self._respect_rate_limit()
+            text = self._strip_html(response.text)
+            if len(text) < 20:
+                logger.warning("SEC document for %s was too short: %s", accession, url)
+                return None
+            return text
+        except Exception as exc:  # noqa: BLE001 - document failures are retryable per accession
+            logger.error("Failed SEC document for %s (%s): %s", accession, url, exc)
+            return None
+
     @staticmethod
     def _strip_html(raw_html: str) -> str:
         """Strip HTML tags to plain text with a lightweight regex (no bs4)."""
@@ -533,3 +667,15 @@ class SECEdgarFilingFetcher:
             return user_agent or cls._DEFAULT_USER_AGENT
         except Exception:
             return cls._DEFAULT_USER_AGENT
+
+    @staticmethod
+    def _load_sec_config() -> dict:
+        """Load SEC form/exhibit selection without reading credential files."""
+        config_path = Path(__file__).parents[2] / "configs" / "sec.yaml"
+        try:
+            with open(config_path, encoding="utf-8") as config_file:
+                loaded = yaml.safe_load(config_file) or {}
+            return loaded.get("sec", loaded)
+        except Exception as exc:  # noqa: BLE001 - safe exhibit defaults remain in code
+            logger.warning("Could not load SEC exhibit config: %s", exc)
+            return {}

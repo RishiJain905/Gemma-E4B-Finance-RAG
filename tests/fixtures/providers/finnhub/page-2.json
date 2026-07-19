@@ -1,0 +1,20 @@
+{
+  "data": [
+    {
+      "id": "aaa-2",
+      "headline": "Alpha expands its factory",
+      "summary": "Alpha will expand its factory in Ohio.",
+      "source": "Bloomberg",
+      "url": "https://news.example/alpha-2",
+      "datetime": 1784030400
+    },
+    {
+      "id": "aaa-bad",
+      "headline": "",
+      "summary": "",
+      "source": "",
+      "url": "not-a-url",
+      "datetime": "not-a-timestamp"
+    }
+  ]
+}

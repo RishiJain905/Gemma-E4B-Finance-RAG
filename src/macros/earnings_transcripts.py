@@ -23,6 +23,7 @@ import requests
 from bs4 import BeautifulSoup
 
 from src.storage.store import Store
+from src.universe.coverage import CoverageResolver
 
 logger = logging.getLogger(__name__)
 
@@ -69,9 +70,12 @@ class EarningsTranscriptIngestor:
         self,
         store: Optional[Store] = None,
         request_delay: float = 1.0,
+        coverage_resolver: Optional[CoverageResolver] = None,
     ):
         self.store = store or Store()
         self.request_delay = request_delay
+        self._coverage_injected = coverage_resolver is not None
+        self.coverage = coverage_resolver or CoverageResolver(self.store)
         self.session = requests.Session()
         self.session.headers.update({
             "User-Agent": (
@@ -162,18 +166,25 @@ class EarningsTranscriptIngestor:
         Returns:
             {ticker: result_dict}
         """
-        from src.ingestion.yfinance_ingestor import YFinanceIngestor
-
-        ingestor = YFinanceIngestor(store=self.store)
         results = {}
+        tickers = self._batch_tickers("earnings_transcripts")
 
-        for ticker in ingestor.core_tickers:
+        for ticker in tickers:
             if ticker in self.TICKER_SA_MAP:
                 result = self.fetch_and_process(ticker)
                 results[ticker] = result
                 time.sleep(self.request_delay)
 
         return results
+
+    def _batch_tickers(self, source_name: str) -> list[str]:
+        """Use the legacy core list only while a fresh registry is empty."""
+        rows = self.store.list_securities(active=None, limit=1, offset=0)
+        if not self._coverage_injected and (not isinstance(rows, list) or not rows):
+            from src.ingestion.yfinance_ingestor import YFinanceIngestor
+
+            return list(YFinanceIngestor(store=self.store).core_tickers)
+        return self.coverage.tickers_for(source_name)
 
     def get_latest_guidance(self, ticker: str) -> dict:
         """

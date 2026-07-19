@@ -31,9 +31,37 @@ from typing import Optional
 import httpx
 import yaml
 
+from src.ingestion.errors import ErrorClass, ProviderError, parse_retry_after, safe_message
 from src.storage.store import Store
+from src.universe.coverage import CoverageResolver
 
 logger = logging.getLogger(__name__)
+
+
+class GDELTRateLimitError(ProviderError):
+    """Raised when GDELT keeps returning HTTP 429 after all retries."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        retry_after: Optional[float] = None,
+        reset_at: Optional[str] = None,
+        attempts: int = 1,
+        retry_timestamps: Optional[list[str]] = None,
+    ) -> None:
+        super().__init__(
+            message,
+            error_class=ErrorClass.RATE_LIMITED,
+            status_code=429,
+            retry_after=retry_after,
+            reset_at=reset_at,
+            attempts=attempts,
+            provider_wide=True,
+            circuit_open=True,
+            retry_timestamps=retry_timestamps,
+        )
+
 
 # Shared across all GDELTIngestor instances — serializes DOC API + GKG downloads.
 _last_gdelt_request_at: float = 0.0
@@ -79,8 +107,11 @@ class GDELTIngestor:
         self,
         store: Optional[Store] = None,
         config_path: Optional[Path] = None,
+        coverage_resolver: Optional[CoverageResolver] = None,
     ):
         self.store = store or Store()
+        self._coverage_injected = coverage_resolver is not None
+        self.coverage = coverage_resolver or CoverageResolver(self.store)
         self.config = self._load_config(config_path)
         self._gkg_file_cache: dict[str, dict[str, float]] = {}
 
@@ -226,18 +257,24 @@ class GDELTIngestor:
         Returns:
             {ticker: articles_stored}
         """
-        from src.ingestion.yfinance_ingestor import YFinanceIngestor
-
-        ingestor = YFinanceIngestor(store=self.store)
         results = {}
 
-        for ticker in ingestor.core_tickers:
+        for ticker in self._batch_tickers("gdelt"):
             count = self.fetch_and_store_for_ticker(
                 ticker, max_records=100,
             )
             results[ticker] = count
 
         return results
+
+    def _batch_tickers(self, source_name: str) -> list[str]:
+        """Use the legacy core list only while a fresh registry is empty."""
+        rows = self.store.list_securities(active=None, limit=1, offset=0)
+        if not self._coverage_injected and (not isinstance(rows, list) or not rows):
+            from src.ingestion.yfinance_ingestor import YFinanceIngestor
+
+            return list(YFinanceIngestor(store=self.store).core_tickers)
+        return self.coverage.tickers_for(source_name)
 
     # ── Tone Analysis ─────────────────────────────────
 
@@ -320,8 +357,8 @@ class GDELTIngestor:
             if articles:
                 return articles
 
-            # Domain-scoped queries may hit length limits (HTTP 200, plain-text error)
-            # or 429 exhaustion; retry bare keyword once via the shared throttle.
+            # Domain-scoped queries may hit length limits (HTTP 200, plain-text
+            # error); retry a bare keyword once via the shared throttle.
             if query != term:
                 logger.info(
                     "GDELT domain query returned no articles for '%s'; retrying without domain filter",
@@ -334,8 +371,10 @@ class GDELTIngestor:
 
             return []
 
+        except GDELTRateLimitError:
+            raise
         except Exception as e:
-            logger.error("GDELT search failed for '%s': %s", term, e)
+            logger.error("GDELT search failed for '%s': %s", term, safe_message(e))
             return []
 
     def _doc_api_get(self, params: dict):
@@ -366,6 +405,7 @@ class GDELTIngestor:
         delay = float(self.config.get("request_delay", 5.0))
         max_retries = int(self.config.get("max_retries_on_429", 2))
         label = log_context or url
+        retry_timestamps: list[str] = []
 
         with _gdelt_request_lock:
             if throttle and delay > 0:
@@ -380,14 +420,43 @@ class GDELTIngestor:
                     return response
 
                 if attempt >= max_retries:
+                    retry_after = response.headers.get("retry-after")
+                    retry_window = parse_retry_after(
+                        retry_after,
+                        now=datetime.now(timezone.utc),
+                    )
+                    retry_hint = (
+                        f"; retry after {retry_after}s" if retry_after else ""
+                    )
                     logger.error(
-                        "GDELT rate limit (429) for '%s' after %d attempts; giving up",
+                        "GDELT rate limit (429) for '%s' after %d attempts; giving up%s",
                         label,
                         attempt + 1,
+                        retry_hint,
                     )
-                    return None
+                    raise GDELTRateLimitError(
+                        f"GDELT rate limit exhausted for '{label}' after "
+                        f"{attempt + 1} attempts{retry_hint}",
+                        retry_after=(
+                            retry_window.delay_seconds if retry_window else None
+                        ),
+                        reset_at=retry_window.reset_at if retry_window else None,
+                        attempts=attempt + 1,
+                        retry_timestamps=retry_timestamps,
+                    )
 
                 backoff = delay * (2 ** attempt)
+                retry_after = response.headers.get("retry-after")
+                retry_window = parse_retry_after(
+                    retry_after,
+                    now=datetime.now(timezone.utc),
+                )
+                if retry_window is not None:
+                    backoff = retry_window.delay_seconds
+                backoff = min(
+                    max(backoff, 0.0),
+                    float(self.config.get("max_retry_sleep", 300.0)),
+                )
                 logger.warning(
                     "GDELT rate limit (429) for '%s' (attempt %d/%d); "
                     "waiting %.1fs before retry",
@@ -395,6 +464,9 @@ class GDELTIngestor:
                     attempt + 1,
                     max_retries + 1,
                     backoff,
+                )
+                retry_timestamps.append(
+                    datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
                 )
                 time.sleep(backoff)
 
@@ -533,6 +605,8 @@ class GDELTIngestor:
                         if doc_url and tone is not None:
                             rows[doc_url] = tone
 
+        except GDELTRateLimitError:
+            raise
         except Exception as e:
             logger.debug("GKG file %s unavailable: %s", stamp, e)
 
@@ -618,7 +692,7 @@ class GDELTIngestor:
             logger.warning(
                 "GDELT rate limit message for '%s': %s",
                 term,
-                body[:200],
+                safe_message(body),
             )
             return []
 
@@ -628,7 +702,7 @@ class GDELTIngestor:
                 "GDELT non-JSON HTML response for '%s' (content-type=%s): %s",
                 term,
                 content_type or "unknown",
-                body[:200],
+                safe_message(body),
             )
             return []
 
@@ -637,7 +711,7 @@ class GDELTIngestor:
                 "GDELT non-JSON response for '%s' (content-type=%s): %s",
                 term,
                 content_type or "unknown",
-                body[:200],
+                safe_message(body),
             )
             return []
 
@@ -648,7 +722,7 @@ class GDELTIngestor:
                 "GDELT JSON parse failed for '%s': %s; body[:200]=%s",
                 term,
                 e,
-                body[:200],
+                safe_message(body),
             )
             return []
 
@@ -728,7 +802,7 @@ class GDELTIngestor:
                 )
                 stored += 1
             except Exception as e:
-                logger.warning("Failed to store GDELT article: %s", e)
+                logger.warning("Failed to store GDELT article: %s", safe_message(e))
         return stored
 
     def _query_stored_articles(

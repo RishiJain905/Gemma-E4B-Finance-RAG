@@ -241,10 +241,23 @@ button, select, input {
 .hidden-count { color: var(--pending); }
 .hidden-count:empty { display: none; }
 
+/* ── Work area (shared canvas + corpus panels) ─────────────────────────── */
+/* Live mode: only .canvas-wrap is visible, so it flexes to fill the row and the
+   Phase 2.2 layout is untouched. Corpus mode: facet rail + inventory pane join
+   the row as the aggregation-first, three-surface layout (2.3.5.2). */
+.work-area {
+  position: relative;
+  flex: 1 1 auto;
+  display: flex;
+  min-height: 0;
+  min-width: 0;
+}
+
 /* ── Canvas & stage rail ───────────────────────────────────────────────── */
 .canvas-wrap {
   position: relative;
   flex: 1 1 auto;
+  min-width: 0;
   min-height: 0;
   background:
     linear-gradient(var(--hairline) 1px, transparent 1px) 0 0 / 100% 24px,
@@ -265,14 +278,18 @@ button, select, input {
   display: none;
   pointer-events: none;
   z-index: 0;
+  overflow: hidden;
 }
-[data-mode="live"] .stage-rail { display: grid; }
+[data-mode="live"] .stage-rail { display: block; }
+/* Lanes are projected onto the Cytoscape viewport by JS (syncStageRail): each
+   lane's translateX + width are set in screen px so lanes track node columns
+   through auto-fit, zoom, and pan. */
 .stage-rail .lane {
+  position: absolute; top: 0; bottom: 0; left: 0;
   border-right: 1px solid var(--hairline);
-  position: relative;
   opacity: 0.55;
+  will-change: transform, width;
 }
-.stage-rail .lane:last-child { border-right: 0; }
 .stage-rail .lane-label {
   position: absolute; top: 8px; left: 50%; transform: translateX(-50%);
   font-size: 11px; text-transform: uppercase; letter-spacing: 0.14em;
@@ -390,7 +407,11 @@ td.mono, td .mono { font-family: var(--mono); }
 .insp-label { font-size: 15px; margin: 2px 0 12px; color: var(--ink); }
 .insp-meta { margin: 0; display: grid; grid-template-columns: minmax(88px, auto) 1fr; gap: 4px 12px; }
 .insp-meta dt { color: var(--ink-dim); font-size: 11px; text-transform: uppercase; letter-spacing: 0.05em; }
-.insp-meta dd { margin: 0; font-family: var(--mono); font-size: 12.5px; word-break: break-word; }
+/* 2.3.5.1: source-aware provenance adds opaque corpus/family ids and a
+   flattened date-semantics line — wrap anywhere and use tabular figures so long
+   ids and timestamps stay legible inside the fixed-width inspector. */
+.insp-meta dd { margin: 0; font-family: var(--mono); font-size: 12.5px;
+  word-break: break-word; overflow-wrap: anywhere; font-variant-numeric: tabular-nums; }
 .insp-meta dd a { color: var(--flow); }
 
 .insp-excerpt-wrap, .insp-prov-wrap { margin-top: 14px; }
@@ -429,6 +450,125 @@ td.mono, td .mono { font-family: var(--mono); }
 .node-row .n-status.s-pending, .node-row .n-status.s-partial, .node-row .n-status.s-fallback { background: var(--pending); }
 .node-row .n-status.s-error, .node-row .n-status.s-missing { background: var(--conflict); }
 
+/* ── Corpus Explorer: facet rail (2.3.5.2) ─────────────────────────────── */
+.facet-rail {
+  flex: 0 0 232px;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  background: var(--surface);
+  border-right: 1px solid var(--hairline);
+  overflow: hidden;
+}
+.facet-rail[hidden] { display: none; }
+.facet-rail-head {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 10px 12px; border-bottom: 1px solid var(--hairline);
+}
+.facet-groups { flex: 1 1 auto; overflow: auto; padding: 2px 0 12px; }
+
+.facet-group { border-bottom: 1px solid var(--hairline); }
+.facet-group-head {
+  width: 100%; display: flex; align-items: center; justify-content: space-between;
+  gap: 6px; padding: 9px 12px; background: transparent; border: 0;
+  color: var(--ink); cursor: pointer; text-align: left; min-height: 30px;
+}
+.facet-group-head .field-label { color: var(--ink); }
+.facet-group-head .chev { color: var(--ink-dim); font-size: 11px; transition: transform 160ms var(--ease); }
+.facet-group[data-open="false"] .chev { transform: rotate(-90deg); }
+.facet-group[data-open="false"] .facet-options,
+.facet-group[data-open="false"] .facet-date { display: none; }
+.facet-group-head .fg-active {
+  font-family: var(--mono); font-size: 10.5px; color: var(--flow);
+  border: 1px solid var(--flow); border-radius: 999px; padding: 0 6px;
+}
+.facet-group-head .fg-active:empty { display: none; }
+
+.facet-options { list-style: none; margin: 0; padding: 0 6px 8px; display: flex; flex-direction: column; gap: 2px; }
+.facet-option {
+  display: flex; align-items: center; gap: 8px;
+  padding: 5px 8px; border-radius: var(--r-sm); cursor: pointer;
+  border: 1px solid transparent; min-height: 26px; width: 100%;
+  background: transparent; color: var(--ink); text-align: left;
+}
+.facet-option:hover { background: var(--surface-2); }
+.facet-option[aria-pressed="true"] { border-color: var(--flow); background: var(--surface-2); }
+.facet-option .fo-mark { width: 12px; flex: 0 0 auto; color: var(--flow); text-align: center; font-size: 11px; }
+.facet-option[aria-pressed="false"] .fo-mark { color: transparent; }
+.facet-option .fo-label { flex: 1 1 auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13px; }
+.facet-option .fo-count { font-family: var(--mono); font-size: 11px; color: var(--ink-dim); font-variant-numeric: tabular-nums; }
+.facet-empty { padding: 6px 14px 10px; color: var(--steel); font-size: 11.5px; }
+.facet-note { padding: 2px 14px 8px; color: var(--steel); font-size: 11px; }
+
+.facet-date { display: flex; flex-direction: column; gap: 6px; padding: 4px 12px 12px; }
+.facet-date label { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.facet-date .field-label { color: var(--ink-dim); }
+.facet-date input[type="date"] {
+  background: var(--surface-2); border: 1px solid var(--hairline);
+  border-radius: var(--r-sm); color: var(--ink); padding: 4px 6px; min-height: 26px;
+  font-family: var(--mono); font-size: 12px;
+}
+
+/* Authority-tier pip — text label + colour, never colour alone */
+.auth-pip { font-size: 10px; text-transform: uppercase; letter-spacing: 0.04em; color: var(--ink-dim); flex: 0 0 auto; }
+.auth-primary { color: var(--supported); }
+.auth-structured { color: var(--flow); }
+.auth-licensed { color: var(--pending); }
+.auth-analysis, .auth-discovery { color: var(--steel); }
+
+/* ── Corpus Explorer: inventory / results pane ─────────────────────────── */
+.inventory-pane {
+  flex: 1 1 46%;
+  display: flex; flex-direction: column;
+  min-width: 0; min-height: 0;
+  background: var(--canvas);
+  border-right: 1px solid var(--hairline);
+}
+.inventory-pane[hidden] { display: none; }
+.inventory-head {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 8px 12px; background: var(--surface); border-bottom: 1px solid var(--hairline);
+}
+#inventory-count { color: var(--ink-dim); }
+.inventory-scroll { flex: 1 1 auto; overflow: auto; position: relative; }
+.inventory-list { list-style: none; margin: 0; padding: 4px 6px; display: flex; flex-direction: column; gap: 3px; }
+.inventory-foot { padding: 8px 12px; border-top: 1px solid var(--hairline); background: var(--surface); }
+.inventory-foot .tool-btn[hidden] { display: none; }
+.inventory-empty { padding: 18px 16px; color: var(--ink-dim); margin: 0; max-width: 40ch; }
+.inventory-empty[hidden] { display: none; }
+
+.inv-row {
+  display: grid;
+  grid-template-columns: 18px 1fr auto;
+  grid-template-areas: "glyph title meta" "glyph sub badges";
+  gap: 1px 8px; align-items: center;
+  padding: 8px 10px; border-radius: var(--r-sm);
+  border: 1px solid transparent; cursor: pointer;
+}
+.inv-row:hover { background: var(--surface-2); }
+.inv-row[aria-selected="true"] { border-color: var(--flow); background: var(--surface-2); }
+.inv-row .inv-glyph { grid-area: glyph; color: var(--ink-dim); text-align: center; align-self: start; padding-top: 2px; }
+.inv-row .inv-title { grid-area: title; font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.inv-row .inv-meta { grid-area: meta; font-family: var(--mono); font-size: 11px; color: var(--ink-dim); white-space: nowrap; text-align: right; }
+.inv-row .inv-sub { grid-area: sub; font-family: var(--mono); font-size: 11px; color: var(--ink-dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.inv-badges { grid-area: badges; display: flex; gap: 5px; flex-wrap: wrap; justify-content: flex-end; }
+.inv-badge {
+  font-family: var(--mono); font-size: 10.5px; padding: 1px 6px; border-radius: 999px;
+  border: 1px solid var(--hairline); color: var(--ink-dim); background: var(--surface);
+  white-space: nowrap; font-variant-numeric: tabular-nums;
+}
+.inv-row.is-aggregate .inv-title { font-weight: 620; }
+
+/* status badge — colour + glyph together, per the 2.2.7.3 status rule */
+.st-badge { display: inline-flex; align-items: center; gap: 4px; font-family: var(--mono); font-size: 10.5px; padding: 1px 6px; border-radius: 999px; border: 1px solid var(--steel); color: var(--ink-dim); }
+.st-fresh { color: var(--supported); border-color: var(--supported); }
+.st-stale { color: var(--pending); border-color: var(--pending); }
+.st-error { color: var(--conflict); border-color: var(--conflict); }
+.st-indexing { color: var(--flow); border-color: var(--flow); }
+.st-backlog { color: var(--pending); border-color: var(--pending); }
+
+.preset-field select { max-width: 210px; }
+
 /* ── Responsive: single 1280px laptop → inspector as bottom sheet ──────── */
 @media (max-width: 1280px) {
   .app-body { grid-template-columns: 1fr; grid-template-rows: 1fr auto; }
@@ -439,6 +579,26 @@ td.mono, td .mono { font-family: var(--mono); }
   }
   .stage-region { border-right: 0; }
   .node-list-wrap { max-height: 24vh; }
+
+  /* Corpus: facet rail becomes an independently accessible left drawer, the
+     inventory pane stays usable full-width, and the canvas collapses below. */
+  [data-mode="corpus"] .work-area { flex-direction: column; }
+  [data-mode="corpus"] .inventory-pane { flex: 1 1 auto; border-right: 0; border-bottom: 1px solid var(--hairline); }
+  [data-mode="corpus"] .canvas-wrap { flex: 0 0 34vh; min-height: 120px; }
+  [data-mode="corpus"] .facet-rail {
+    position: absolute; z-index: 12; top: 0; bottom: 0; left: 0;
+    width: 280px; max-width: 86%;
+    border-right: 1px solid var(--hairline);
+    box-shadow: 8px 0 24px rgba(0, 0, 0, 0.45);
+    transform: translateX(-100%);
+    transition: transform 200ms var(--ease);
+  }
+  [data-mode="corpus"][data-facets="open"] .facet-rail { transform: translateX(0); }
+}
+
+/* Wide layouts never need the in-toolbar facet toggle: the rail is persistent. */
+@media (min-width: 1281px) {
+  #btn-facets-toggle { display: none !important; }
 }
 
 /* ── Reduced motion ────────────────────────────────────────────────────── */

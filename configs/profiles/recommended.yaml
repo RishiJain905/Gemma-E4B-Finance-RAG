@@ -1,0 +1,43 @@
+# configs/profiles/recommended.yaml
+# Current measured-safe starting surface. Later Phase 2.3.7 arms may update
+# this profile; live arm results and dispositions do not belong in this file.
+profile: recommended
+profile_metadata:
+  config_label: recommended
+  include_evidence_trace: false
+  include_progress_events: true
+
+enable_citations: true
+allow_general_fallback: true
+enable_streaming: true
+enable_phase2_3_retrieval: true
+enable_phase2_3_corpus_projection: true
+enable_tool_final_streaming: true
+enable_stream_progress_events: true
+stream_progress_include_counts: true
+enable_graph_observer: true
+enable_tools: true
+allow_write_tools: true
+
+enable_deterministic_tool_routing: true
+enable_deterministic_answers: true
+enable_adaptive_rag: true
+adaptive_enable_planning_call: false
+adaptive_conditional_rerank: true
+enable_evidence_sufficiency: false
+enable_corrective_retry: false
+enable_query_decomposition: false
+answer_validation: report
+require_evidence_ids: false
+enable_hierarchical_retrieval: false
+enable_retrieval_cache: false
+llama_cache_prompt: false
+enable_fetch_on_miss: true
+enable_conversation_rewrite: false
+enable_llm_rewrite_fallback: false
+enable_lexical: true
+lexical_backend: fts5
+enable_reranker: false
+enable_evidence_taxonomy: true
+enable_authority_ranking: true
+enable_duplicate_coverage_packing: true

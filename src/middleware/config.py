@@ -4,6 +4,7 @@ Middleware configuration — loaded from configs/ or environment.
 """
 
 import logging
+import os
 from pathlib import Path
 from typing import Optional
 
@@ -40,19 +41,110 @@ _GRAPH_QUESTION_PREVIEW_CHARS_RANGE = (0, 2000)
 # Safe corpus explorer budgets (2.2.7.2). These caps are also enforced by the
 # API/projector so a bad configuration cannot overload a local graph client.
 _CORPUS_PAGE_LIMIT_RANGE = (1, 200)
+_CORPUS_DEFAULT_PAGE_LIMIT_RANGE = (1, 100)
 _CORPUS_ELEMENT_LIMIT_RANGE = (1, 2000)
 _CORPUS_VISIBLE_NODE_TARGET_RANGE = (1, 499)
 _CORPUS_OVERVIEW_TTL_RANGE = (0.1, 60.0)
 _CORPUS_OPAQUE_ID_TTL_RANGE = (1.0, 3600.0)
+_CORPUS_INSPECTOR_EXCERPT_BYTES_RANGE = (0, 4000)
+_CORPUS_INSPECTOR_METADATA_BYTES_RANGE = (0, 16000)
+
+DEFAULT_CONFIG_PATH = Path(__file__).parent.parent.parent / "configs" / "middleware.yaml"
+PROFILE_DIR = DEFAULT_CONFIG_PATH.parent / "profiles"
+PROFILE_NAMES = ("legacy", "recommended", "evaluation")
+
+# Feature flags are deliberately enumerated here so the configuration, profile,
+# documentation, and test parity checks share one small source of truth. Numeric
+# budgets remain ordinary settings and are not part of this inventory.
+MIDDLEWARE_FEATURE_FLAGS = (
+    "enable_citations",
+    "allow_general_fallback",
+    "enable_streaming",
+    "enable_phase2_3_retrieval",
+    "enable_phase2_3_corpus_projection",
+    "enable_tool_final_streaming",
+    "enable_stream_progress_events",
+    "stream_progress_include_counts",
+    "enable_graph_observer",
+    "enable_tools",
+    "allow_write_tools",
+    "enable_deterministic_tool_routing",
+    "enable_deterministic_answers",
+    "enable_adaptive_rag",
+    "adaptive_enable_planning_call",
+    "adaptive_conditional_rerank",
+    "enable_evidence_sufficiency",
+    "enable_corrective_retry",
+    "enable_query_decomposition",
+    "answer_validation",
+    "require_evidence_ids",
+    "enable_hierarchical_retrieval",
+    "enable_retrieval_cache",
+    "llama_cache_prompt",
+    "enable_fetch_on_miss",
+    "enable_conversation_rewrite",
+    "enable_llm_rewrite_fallback",
+    "enable_lexical",
+    "enable_reranker",
+    "enable_evidence_taxonomy",
+    "enable_authority_ranking",
+    "enable_duplicate_coverage_packing",
+)
+
+MIDDLEWARE_ENV_OVERRIDES = {
+    "enable_citations": "ENABLE_CITATIONS",
+    "allow_general_fallback": "ALLOW_GENERAL_FALLBACK",
+    "enable_streaming": "ENABLE_STREAMING",
+    "enable_phase2_3_retrieval": "ENABLE_PHASE2_3_RETRIEVAL",
+    "enable_phase2_3_corpus_projection": "ENABLE_PHASE2_3_CORPUS_PROJECTION",
+    "enable_tool_final_streaming": "ENABLE_TOOL_FINAL_STREAMING",
+    "enable_stream_progress_events": "ENABLE_STREAM_PROGRESS_EVENTS",
+    "stream_progress_include_counts": "STREAM_PROGRESS_INCLUDE_COUNTS",
+    "enable_graph_observer": "ENABLE_GRAPH_OBSERVER",
+    "enable_tools": "ENABLE_TOOLS",
+    "allow_write_tools": "ALLOW_WRITE_TOOLS",
+    "enable_deterministic_tool_routing": "ENABLE_DETERMINISTIC_TOOL_ROUTING",
+    "enable_deterministic_answers": "ENABLE_DETERMINISTIC_ANSWERS",
+    "enable_adaptive_rag": "ENABLE_ADAPTIVE_RAG",
+    "adaptive_enable_planning_call": "ADAPTIVE_ENABLE_PLANNING_CALL",
+    "adaptive_conditional_rerank": "ADAPTIVE_CONDITIONAL_RERANK",
+    "enable_evidence_sufficiency": "ENABLE_EVIDENCE_SUFFICIENCY",
+    "enable_corrective_retry": "ENABLE_CORRECTIVE_RETRY",
+    "enable_query_decomposition": "ENABLE_QUERY_DECOMPOSITION",
+    "answer_validation": "ANSWER_VALIDATION",
+    "require_evidence_ids": "REQUIRE_EVIDENCE_IDS",
+    "enable_hierarchical_retrieval": "ENABLE_HIERARCHICAL_RETRIEVAL",
+    "enable_retrieval_cache": "ENABLE_RETRIEVAL_CACHE",
+    "llama_cache_prompt": "LLAMA_CACHE_PROMPT",
+    "enable_fetch_on_miss": "ENABLE_FETCH_ON_MISS",
+    "enable_conversation_rewrite": "ENABLE_CONVERSATION_REWRITE",
+    "enable_llm_rewrite_fallback": "ENABLE_LLM_REWRITE_FALLBACK",
+    "enable_lexical": "ENABLE_LEXICAL",
+    "enable_reranker": "ENABLE_RERANKER",
+    "enable_evidence_taxonomy": "ENABLE_EVIDENCE_TAXONOMY",
+    "enable_authority_ranking": "ENABLE_AUTHORITY_RANKING",
+    "enable_duplicate_coverage_packing": "ENABLE_DUPLICATE_COVERAGE_PACKING",
+}
 
 
 class MiddlewareConfig:
     """Configuration for the FastAPI middleware layer."""
 
-    def __init__(self, config_path: Optional[Path] = None):
-        config_path = config_path or (
-            Path(__file__).parent.parent.parent / "configs/middleware.yaml"
-        )
+    def __init__(self, config_path: Optional[Path] = None,
+                 profile: Optional[str] = None):
+        """Load defaults, an optional profile, explicit YAML, then env values.
+
+        ``MIDDLEWARE_PROFILE`` selects a complete profile runtime source when no
+        explicit ``config_path`` is supplied. A ``profile:`` key in an explicit
+        YAML file loads that profile first, allowing the file to override it.
+        Environment values always have the final say. Profile dependency
+        violations are hard errors; post-profile overrides are clamped with a
+        warning so A/B experiments cannot create an invalid runtime.
+        """
+        config_path = Path(config_path) if config_path is not None else None
+
+        self.profile: Optional[str] = None
+        self.profile_metadata: dict[str, object] = {}
 
         self.llama_endpoint: str = "http://127.0.0.1:8087/v1/chat/completions"
         self.embedding_endpoint: str = "http://127.0.0.1:8087/v1/embeddings"
@@ -67,6 +159,11 @@ class MiddlewareConfig:
         self.return_timings: bool = True
         self.enable_streaming: bool = True
         self.embedding_cache_size: int = 256
+
+        # Phase 2.3 additive rollout gates. Off preserves the Phase 2.2 query
+        # and Corpus Explorer paths; stored evidence and schema remain intact.
+        self.enable_phase2_3_retrieval: bool = False
+        self.enable_phase2_3_corpus_projection: bool = False
 
         # Phase 2.2.6.1 — tool-aware streaming & progress events. Both feature
         # flags default off so behavior is byte-identical to the pre-2.2.6
@@ -100,10 +197,14 @@ class MiddlewareConfig:
 
         # Phase 2.2.7.2 — Store-backed, read-only corpus explorer budgets.
         self.corpus_page_limit: int = 100
+        self.corpus_default_page_limit: int = 50
         self.corpus_element_limit: int = 2000
         self.corpus_visible_node_target: int = 450
         self.corpus_overview_cache_ttl_s: float = 2.0
         self.corpus_opaque_id_ttl_s: float = 300.0
+        # Phase 2.3.5.3 — inspector detail byte caps enforced server-side.
+        self.corpus_inspector_excerpt_bytes: int = 1000
+        self.corpus_inspector_metadata_bytes: int = 4000
 
         # Phase 2.1.4 — analytical tool-calling controls.
         self.enable_tools: bool = False
@@ -240,6 +341,7 @@ class MiddlewareConfig:
         # Phase 2.1.2 — hybrid retrieval & re-ranking.
         # Lexical (BM25) channel + RRF fusion (2.1.2.1).
         self.enable_lexical: bool = True
+        self.lexical_backend: str = "fts5"
         self.rrf_k: int = 60
         # Cross-encoder re-ranker (2.1.2.2). Opt-in by default — the
         # cross-encoder backend downloads a model on first use.
@@ -249,23 +351,182 @@ class MiddlewareConfig:
         self.rerank_candidates: int = 30   # broad retrieve, then re-rank
         self.rerank_top_n: int = 5         # final docs after re-rank
 
-        if config_path.exists():
-            self._load_from_file(config_path)
+        # Phase 2.3.3.3 — additive stable evidence metadata plus bounded
+        # post-relevance policy ranking/packing. Taxonomy normalization is
+        # additive. Authority can add at most 0.025 and duplicate packing keeps
+        # one primary plus at most two materially different secondaries.
+        self.enable_evidence_taxonomy: bool = True
+        self.enable_authority_ranking: bool = True
+        self.enable_duplicate_coverage_packing: bool = True
+        self.authority_max_boost: float = 0.025
+        self.max_secondary_per_event: int = 2
+
+        self._load_selected_sources(config_path, profile)
         self._apply_env_overrides()
+        if self.lexical_backend not in {"fts5", "memory"}:
+            logger.warning(
+                "Invalid lexical_backend=%r; using fts5", self.lexical_backend
+            )
+            self.lexical_backend = "fts5"
         self._clamp_conversation_limits()
         self._clamp_adaptive_limits()
         self._clamp_corrective_limits()
         self._clamp_hierarchy_limits()
         self._clamp_graph_limits()
         self._clamp_corpus_limits()
+        self._clamp_evidence_policy()
         self._normalize_answer_validation()
+        self._validate_dependencies(strict=False)
 
-    def _load_from_file(self, path: Path):
-        with open(path) as f:
-            data = yaml.safe_load(f) or {}
+    @staticmethod
+    def _read_yaml(path: Path) -> dict:
+        with path.open(encoding="utf-8") as config_file:
+            data = yaml.safe_load(config_file) or {}
+        if not isinstance(data, dict):
+            raise ValueError(f"Middleware config must be a mapping: {path}")
+        return data
+
+    @staticmethod
+    def _resolve_profile_path(profile: str | Path) -> Path:
+        """Resolve a named profile or an explicit YAML path."""
+        value = str(profile).strip()
+        if not value:
+            raise ValueError("Middleware profile name cannot be blank")
+
+        candidate = Path(value)
+        if candidate.is_absolute() or candidate.suffix in (".yaml", ".yml"):
+            path = candidate if candidate.is_absolute() else Path.cwd() / candidate
+        else:
+            if value not in PROFILE_NAMES:
+                raise ValueError(
+                    f"Unknown middleware profile {value!r}; expected one of "
+                    f"{', '.join(PROFILE_NAMES)}"
+                )
+            path = PROFILE_DIR / f"{value}.yaml"
+        path = path.resolve()
+        if not path.exists():
+            raise FileNotFoundError(f"Middleware profile not found: {path}")
+        return path
+
+    def _apply_mapping(self, data: dict) -> None:
+        metadata = data.get("profile_metadata")
+        if isinstance(metadata, dict):
+            self.profile_metadata.update(metadata)
         for key, value in data.items():
+            if key in ("profile", "profile_metadata"):
+                continue
             if hasattr(self, key):
                 setattr(self, key, value)
+
+    def _load_selected_sources(
+        self, config_path: Optional[Path], requested_profile: Optional[str]
+    ) -> None:
+        """Apply profile values before an explicit YAML source."""
+        explicit_path = config_path or DEFAULT_CONFIG_PATH
+        explicit_data = (
+            self._read_yaml(explicit_path) if explicit_path.exists() else {}
+        )
+        env_profile = os.environ.get("MIDDLEWARE_PROFILE")
+
+        # Passing a file from configs/profiles means that file itself is the
+        # profile source, even when it carries its own descriptive `profile:`
+        # key. This keeps direct profile loading deterministic in tests/tools.
+        is_profile_file = (
+            config_path is not None
+            and explicit_path.parent.resolve() == PROFILE_DIR.resolve()
+        )
+        profile_spec = requested_profile or env_profile
+        if profile_spec is None:
+            profile_spec = explicit_path if is_profile_file else explicit_data.get("profile")
+
+        profile_path: Optional[Path] = None
+        if profile_spec:
+            profile_path = self._resolve_profile_path(profile_spec)
+            profile_data = self._read_yaml(profile_path)
+            self.profile = str(profile_data.get("profile") or profile_path.stem)
+            self._apply_mapping(profile_data)
+            # A profile is an operator-reviewed bundle. It must be internally
+            # coherent before an explicit YAML/env experiment can override it.
+            self._validate_dependencies(strict=True)
+
+        # MIDDLEWARE_PROFILE with the default constructor is a complete runtime
+        # selection. An explicitly supplied config_path remains an overlay, as
+        # required for controlled tests and operator-local overrides.
+        skip_default_for_selected_profile = (
+            config_path is None and (env_profile is not None or requested_profile is not None)
+        )
+        if explicit_path.exists() and not skip_default_for_selected_profile:
+            if profile_path is None or explicit_path.resolve() != profile_path.resolve():
+                self._apply_mapping(explicit_data)
+
+    def _load_from_file(self, path: Path):
+        """Backward-compatible helper for callers that load one YAML file."""
+        self._apply_mapping(self._read_yaml(path))
+
+    def _sec_filing_text_indexed(self) -> bool:
+        """Return whether SEC filing sections are configured for indexing."""
+        env_value = os.environ.get("SEC_INDEX_FILING_TEXT")
+        if env_value is not None:
+            return env_value.strip().lower() in ("1", "true", "yes", "on")
+
+        path = Path(os.environ.get(
+            "SEC_CONFIG_PATH",
+            str(DEFAULT_CONFIG_PATH.parent / "sec.yaml"),
+        ))
+        if not path.exists():
+            return False
+        try:
+            data = self._read_yaml(path)
+        except (OSError, ValueError, yaml.YAMLError):
+            return False
+        return bool((data.get("sec") or {}).get("index_filing_text", False))
+
+    def _validate_dependencies(self, *, strict: bool) -> None:
+        """Validate capability prerequisites, hard-failing profiles or clamping.
+
+        The returned runtime always satisfies these relationships. Explicit
+        profiles fail before overrides are applied; env/config experiments clamp
+        only the dependent capability and emit a warning.
+        """
+        violations: list[tuple[str, str]] = []
+        if self.enable_deterministic_answers:
+            if not self.enable_deterministic_tool_routing:
+                violations.append((
+                    "enable_deterministic_answers",
+                    "enable_deterministic_tool_routing",
+                ))
+            if not self.enable_adaptive_rag:
+                violations.append(("enable_deterministic_answers", "enable_adaptive_rag"))
+        if self.enable_corrective_retry and not self.enable_evidence_sufficiency:
+            violations.append(("enable_corrective_retry", "enable_evidence_sufficiency"))
+        if self.enable_hierarchical_retrieval and not self._sec_filing_text_indexed():
+            violations.append((
+                "enable_hierarchical_retrieval",
+                "sec.index_filing_text",
+            ))
+        if self.adaptive_enable_planning_call and not self.enable_adaptive_rag:
+            violations.append(("adaptive_enable_planning_call", "enable_adaptive_rag"))
+        if self.enable_llm_rewrite_fallback and not self.enable_conversation_rewrite:
+            violations.append((
+                "enable_llm_rewrite_fallback",
+                "enable_conversation_rewrite",
+            ))
+
+        if not violations:
+            return
+
+        details = "; ".join(f"{flag} requires {dependency}" for flag, dependency in violations)
+        if strict:
+            raise ValueError(f"Invalid middleware profile dependencies: {details}")
+
+        for flag, dependency in violations:
+            setattr(self, flag, False)
+            logger.warning(
+                "Clamped dependency violation: %s requires %s; setting %s=false",
+                flag,
+                dependency,
+                flag,
+            )
 
     def _apply_env_overrides(self):
         """Let the 2.1.2 retrieval knobs be overridden by env vars (A/B eval)."""
@@ -298,11 +559,21 @@ class MiddlewareConfig:
                     pass
 
         _bool("ENABLE_LEXICAL", "enable_lexical")
+        _str("LEXICAL_BACKEND", "lexical_backend")
+        _bool("ENABLE_CITATIONS", "enable_citations")
         _bool("ENABLE_RERANKER", "enable_reranker")
         _str("RERANKER_BACKEND", "reranker_backend")
         _str("RERANKER_MODEL", "reranker_model")
         _int("RERANK_CANDIDATES", "rerank_candidates")
         _int("RERANK_TOP_N", "rerank_top_n")
+        _bool("ENABLE_EVIDENCE_TAXONOMY", "enable_evidence_taxonomy")
+        _bool("ENABLE_AUTHORITY_RANKING", "enable_authority_ranking")
+        _bool(
+            "ENABLE_DUPLICATE_COVERAGE_PACKING",
+            "enable_duplicate_coverage_packing",
+        )
+        _float("AUTHORITY_MAX_BOOST", "authority_max_boost")
+        _int("MAX_SECONDARY_PER_EVENT", "max_secondary_per_event")
         _bool("ENABLE_TOOLS", "enable_tools")
         _int("MAX_TOOL_ITERATIONS", "max_tool_iterations")
         _bool("ALLOW_WRITE_TOOLS", "allow_write_tools")
@@ -321,14 +592,22 @@ class MiddlewareConfig:
         _bool("ENABLE_STREAM_PROGRESS_EVENTS", "enable_stream_progress_events")
         _bool("STREAM_PROGRESS_INCLUDE_COUNTS", "stream_progress_include_counts")
         _bool("ENABLE_GRAPH_OBSERVER", "enable_graph_observer")
+        _bool("ENABLE_PHASE2_3_RETRIEVAL", "enable_phase2_3_retrieval")
+        _bool(
+            "ENABLE_PHASE2_3_CORPUS_PROJECTION",
+            "enable_phase2_3_corpus_projection",
+        )
         _int("GRAPH_TRACE_LIMIT", "graph_trace_limit")
         _int("GRAPH_ELEMENT_LIMIT", "graph_element_limit")
         _int("GRAPH_TRACE_TTL_S", "graph_trace_ttl_s")
         _int("GRAPH_EXCERPT_CHARS", "graph_excerpt_chars")
         _int("GRAPH_QUESTION_PREVIEW_CHARS", "graph_question_preview_chars")
         _int("CORPUS_PAGE_LIMIT", "corpus_page_limit")
+        _int("CORPUS_DEFAULT_PAGE_LIMIT", "corpus_default_page_limit")
         _int("CORPUS_ELEMENT_LIMIT", "corpus_element_limit")
         _int("CORPUS_VISIBLE_NODE_TARGET", "corpus_visible_node_target")
+        _int("CORPUS_INSPECTOR_EXCERPT_BYTES", "corpus_inspector_excerpt_bytes")
+        _int("CORPUS_INSPECTOR_METADATA_BYTES", "corpus_inspector_metadata_bytes")
         _float("CORPUS_OVERVIEW_CACHE_TTL_S", "corpus_overview_cache_ttl_s")
         _float("CORPUS_OPAQUE_ID_TTL_S", "corpus_opaque_id_ttl_s")
         _int("EMBEDDING_CACHE_SIZE", "embedding_cache_size")
@@ -509,10 +788,18 @@ class MiddlewareConfig:
             setattr(self, attr, bounded)
 
         _clamp_int("corpus_page_limit", _CORPUS_PAGE_LIMIT_RANGE)
+        _clamp_int("corpus_default_page_limit", _CORPUS_DEFAULT_PAGE_LIMIT_RANGE)
         _clamp_int("corpus_element_limit", _CORPUS_ELEMENT_LIMIT_RANGE)
         _clamp_int("corpus_visible_node_target", _CORPUS_VISIBLE_NODE_TARGET_RANGE)
+        _clamp_int(
+            "corpus_inspector_excerpt_bytes", _CORPUS_INSPECTOR_EXCERPT_BYTES_RANGE)
+        _clamp_int(
+            "corpus_inspector_metadata_bytes", _CORPUS_INSPECTOR_METADATA_BYTES_RANGE)
         _clamp_float("corpus_overview_cache_ttl_s", _CORPUS_OVERVIEW_TTL_RANGE)
         _clamp_float("corpus_opaque_id_ttl_s", _CORPUS_OPAQUE_ID_TTL_RANGE)
+        # The default page cannot exceed the hard maximum page size.
+        if self.corpus_default_page_limit > self.corpus_page_limit:
+            self.corpus_default_page_limit = self.corpus_page_limit
         if clamped:
             logger.warning(
                 "Clamped corpus explorer limits to safe ranges: %s", ", ".join(clamped))
@@ -530,3 +817,16 @@ class MiddlewareConfig:
                 value, bounded,
             )
         self.max_corrective_retries = bounded
+
+    def _clamp_evidence_policy(self) -> None:
+        """Clamp Phase 2.3 authority and event-packing policy bounds."""
+        try:
+            authority = float(self.authority_max_boost)
+        except (TypeError, ValueError):
+            authority = 0.025
+        self.authority_max_boost = max(0.0, min(0.025, authority))
+        try:
+            secondary = int(self.max_secondary_per_event)
+        except (TypeError, ValueError):
+            secondary = 2
+        self.max_secondary_per_event = max(0, min(5, secondary))

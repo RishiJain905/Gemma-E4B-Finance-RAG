@@ -177,8 +177,19 @@ def _emit_tool_completed(name: str, status: str, *, count=None, elapsed_ms=None,
             name, status, count=count, elapsed_ms=elapsed_ms, subquery_id=subquery_id)
 
 
-def _emit_graph_legacy_intent(intent: dict) -> None:
-    """Emit the compact legacy query -> intent -> retrieval route."""
+def _emit_graph_legacy_intent(intent: dict, *, fallback_reason: Optional[str] = None) -> None:
+    """Emit the compact legacy query -> route(intent) -> retrieval step.
+
+    The legacy intent-parse *is* the routing stage, so its node uses the shared
+    ``stage:route`` id (label stays "Intent" for the reader). This keeps it in
+    the ROUTE column and, critically, lets the observer's tool ``routed_to``
+    edges — which source from ``stage:route`` whenever a tool has no subquery,
+    as legacy tools never do — resolve to a real node instead of dangling.
+
+    ``fallback_reason`` is set only when the adaptive layer demoted to legacy;
+    it marks the routing node as ``fallback`` so that signal survives the merge
+    with the ``stage:route`` node the fallback branch already emitted.
+    """
     emitter = _stream_emitter_var.get()
     if emitter is None or not _graph_observer_enabled():
         return
@@ -186,31 +197,34 @@ def _emit_graph_legacy_intent(intent: dict) -> None:
 
     query_id = emitter.query_id
     query_node = _node_id(query_id, "query", "request")
-    intent_node = _node_id(query_id, "stage", "intent")
+    route_node = _node_id(query_id, "stage", "route")
     retrieve_node = _node_id(query_id, "stage", "retrieve")
+    metadata = {
+        "ticker": intent.get("ticker"),
+        "metrics": list(intent.get("metrics") or ()),
+        "period": intent.get("timeframe"),
+        "kind": intent.get("question_type"),
+    }
+    if fallback_reason:
+        metadata["reason"] = fallback_reason
     emitter.graph_update(
         nodes=[{
-            "id": intent_node,
+            "id": route_node,
             "kind": "stage",
             "label": "Intent",
-            "status": "complete",
-            "metadata": {
-                "ticker": intent.get("ticker"),
-                "metrics": list(intent.get("metrics") or ()),
-                "period": intent.get("timeframe"),
-                "kind": intent.get("question_type"),
-            },
+            "status": "fallback" if fallback_reason else "complete",
+            "metadata": metadata,
         }],
         edges=[
             {
-                "id": _edge_id(query_id, query_node, "compiled_to", intent_node),
+                "id": _edge_id(query_id, query_node, "compiled_to", route_node),
                 "source": query_node,
-                "target": intent_node,
+                "target": route_node,
                 "relation": "compiled_to",
             },
             {
-                "id": _edge_id(query_id, intent_node, "routed_to", retrieve_node),
-                "source": intent_node,
+                "id": _edge_id(query_id, route_node, "routed_to", retrieve_node),
+                "source": route_node,
                 "target": retrieve_node,
                 "relation": "routed_to",
             },
@@ -378,6 +392,7 @@ def _emit_graph_evidence(
             "section": item.section,
             "parent_id": item.parent_id,
         }
+        metadata.update(item.graph_evidence_metadata())
         retrieved_from = None
         if item.subquery_ids:
             from .graph_observer import _node_id
@@ -392,6 +407,7 @@ def _emit_graph_evidence(
             rank=rank,
             retrieved_from=retrieved_from,
             status=status,
+            source_metadata=item.source_node_metadata(),
         )
         parent_reference = reference_by_store_id.get(str(item.parent_id))
         if parent_reference:
@@ -460,6 +476,9 @@ def _emit_graph_terminal(
             "status": context.get("grounding_level"),
             "facts": len(usable_facts(context.get("retrieval"))),
             "documents": len(usable_documents(context.get("retrieval"))),
+            "answer_origin": context.get("answer_origin"),
+            "generation_skipped": context.get("generation_skipped"),
+            "generation_skip_reason": context.get("generation_skip_reason"),
         },
     }]
     query_node = _node_id(query_id, "query", "request")
@@ -493,6 +512,16 @@ def _emit_graph_terminal(
                 "metric": data.get("metric"),
                 "period": data.get("period"),
                 "support_status": data.get("support_status"),
+                "item_type": data.get("item_type"),
+                "event_type": data.get("event_type"),
+                "authority_tier": data.get("authority_tier"),
+                "source": data.get("source"),
+                "date_semantics": data.get("date_semantics"),
+                "canonical_security": data.get("canonical_security"),
+                "coverage_tier": data.get("coverage_tier"),
+                "source_category": data.get("source_category"),
+                "provider": data.get("provider"),
+                "publisher": data.get("publisher"),
             },
         })
         if data.get("evidence_id"):
@@ -1065,6 +1094,12 @@ async def health(request: Request):
             "conversation_max_turns": int(getattr(config, "conversation_max_turns", 8)),
             "conversation_max_history_chars": int(
                 getattr(config, "conversation_max_history_chars", 8000)),
+            "lexical_backend": str(getattr(config, "lexical_backend", "fts5")),
+            "lexical_mode": (
+                retriever.lexical.mode
+                if bool(getattr(config, "enable_lexical", True)) and retriever is not None
+                else "disabled"
+            ),
         }
         # Local query-graph observer (2.2.7.4). Advertised only when enabled so
         # older/observer-off servers stay byte-compatible and the chat client
@@ -1199,6 +1234,70 @@ def _stage_timing(timings: dict[str, object], name: str, stage_start: float) -> 
     return elapsed
 
 
+QUALITY_STAGE_TIMING_FIELDS = (
+    "intent_plan_ms",
+    "catalog_tools_ms",
+    "dense_retrieval_ms",
+    "lexical_retrieval_ms",
+    "fusion_rerank_ms",
+    "prompt_construction_ms",
+    "model_ttft_ms",
+    "model_total_ms",
+    "end_to_end_ms",
+)
+
+
+def _available_timing(value) -> Optional[float]:
+    """Normalize an observed duration; missing/unobserved stages stay unavailable."""
+    if not isinstance(value, (int, float)) or isinstance(value, bool) or value <= 0:
+        return None
+    return round(float(value), 1)
+
+
+def _quality_stage_timings(
+    timings: dict[str, object], *, end_to_end_ms: Optional[float] = None
+) -> dict[str, Optional[float]]:
+    """Project legacy timing details onto the stable Phase 2.3.7.7 stage schema."""
+    retrieval = timings.get("retrieval")
+    retrieval = retrieval if isinstance(retrieval, dict) else {}
+    existing = timings.get("stages")
+    existing = existing if isinstance(existing, dict) else {}
+
+    intent_parts = [
+        value for value in (timings.get("intent_parse"), timings.get("query_plan"))
+        if _available_timing(value) is not None
+    ]
+    dense_parts = [
+        value for value in (retrieval.get("embedding"), retrieval.get("chroma"))
+        if _available_timing(value) is not None
+    ]
+    stages = {
+        "intent_plan_ms": _available_timing(sum(intent_parts)) if intent_parts else None,
+        "catalog_tools_ms": _available_timing(timings.get("catalog_tools")),
+        "dense_retrieval_ms": _available_timing(sum(dense_parts)) if dense_parts else None,
+        "lexical_retrieval_ms": _available_timing(retrieval.get("lexical")),
+        "fusion_rerank_ms": _available_timing(retrieval.get("fusion_rerank")),
+        "prompt_construction_ms": _available_timing(timings.get("prompt_build")),
+        "model_ttft_ms": _available_timing(timings.get("model_ttft")),
+        "model_total_ms": _available_timing(
+            timings.get("model_total", timings.get("model_call"))
+        ),
+        "end_to_end_ms": _available_timing(end_to_end_ms),
+    }
+    for timing_field in QUALITY_STAGE_TIMING_FIELDS:
+        if stages[timing_field] is None:
+            stages[timing_field] = _available_timing(existing.get(timing_field))
+    return stages
+
+
+def _refresh_quality_stage_timings(
+    timings: dict[str, object], *, end_to_end_ms: Optional[float] = None
+) -> None:
+    timings["stages"] = _quality_stage_timings(
+        timings, end_to_end_ms=end_to_end_ms,
+    )
+
+
 def _return_timings_enabled() -> bool:
     """Return whether response timing metadata should be included."""
     return_timings = getattr(config, "return_timings", True)
@@ -1227,7 +1326,9 @@ async def _build_query_context(request: QueryRequest) -> dict:
         raise HTTPException(status_code=503, detail="Store not initialized")
 
     start = time.time()
-    timings: dict[str, object] = {}
+    timings: dict[str, object] = {
+        "stages": {field: None for field in QUALITY_STAGE_TIMING_FIELDS},
+    }
     _reset_request_scoped_state(request.answer_policy)
 
     compile_start = time.perf_counter()
@@ -1355,9 +1456,12 @@ async def _build_legacy_query_context(
     timings = shared["timings"]
     retrieval_query = shared["retrieval_query"]
     retrieval_intent = shared["retrieval_intent"]
-    _emit_graph_legacy_intent(retrieval_intent)
+    _emit_graph_legacy_intent(
+        retrieval_intent, fallback_reason=(orchestration or {}).get("fallback_reason")
+    )
 
     freshness_meta = await _freshness_stage(retrieval_intent, request.refresh, timings)
+    write_requested = bool(freshness_meta.pop("_write_requested", False))
 
     stage_start = time.perf_counter()
     _emit_stage("retrieve", "started")
@@ -1375,9 +1479,11 @@ async def _build_legacy_query_context(
     retrieval_timings = retrieval.get("timings", {}) if isinstance(retrieval, dict) else {}
     timings["retrieval"] = {
         "total": retrieval_ms,
-        "embedding": round(float(retrieval_timings.get("embedding", 0.0) or 0.0), 1),
-        "chroma": round(float(retrieval_timings.get("chroma", 0.0) or 0.0), 1),
-        "sqlite": round(float(retrieval_timings.get("sqlite", 0.0) or 0.0), 1),
+        "embedding": _available_timing(retrieval_timings.get("embedding")),
+        "chroma": _available_timing(retrieval_timings.get("chroma")),
+        "sqlite": _available_timing(retrieval_timings.get("sqlite")),
+        "lexical": _available_timing(retrieval_timings.get("lexical")),
+        "fusion_rerank": _available_timing(retrieval_timings.get("fusion_rerank")),
     }
     grounding_level = _grounding_level(retrieval)
 
@@ -1441,6 +1547,7 @@ async def _build_legacy_query_context(
         "evidence_ledger": evidence_ledger,
         "graph_evidence_ids": graph_evidence_ids,
         "calculations": [],
+        "_write_requested": write_requested,
     }
 
 
@@ -1571,9 +1678,13 @@ def _orchestration_metadata(result) -> dict:
         "planning_calls": 1 if result.planning_ran else 0,
         "reranker_calls": 1 if result.rerank_ran else 0,
         "deterministic_tools": tools,
+        "set_complete": result.set_complete,
+        "result_set_size": result.result_set_size,
+        "model_calls": 0,
         "context_chars": int(result.context_size),
         "evidence_dropped": dropped,
         "fallback_reason": result.fallback_reason,
+        "query_plan": _plan_trace(result.plan),
     }
 
 
@@ -1603,6 +1714,7 @@ def _doc_trace_id(doc: dict):
 
 
 def _plan_trace(plan) -> dict:
+    obligations = plan.obligations
     return {
         "retrieval_query": plan.retrieval_query,
         "entities": list(plan.tickers),
@@ -1612,6 +1724,19 @@ def _plan_trace(plan) -> dict:
         "primary_intent": plan.primary_intent,
         "subqueries": [sq.id for sq in plan.subqueries],
         "reason_codes": list(plan.reason_codes),
+        "obligations": {
+            "entity_set": list(obligations.entity_set),
+            "universe_scope": obligations.universe_scope,
+            "operation": obligations.operation,
+            "metrics": list(obligations.metrics),
+            "item_types": list(obligations.item_types),
+            "sources": list(obligations.sources),
+            "completeness": obligations.completeness,
+            "limit": obligations.limit,
+            "as_of": obligations.as_of,
+            "qualitative": obligations.qualitative,
+            "evidence_modes": list(obligations.evidence_modes),
+        },
     }
 
 
@@ -1697,6 +1822,7 @@ async def _build_adaptive_query_context(shared: dict) -> dict:
 
     intent = plan.to_legacy_intent()
     freshness_meta = await _freshness_stage(intent, request.refresh, timings)
+    write_requested = bool(freshness_meta.pop("_write_requested", False))
 
     stage_start = time.perf_counter()
     _emit_stage("retrieve", "started")
@@ -1704,12 +1830,24 @@ async def _build_adaptive_query_context(shared: dict) -> dict:
     from .retriever import Retriever
 
     r = retriever or Retriever(store=store, config=config)
+    from . import deterministic_router
+
+    def timed_execute_route(*args, **kwargs):
+        tool_started = time.perf_counter()
+        try:
+            return deterministic_router.execute_route(*args, **kwargs)
+        finally:
+            timings["catalog_tools"] = float(timings.get("catalog_tools") or 0.0) + (
+                time.perf_counter() - tool_started
+            ) * 1000
+
     result = orchestrate(
         plan,
         store,
         config,
         retriever=r,
         available_metrics=_adaptive_available_metrics(),
+        execute_fn=timed_execute_route,
         retrieval_cache=_get_retrieval_cache(),
         refresh=bool(getattr(request, "refresh", False)),
     )
@@ -1732,6 +1870,20 @@ async def _build_adaptive_query_context(shared: dict) -> dict:
         "retrieval_strategy": result.retrieval_strategy or "vector",
         "timings": {},
     }
+    retrieval_timings = (
+        getattr(r, "_timings", {})
+        if int(result.retrieval_rounds_used or 0) > 0
+        else {}
+    )
+    retrieval_timings = retrieval_timings if isinstance(retrieval_timings, dict) else {}
+    timings["retrieval"] = {
+        "total": _available_timing(timings.get("orchestration")),
+        "embedding": _available_timing(retrieval_timings.get("embedding")),
+        "chroma": _available_timing(retrieval_timings.get("chroma")),
+        "sqlite": _available_timing(retrieval_timings.get("sqlite")),
+        "lexical": _available_timing(retrieval_timings.get("lexical")),
+        "fusion_rerank": _available_timing(retrieval_timings.get("fusion_rerank")),
+    }
     if result.sufficiency is not None:
         specific = bool(plan.entities) or bool(plan.metrics) or bool(
             set(plan.intents) & {"fact_lookup", "comparison", "trend", "projection"}
@@ -1749,7 +1901,15 @@ async def _build_adaptive_query_context(shared: dict) -> dict:
         calculations = [dict(c) for c in result.tool_execution.calculations]
 
     # Request-local [E#] evidence ledger over the pre-budgeted evidence.
-    evidence_ledger = _build_evidence_ledger(retrieval) if _evidence_ids_enabled() else []
+    deterministic_evidence = bool(
+        getattr(config, "enable_deterministic_answers", False)
+        and result.tool_execution is not None
+    )
+    evidence_ledger = (
+        _build_evidence_ledger(retrieval)
+        if _evidence_ids_enabled() or deterministic_evidence
+        else []
+    )
     graph_evidence_ids = _emit_graph_evidence(retrieval, evidence_ledger)
     _emit_graph_dropped_evidence(result, retrieval)
 
@@ -1805,10 +1965,15 @@ async def _build_adaptive_query_context(shared: dict) -> dict:
         "compiled": shared["compiled"],
         "retrieval_query": retrieval_query,
         "orchestration": _orchestration_metadata(result),
+        "deterministic_answer": result.deterministic_answer,
+        "answer_origin": None,
+        "coverage_metadata": result.answer_metadata,
         "evidence_sufficiency": sufficiency_meta,
         "evidence_ledger": evidence_ledger,
         "graph_evidence_ids": graph_evidence_ids,
         "calculations": calculations,
+        "_orchestration_result": result,
+        "_write_requested": write_requested,
     }
 
 
@@ -1932,6 +2097,7 @@ def _build_query_response(
     intent = context["intent"]
     retrieval = context["retrieval"]
     elapsed_ms = round((time.time() - context["start"]) * 1000, 1)
+    _refresh_quality_stage_timings(context["timings"], end_to_end_ms=elapsed_ms)
     # Usable-evidence counts (2.2.1.1) — shared by /query and the
     # /query/stream terminal metadata event since both call this function.
     n_facts, n_docs = evidence_counts(retrieval)
@@ -1973,6 +2139,10 @@ def _build_query_response(
 
     return QueryResponse(
         answer=answer_text,
+        answer_origin=context.get("answer_origin"),
+        generation_skipped=context.get("generation_skipped"),
+        generation_skip_reason=context.get("generation_skip_reason"),
+        coverage_metadata=context.get("coverage_metadata"),
         citations=citations,
         detected_ticker=intent.get("ticker"),
         detected_intent=intent.get("question_type"),
@@ -2001,23 +2171,180 @@ def _build_query_response(
     )
 
 
+def _source_citations_from_validation(report) -> list[SourceCitation]:
+    """Project supported evidence citations onto the legacy source list."""
+    citations: list[SourceCitation] = []
+    seen: set[tuple] = set()
+    for record in report.citations:
+        if record.support_status != "supported" or not record.ticker:
+            continue
+        key = (
+            record.source_type or "tool", record.ticker, record.metric,
+            record.period, record.source_url,
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        citations.append(SourceCitation(
+            source_type=record.source_type or "tool",
+            ticker=record.ticker,
+            metric=record.metric,
+            period=record.period,
+            source_url=record.source_url,
+        ))
+    return citations
+
+
+def _discard_deterministic_trace() -> None:
+    collector = _evidence_trace_var.get()
+    if collector is not None and hasattr(collector, "discard_deterministic_answer"):
+        collector.discard_deterministic_answer()
+
+
+def _try_deterministic_response(context: dict) -> Optional[QueryResponse]:
+    """Validate and finalize the shared deterministic fast path, or fall back.
+
+    The entire render/validate/response/graph sequence is one fail-soft
+    boundary. Returning ``None`` means the caller must run normal generation
+    exactly once.
+    """
+    if not bool(getattr(config, "enable_deterministic_answers", False)):
+        return None
+    result = context.get("_orchestration_result")
+    if result is None:
+        return None
+
+    from . import deterministic_answers
+
+    contract = deterministic_answers.check_final_answer_contract(
+        result,
+        evidence_ledger=context.get("evidence_ledger") or [],
+        freshness=context.get("freshness"),
+        write_requested=bool(context.get("_write_requested")),
+    )
+    if not contract.eligible:
+        return None
+
+    started_at = time.perf_counter()
+    try:
+        rendered = deterministic_answers.render_deterministic_answer(
+            result, evidence_ledger=context.get("evidence_ledger") or [],
+        )
+        if rendered.template is not contract.template:
+            raise deterministic_answers.DeterministicAnswerError(
+                "contract and renderer selected different templates"
+            )
+
+        from .answer_validator import validate_deterministic_answer
+
+        validation_values = [
+            *(context.get("calculations") or []),
+            *rendered.validation_values,
+        ]
+        report = validate_deterministic_answer(
+            rendered.text,
+            context.get("evidence_ledger") or [],
+            calculations=validation_values,
+        )
+        validation = report.to_metadata()
+        validation["enforcement"] = "deterministic"
+        evidence_citations = [_evidence_citation_model(c) for c in report.citations]
+        citations = _source_citations_from_validation(report)
+
+        context["answer_origin"] = "deterministic"
+        context["generation_skipped"] = True
+        context["generation_skip_reason"] = deterministic_answers.GENERATION_SKIP_REASON
+        context["grounding_level"] = "grounded"
+        if isinstance(context.get("orchestration"), dict):
+            context["orchestration"]["model_calls"] = 0
+
+        collector = _evidence_trace_var.get()
+        if collector is not None:
+            collector.record_deterministic_answer(rendered.template.value)
+
+        context["timings"]["model_call"] = None
+        context["timings"]["deterministic_answer"] = round(
+            (time.perf_counter() - started_at) * 1000, 1
+        )
+        _emit_stage(
+            "generate", "skipped",
+            reason=deterministic_answers.GENERATION_SKIP_REASON,
+        )
+        response = _build_query_response(
+            context=context,
+            answer_text=rendered.text,
+            citations=citations,
+            model_available=True,
+            validation=validation,
+            evidence_citations=evidence_citations,
+        )
+        _emit_graph_terminal(
+            context,
+            model_available=True,
+            evidence_citations=evidence_citations,
+            validation=validation,
+            citations=citations,
+        )
+        return response
+    except Exception:  # noqa: BLE001 - the normal model path is the safety net
+        logger.exception("Deterministic final-answer path failed; using model generation")
+        _discard_deterministic_trace()
+        context["answer_origin"] = None
+        context["generation_skipped"] = None
+        context["generation_skip_reason"] = None
+        _emit_stage("generate", "fallback", reason="deterministic_fast_path_error")
+        return None
+
+
+def _deterministic_contract_eligible(context: dict) -> bool:
+    """Cheap streaming preflight used to avoid probing the model unnecessarily."""
+    if not bool(getattr(config, "enable_deterministic_answers", False)):
+        return False
+    result = context.get("_orchestration_result")
+    if result is None:
+        return False
+    from .deterministic_answers import check_final_answer_contract
+
+    return check_final_answer_contract(
+        result,
+        evidence_ledger=context.get("evidence_ledger") or [],
+        freshness=context.get("freshness"),
+        write_requested=bool(context.get("_write_requested")),
+    ).eligible
+
+
 async def _answer_query_context(request: QueryRequest, context: dict) -> QueryResponse:
     """Complete a prepared query context through the non-streaming model path."""
     intent = context["intent"]
     retrieval = context["retrieval"]
     grounding_level = context["grounding_level"]
+    deterministic = _try_deterministic_response(context)
+    if deterministic is not None:
+        return deterministic
+
     stage_start = time.perf_counter()
     _emit_stage("generate", "started")
     model_available = await _check_model_health()
     if model_available:
+        if (
+            isinstance(context.get("orchestration"), dict)
+            and "model_calls" in context["orchestration"]
+        ):
+            context["orchestration"]["model_calls"] = 1
         temperature, max_tokens = _task_settings(request, intent)
-        answer_text, citations = await _invoke_model(
-            prompt=context["augmented_prompt"],
-            temperature=temperature,
-            max_tokens=max_tokens,
-            intent=intent,
-            grounding_level=grounding_level,
-        )
+        model_started = time.perf_counter()
+        try:
+            answer_text, citations = await _invoke_model(
+                prompt=context["augmented_prompt"],
+                temperature=temperature,
+                max_tokens=max_tokens,
+                intent=intent,
+                grounding_level=grounding_level,
+            )
+        finally:
+            context["timings"]["model_total"] = (
+                time.perf_counter() - model_started
+            ) * 1000
         if not answer_text.startswith("Error calling model:"):
             _mark_model_health(True)
         if intent.get("question_type") == "projection":
@@ -2027,21 +2354,29 @@ async def _answer_query_context(request: QueryRequest, context: dict) -> QueryRe
                 answer_text,
                 context["augmented_prompt"],
             )
+        if bool(getattr(config, "enable_deterministic_answers", False)):
+            context["answer_origin"] = "model"
+            context["generation_skipped"] = False
     else:
         logger.warning("Model unavailable - returning degraded answer")
         _emit_stage("generate", "fallback", reason="model_unavailable")
         answer_text = _format_degraded_answer(
             retrieval, intent, context.get("evidence_sufficiency"))
         citations = []
-    _stage_timing(context["timings"], "model_call", stage_start)
-    if model_available:
-        _emit_stage("generate", "completed")
+        if bool(getattr(config, "enable_deterministic_answers", False)):
+            context["answer_origin"] = "degraded"
+            context["generation_skipped"] = False
 
     # Deterministic citation/numeric validation (2.2.4.3). off -> passthrough;
     # report -> metadata only; enforce -> may downgrade/refuse. Updates the
     # context grounding so _build_query_response reflects an enforced downgrade.
     answer_text, grounding_level, validation, evidence_citations = _apply_answer_validation(
         context, answer_text, grounding_level)
+
+    _stage_timing(context["timings"], "model_call", stage_start)
+    if model_available:
+        _emit_stage("generate", "completed")
+
     context["grounding_level"] = grounding_level
     _emit_graph_terminal(
         context,
@@ -2089,8 +2424,18 @@ async def query(request: QueryRequest):
 def _response_to_dict(response: QueryResponse) -> dict:
     """Return a pydantic model as a JSON-serializable dict."""
     if hasattr(response, "model_dump"):
-        return response.model_dump()
-    return response.dict()
+        data = response.model_dump()
+    else:
+        data = response.dict()
+    # Keep optional rollout/observer fields byte-compatible on runtimes whose
+    # pydantic serializer does not yet honor Field(exclude_if=...).
+    for key in (
+        "generation_skipped", "generation_skip_reason", "evidence_sufficiency",
+        "evidence_citations", "answer_validation", "graph_trace_id",
+    ):
+        if data.get(key) is None:
+            data.pop(key, None)
+    return data
 
 
 def _sse(event: str, data: dict) -> str:
@@ -2239,21 +2584,23 @@ async def query_stream(request: QueryRequest):
         if request_emitter is not None:
             request_emitter.error("query failed", terminal=True)
         raise
-    model_available = await _check_model_health()
-
     run_tool_final = (
         tool_final and _tools_supported and not _context_used_deterministic_tools(context)
     )
-
-    # Model-unavailable: the pre-2.2.6 legacy path returns 404 (byte-identical).
-    # The new paths (progress events or tool-final) degrade gracefully to a
-    # streamed degraded answer instead, so a transient model outage never
-    # poisons the client's streaming capability.
-    if not model_available and emitter is None and not run_tool_final:
-        raise HTTPException(status_code=404, detail="Streaming unavailable when model is unavailable")
+    model_available: Optional[bool] = None
+    if not _deterministic_contract_eligible(context):
+        model_available = await _check_model_health()
+        # Feature-off/ineligible requests retain the legacy capability response.
+        if not model_available and emitter is None and not run_tool_final:
+            raise HTTPException(
+                status_code=404,
+                detail="Streaming unavailable when model is unavailable",
+            )
 
     return StreamingResponse(
-        _query_stream_events(request, context, emitter, run_tool_final, model_available),
+        _query_stream_events(
+            request, context, emitter, run_tool_final, model_available,
+        ),
         media_type="text/event-stream",
     )
 
@@ -2302,12 +2649,29 @@ async def _query_stream_events(
     context: dict,
     emitter,
     run_tool_final: bool,
-    model_available: bool,
+    model_available: Optional[bool],
 ):
     """SSE generator: flush progress, stream the final answer, emit metadata."""
     # 1. Flush the buffered context-build progress (query_started + stages).
     for chunk in _drain_progress(emitter):
         yield chunk
+
+    # 2.3.7.3: render/validate/finalize before any model health probe or call.
+    deterministic = _try_deterministic_response(context)
+    if deterministic is not None:
+        for chunk in _drain_progress(emitter):
+            yield chunk
+        yield _sse("token", {"token": deterministic.answer})
+        metadata = _response_to_dict(deterministic)
+        metadata.pop("answer", None)
+        yield _sse("metadata", metadata)
+        return
+
+    if model_available is None:
+        model_available = await _check_model_health()
+    # Model-unavailable: the pre-2.2.6 legacy path historically returned a
+    # capability 404. Once the SSE generator has started, preserve the newer
+    # fail-soft behavior and return one degraded answer instead.
 
     stage_start = time.perf_counter()
     temperature, max_tokens = _task_settings(request, context["intent"])
@@ -2353,11 +2717,16 @@ async def _query_stream_events(
 
     # 4. Stream the final synthesis.
     _emit_stage("generate", "started")
+    model_started = time.perf_counter()
     for chunk in _drain_progress(emitter):
         yield chunk
     answer_parts: list[str] = []
     try:
         async for token in token_source:
+            if "model_ttft" not in context["timings"]:
+                context["timings"]["model_ttft"] = (
+                    time.perf_counter() - model_started
+                ) * 1000
             answer_parts.append(token)
             yield _sse("token", {"token": token})
     except Exception as exc:  # noqa: BLE001 - streaming must never fail a query
@@ -2380,6 +2749,9 @@ async def _query_stream_events(
         async for chunk in _stream_degraded_answer(request, context):
             yield chunk
         return
+    context["timings"]["model_total"] = (
+        time.perf_counter() - model_started
+    ) * 1000
     _emit_stage("generate", "completed")
     for chunk in _drain_progress(emitter):
         yield chunk
@@ -2478,6 +2850,10 @@ _SOURCE_ALIASES = {
     "yfinance_fundamentals": "yfinance_fundamentals",
     "news": "yfinance_news",
     "yfinance_news": "yfinance_news",
+    "finnhub": "finnhub_news",
+    "finnhub_news": "finnhub_news",
+    "massive": "massive_market",
+    "massive_market": "massive_market",
     "sec": "sec_filings",
     "sec_filings": "sec_filings",
     "gdelt": "gdelt_news",
@@ -2558,7 +2934,9 @@ def _refresh_one_source(ticker: str, logical: str) -> None:
     if logical in SCHEDULER_SOURCE_MAP:
         _refresh_via_scheduler(ticker, logical)
         return
-    _refresh_one_source_direct(ticker, logical)
+    from src.scheduler import UnifiedScheduler
+
+    UnifiedScheduler(store=store).run_bounded_security_refresh(ticker, logical)
 
 
 def _refresh_one_source_direct(ticker: str, logical: str) -> None:
@@ -2584,6 +2962,22 @@ def _refresh_one_source_direct(ticker: str, logical: str) -> None:
         t = ing._fetch_ticker(ticker)
         if t is not None:
             ing._ingest_ticker_news(ticker, t)  # marks cache fresh
+    elif logical == "finnhub_news":
+        from src.ingestion.finnhub_ingestor import FinnhubIngestor
+        result = FinnhubIngestor(store=store).ingest_ticker_news(ticker)
+        if result.get("status") not in {"ok", "success", "no_data"}:
+            raise RuntimeError(
+                f"finnhub refresh failed for {ticker}: "
+                f"{result.get('status') or result.get('error_class') or 'error'}"
+            )
+    elif logical == "massive_market":
+        from src.ingestion.massive_ingestor import MassiveIngestor
+        result = MassiveIngestor(store=store).ingest_market_data(tickers=[ticker])
+        if result.get("status") not in {"ok", "success", "no_data"}:
+            raise RuntimeError(
+                f"massive refresh failed for {ticker}: "
+                f"{result.get('status') or result.get('error_class') or 'error'}"
+            )
     elif logical == "sec_filings":
         from src.sec import FilingScheduler
         sched = FilingScheduler(store=store)
@@ -2673,6 +3067,7 @@ def _evaluate_and_refresh(ticker: Optional[str], do_refresh: bool) -> dict:
         return meta
 
     if do_refresh:
+        meta["_write_requested"] = True
         refreshed, _errors = _refresh_ticker_sources(ticker, stale)
         meta["refreshed_during_query"] = refreshed
         meta["stale_sources_used"] = [s for s in stale if s not in refreshed]
@@ -2968,6 +3363,8 @@ async def _post_and_parse(payload: dict) -> tuple[str, list[SourceCitation]]:
 def _extract_citations(text: str) -> list[SourceCitation]:
     """Extract [Source: ...] citations from model output."""
     import re
+    if config is not None and not bool(getattr(config, "enable_citations", True)):
+        return []
     citations = []
     pattern = r'\[Source:\s*([^\]]+)\]'
     for match in re.finditer(pattern, text):

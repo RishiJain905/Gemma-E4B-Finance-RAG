@@ -1,0 +1,16 @@
+{
+  "status": "OK",
+  "results": [
+    {
+      "id": "split-1",
+      "ticker": "AAA",
+      "execution_date": "2026-07-10",
+      "declared_date": "2026-06-20",
+      "ex_date": "2026-07-10",
+      "record_date": "2026-07-11",
+      "payable_date": "2026-07-20",
+      "split_from": 2,
+      "split_to": 1
+    }
+  ]
+}

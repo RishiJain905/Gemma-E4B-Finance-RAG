@@ -113,6 +113,7 @@ class IntentParser:
         # false multi-metric ambiguity that made the router abstain.
         (r"\bgross profit\b", "gross_profit"),
         (r"\bgross margin\b", "gross_margin_pct"),
+        (r"\bmargins?\b", "gross_margin_pct"),
 
         # Earnings / Profit
         (r"\bnet income\b", "net_income"),
@@ -183,6 +184,52 @@ class IntentParser:
     ]
 
     # ── Question Type Patterns ──────────────────────────
+
+    _CAPABILITY_INTENTS = frozenset({
+        "capability_inventory",
+        "coverage_check",
+        "source_inventory",
+        "metric_inventory",
+        "corpus_summary",
+    })
+    _SOURCE_INVENTORY_RE = re.compile(
+        r"\b(?:what|which|list|show|enumerate|available|complete|full).*"
+        r"(?:sources?|providers?|source categories|data providers)\b"
+        r"|\b(?:sources?|providers?)\s+(?:do you have|are available|are represented)\b",
+        re.IGNORECASE,
+    )
+    _METRIC_INVENTORY_RE = re.compile(
+        r"\b(?:what|which|list|show|enumerate|available|complete|full).*"
+        r"(?:metrics?|metric families|financial measures)\b"
+        r"|\b(?:metrics?|metric families)\s+(?:do you track|are available)\b",
+        re.IGNORECASE,
+    )
+    _CORPUS_SUMMARY_RE = re.compile(
+        r"\bwhat(?:'s| is) in (?:your|the) (?:database|corpus|knowledge base)\b"
+        r"|\b(?:summary|overview|accounting)\b.*\b(?:database|corpus|securities|evidence types)\b"
+        r"|\bhigh[- ]level\b.*\b(?:represented|corpus|database)\b",
+        re.IGNORECASE,
+    )
+    _COVERAGE_CHECK_RE = re.compile(
+        r"\b(?:do you (?:cover|track|have data (?:for|on))|"
+        r"is .{1,80} covered|coverage for|have coverage (?:for|on))\b",
+        re.IGNORECASE,
+    )
+    _CAPABILITY_INVENTORY_RE = re.compile(
+        r"\b(?:available|supported|tracked|covered)\s+(?:companies|company|tickers|securities)\b"
+        r"|\b(?:which|what|list|show|enumerate|every|all|how many)\b.{0,100}"
+        r"\b(?:companies|company|tickers|securities)\b.{0,100}"
+        r"\b(?:cover|coverage|covered|know|available|supported|track|database|answer)\b"
+        r"|\b(?:what can you answer|what do you cover|system capabilities)\b"
+        r"|\bwhich of (?:those|these)\b.{0,80}\b(?:have|with|covered)\b"
+        r"|\b(?:that|the)\s+(?:previously\s+)?returned\s+set\b"
+        r"|\bwhich\s+(?:companies|company|tickers|securities)\b.{0,80}"
+        r"\b(?:have|with)\b.{0,40}\b(?:filings?|transcripts?|news|data)\b"
+        r"|\b(?:companies|company|tickers|securities)\b.{0,80}"
+        r"\b(?:you can answer|you know about|you cover|in your database)\b"
+        r"|\bcovered\s+set\b.{0,80}\b(?:companies|company|tickers|securities)\b",
+        re.IGNORECASE,
+    )
 
     QUESTION_TYPE_PATTERNS = {
         "fact_lookup": [
@@ -295,6 +342,60 @@ class IntentParser:
         re.IGNORECASE,
     )
 
+    _EVIDENCE_TOPIC_PATTERNS = (
+        ("financing", re.compile(
+            r"\b(financ(?:e|ed|ing)|debt raise|raise(?:d|s|ing)? (?:debt|capital)|"
+            r"equity offering|convertible offering|shelf registration|prospectus)\b", re.I)),
+        ("corporate_action", re.compile(
+            r"\b(corporate actions?|buybacks?|repurchases?|dividends?|stock splits?|"
+            r"acqui(?:re[ds]?|sitions?)|mergers?|divest(?:ed|itures?)|dispositions?)\b", re.I)),
+        ("ownership", re.compile(
+            r"\b(beneficial ownership|ownership changes?|insider transactions?|"
+            r"schedule 13[DG]|form [345])\b", re.I)),
+        ("regulatory", re.compile(
+            r"\b(regulatory|regulator|enforcement|investigation|recall|safety alert)\b", re.I)),
+        ("macro_release", re.compile(
+            r"\b(inflation|cpi|gdp|jobs report|payroll|unemployment|economic release|"
+            r"policy decision|rate decision|treasury auction)\b", re.I)),
+        ("company_news", re.compile(
+            r"\b(company news|press release|latest news|recent news|what happened)\b", re.I)),
+    )
+
+    _EVIDENCE_TOPIC_FILTERS = {
+        "financing": {
+            "item_type": "filing",
+            "event_types": [
+                "debt_raise", "equity_raise", "convertible_offering",
+                "shelf_registration", "prospectus_update",
+            ],
+        },
+        "corporate_action": {
+            "item_type": "corporate_action",
+            "event_types": [
+                "acquisition", "divestiture", "buyback", "dividend_change",
+                "split", "dividend", "corporate_action",
+            ],
+        },
+        "ownership": {
+            "item_type": "filing",
+            "event_types": ["beneficial_ownership_change", "insider_transaction"],
+        },
+        "regulatory": {
+            "item_type": "regulatory_event",
+            "event_types": ["enforcement_action", "investigation", "recall", "safety_alert"],
+            "source_categories": ["sec", "regulator", "sector_agency"],
+        },
+        "macro_release": {
+            "item_type": "economic_release",
+            "event_types": ["economic_release", "monetary_policy_decision", "treasury_auction"],
+            "source_categories": ["central_bank", "treasury", "economic_agency"],
+        },
+        "company_news": {
+            "item_type": "news",
+            "source_categories": ["issuer", "company_news"],
+        },
+    }
+
     def __init__(self, resolver: Optional["SymbolResolver"] = None):
         from .symbol_resolver import NO_MATCH, get_default_resolver
 
@@ -345,16 +446,21 @@ class IntentParser:
             ticker = self._detect_ticker(question)
             ticker_resolution = self._last_resolution
 
+        intent_signals = self._classify_all_types(question) or ["general"]
+        evidence_topic, evidence_filters = self._extract_evidence_intent(question)
         intent = {
             "ticker": ticker,
             "metrics": self._extract_metrics(question),
-            "question_type": self._classify_question_type(question),
+            "question_type": intent_signals[0],
+            "intent_signals": intent_signals,
             "timeframe": self._extract_timeframe(question),
             "timeframe_type": self._extract_timeframe_type(question),
             "original_question": question,
             "ticker_confidence": ticker_resolution.confidence,
             "resolved_name": ticker_resolution.resolved_name,
             "ticker_source": ticker_resolution.source,
+            "evidence_topic": evidence_topic,
+            "evidence_filters": evidence_filters,
         }
         logger.debug(
             "Parsed intent: ticker=%s type=%s metrics=%s timeframe=%s",
@@ -391,14 +497,31 @@ class IntentParser:
 
         entities = self._plan_entities(match_text, override_ticker)
         intents = self._classify_all_types(match_text) or ["general"]
+        # Whole-query fuzzy matching is useful for misspelled company research,
+        # but generic inventory wording can resemble an arbitrary catalog name
+        # (for example, "available for questions" -> a ticker). Only an explicit
+        # coverage check is allowed to retain such a fuzzy entity in a catalog
+        # request; exact names/symbols remain untouched for every intent.
+        if set(intents) & self._CAPABILITY_INTENTS and "coverage_check" not in intents:
+            entities = [entity for entity in entities if entity.source != "fuzzy"]
         primary_intent = intents[0]
         metrics = self._extract_metrics(match_text)
         periods = self._extract_all_timeframes(match_text)
+        evidence_topic, evidence_filters = self._extract_evidence_intent(match_text)
+        obligations = self._compile_obligations(
+            match_text, entities, intents, metrics, periods
+        )
 
         reason_codes = self._plan_reason_codes(
             entities, intents, metrics, periods, override_ticker
         )
-        modes = self._subquery_modes(primary_intent, metrics, entities, match_text)
+        modes = self._subquery_modes(
+            primary_intent,
+            metrics,
+            entities,
+            match_text,
+            evidence_modes=obligations.evidence_modes,
+        )
 
         sq0 = QuerySubquery(
             id="sq0",
@@ -424,6 +547,9 @@ class IntentParser:
             primary_intent=primary_intent,
             primary_period=self._extract_timeframe(match_text),
             primary_period_type=self._extract_timeframe_type(match_text),
+            evidence_topic=evidence_topic,
+            evidence_filters=evidence_filters,
+            obligations=obligations,
             reason_codes=reason_codes,
         )
         plan.validate()
@@ -486,17 +612,155 @@ class IntentParser:
         request ("revenue trend, then risks") retains ``trend`` and ``risk``.
         """
         normalized = text.lower()
-        matched: list[str] = []
+        matched: list[str] = self._classify_capability_types(text)
         for qtype in self._TYPE_PRIORITY:
             if qtype == "fact_lookup":
                 if self._matches_fact_lookup(normalized, text):
-                    matched.append(qtype)
+                    if not matched:
+                        matched.append(qtype)
                 continue
             for pattern in self._type_regexes[qtype]:
                 if pattern.search(normalized):
                     matched.append(qtype)
                     break
-        return matched
+        return list(dict.fromkeys(matched))
+
+    def _classify_capability_types(self, text: str) -> list[str]:
+        """Return stable catalog signals without routing on a bare noun."""
+        if self._CORPUS_SUMMARY_RE.search(text):
+            return ["corpus_summary"]
+        if self._SOURCE_INVENTORY_RE.search(text):
+            return ["source_inventory"]
+        if self._METRIC_INVENTORY_RE.search(text):
+            return ["metric_inventory"]
+        if self._CAPABILITY_INVENTORY_RE.search(text):
+            return ["capability_inventory"]
+        if self._COVERAGE_CHECK_RE.search(text):
+            return ["coverage_check"]
+        return []
+
+    def _compile_obligations(
+        self,
+        text: str,
+        entities: list["QueryEntity"],
+        intents: list[str],
+        metrics: list[str],
+        periods: list[str],
+    ):
+        """Compile deterministic answer requirements for routing and grading."""
+        from .query_plan import AnswerObligations
+
+        lowered = text.lower()
+        catalog_intents = set(intents) & self._CAPABILITY_INTENTS
+        entity_set = tuple(entity.ticker for entity in entities)
+
+        item_types: list[str] = []
+        if re.search(r"\btranscripts?\b", lowered):
+            item_types.append("transcript")
+        if re.search(r"\b(?:sec )?filings?|10-[kq]\b", lowered):
+            item_types.append("sec_filing")
+        if re.search(r"\bnews\b", lowered):
+            item_types.append("news")
+
+        sources: list[str] = []
+        for pattern, source in (
+            (r"\bsec\b", "sec"),
+            (r"\bfred\b", "fred"),
+            (r"\byahoo(?: finance)?\b", "yfinance"),
+            (r"\bgdelt\b", "gdelt"),
+        ):
+            if re.search(pattern, lowered):
+                sources.append(source)
+
+        limit_match = re.search(r"\btop\s+(\d{1,3})\b", lowered)
+        bottom_match = re.search(r"\bbottom\s+(\d{1,3})\b", lowered)
+        if re.search(r"\b(?:how many|count|number of)\b", lowered):
+            completeness = "count"
+            limit = None
+        elif limit_match:
+            completeness = "top_n"
+            limit = int(limit_match.group(1))
+        elif bottom_match:
+            completeness = "bottom_n"
+            limit = int(bottom_match.group(1))
+        elif "coverage_check" in catalog_intents:
+            completeness = "existence"
+            limit = None
+        elif "corpus_summary" in catalog_intents:
+            completeness = "count"
+            limit = None
+        elif catalog_intents and re.search(
+            r"\b(?:all|every|which|what|list|show|enumerate|complete|full|available)\b",
+            lowered,
+        ):
+            completeness = "all"
+            limit = None
+        else:
+            completeness = "sample"
+            limit = None
+
+        if re.search(r"\b(?:those|these|that set|that list)\b", lowered) and not entity_set:
+            universe_scope = "unresolved"
+        elif "deep coverage" in lowered:
+            universe_scope = "coverage_tier:deep"
+        elif "broad coverage" in lowered:
+            universe_scope = "coverage_tier:broad"
+        elif re.search(r"\bsemiconductors?\b", lowered):
+            universe_scope = "industry:Semiconductors"
+        elif entity_set:
+            universe_scope = "explicit_entities"
+        elif catalog_intents & {"source_inventory", "metric_inventory", "corpus_summary"}:
+            universe_scope = "corpus"
+        elif catalog_intents:
+            universe_scope = "security_registry"
+        else:
+            universe_scope = None
+
+        qualitative = bool(set(intents) & {"explanation", "risk", "news"})
+        if "comparison" in intents and catalog_intents:
+            operation = "compare"
+        elif "corpus_summary" in catalog_intents:
+            operation = "summary"
+        elif "source_inventory" in catalog_intents:
+            operation = "security_sources" if len(entity_set) == 1 else "list_sources"
+        elif "metric_inventory" in catalog_intents:
+            operation = "list_metrics"
+        elif "coverage_check" in catalog_intents:
+            operation = "contains_security"
+        elif "capability_inventory" in catalog_intents:
+            operation = "list_securities"
+        elif "comparison" in intents:
+            operation = "compare"
+        elif metrics:
+            operation = "lookup"
+        else:
+            operation = "research"
+
+        evidence_modes: list[str] = []
+        if catalog_intents:
+            evidence_modes.append("catalog")
+        if metrics or "comparison" in intents:
+            evidence_modes.append("facts")
+        if qualitative or (not catalog_intents and not metrics):
+            evidence_modes.append("documents")
+
+        as_of = "latest" if re.search(
+            r"\b(?:latest|current|most recent|newest)\b", lowered
+        ) else (periods[0] if len(periods) == 1 else None)
+        obligation_metrics = tuple(metrics) if "metric_inventory" not in catalog_intents else ()
+        return AnswerObligations(
+            entity_set=entity_set,
+            universe_scope=universe_scope,
+            operation=operation,
+            metrics=obligation_metrics,
+            item_types=tuple(dict.fromkeys(item_types)),
+            sources=tuple(dict.fromkeys(sources)),
+            completeness=completeness,
+            limit=limit,
+            as_of=as_of,
+            qualitative=qualitative,
+            evidence_modes=tuple(dict.fromkeys(evidence_modes)),
+        )
 
     def _extract_all_timeframes(self, text: str) -> list[str]:
         """Every explicit timeframe in mention order (deduped).
@@ -535,6 +799,7 @@ class IntentParser:
         metrics: list[str],
         entities: list["QueryEntity"],
         text: str,
+        evidence_modes: tuple[str, ...] = (),
     ) -> tuple[str, ...]:
         """Advisory retrieval-mode hints for ``sq0`` (the 2.2.3.2 router decides).
 
@@ -543,6 +808,14 @@ class IntentParser:
         request has no company entity but names a macro series. The router in
         2.2.3.2 makes the binding lane decision; these are only hints.
         """
+        if evidence_modes:
+            mapped = {
+                "catalog": "tools",
+                "facts": "facts",
+                "documents": "documents",
+            }
+            return tuple(dict.fromkeys(mapped[mode] for mode in evidence_modes))
+
         modes: list[str] = []
         if metrics or primary_intent in {"fact_lookup", "comparison", "projection"}:
             modes.append("facts")
@@ -555,6 +828,19 @@ class IntentParser:
         if not modes:
             modes.append("documents")
         return tuple(dict.fromkeys(modes))
+
+    def _extract_evidence_intent(self, text: str) -> tuple[Optional[str], dict]:
+        """Return provider-independent finance evidence routing facets."""
+        topic = next((name for name, pattern in self._EVIDENCE_TOPIC_PATTERNS if pattern.search(text)), None)
+        filters = dict(self._EVIDENCE_TOPIC_FILTERS.get(topic, {}))
+        years = re.findall(r"\b(?:19|20)\d{2}\b", text)
+        if years:
+            filters["as_of"] = f"{years[0]}-12-31"
+        if re.search(r"\b(latest|newest|current|recent|today)\b", text, re.I):
+            filters["recency"] = "strong"
+        elif re.search(r"\b(historical|history)\b", text, re.I) or years:
+            filters["recency"] = "weak"
+        return topic, filters
 
     @staticmethod
     def _plan_reason_codes(
@@ -634,6 +920,9 @@ class IntentParser:
 
     def _classify_question_type(self, text: str) -> str:
         """Classify the question into a type category."""
+        capability = self._classify_capability_types(text)
+        if capability:
+            return capability[0]
         normalized = text.lower()
 
         for qtype in self._TYPE_PRIORITY:

@@ -427,6 +427,7 @@ def test_sec_filing_family_uses_deterministic_child_ids_and_full_metadata(chroma
     assert call["metadatas"][0] == {
         **metadata, "ticker": "AAPL", "source": "sec_filing", "date": "2025-01-15",
         "chunk_index": 0, "chunk_count": 1, "section": "Item 1. Business",
+        "chunk_ordinal": 0, "child_chunk_id": "sec:ACC-1:item_1#0",
         "document_id": "sec:ACC-1:item_1#0",
     }
 
@@ -503,3 +504,128 @@ def test_count_filing_section_chunks_filters_parent_without_documents(chroma_sto
     chroma_store.collection.get.assert_called_once_with(
         where={"parent_id": "a"}, include=["metadatas"],
     )
+
+
+def test_narrative_family_replay_uses_stable_chunk_ids(chroma_store):
+    text = "First sentence about revenue. " * 80
+    metadata = {
+        "document_family_id": "news-1",
+        "corpus_item_id": "news-1",
+        "source_category": "news_vendor",
+        "source_name": "finnhub",
+        "provider_record_id": "provider-1",
+        "security_ids": "security-1",
+        "tickers": "ACME",
+        "index_memberships": "sp500",
+        "sectors": "Industrials",
+        "industries": "Machinery",
+        "item_type": "news",
+        "published_at": "2026-07-14T00:00:00Z",
+        "content_hash": "a" * 64,
+        "normalization_version": "1",
+        "authority_tier": "provider",
+    }
+    chroma_store.collection.get.return_value = {"ids": [], "metadatas": []}
+
+    chroma_store.add_document(
+        "news-1", text, source="finnhub", metadata=metadata, replace_family=True,
+    )
+    first_ids = chroma_store.collection.upsert.call_args.kwargs["ids"]
+    chroma_store.collection.reset_mock()
+    chroma_store.collection.get.return_value = {
+        "ids": first_ids, "metadatas": metadata,
+    }
+
+    chroma_store.add_document(
+        "news-1", text, source="finnhub", metadata=metadata, replace_family=True,
+    )
+
+    assert chroma_store.collection.upsert.call_args.kwargs["ids"] == first_ids
+    chroma_store.collection.delete.assert_not_called()
+    chunk_metadata = chroma_store.collection.upsert.call_args.kwargs["metadatas"]
+    assert all(row["parent_id"] == "news-1" for row in chunk_metadata)
+    assert [row["chunk_ordinal"] for row in chunk_metadata] == list(range(len(first_ids)))
+    assert [row["child_chunk_id"] for row in chunk_metadata] == first_ids
+
+
+def test_family_replacement_accepts_new_chunks_before_deleting_orphans(chroma_store):
+    chroma_store.collection.get.return_value = {
+        "ids": ["release-1#0", "release-1#1", "release-1#2"],
+        "metadatas": [{"document_family_id": "release-1"}] * 3,
+    }
+
+    chroma_store.add_document(
+        "release-1",
+        "Updated release text.",
+        source="treasury",
+        metadata={"document_family_id": "release-1", "corpus_item_id": "release-1"},
+        replace_family=True,
+    )
+
+    assert chroma_store.collection.upsert.call_args.kwargs["ids"] == ["release-1#0"]
+    chroma_store.collection.get.assert_called_once_with(
+        where={"$or": [
+            {"document_family_id": "release-1"},
+            {"corpus_item_id": "release-1"},
+            {"parent_id": "release-1"},
+        ]},
+        include=["metadatas"],
+    )
+    chroma_store.collection.delete.assert_called_once_with(
+        ids=["release-1#1", "release-1#2"],
+    )
+    calls = [call[0] for call in chroma_store.collection.mock_calls]
+    assert calls.index("upsert") < calls.index("delete")
+
+
+def test_delete_document_family_targets_current_and_legacy_metadata(chroma_store):
+    chroma_store.delete_document_family("news-1")
+
+    chroma_store.collection.delete.assert_called_once_with(where={"$or": [
+        {"document_family_id": "news-1"},
+        {"corpus_item_id": "news-1"},
+        {"parent_id": "news-1"},
+    ]})
+
+
+def test_markdown_table_keeps_heading_and_units_in_its_chunk():
+    from src.storage.chunking import chunk_document
+
+    text = "## Revenue (USD millions)\n| Quarter | Revenue |\n| Q1 | 42 |\n| Q2 | 45 |"
+    chunks = chunk_document(text, source="issuer_release", max_chars=40)
+
+    assert len(chunks) == 1
+    assert "Revenue (USD millions)" in chunks[0]["text"]
+    assert "| Quarter | Revenue |" in chunks[0]["text"]
+
+
+def test_mark_corpus_revision_strips_index_config_keys(chroma_store):
+    """Re-sending hnsw:* keys makes chromadb reject the whole modify call
+    ("Changing the distance function ... is not supported"), which left the
+    Chroma-visible revision permanently stale and silently disabled lexical
+    fusion via the revision-consistency guard (found live 2026-07-17)."""
+    chroma_store.collection.metadata = {"hnsw:space": "cosine", "corpus_revision": 3}
+
+    def _reject_hnsw(metadata):
+        if any(k.startswith("hnsw:") for k in metadata):
+            raise ValueError(
+                "Changing the distance function of a collection once it is "
+                "created is not supported currently.")
+
+    chroma_store.collection.modify.side_effect = (
+        lambda metadata: _reject_hnsw(metadata))
+
+    chroma_store.mark_corpus_revision(7)
+
+    chroma_store.collection.modify.assert_called_once()
+    sent = chroma_store.collection.modify.call_args.kwargs["metadata"]
+    assert sent["corpus_revision"] == 7
+    assert not any(k.startswith("hnsw:") for k in sent)
+
+
+def test_mark_corpus_revision_never_regresses(chroma_store):
+    chroma_store.collection.metadata = {"corpus_revision": 9}
+
+    chroma_store.mark_corpus_revision(7)
+
+    chroma_store.collection.modify.assert_not_called()

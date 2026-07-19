@@ -41,7 +41,8 @@ intent parsing, hybrid retrieval, and prompt augmentation.
 | Intent parser | `src/middleware/intent_parser.py` (`IntentParser`) | Extracts ticker, metrics, question type, timeframe |
 | Retriever | `src/middleware/retriever.py` (`Retriever`) | Selects a retrieval strategy and queries both stores |
 | Prompt augmenter | `src/middleware/prompt_augmenter.py` (`PromptAugmenter`) | Builds the grounded prompt from retrieval results |
-| Unified scheduler | `src/scheduler/__init__.py` (`UnifiedScheduler`) | Orchestrates ingestion with staggered execution + TTL tracking |
+| Unified scheduler | `src/scheduler/__init__.py` (`UnifiedScheduler`) | Runs explicit bootstrap, incremental refresh, repair, and retention controls with budgets/cursors/TTL tracking |
+| Scheduler status | `src/scheduler/status.py` | SQLite-only run summaries and denominator-explicit coverage health |
 | Ingestors | `src/ingestion/`, `src/macros/`, `src/sec/` | Per-source data fetching |
 | Resilience utils | `src/utils/resilience.py` | Retry/backoff, circuit breaker, dead-letter queue |
 | Lexical index | `src/middleware/lexical_index.py` (`LexicalIndex`) | BM25 keyword index over the ChromaDB corpus (Phase 2.1.2.1) |
@@ -161,13 +162,13 @@ Registered tools:
 | `refresh_data` | Yes | Refresh stale or never-fetched sources for one ticker. |
 
 `refresh_data` is intentionally narrow: source aliases are normalized through
-`_normalize_sources()`, and an explicitly invalid request (e.g. `"all"`)
-returns a structured error rather than falling back to a broader refresh.
-Scheduler-managed sources (`sec_filings`, `earnings_transcripts`, `ir_pages`)
-run watchlist-wide via the `UnifiedScheduler`, so the tool skips them and
-reports them in `skipped_scheduler_managed`; only truly per-ticker sources
-(yfinance fundamentals/news, GDELT) are refreshed through
-`_refresh_ticker_sources()`. The human-facing `/refresh` endpoint keeps its
+`_normalize_sources()`, an explicitly invalid or unbounded request (for example
+`"all"`, a universe scope, or more than eight sources) returns a structured
+error, and the target is always one ticker. The handler preflights the same
+source registry, durable request budgets, and persisted provider cooldowns
+used by the scheduler. Scheduler-managed sources (`sec_filings`,
+`earnings_transcripts`, `ir_pages`) are reported as skipped rather than being
+expanded into a broad run. The human-facing `/refresh` endpoint keeps its
 original wider behavior.
 
 ---
@@ -309,6 +310,19 @@ Additive, flag-gated, and local-safe; all off by default.
 
 ---
 
+## Configuration Profiles (Phase 2.3.7.4)
+
+`src/middleware/config.py` resolves middleware settings in this order: code
+defaults, a selected profile, explicit YAML values, and environment overrides.
+The committed `configs/middleware.yaml` selects `recommended`, which matches
+the currently enabled source-of-truth set. `legacy` is a complete Phase 2.2
+rollback with Phase 2.2.3+ optional capabilities off; `evaluation` keeps the
+recommended flags but records trace/progress metadata for promotion arms and is
+not a production default. Profile files are validated as reviewed bundles;
+explicit YAML/environment dependency violations are clamped off with a logged
+warning. This keeps each arm reproducible while preserving one explicit,
+tested rollback path.
+
 ## Data Sources
 
 | Source | Module | Storage target | Scheduler cadence | TTL (hours) |
@@ -374,6 +388,72 @@ all ingestion:
 Each ingestor marks its per-ticker cache entry fresh in `cache_meta` on
 success, which feeds the freshness reports surfaced by the middleware.
 
+### Operational run modes (Phase 2.3.4.3)
+
+The four operational modes are deliberately separate:
+
+| Mode | Behavior | Safety boundary |
+|---|---|---|
+| `bootstrap` | Explicit, resumable current-universe plus bounded SEC, company-news, market, and macro population | Partition checkpoints; no broad full periodic-filing backfill |
+| `daily` / legacy incremental modes | TTL/cursor/overlap-driven refresh through the source registry | Missing keys and open circuits remain skipped/stale, never fresh |
+| `repair` | Re-indexes stored pending/error narratives and stored SEC artifacts | No provider download; bounded filters and item limit |
+| `retention` | Previews and explicitly applies configured narrative expiry | Daily refresh never invokes it; apply uses the displayed ID set |
+
+Every operation writes one `scheduler_runs` row and one
+`scheduler_run_sources` row per requested source. The rows retain policy and
+registry revisions, timings, counts, cursor/quota/freshness snapshots, and a
+redacted terminal error class/message. `bootstrap_partitions` is the durable
+resume ledger: the manifest is created with the run header, and resumed source
+counts are aggregated from completed checkpoints. Historical terminal runs
+are pruned to the configured bound without deleting active/resumable runs.
+
+`status` combines those rows with `cache_meta` compatibility freshness and the
+SQLite-only `build_coverage_health()` projection. It reports active-security
+denominators by index/scope/sector, recent news/market/SEC coverage, source
+partition states, indexing backlog, corpus date bounds, and last successful
+refresh. It does not invoke network, Chroma embedding, or provider code.
+
+### Source registry, budgets, and provider circuits (Phase 2.3.4.1–2.3.4.2)
+
+`configs/sources.yaml` replaced the scheduler's static source dictionary with
+a validated, data-driven registry. `SourceRegistry.load()`
+(`src/scheduler/source_registry.py`) parses each entry into a `SourceSpec`
+(`capability_group`, `scope`, `cadence`/`run_modes`, `priority`,
+`dependencies`, `cursor_kind`, `overlap`, `requests_per_minute/day/run`,
+`batch_size`, `max_work_items_per_run`, `retry_policy`, `ttl_key`/`ttl_hours`,
+optional `required_env`); an invalid entry or unknown dependency is converted
+to a disabled `status: invalid_configuration` spec instead of raising, so one
+bad definition never crashes registry load or another source's run
+(`SourceSpec.is_available`). `UnifiedScheduler` reads `self.SOURCES` from the
+loaded registry rather than a hard-coded dict.
+
+- **Incremental cursors.** `CursorManager` (`src/scheduler/cursors.py`)
+  persists one transactional `source_cursors` row per source+partition and
+  orders partitions fair-oldest-first on resume; each source's `overlap`
+  window (e.g. `6h`, `2d`) is re-fetched on top of the last cursor so a
+  late-arriving record is never missed by an incremental run.
+- **Durable budgets.** `RunBudget` (`src/scheduler/budget.py`) enforces
+  per-run minute/day/run request and work-item caps *before* work starts, and
+  persists attempted/successful counts across process restarts via
+  `Store.get_source_budget_usage` / `record_source_budget_usage`. `--force`
+  bypasses only freshness (TTL) checks — it never bypasses registry
+  availability, request budgets, or an open provider circuit.
+- **Error taxonomy.** `src/ingestion/errors.py` normalizes every adapter
+  failure into one of eight `ErrorClass` values: `authentication`,
+  `entitlement`, `rate_limited`, `quota_exhausted` (provider-wide — stop only
+  that source), `transient`, `contract`, `item` (source-local), and
+  `permanent`. Only `rate_limited`/`transient` are retryable. `ProviderError`
+  carries a `safe_message` (credential/token-redacted before it reaches logs,
+  `scheduler_run_sources`, or the DLQ) and a parsed retry window
+  (`parse_retry_after`, accepting numeric seconds or an HTTP-date Retry-After
+  header).
+- **Provider circuits.** A provider-wide failure opens a per-source circuit
+  persisted in `source_circuit_state` with its cooldown reset timestamp; the
+  circuit is consulted on every later invocation, including a fresh process,
+  until the reset passes — so an exhausted or unentitled provider stops being
+  retried without ever blocking a different source in the same run. Failures
+  are additionally recorded in a deduplicated bounded dead-letter queue.
+
 ---
 
 ## Storage Layer
@@ -384,11 +464,46 @@ WAL journaling and foreign keys are enabled per connection. The schema is
 loaded from `docs/phase1.2/schema.sql` if present, otherwise from the inline
 DDL in `SQLiteStore._inline_schema()`.
 
+### Ordered schema migration and Phase 2.3 backfill
+
+`SQLiteStore` distinguishes a brand-new database from an existing application
+database. New databases bootstrap from the canonical (or inline fallback)
+final DDL. Existing databases retain their Phase 2.2 tables and are upgraded by
+five standard-library SQL migrations in dependency order:
+
+```text
+identities -> corpus bridge -> observations/events -> refresh state -> indexes
+```
+
+Each applied file is checksum-protected in `schema_migrations`. Conditional
+legacy columns (`security_id`, filing index metadata, retention accounting)
+are added transactionally by the runner because SQLite has no portable
+`ADD COLUMN IF NOT EXISTS`. No migration deletes a row or Chroma family.
+
+The explicit `scripts/migrate_phase2_3.py` command performs data backfill. It
+creates deterministic legacy security/corpus IDs, attaches a CIK only when the
+ticker-to-CIK mapping is unique, and links legacy structured tables through
+nullable canonical security IDs. Chroma is read metadata-only and one SQLite
+ledger row is created per stable family; unchanged text is never re-embedded.
+Ambiguous/orphan records enter `identity_reconciliation_errors`. Stage cursors
+and a Store revision increment commit with every bounded batch.
+
+All Phase 2.3 rollout controls are additive and default off. Disabling a
+capability stops new scheduling or selects the Phase 2.2 query/projection path;
+it never hides or destroys stored evidence. Operational rollback is flags-only.
+
 | Table | Purpose | Key columns |
 |-------|---------|-------------|
 | `fundamentals` | Structured financial metrics | `ticker`, `metric`, `value`, `unit`, `period`, `period_type`, `source_type`, `source_url`, `ingested_at`; `UNIQUE(ticker, metric, period)` |
 | `filings` | SEC filing index / processing state | `ticker`, `filing_type`, `filing_date`, `period`, `accession` (UNIQUE), `source_url`, `file_path`, `status` (`unprocessed`/`parsed`), `summary_embedding_id` |
 | `cache_meta` | Per-(ticker, source) freshness/TTL | `ticker`, `source`, `metric_scope`, `last_updated`, `next_scheduled_update`, `status` (`fresh`/`stale`/`fetching`), `error_message`; `PRIMARY KEY (ticker, source, metric_scope)` |
+| `scheduler_runs` | Bounded operation headers | `run_id`, `mode`, policy/config revisions, timings, source rollups, safe terminal error |
+| `scheduler_run_sources` | Per-source operation summaries | counts, cursor before/after, quota remaining, freshness/next due/cooldown, safe error |
+| `bootstrap_partitions` | Resumable bootstrap manifest/checkpoints | `run_id`, `source`, `partition_key`, status, attempts, item/new/updated/duplicate counts |
+| `schema_migrations` | Ordered schema history | version, name, SHA-256 checksum, applied timestamp |
+| `identity_reconciliation_errors` | Review queue for unresolved legacy identities | stable id, stage/table/row, identifier, issue type, candidates |
+| `phase2_3_backfill_progress` | Resumable metadata migration cursors | stage, cursor, completion, processed count |
+| `source_circuit_state` | Additive provider circuit/cooldown state | source, status, failures, cooldown, safe error metadata |
 | `ingestion_log` | Audit log of ingestion runs | `run_id`, `ticker`, `source`, `status`, `items_processed`/`items_new`/`items_updated`, `started_at`, `completed_at`, `duration_seconds` |
 | `dead_letter` | Persistently failing items (lazily created) | `source`, `item_key`, `error`, `failed_at`, `retry_count`, `last_error`; `PRIMARY KEY (source, item_key)` |
 
@@ -625,6 +740,42 @@ model; every page is hard-bounded and keyed to `Store.retrieval_revision()` via
 opaque cursors so a mid-browse ingestion write is detected (HTTP 409) rather than
 silently mixing revisions. The overview is cached for a short TTL keyed by
 revision.
+
+### Phase 2.3 scale — source-aware Live Trace and Corpus Explorer
+
+Both projections extend additively to the broad-universe corpus without
+changing the observability-graph schema (`schema_version` stays `1`) or the
+query path.
+
+- **Source-aware Live Trace (2.3.5.1).** `evidence`/`source`/`citation` nodes
+  carry additional allowlisted fields on top of the Phase 2.2 shape: security
+  identity (`security_id`, `canonical_security`), index membership
+  (`index_memberships`), `sector`, `source_category`, `authority_tier`,
+  `coverage_tier`, provider vs. publisher (`provider`, `publisher`,
+  `source_name`), `item_type`/`event_type`, filing `form`/`filing_item`/
+  `exhibit`, date semantics (`published_at`, `effective_at`, `accessed_at`),
+  and an `evidence_role` of `primary` or `corroborating` so the trace shows
+  which source directly substantiates a claim versus which one corroborates
+  it. Every field is an already-safe scalar, bounded date, or opaque id —
+  never a key, payload, or full document body. The shared `stage:route` node
+  identity is preserved through both the legacy and adaptive-fallback paths,
+  and the Phase 2.2 golden trace fixture is untouched by the additive fields.
+- **Aggregation-first Corpus Explorer (2.3.5.2–2.3.5.3).** The explorer opens
+  on a bounded aggregate landing (market universe → index → sector → security
+  → source category → item/event type → time bucket) instead of rendering the
+  corpus directly, with a persistent, combinable facet rail backed by
+  authoritative SQLite-only counts. `CorpusGraph`
+  (`src/middleware/corpus_graph.py`) adds `aggregates()`, `facets()`,
+  `groups()`, and `item_detail()` alongside the Phase 2.2.7.2 `overview()`/
+  `search()`/`detail()`/`neighbors()`; every method is paged and
+  revision-aware — a mid-browse ingestion write is detected and surfaced as
+  HTTP 409 (`CorpusRevisionChanged`) rather than silently mixing revisions.
+  URL-hash deep links hold the full filter state client-side (no server
+  storage, no cookies). The bounded-scale fixture exercised in the offline
+  gate seeds 600 securities across 11 sectors with overlapping index
+  memberships and 100,000 corpus items, asserting warm p95 under 250 ms for
+  overview/facet queries and under 300 ms for a filtered first page on the
+  reference machine.
 
 ### Serving & security
 

@@ -14,7 +14,8 @@ from fastapi.responses import StreamingResponse
 
 from .graph_observer import TraceHub
 from .corpus_graph import CorpusGraph, CorpusRevisionChanged
-from .models import (
+from .graph_models import (
+    CorpusFacetFilters,
     CorpusGraphResponse,
     GraphHealthResponse,
     GraphTraceSnapshot,
@@ -82,6 +83,11 @@ def create_graph_router(
         nonlocal corpus_projector, corpus_store
         if not is_enabled() or get_store is None:
             raise HTTPException(status_code=404, detail="Graph observer disabled")
+        config = get_config() if get_config is not None else None
+        if config is not None and not bool(
+            getattr(config, "enable_phase2_3_corpus_projection", True)
+        ):
+            raise HTTPException(status_code=404, detail="Corpus projection disabled")
         current_store = get_store()
         if current_store is None:
             raise HTTPException(status_code=404, detail="Graph observer disabled")
@@ -90,17 +96,20 @@ def create_graph_router(
             corpus_projector = CorpusGraph(
                 current_store,
                 page_limit=int(getattr(cfg, "corpus_page_limit", 100)),
+                default_page_limit=int(getattr(cfg, "corpus_default_page_limit", 50)),
                 element_limit=int(getattr(cfg, "corpus_element_limit", 2000)),
                 visible_node_target=int(getattr(cfg, "corpus_visible_node_target", 450)),
                 overview_ttl_s=float(getattr(cfg, "corpus_overview_cache_ttl_s", 2.0)),
                 id_ttl_s=float(getattr(cfg, "corpus_opaque_id_ttl_s", 300.0)),
+                excerpt_bytes=int(getattr(cfg, "corpus_inspector_excerpt_bytes", 1000)),
+                metadata_bytes=int(getattr(cfg, "corpus_inspector_metadata_bytes", 4000)),
             )
             corpus_store = current_store
         return corpus_projector
 
     def corpus_limit(projector: CorpusGraph, limit: Optional[int]) -> int:
         """Use the configured page default and map invalid caps to HTTP 422."""
-        value = projector.page_limit if limit is None else limit
+        value = projector.default_page_limit if limit is None else limit
         try:
             return projector._validate_limit(value)
         except ValueError as exc:
@@ -152,20 +161,72 @@ def create_graph_router(
         kinds: Optional[list[str]] = Query(None, max_length=256),
         sources: Optional[list[str]] = Query(None, max_length=256),
         ticker: Optional[str] = Query(None, max_length=32),
+        facets: CorpusFacetFilters = Depends(),
         limit: Optional[int] = Query(None),
         cursor: Optional[str] = Query(None, max_length=2_048),
     ) -> dict:
-        """Search labels/metadata only; this route never invokes embeddings."""
+        """Search labels/metadata only; this route never invokes embeddings.
+
+        Server-side facet filters narrow the same authoritative metadata; a
+        filter change resets paging by changing the opaque cursor scope.
+        """
         projector = enabled_corpus()
         page_limit = corpus_limit(projector, limit)
         try:
             return projector.search(
                 q=q, kinds=_csv(kinds), sources=_csv(sources), ticker=ticker,
-                limit=page_limit, cursor=cursor,
+                filters=facets.as_filters(), limit=page_limit, cursor=cursor,
             )
         except (CorpusRevisionChanged, ValueError) as exc:
             corpus_error(exc)
         return {}  # pragma: no cover
+
+    @router.get("/corpus/facets", response_model=CorpusGraphResponse)
+    def corpus_facets(
+        facets: CorpusFacetFilters = Depends(),
+        dimensions: Optional[list[str]] = Query(None, max_length=256),
+    ) -> dict:
+        """Return bounded facet counts for the current filter set (cached)."""
+        try:
+            return enabled_corpus().facets(
+                filters=facets.as_filters(), dimensions=_csv(dimensions),
+            )
+        except HTTPException:
+            raise
+        except (CorpusRevisionChanged, ValueError) as exc:
+            corpus_error(exc)
+        return {}  # pragma: no cover
+
+    @router.get("/corpus/groups", response_model=CorpusGraphResponse)
+    def corpus_groups(
+        group_by: str = Query("source_category", max_length=32),
+        facets: CorpusFacetFilters = Depends(),
+        limit: Optional[int] = Query(None),
+        cursor: Optional[str] = Query(None, max_length=2_048),
+    ) -> dict:
+        """Return one paged aggregate level as drillable, counted nodes."""
+        projector = enabled_corpus()
+        page_limit = corpus_limit(projector, limit)
+        try:
+            return projector.groups(
+                group_by, filters=facets.as_filters(), limit=page_limit,
+                cursor=cursor,
+            )
+        except (CorpusRevisionChanged, ValueError) as exc:
+            corpus_error(exc)
+        return {}  # pragma: no cover
+
+    @router.get("/corpus/items/{node_id}", response_model=CorpusGraphResponse)
+    def corpus_item(node_id: str) -> dict:
+        """Return one bounded corpus-item/event detail with safe provenance."""
+        projector = enabled_corpus()
+        try:
+            result = projector.item_detail(node_id)
+        except ValueError as exc:
+            corpus_error(exc, missing_is_404=True)
+        if result is None:
+            raise HTTPException(status_code=404, detail="Corpus item not found")
+        return result
 
     @router.get("/corpus/nodes/{node_id}", response_model=CorpusGraphResponse)
     def corpus_node(node_id: str) -> dict:
@@ -212,6 +273,36 @@ def create_graph_router(
             )
         except (CorpusRevisionChanged, KeyError, ValueError) as exc:
             corpus_error(exc, missing_is_404=isinstance(exc, KeyError))
+        return {}  # pragma: no cover
+
+    @router.get("/corpus/aggregates", response_model=CorpusGraphResponse)
+    def corpus_aggregates(
+        group_by: str = Query("source_category", max_length=32),
+        source_category: Optional[str] = Query(None, max_length=64),
+        source: Optional[str] = Query(None, max_length=64),
+        item_type: Optional[str] = Query(None, max_length=64),
+        security: Optional[str] = Query(None, max_length=64),
+        year: Optional[str] = Query(None, max_length=8),
+        month: Optional[str] = Query(None, max_length=8),
+        indexing_state: Optional[str] = Query(None, max_length=32),
+        limit: Optional[int] = Query(None),
+        cursor: Optional[str] = Query(None, max_length=2_048),
+    ) -> dict:
+        """Return bounded authoritative facet counts; never scans Chroma bodies."""
+        projector = enabled_corpus()
+        page_limit = corpus_limit(projector, limit)
+        try:
+            return projector.aggregates(
+                group_by,
+                filters={
+                    "source_category": source_category, "source": source,
+                    "item_type": item_type, "security": security,
+                    "year": year, "month": month, "indexing_state": indexing_state,
+                },
+                limit=page_limit, cursor=cursor,
+            )
+        except (CorpusRevisionChanged, ValueError) as exc:
+            corpus_error(exc)
         return {}  # pragma: no cover
 
     @router.get("/corpus/refresh-status", response_model=CorpusGraphResponse)

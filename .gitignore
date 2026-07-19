@@ -61,3 +61,8 @@ configs/model.local.yaml
 
 # Claude Code local (machine-specific) settings; project skills ARE committed
 .claude/settings.local.json
+
+# Local loop notes
+/how-to-loop-global.md
+/how-to-loop.md
+/loops.txt

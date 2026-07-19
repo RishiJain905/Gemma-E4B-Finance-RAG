@@ -97,9 +97,19 @@ class CitationRecord:
     period: Optional[str]
     source_url: Optional[str]
     support_status: str  # supported | missing | malformed
+    item_type: Optional[str] = None
+    event_type: Optional[str] = None
+    authority_tier: Optional[str] = None
+    source: Optional[str] = None
+    date_semantics: Optional[dict] = None
+    canonical_security: Optional[str] = None
+    coverage_tier: Optional[str] = None
+    source_category: Optional[str] = None
+    provider: Optional[str] = None
+    publisher: Optional[str] = None
 
     def to_dict(self) -> dict:
-        return {
+        data = {
             "evidence_id": self.evidence_id,
             "source_type": self.source_type,
             "ticker": self.ticker,
@@ -108,10 +118,28 @@ class CitationRecord:
             "source_url": self.source_url,
             "support_status": self.support_status,
         }
+        data.update(self._taxonomy_reference())
+        return data
+
+    def _taxonomy_reference(self) -> dict:
+        """Return populated stable taxonomy fields without changing legacy rows."""
+        values = {
+            "item_type": self.item_type,
+            "event_type": self.event_type,
+            "authority_tier": self.authority_tier,
+            "source": self.source,
+            "date_semantics": self.date_semantics,
+            "canonical_security": self.canonical_security,
+            "coverage_tier": self.coverage_tier,
+            "source_category": self.source_category,
+            "provider": self.provider,
+            "publisher": self.publisher,
+        }
+        return {key: value for key, value in values.items() if value not in (None, {})}
 
     def graph_reference(self) -> dict:
         """Return the allowlisted provenance fields used by graph citations."""
-        return {
+        data = {
             "evidence_id": self.evidence_id,
             "source_type": self.source_type,
             "ticker": self.ticker,
@@ -119,6 +147,8 @@ class CitationRecord:
             "period": self.period,
             "support_status": self.support_status,
         }
+        data.update(self._taxonomy_reference())
+        return data
 
 
 @dataclass
@@ -205,7 +235,6 @@ class AnswerValidation:
             "citations_malformed": self.citations_malformed,
             "mismatch_counts": dict(self.mismatch_counts),
         }
-
     @classmethod
     def unavailable(cls) -> "AnswerValidation":
         """Fail-soft sentinel used when the validator itself errors."""
@@ -219,6 +248,10 @@ class AnswerValidation:
             claims=(),
             mismatch_counts={},
         )
+
+
+class DeterministicValidationError(ValueError):
+    """A typed deterministic answer did not resolve exactly to its evidence."""
 
 
 # ── Internal numeric view ─────────────────────────────────────────────────
@@ -394,6 +427,16 @@ def _parse_citations(answer: str, by_id: dict) -> list[CitationRecord]:
                     period=item.period,
                     source_url=item.source_url,
                     support_status="supported",
+                    item_type=item.item_type,
+                    event_type=item.event_type,
+                    authority_tier=item.authority_tier,
+                    source=item.source or item.source_type,
+                    date_semantics=dict(item.date_semantics),
+                    canonical_security=item.canonical_security,
+                    coverage_tier=item.coverage_tier,
+                    source_category=item.source_category,
+                    provider=item.provider,
+                    publisher=item.publisher,
                 ))
             else:
                 records.append(CitationRecord(
@@ -596,6 +639,37 @@ def validate_answer(
             "validate", "completed",
             elapsed_ms=(perf_counter() - started_at) * 1000,
             reason=result.status,
+        )
+    return result
+
+
+def validate_deterministic_answer(
+    answer: str,
+    ledger,
+    *,
+    calculations: Optional[list[dict]] = None,
+) -> AnswerValidation:
+    """Validate a deterministic answer under the strict fast-path contract.
+
+    Unlike report/enforce model validation, any unresolved citation or numeric
+    claim rejects the skip and lets the caller fall back to normal generation.
+    """
+    result = validate_answer(
+        answer,
+        ledger,
+        calculations=calculations,
+        require_evidence_ids=True,
+    )
+    if (
+        result.status not in {"supported", "no_claims"}
+        or result.numeric_claims_unsupported
+        or result.numeric_claims_ambiguous
+        or result.citations_missing
+        or result.citations_malformed
+        or (result.numeric_claims_total and not result.citations_resolved)
+    ):
+        raise DeterministicValidationError(
+            "deterministic answer did not resolve exactly to supplied evidence"
         )
     return result
 

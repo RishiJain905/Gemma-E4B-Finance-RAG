@@ -16,6 +16,7 @@ from .base import (
 )
 
 from . import data_tools  # noqa: F401
+from . import coverage_tools  # noqa: F401
 
 __all__ = [
     "REGISTRY",

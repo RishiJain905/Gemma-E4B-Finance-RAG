@@ -1,0 +1,96 @@
+{
+  "cases": [
+    {
+      "id": "inventory-concise",
+      "pair_id": "inventory",
+      "question": "List all supported tickers.",
+      "expected_intents": ["capability_inventory"],
+      "expected_obligations": {"operation": "list_securities", "universe_scope": "security_registry", "entity_set": [], "metrics": [], "item_types": [], "sources": [], "completeness": "all", "limit": null, "as_of": null, "qualitative": false, "evidence_modes": ["catalog"]}
+    },
+    {
+      "id": "inventory-verbose",
+      "pair_id": "inventory",
+      "question": "Could you tell me every company currently available in the set of securities you can answer questions about?",
+      "expected_intents": ["capability_inventory"],
+      "expected_obligations": {"operation": "list_securities", "universe_scope": "security_registry", "entity_set": [], "metrics": [], "item_types": [], "sources": [], "completeness": "all", "limit": null, "as_of": null, "qualitative": false, "evidence_modes": ["catalog"]}
+    },
+    {
+      "id": "sources-concise",
+      "pair_id": "sources",
+      "question": "What sources do you have?",
+      "expected_intents": ["source_inventory"],
+      "expected_obligations": {"operation": "list_sources", "universe_scope": "corpus", "entity_set": [], "metrics": [], "item_types": [], "sources": [], "completeness": "all", "limit": null, "as_of": null, "qualitative": false, "evidence_modes": ["catalog"]}
+    },
+    {
+      "id": "sources-verbose",
+      "pair_id": "sources",
+      "question": "Please enumerate the complete set of data providers and source categories represented in your corpus.",
+      "expected_intents": ["source_inventory"],
+      "expected_obligations": {"operation": "list_sources", "universe_scope": "corpus", "entity_set": [], "metrics": [], "item_types": [], "sources": [], "completeness": "all", "limit": null, "as_of": null, "qualitative": false, "evidence_modes": ["catalog"]}
+    },
+    {
+      "id": "metrics-concise",
+      "pair_id": "metrics",
+      "question": "Which metrics do you track?",
+      "expected_intents": ["metric_inventory"],
+      "expected_obligations": {"operation": "list_metrics", "universe_scope": "corpus", "entity_set": [], "metrics": [], "item_types": [], "sources": [], "completeness": "all", "limit": null, "as_of": null, "qualitative": false, "evidence_modes": ["catalog"]}
+    },
+    {
+      "id": "metrics-verbose",
+      "pair_id": "metrics",
+      "question": "What is the full inventory of financial metric families available for questions?",
+      "expected_intents": ["metric_inventory"],
+      "expected_obligations": {"operation": "list_metrics", "universe_scope": "corpus", "entity_set": [], "metrics": [], "item_types": [], "sources": [], "completeness": "all", "limit": null, "as_of": null, "qualitative": false, "evidence_modes": ["catalog"]}
+    },
+    {
+      "id": "summary-concise",
+      "pair_id": "summary",
+      "question": "What is in your database?",
+      "expected_intents": ["corpus_summary"],
+      "expected_obligations": {"operation": "summary", "universe_scope": "corpus", "entity_set": [], "metrics": [], "item_types": [], "sources": [], "completeness": "count", "limit": null, "as_of": null, "qualitative": false, "evidence_modes": ["catalog"]}
+    },
+    {
+      "id": "summary-verbose",
+      "pair_id": "summary",
+      "question": "Give me a high-level accounting of the securities, evidence types, and metrics currently represented in the corpus.",
+      "expected_intents": ["corpus_summary"],
+      "expected_obligations": {"operation": "summary", "universe_scope": "corpus", "entity_set": [], "metrics": [], "item_types": [], "sources": [], "completeness": "count", "limit": null, "as_of": null, "qualitative": false, "evidence_modes": ["catalog"]}
+    },
+    {
+      "id": "coverage-apple",
+      "question": "Do you have data for Apple?",
+      "expected_intents": ["coverage_check"],
+      "expected_obligations": {"operation": "contains_security", "universe_scope": "explicit_entities", "entity_set": ["AAPL"], "metrics": [], "item_types": [], "sources": [], "completeness": "existence", "limit": null, "as_of": null, "qualitative": false, "evidence_modes": ["catalog"]}
+    },
+    {
+      "id": "research-apple-negative",
+      "question": "What do you know about Apple?",
+      "expected_intents": ["general"],
+      "expected_obligations": {"operation": "research", "universe_scope": "explicit_entities", "entity_set": ["AAPL"], "metrics": [], "item_types": [], "sources": [], "completeness": "sample", "limit": null, "as_of": null, "qualitative": false, "evidence_modes": ["documents"]}
+    },
+    {
+      "id": "count-companies",
+      "question": "How many companies are in your database?",
+      "expected_intents": ["capability_inventory"],
+      "expected_obligations": {"operation": "list_securities", "universe_scope": "security_registry", "entity_set": [], "metrics": [], "item_types": [], "sources": [], "completeness": "count", "limit": null, "as_of": null, "qualitative": false, "evidence_modes": ["catalog"]}
+    },
+    {
+      "id": "deep-coverage",
+      "question": "Which companies have deep coverage?",
+      "expected_intents": ["capability_inventory"],
+      "expected_obligations": {"operation": "list_securities", "universe_scope": "coverage_tier:deep", "entity_set": [], "metrics": [], "item_types": [], "sources": [], "completeness": "all", "limit": null, "as_of": null, "qualitative": false, "evidence_modes": ["catalog"]}
+    },
+    {
+      "id": "mixed-semiconductor-margin",
+      "question": "Which semiconductor companies do you cover, and compare their latest margins?",
+      "expected_intents": ["capability_inventory", "comparison"],
+      "expected_obligations": {"operation": "compare", "universe_scope": "industry:Semiconductors", "entity_set": [], "metrics": ["gross_margin_pct"], "item_types": [], "sources": [], "completeness": "all", "limit": null, "as_of": "latest", "qualitative": false, "evidence_modes": ["catalog", "facts"]}
+    },
+    {
+      "id": "ambiguous-those",
+      "question": "Which of those also have transcripts?",
+      "expected_intents": ["capability_inventory"],
+      "expected_obligations": {"operation": "list_securities", "universe_scope": "unresolved", "entity_set": [], "metrics": [], "item_types": ["transcript"], "sources": [], "completeness": "all", "limit": null, "as_of": null, "qualitative": false, "evidence_modes": ["catalog"]}
+    }
+  ]
+}

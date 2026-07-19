@@ -1,0 +1,13 @@
+{
+  "response": {
+    "id": "eia-fixture",
+    "description": "Energy indicators",
+    "units": "varies",
+    "data": [
+      {"seriesId": "PET.RWTC.D", "period": "2026-07-13", "value": "78.42", "unit": "dollars per barrel", "vintage_date": "2026-07-14", "record_id": "eia-price-20260713"},
+      {"seriesId": "PET.WCRSTUS1.W", "period": "2026-07-10", "value": "442.1", "unit": "million barrels", "vintage_date": "2026-07-14", "record_id": "eia-inventory-20260710"},
+      {"seriesId": "ELEC.GEN.ALL-US-99.M", "period": "2026-06", "value": "410000", "unit": "thousand megawatthours", "vintage_date": "2026-07-14", "record_id": "eia-generation-202606"},
+      {"seriesId": "NG.PROD.TX-1.M", "period": "2026-06", "value": "12.7", "unit": "billion cubic feet", "vintage_date": "2026-07-14", "record_id": "eia-production-202606"}
+    ]
+  }
+}

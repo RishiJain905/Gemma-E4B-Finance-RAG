@@ -70,10 +70,10 @@ class TestGDELTIngestor:
         assert len(ingestor.TICKER_TO_QUERY) > 20
         assert "NVDA" in ingestor.TICKER_TO_QUERY
 
-    def test_process_articles_dedup(self):
+    def test_process_articles_dedup(self, store):
         """Duplicate URLs are removed during processing."""
         from src.macros.gdelt_ingestor import GDELTIngestor
-        ingestor = GDELTIngestor()
+        ingestor = GDELTIngestor(store=store)
 
         articles = [
             {"url": "https://example.com/news1", "title": "News 1",
@@ -87,10 +87,10 @@ class TestGDELTIngestor:
         processed = ingestor._process_articles(articles, "NVDA")
         assert len(processed) == 2
 
-    def test_process_articles_parses_tone(self):
+    def test_process_articles_parses_tone(self, store):
         """Tone scores are parsed correctly as floats."""
         from src.macros.gdelt_ingestor import GDELTIngestor
-        ingestor = GDELTIngestor()
+        ingestor = GDELTIngestor(store=store)
 
         articles = [
             {"url": "https://example.com/nvda1", "title": "NVDA Up",
@@ -106,10 +106,10 @@ class TestGDELTIngestor:
         assert processed[0]["tone"] == 12.5
         assert processed[1]["tone"] == -8.3
 
-    def test_process_articles_missing_fields(self):
+    def test_process_articles_missing_fields(self, store):
         """Articles missing critical fields are filtered."""
         from src.macros.gdelt_ingestor import GDELTIngestor
-        ingestor = GDELTIngestor()
+        ingestor = GDELTIngestor(store=store)
 
         articles = [
             {"url": "", "title": "No URL", "content": "Missing URL"},
@@ -253,25 +253,53 @@ class TestGDELTIngestor:
         assert mock_get.call_count == 2
         assert mock_get.call_args_list[1].args[0]["query"] == "NVIDIA"
 
-    def test_search_gdelt_falls_back_after_429(self, store):
-        """429 exhaustion on domain query still retries bare keyword once."""
-        from src.macros.gdelt_ingestor import GDELTIngestor
+    def test_http_429_exhaustion_raises_rate_limit_error(self, store):
+        """The HTTP layer preserves an exhausted 429 as a typed failure."""
+        from src.macros.gdelt_ingestor import GDELTIngestor, GDELTRateLimitError
+
+        ingestor = GDELTIngestor(store=store)
+        ingestor.config["request_delay"] = 5.0
+        ingestor.config["max_retries_on_429"] = 2
+
+        response = MagicMock()
+        response.status_code = 429
+        response.headers = {"retry-after": "60"}
+
+        with patch(
+            "src.macros.gdelt_ingestor.httpx.get", return_value=response,
+        ) as mock_get, patch("src.macros.gdelt_ingestor.time.sleep") as mock_sleep:
+            with pytest.raises(GDELTRateLimitError, match="retry after 60") as caught:
+                ingestor._doc_api_get({"query": "NVIDIA"})
+
+        assert mock_get.call_count == 3
+        assert [call.args[0] for call in mock_sleep.call_args_list] == [60.0, 60.0]
+        assert caught.value.error_class == "rate_limited"
+        assert caught.value.attempts == 3
+        assert len(caught.value.retry_timestamps) == 2
+        assert caught.value.reset_at is not None
+
+    def test_rate_limit_exhaustion_aborts_alias_and_fallback_queries(self, store):
+        """A rate-limited ticker stops after one query's three attempts."""
+        from src.macros.gdelt_ingestor import GDELTIngestor, GDELTRateLimitError
+
         ingestor = GDELTIngestor(store=store)
         ingestor.config["finance_domains"] = ["reuters.com"]
+        ingestor.config["request_delay"] = 0
+        ingestor.config["max_retries_on_429"] = 2
 
-        json_response = MagicMock()
-        json_response.text = (
-            '{"articles": [{"url": "https://example.com/nvda", "title": "NVDA news"}]}'
-        )
-        json_response.headers = {"content-type": "application/json"}
+        response = MagicMock()
+        response.status_code = 429
+        response.headers = {}
 
-        with patch.object(
-            ingestor, "_doc_api_get", side_effect=[None, json_response],
-        ) as mock_get:
-            articles = ingestor._search_gdelt("NVIDIA", max_records=5, lookback_days=7)
+        with patch(
+            "src.macros.gdelt_ingestor.httpx.get", return_value=response,
+        ) as mock_get, patch("src.macros.gdelt_ingestor.time.sleep"):
+            with pytest.raises(GDELTRateLimitError):
+                ingestor.fetch_news_for_ticker("NVDA", max_records=10)
 
-        assert len(articles) == 1
-        assert mock_get.call_count == 2
+        assert mock_get.call_count == 3
+        queries = [call.kwargs["params"]["query"] for call in mock_get.call_args_list]
+        assert all(query.startswith("NVIDIA ") for query in queries)
 
     def test_parse_doc_api_articles_non_json(self, store):
         """Non-JSON DOC API bodies log a warning and return []."""
@@ -377,10 +405,10 @@ class TestGDELTIngestor:
         topics = ingestor.config.get("financial_topics", [])
         assert mock_search.call_count == len(topics)
 
-    def test_parse_v2tone(self):
+    def test_parse_v2tone(self, store):
         """V2Tone CSV field parses to average tone float."""
         from src.macros.gdelt_ingestor import GDELTIngestor
-        ingestor = GDELTIngestor()
+        ingestor = GDELTIngestor(store=store)
 
         assert ingestor._parse_v2tone(
             "1.86,2.83,0.97,3.80,18.70,0.22,1165",
@@ -388,10 +416,10 @@ class TestGDELTIngestor:
         assert ingestor._parse_v2tone("") is None
         assert ingestor._parse_v2tone("not-a-number,1,2") is None
 
-    def test_estimate_title_tone(self):
+    def test_estimate_title_tone(self, store):
         """Title lexicon produces bounded sentiment scores."""
         from src.macros.gdelt_ingestor import GDELTIngestor
-        ingestor = GDELTIngestor()
+        ingestor = GDELTIngestor(store=store)
 
         positive = ingestor._estimate_title_tone("NVIDIA stock soars on record earnings beat")
         negative = ingestor._estimate_title_tone("Tech stocks plunge amid sell-off fears")
@@ -426,10 +454,10 @@ class TestGDELTIngestor:
         assert articles[0]["tone"] == 3.5
         assert articles[1]["tone"] > 0
 
-    def test_process_articles_without_doc_tone(self):
+    def test_process_articles_without_doc_tone(self, store):
         """DOC ArtList articles get tone via enrichment or title fallback."""
         from src.macros.gdelt_ingestor import GDELTIngestor
-        ingestor = GDELTIngestor()
+        ingestor = GDELTIngestor(store=store)
 
         articles = [
             {
@@ -472,6 +500,17 @@ class TestGDELTIngestor:
             rows = ingestor._load_gkg_file("20260608040000")
 
         assert rows["https://example.com/nvda-gkg"] == 2.5
+
+    def test_load_gkg_file_propagates_exhausted_rate_limit(self, store):
+        """GKG enrichment stops the GDELT run when its retries are exhausted."""
+        from src.macros.gdelt_ingestor import GDELTIngestor, GDELTRateLimitError
+
+        ingestor = GDELTIngestor(store=store)
+        error = GDELTRateLimitError("GDELT rate limit exhausted")
+
+        with patch.object(ingestor, "_gdelt_http_get", side_effect=error):
+            with pytest.raises(GDELTRateLimitError):
+                ingestor._load_gkg_file("20260608040000")
 
     def test_fetch_news_for_ticker_enriches_tone(self, store):
         """fetch_news_for_ticker enriches DOC articles with tone metadata."""

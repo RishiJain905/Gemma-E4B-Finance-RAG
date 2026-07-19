@@ -42,7 +42,7 @@ unavailable).
 | `status` | string | `"ok"` or `"degraded"`. |
 | `storage` | object | `Store.heartbeat()` — `{sqlite, chroma, chroma_doc_count}`. |
 | `model_available` | bool | Whether the llama-server `/health` returns 200. |
-| `scheduler` | object \| null | `UnifiedScheduler.status_report()` per-source freshness. |
+| `scheduler` | object \| null | `UnifiedScheduler.status_report()`. Beyond per-source freshness (`status`, `age_hours`, `ttl_hours`, `error`), it also carries `runs` (recent `scheduler_runs` history), `coverage_health` (denominator-explicit active-security coverage by index/scope/sector, recent news/market/SEC coverage, partition states — Phase 2.3.4.3), and `registry_version` (`configs/sources.yaml` version). This is the same method behind `python -m src.scheduler status`; see `scripts/CHAT.md`. |
 | `freshness` | object | Per-ticker overall freshness for the core watchlist. |
 | `capabilities` | object \| null | Active deployment capabilities and effective limits. Always includes `{tools, streaming, answer_policy}`. `streaming` is the **effective** capability (2.2.6.1): whether `/query/stream` can be served at all — `false` when tools are enabled but tool-final streaming is off. `streaming_tool_final` is `true` only when a tools-enabled request streams its final synthesis after bounded non-streaming tool rounds. On conversation-memory builds (2.2.2) it also advertises `{history, multiline, max_question_chars, conversation_max_turns, conversation_max_history_chars}` so clients read the real limits instead of guessing. |
 | `version` | string | API version (`"1.0.0"`). |
@@ -94,6 +94,7 @@ curl http://127.0.0.1:8000/tools
   "enabled": true,
   "allow_write_tools": false,
   "tools": [
+    { "name": "describe_coverage", "description": "Read-only capability inventory...", "write": false },
     { "name": "query_facts", "description": "Rank, filter...", "write": false },
     { "name": "refresh_data", "description": "Use ONLY...", "write": true }
   ]
@@ -102,11 +103,39 @@ curl http://127.0.0.1:8000/tools
 
 ---
 
+## `describe_coverage` tool
+
+`describe_coverage` is a bounded, read-only inventory of the canonical Phase
+2.3 security registry and corpus ledger. It does not call a provider, the
+model, or ingestion. Callers use the Store facade; the tool never joins SQLite
+tables or scans Chroma directly.
+
+Supported operations are `summary`, `list_securities`, `contains_security`,
+`security_sources`, `list_sources`, `list_item_types`, and `list_metrics`.
+Arguments are `operation` plus optional `ticker`, `filters`, `limit`, `cursor`,
+and `ticker_only`. Filters may include `index`, `sector`, `industry`,
+`coverage_tier`, `item_type`, `source`, `source_category`, `active`, `as_of`,
+`date_from`, and `date_to`.
+
+Responses include `coverage_basis` (`canonical` or `legacy_partial`), registry
+and corpus counts, membership tiers, stored evidence, configured/enabled/
+available source capability, terminal source status, item types, metric
+families, `data_revision`, and `universe_snapshot_at`. Detail pages are bounded
+and set `complete: false` with an opaque `next_cursor` when more rows remain.
+An explicit ticker-only inventory is complete when it fits the safe 1,000-ticker
+bound. Missing canonical tables are disclosed through `coverage_basis` rather
+than silently treated as complete canonical coverage.
+
+---
+
 ## POST `/query`
 
 Full RAG pipeline: parse intent → check/refresh freshness → hybrid retrieval →
 prompt augmentation → model call. If the model server is down, returns a
 **degraded** answer built from raw retrieved data (`model_available: false`).
+Explicit capability-coverage questions are answered deterministically from
+`describe_coverage`; an unavailable inventory produces an unavailable answer,
+not a model-generated guess.
 When `enable_tools` is on, `/query` may advertise registered tools to the model
 and perform extra model round-trips before the final answer. Write tools are
 additionally gated by `allow_write_tools` and per-query refresh limits.
@@ -132,6 +161,8 @@ additionally gated by `allow_write_tools` and per-query refresh limits.
 | Field | Type | Meaning |
 |-------|------|---------|
 | `answer` | string | Grounded answer (or degraded raw-data summary). |
+| `answer_origin` | string \| null | Answer source; `deterministic_coverage` identifies a capability-inventory answer. |
+| `coverage_metadata` | object \| null | Coverage basis, Store revision, snapshot, completeness, pagination, and applied filters for a deterministic coverage answer. |
 | `citations` | array | `SourceCitation` objects parsed from `[Source: type/ticker]` markers. |
 | `detected_ticker` | string \| null | Ticker the parser detected. |
 | `detected_intent` | string \| null | Question type (`fact_lookup`, `comparison`, `trend`, `explanation`, `sentiment`, `news`, `risk`, `general`). |
@@ -581,10 +612,19 @@ invoke embeddings or a model.
 |---|---|
 | `GET /graph/api/corpus/overview` | Cached source/ticker/freshness projection. |
 | `GET /graph/api/corpus/search` | Label/metadata search (`q`, `kinds`, `sources`, `ticker`, `limit`, `cursor`). |
+| `GET /graph/api/corpus/aggregates` | Bounded authoritative facet counts, grouped by `group_by` (`source_category` default, or `source`/`item_type`/`security`/`year`/`month`/`indexing_state`), narrowable by the same filter set. Never scans Chroma bodies (2.3.5.2). |
+| `GET /graph/api/corpus/facets` | Bounded, cached facet counts for the current combined filter set — backs the persistent facet rail (2.3.5.2). |
+| `GET /graph/api/corpus/groups` | One paged aggregate level (`group_by`) as drillable, counted nodes for the aggregation-first landing view (2.3.5.2). |
+| `GET /graph/api/corpus/items/{node_id}` | One bounded corpus-item/event detail with safe provenance (2.3.5.3). |
 | `GET /graph/api/corpus/nodes/{node_id}` | One node detail (at most one excerpt). |
 | `GET /graph/api/corpus/nodes/{node_id}/neighbors` | One bounded neighbor page. |
 | `GET /graph/api/corpus/filings/{accession}/sections` | Section-family page for a filing. |
 | `GET /graph/api/corpus/refresh-status` | Persisted freshness/scheduler state (never refreshes). |
+
+`aggregates`, `facets`, and `groups` accept the shared `CorpusFacetFilters`
+query params plus `limit`/`cursor`; a filter change resets paging by changing
+the opaque cursor scope, and a mid-browse ingestion write between pages
+returns **409** (`CorpusRevisionChanged`) rather than mixing revisions.
 
 ### Graph event/delta schema
 
@@ -598,3 +638,13 @@ allowlisted `metadata`, and sequence numbers. Edges carry a `relation`
 shape carries **no** pixel/layout positions — layout is UI behavior; graph
 meaning is the contract. A golden fixture pins this schema at
 `tests/fixtures/graph/query_trace_v1.json`.
+
+**Source-aware evidence (Phase 2.3.5.1).** `evidence`/`source`/`citation`
+nodes may additionally carry `security_id`, `canonical_security`,
+`index_memberships`, `sector`, `source_category`, `authority_tier`,
+`coverage_tier`, `provider`, `publisher`, `source_name`, `item_type`,
+`event_type`, `form`, `filing_item`, `exhibit`, `date_semantics`,
+`published_at`, `effective_at`, `accessed_at`, and `evidence_role` (`primary`
+| `corroborating`) — additive allowlisted fields that did not require bumping
+`schema_version`. A mixed SEC/news/macro/market golden fixture covers this
+shape alongside the unchanged Phase 2.2 fixture above.

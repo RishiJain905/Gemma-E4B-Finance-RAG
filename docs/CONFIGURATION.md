@@ -6,22 +6,63 @@ All runtime configuration lives in `configs/*.yaml`. Secrets are supplied via a
 Most config loaders use a tolerant pattern: built-in defaults are applied
 first, then any matching keys present in the YAML file override them. A missing
 config file is therefore not fatal — the code falls back to its hard-coded
-defaults.
+ defaults.
+
+### Middleware profiles
+
+`MiddlewareConfig` supports three reviewed runtime profiles:
+
+| Profile | Purpose | Production default? |
+|---|---|---:|
+| `legacy` | Phase 2.2-compatible rollback with optional Phase 2.2.3+ capabilities off. | No |
+| `recommended` | Current promoted-safe deployment surface; later measured arms may update it. | Yes |
+| `evaluation` | Recommended behavior plus evaluation trace/progress metadata; never a production default. | No |
+
+Select a profile with `MIDDLEWARE_PROFILE=legacy` (or another profile name), or
+put `profile: legacy` in an explicit middleware YAML file. The loader applies
+code defaults, the selected profile, explicit YAML values, and finally
+environment overrides in that order. A direct `MiddlewareConfig` profile file
+is validated as a reviewed bundle. Invalid dependencies in an explicit/env
+override are clamped to `false` with an explicit warning.
+
+Promotion arms should use `evaluation` plus an explicit `--config-label` in the
+evaluation harness. The profile metadata records the intended label and trace
+requirements; the runner still requests `include_evidence_trace: true` on each
+live evaluation request.
 
 ---
 
 ## Environment Variables (`.env`)
 
-| Variable | Required for | Used by | Notes |
-|----------|--------------|---------|-------|
-| `FRED_API_KEY` | FRED macro ingestion | `src/macros/fred_ingestor.py` | Resolution order: constructor arg → value of the `${FRED_API_KEY}` placeholder in `configs/fred.yaml` → `FRED_API_KEY` env var. Get a free key at <https://fred.stlouisfed.org/docs/api/api_key.html>. |
-| `SEC_EDGAR_USER_AGENT` | SEC EDGAR access | `src/sec/edgar_fetcher.py` | SEC requires a descriptive User-Agent (name + contact email). Resolution order: constructor arg → `SEC_EDGAR_USER_AGENT` env var → `sec.user_agent` in `configs/storage.yaml` → built-in default. |
+| Variable | Required for | Used by | Verified | Notes |
+|----------|--------------|---------|----------|-------|
+| `FRED_API_KEY` | FRED macro ingestion | `src/macros/fred_ingestor.py` | ✅ 2026-07-15 | Resolution order: constructor arg → value of the `${FRED_API_KEY}` placeholder in `configs/fred.yaml` → `FRED_API_KEY` env var. Get a free key at <https://fred.stlouisfed.org/docs/api/api_key.html>. |
+| `SEC_EDGAR_USER_AGENT` | SEC EDGAR access | `src/sec/edgar_fetcher.py` | ✅ 2026-07-15 | SEC requires a descriptive User-Agent (name + contact email). Resolution order: constructor arg → `SEC_EDGAR_USER_AGENT` env var → `sec.user_agent` in `configs/storage.yaml` → built-in default. |
+| `FINNHUB_API_KEY` | Finnhub company news | `src/ingestion/finnhub_ingestor.py` | ✅ 2026-07-15 | Missing or invalid credentials disable only the Finnhub news capability; the adapter never crawls publisher URLs. |
+| `MASSIVE_API_KEY` | Massive grouped market data/actions | `src/ingestion/massive_ingestor.py` | ✅ 2026-07-15 | Missing or limited entitlements disable only the affected Massive capability. Grouped US market data remains one request per market date. |
+| `BLS_API_KEY` | Optional BLS extended API access | `src/ingestion/official/bls.py` | ✅ 2026-07-15 | Missing credentials set only the BLS source to `disabled_missing_key`; other official feeds continue. |
+| `BEA_API_KEY` | BEA national-accounts API | `src/ingestion/official/bea.py` | ✅ 2026-07-15 | Missing credentials set only the BEA source to `disabled_missing_key`. BEA keys need activation via the emailed link before first use; a not-yet-activated key returns an API error body with HTTP 200. |
+| `EIA_API_KEY` | EIA energy API | `src/ingestion/official/eia.py` | ✅ 2026-07-15 | Missing credentials set only the EIA source to `disabled_missing_key`. |
+| `OPENFDA_API_KEY` | Optional openFDA event queries | `src/ingestion/official/openfda.py` | ✅ 2026-07-15 | Missing credentials disable only openFDA sector events. |
+| `TWELVE_DATA_API_KEY` | Optional Twelve Data fallback | Future optional adapter | ✅ 2026-07-15 | Disabled unless explicitly configured; it is not used as a required Massive fallback. |
+
+**Verified** = one cheap authenticated call per provider succeeded from this
+machine on that date (status/HTTP checks only — no key values are ever logged).
+Verification is point-in-time, not continuous; re-check a provider with a
+single authenticated request if it later reports `disabled_missing_key` or
+`disabled_authentication` in `python -m src.scheduler status`.
 
 Example `.env`:
 
 ```
 FRED_API_KEY=your_fred_api_key_here
 SEC_EDGAR_USER_AGENT=Your Name your.email@example.com
+FINNHUB_API_KEY=your_finnhub_api_key_here
+MASSIVE_API_KEY=your_massive_api_key_here
+BLS_API_KEY=your_bls_api_key_here
+BEA_API_KEY=your_bea_api_key_here
+EIA_API_KEY=your_eia_api_key_here
+OPENFDA_API_KEY=your_openfda_api_key_here
 ```
 
 ---
@@ -211,23 +252,34 @@ top_k_facts: 10
 enable_citations: true
 ```
 
-| Field | Default | Meaning |
-|-------|---------|---------|
-| `llama_endpoint` | `http://127.0.0.1:8087/v1/chat/completions` | Chat-completions endpoint for answer generation. |
-| `embedding_endpoint` | `http://127.0.0.1:8087/v1/embeddings` | Embeddings endpoint passed through to the `Store`. |
-| `model_name` | `tracealchemy` | Model id sent in the chat payload. |
-| `default_temperature` | `0.3` | Temperature when the request does not override it. |
-| `max_tokens` | `2048` | Max response tokens when the request does not override it. |
-| `top_k_documents` | `5` | Max ChromaDB documents retrieved per query. |
-| `top_k_facts` | `10` | Max SQLite facts retrieved per query. |
-| `enable_citations` | `true` | Whether citation extraction is enabled. |
+| Field | Default | Env | Meaning |
+|-------|---------|-----|---------|
+| `llama_endpoint` | `http://127.0.0.1:8087/v1/chat/completions` | - | Chat-completions endpoint for answer generation. |
+| `embedding_endpoint` | `http://127.0.0.1:8087/v1/embeddings` | - | Embeddings endpoint passed through to the `Store`. |
+| `model_name` | `tracealchemy` | - | Model id sent in the chat payload. |
+| `default_temperature` | `0.3` | - | Temperature when the request does not override it. |
+| `max_tokens` | `2048` | - | Max response tokens when the request does not override it. |
+| `top_k_documents` | `5` | - | Max ChromaDB documents retrieved per query. |
+| `top_k_facts` | `10` | - | Max SQLite facts retrieved per query. |
+| `enable_citations` | `true` | `ENABLE_CITATIONS` | Whether citation extraction is enabled. |
 
 The remaining middleware keys are grouped by the phase that introduced them.
-Every Phase 2.2.4–2.2.6 feature ships **disabled by default** (the one exception
-is `answer_validation: report`, which is metadata-only and changes no answer).
-For each, **rollback is to flip the flag back to its default** — none involves a
-schema or storage migration. Any key can also be overridden by the environment
-variable listed in its row (used for A/B evaluation).
+The code fallback defaults preserve the pre-profile behavior; the committed
+source file currently selects the `recommended` surface. The `legacy` profile is
+the tested rollback for every promotion candidate. Any key can also be
+overridden by the environment variable listed in its row (used for A/B
+evaluation).
+
+#### Phase 2.3 retrieval and Corpus Explorer rollout
+
+These two switches are read by the retrieval post-processing and graph corpus
+projection paths. The committed source file currently enables them; the legacy
+profile disables them.
+
+| Field | Current source | Env | Meaning |
+|-------|----------------|-----|---------|
+| `enable_phase2_3_retrieval` | `true` | `ENABLE_PHASE2_3_RETRIEVAL` | Enable the Phase 2.3 evidence-taxonomy/ranking/packing retrieval seam. |
+| `enable_phase2_3_corpus_projection` | `true` | `ENABLE_PHASE2_3_CORPUS_PROJECTION` | Enable the Phase 2.3 aggregation-first Corpus Explorer projection. |
 
 #### Answer policy & grounding (Phase 2.1.7)
 
@@ -245,12 +297,52 @@ a query never errors because a retrieval stage failed.
 | Field | Default | Env | Meaning |
 |-------|---------|-----|---------|
 | `enable_lexical` | `true` | `ENABLE_LEXICAL` | Add the BM25 lexical channel and RRF fusion. |
+| `lexical_backend` | `fts5` | `LEXICAL_BACKEND` | `fts5` uses the persistent SQLite index without loading all Chroma text at startup; `memory` selects the legacy full-corpus `rank_bm25` rollback path. All three profiles assign this key. |
 | `rrf_k` | `60` | — | RRF constant; larger dampens the contribution of top ranks. |
 | `enable_reranker` | `false` | `ENABLE_RERANKER` | Re-rank fused candidates. The `cross-encoder` backend downloads a HuggingFace model on first use. |
 | `reranker_backend` | `cross-encoder` | `RERANKER_BACKEND` | `cross-encoder` (sentence-transformers) or `llm` (reuse TraceAlchemy on `:8087`, no download). |
 | `reranker_model` | `cross-encoder/ms-marco-MiniLM-L-6-v2` | `RERANKER_MODEL` | Cross-encoder model id. |
 | `rerank_candidates` | `30` | `RERANK_CANDIDATES` | Candidate pool retrieved before re-ranking. |
 | `rerank_top_n` | `5` | `RERANK_TOP_N` | Documents kept after re-ranking (= `top_k_documents`). |
+
+The `fts5` backend probes SQLite support at startup. If the module or table is
+unavailable, health reports `lexical_mode: degraded` and queries remain bounded
+vector-only. An FTS query error or SQLite/Chroma corpus-revision mismatch also
+skips lexical fusion for that request and records the reason under
+`retrieval_trace.lexical`.
+
+Rebuild or reconcile the index without embedding or generation calls:
+
+```bash
+python scripts/rebuild_lexical_index.py --batch-size 100
+python scripts/rebuild_lexical_index.py --reconcile
+python scripts/rebuild_lexical_index.py --reconcile --repair
+```
+
+The rebuild cursor commits after every batch and resumes automatically. Use
+`--restart` to discard saved progress; `--db-path` and `--chroma-path` select
+isolated stores for maintenance or tests.
+
+#### Evidence taxonomy, authority ranking & duplicate-coverage packing (Phase 2.3.3.3)
+
+Source-independent, additive, fail-soft post-relevance policy applied on top
+of the fused/re-ranked evidence set. Authority boosting is capped below
+exact-entity, type, and latest-recency ranking terms, and duplicate packing
+keeps a bounded amount of useful secondary coverage while preventing
+syndicated copies of the same story from spending the whole evidence budget.
+
+| Field | Default | Env | Meaning |
+|-------|---------|-----|---------|
+| `enable_evidence_taxonomy` | `true` | `ENABLE_EVIDENCE_TAXONOMY` | Classify retrieved evidence into the source-independent item/event taxonomy (authority tier, primary/secondary role) used by ranking and Live Trace. |
+| `enable_authority_ranking` | `true` | `ENABLE_AUTHORITY_RANKING` | Apply the capped authority-tier boost on top of relevance ranking. |
+| `enable_duplicate_coverage_packing` | `true` | `ENABLE_DUPLICATE_COVERAGE_PACKING` | Keep a bounded number of secondary/corroborating items per event instead of dropping or over-including syndicated duplicates. |
+| `authority_max_boost` | `0.025` | `AUTHORITY_MAX_BOOST` | Hard ceiling on the authority-tier score boost. |
+| `max_secondary_per_event` | `2` | `MAX_SECONDARY_PER_EVENT` | Max secondary/corroborating evidence items packed per primary event. |
+
+These three switches default **on** — unlike the eight Phase 2.3.6.1 rollout
+gates below, which default off — because they shipped and were evaluated in
+2.3.3.3, ahead of the 2.3.4–2.3.6 registry/migration work. Flip them off to
+compare against pre-2.3.3.3 relevance-only ranking.
 
 #### Analytical tools (Phase 2.1.4)
 
@@ -338,12 +430,13 @@ corrective retrieval when borderline. Total retrieval rounds stay capped at two.
 
 Keeps the bounded tool/planning rounds non-streaming, then streams the final
 answer synthesis — so enabling tools no longer disables streaming for the whole
-request. Both feature flags default off (behavior byte-identical to pre-2.2.6).
+request. The committed source file has both capabilities on since 2026-07-15;
+the code fallback and legacy profile keep them off for rollback.
 
 | Field | Default | Env | Meaning |
 |-------|---------|-----|---------|
-| `enable_tool_final_streaming` | `false` | `ENABLE_TOOL_FINAL_STREAMING` | Serve a tools-enabled `/query/stream` by running tool rounds non-streaming, then streaming only the final answer. Off → `/query/stream` 404s while tools are enabled. |
-| `enable_stream_progress_events` | `false` | `ENABLE_STREAM_PROGRESS_EVENTS` | Emit versioned, redacted progress events (`query_started`, `stage`, `tool_started`, `tool_completed`, `error`) on the SSE stream. Off → only the legacy `token`/`metadata` events. |
+| `enable_tool_final_streaming` | `true` in source / `false` in code fallback | `ENABLE_TOOL_FINAL_STREAMING` | Serve a tools-enabled `/query/stream` by running tool rounds non-streaming, then streaming only the final answer. Off → `/query/stream` 404s while tools are enabled. |
+| `enable_stream_progress_events` | `true` in source / `false` in code fallback | `ENABLE_STREAM_PROGRESS_EVENTS` | Emit versioned, redacted progress events (`query_started`, `stage`, `tool_started`, `tool_completed`, `error`) on the SSE stream. Off → only the legacy `token`/`metadata` events. |
 | `stream_progress_include_counts` | `true` | `STREAM_PROGRESS_INCLUDE_COUNTS` | Include row/item counts on retrieve and `tool_completed` progress events. |
 
 #### Versioned retrieval cache & prompt efficiency (Phase 2.2.6.2)
@@ -364,6 +457,10 @@ answers (prices, news, estimates, "latest") are never reused by similarity.
 | `llama_cache_prompt` | `false` | `LLAMA_CACHE_PROMPT` | Send llama-server's `cache_prompt: true` on the final answer request when the backend supports it; on rejection it disables for the process and retries the plain payload once (fail-soft). Off → the request JSON is byte-identical. |
 
 ### Hierarchical retrieval (Phase 2.2.5.3)
+
+The feature switch is `enable_hierarchical_retrieval`; its environment override
+is `ENABLE_HIERARCHICAL_RETRIEVAL`. It requires `sec.index_filing_text`, so an
+invalid profile fails validation and an explicit/env override is clamped off.
 
 Bounded filing → section → child expansion of precise SEC hits. Off by default;
 the corrective `EXPAND_PARENT_SECTION` seam keeps its 2.2.4.1 sibling-only
@@ -390,6 +487,9 @@ enabled, authoritative filed GAAP facts are merged into structured retrieval and
 conflicting values are surfaced as separate evidence, never averaged.
 
 ### Live retrieval-graph observer (Phase 2.2.7)
+
+The committed source file has `enable_graph_observer` enabled since
+2026-07-15; the code fallback and legacy profile keep it disabled for rollback.
 
 A local, **read-only** visualization of the retrieval pipeline and corpus
 inventory. **Disabled by default.** When on, the UI (`/graph`) and its API
@@ -421,7 +521,7 @@ corpus_opaque_id_ttl_s: 300.0     # clamp 1–3600
 
 | Field | Default | Env | Meaning |
 |-------|---------|-----|---------|
-| `enable_graph_observer` | `false` | `ENABLE_GRAPH_OBSERVER` | Enable the loopback-only live retrieval graph UI + API. Off → every `/graph*` route 404s and `/query` responses omit `graph_trace_id`. |
+| `enable_graph_observer` | `true` in source / `false` in code fallback | `ENABLE_GRAPH_OBSERVER` | Enable the loopback-only live retrieval graph UI + API. Off → every `/graph*` route 404s and `/query` responses omit `graph_trace_id`. |
 | `graph_trace_limit` | `100` | `GRAPH_TRACE_LIMIT` | Max concurrent in-memory traces (oldest evicted). |
 | `graph_element_limit` | `5000` | `GRAPH_ELEMENT_LIMIT` | Max total nodes+edges across all traces. |
 | `graph_trace_ttl_s` | `3600` | `GRAPH_TRACE_TTL_S` | Trace time-to-live in seconds. |
@@ -435,20 +535,279 @@ corpus_opaque_id_ttl_s: 300.0     # clamp 1–3600
 
 ---
 
-## `configs/watchlist.yaml`
+## `configs/coverage.yaml`
 
-Tracked tickers and the per-source ingestion schedule. The `schedule` block is
-the source of truth for TTLs used by both `UnifiedScheduler` and the `Store`
-freshness logic (each falls back to built-in defaults if a key is missing).
+Source-aware security coverage policy. `CoverageResolver` reads this file and
+the canonical security registry only; it never calls a provider or changes
+security/index membership. A security may hold multiple scopes:
+`universe`, `broad`, `deep`, `sector`, and `global`.
 
 ```yaml
-core:        [NVDA, AMD, AAPL, MSFT, META, CRWD]
-extended:    [GOOGL, AMZN, TSLA, AVGO, ORCL, INTC, QCOM, PANW, PLTR, SNOW]
+revision: "2.3.1.2-r1"
+fallback_when_registry_empty: deep
+
+deep:
+  tickers: [NVDA, AMD, AAPL, MSFT, META, CRWD]
+  allow_outside_indexes: []
+broad:
+  additions: [GOOGL, AMZN, TSLA, AVGO, ORCL, INTC, QCOM, PANW, PLTR, SNOW]
+sector:
+  rules:
+    health_care: [Health Care, Healthcare]
+
+sources:
+  sec_filings:
+    enabled: true
+    scopes: [broad]
+    capabilities: [sec_event_discovery]
+  finnhub:
+    enabled: true
+    optional: true
+    required_env: FINNHUB_API_KEY
+    scopes: [broad]
+    capabilities: [company_news]
+  massive:
+    enabled: true
+    optional: true
+    required_env: MASSIVE_API_KEY
+    scopes: [broad]
+    capabilities: [market_summary, corporate_actions, company_news, vendor_filing_metadata]
+  twelve_data:
+    enabled: false
+    optional: true
+    required_env: TWELVE_DATA_API_KEY
+    scopes: [broad]
+    capabilities: [market_summary]
+  sec_filing_text:
+    enabled: true
+    scopes: [deep]
+    capabilities: [full_filing_text]
+  fred:
+    enabled: true
+    scopes: [global]
+    capabilities: [official_macro]
+```
+
+| Field | Meaning |
+|-------|---------|
+| `revision` | Non-secret policy revision included in scheduler/status and graph-ready explanations. |
+| `fallback_when_registry_empty` | Fresh-install behavior. `deep` means broad sources temporarily receive only `deep.tickers` until the first universe snapshot; broad additions are not fanned out during fallback. `empty` is also accepted. |
+| `deep.tickers` | Explicit focused-research list. Deep is additive policy over canonical identities, not a second identity registry. |
+| `deep.allow_outside_indexes` | Explicit ticker list (or `true`) permitting intentional off-index deep coverage. Without this opt-in, a deep ticker outside the active index union is a validation error once the registry is populated. |
+| `broad.additions` | Optional explicit additions to the unique active S&P 500/Nasdaq-100 union. This replaces the old hidden `extended` semantics. |
+| `sector.rules` | Named lists of canonical sector labels used by sector-scoped sources. |
+| `sources.<name>.enabled` | Enables or disables the source independently. |
+| `sources.<name>.scopes` | One or more allowed scopes (`universe`, `broad`, `deep`, `sector`, `global`). Overlap is deduplicated per source run. |
+| `sources.<name>.sector_rules` | Named sector rules applied by a sector-scoped source. |
+| `sources.<name>.capabilities` | Safe capability labels exposed by policy explanations. |
+
+Default policy keeps SEC event discovery, Finnhub company news, and Massive
+market/corporate-action work broad;
+full filing text, CompanyFacts, IR pages, transcripts, estimates, and optional
+GDELT work deep; FRED global; and future openFDA/NHTSA/USAspending adapters
+disabled and bounded to their configured sector rules. Universe-provider
+capabilities use the `universe` scope.
+
+`CoverageResolver.explain()` exposes only the source, scope, inclusion reason,
+enabled capabilities, ticker count/identity, and policy revision. It never
+returns config paths, provider keys, or raw YAML.
+
+The six tickers from the deprecated `watchlist.yaml -> core` list remain the
+explicit `coverage.yaml -> deep.tickers` set. Migration does not broaden
+deep-only CompanyFacts, filing-text, transcript, IR, or estimates work.
+
+For one compatibility release, a legacy YAML containing `core` and `extended`
+can be supplied as the resolver config. It logs a deprecation warning, maps
+`core` to `deep.tickers`, and maps `extended` to `broad.additions`.
+
+---
+
+## `configs/sources.yaml` and operational windows (Phase 2.3.4.3)
+
+`sources.yaml` is the scheduler-owned registry for cadence, cursor overlap,
+request limits, work limits, retry policy, and optional environment-key
+availability. Its `version` is persisted in every scheduler run summary.
+`SourceRegistry.load()` (`src/scheduler/source_registry.py`) validates every
+entry; an invalid entry or unknown `dependencies` name is disabled
+(`status: invalid_configuration`) without crashing registry load or any other
+source. One representative entry:
+
+```yaml
+sources:
+  finnhub:
+    capability_group: company_news
+    enabled: true
+    required_env: FINNHUB_API_KEY
+    scope: broad
+    cadence: daily
+    run_modes: [daily, all]
+    priority: 40
+    dependencies: []
+    cursor_kind: timestamp
+    overlap: 6h
+    requests_per_minute: 30
+    requests_per_day: 500
+    requests_per_run: 200
+    batch_size: 1
+    max_work_items_per_run: 200
+    retry_policy: vendor_news
+    ttl_key: finnhub_news
+    ttl_hours: 6
+```
+
+| Field | Meaning |
+|-------|---------|
+| `capability_group` | Non-authoritative grouping label surfaced in status/policy explanations (e.g. `company_news`, `market_data`, `official_feeds`). |
+| `enabled` | Registry-level on/off; combined with capability rollout flags and `required_env` to compute `is_available`. |
+| `required_env` | Optional env var name gating availability. A missing key sets `status: disabled_missing_key` for that source only; status reports `configured: true|false`, never a value or fingerprint. |
+| `scope` | One of `universe`, `broad`, `deep`, `sector`, `global`. |
+| `cadence` / `run_modes` | Scheduling cadence and the CLI run modes (`daily`/`hourly`/`weekly`/`all`) that select this source. |
+| `priority` | Ascending execution order within a run (the legacy `weight`). |
+| `dependencies` | Other registry source names that must be available first; an unavailable dependency skips this source with `reason: dependency_unavailable`. |
+| `cursor_kind` | `date`, `timestamp`, `page_token`, `daily_index`, or `none` — the incremental-cursor shape `CursorManager` persists per source+partition. |
+| `overlap` | Re-fetch overlap window layered on top of the last cursor (e.g. `6h`, `2d`) so a late-arriving record is never missed. |
+| `requests_per_minute` / `requests_per_day` / `requests_per_run` | Durable request budgets (`RunBudget`), persisted across process restarts. |
+| `batch_size` / `max_work_items_per_run` | Bound on per-run work (partitions/tickers/pages) independent of the raw request budget. |
+| `retry_policy` | Named backoff/circuit policy passed to `provider_request_policy` (e.g. `sec`, `vendor_news`, `vendor_market`, `official_feed`, `public_api`, `deep_source`). |
+| `ttl_key` / `ttl_hours` | Freshness TTL — the same `cache_meta` mechanism used by the legacy scheduler. |
+
+Phase 2.3 rollout switches are additive and default off:
+
+```yaml
+# configs/universe.yaml
+feature_flags:
+  universe_refresh: false
+
+# configs/sources.yaml
+feature_flags:
+  sec_broad_events: false
+  company_news: false
+  grouped_market_data: false
+  official_feeds: false
+  sector_feeds: false
+
+# configs/middleware.yaml
+enable_phase2_3_retrieval: true
+enable_phase2_3_corpus_projection: true
+```
+
+These are the complete set of eight Phase 2.3.6.1 capability switches — one
+universe flag, five `sources.yaml` capability-group flags, and two middleware
+flags — and every one defaults to `false`. The middleware switches may be
+overridden by `ENABLE_PHASE2_3_RETRIEVAL` and
+`ENABLE_PHASE2_3_CORPUS_PROJECTION`. Credentials are referenced only by
+environment-variable name (`required_env`). Status reports
+`configured: true|false`; it never prints a value or fingerprint. A missing
+optional key disables only that source.
+
+### Provider error taxonomy and circuits (Phase 2.3.4.2)
+
+Every adapter failure is normalized (`src/ingestion/errors.py`) into one of
+eight `ErrorClass` values: `authentication`, `entitlement`, `rate_limited`,
+`quota_exhausted` (all four provider-wide — they stop only that source, never
+another), `transient`, `contract`, `item` (source-local), or `permanent`.
+Only `rate_limited` and `transient` are retryable. Every message is
+credential-redacted (`safe_message`) before it reaches logs,
+`scheduler_run_sources`, or the dead-letter queue — an API key, bearer token,
+or `?api_key=`/`?token=` query value is never persisted or printed.
+
+A provider-wide failure opens a per-source circuit persisted in
+`source_circuit_state` with a cooldown reset parsed by `parse_retry_after`
+(numeric seconds or an HTTP-date `Retry-After` header). The circuit is
+consulted on every later invocation — including a fresh process — until its
+reset time passes, so a rate-limited or unentitled provider stops being
+retried without ever blocking a different source in the same run.
+
+Turning a switch off stops new capability-specific work and restores the
+Phase 2.2 retrieval/projection behavior. It does not remove migration tables,
+security links, corpus metadata, or indexed narratives. Rollback is therefore
+flags-only and non-destructive; removal requires a separately authorized
+maintenance command.
+
+### Phase 2.3 schema and metadata migration
+
+`src/storage/migrations.py` applies the ordered SQL files under
+`src/storage/migrations/` and records version, name, checksum, and timestamp in
+`schema_migrations`. Reopening or rerunning is a no-op; a changed checksum is
+rejected. The order is identities, corpus metadata, structured
+observations/events, refresh/circuit state, then indexes.
+
+Legacy Phase 2.2 data is backfilled explicitly, never during a request:
+
+```text
+python scripts/migrate_phase2_3.py --batch-size 100
+python scripts/migrate_phase2_3.py --batch-size 100 --max-batches 5
+```
+
+The command checkpoints each bounded stage in `phase2_3_backfill_progress` and
+bumps `store_revision` in the same commit. It reads Chroma metadata in bounded
+pages, creates one `corpus_items` row per family, and never invokes an embedding
+or Chroma write. Unknown/conflicting identities remain in
+`identity_reconciliation_errors` for review rather than being guessed or
+dropped.
+
+The top-level `bootstrap` block is used only by the explicit bootstrap command:
+
+```yaml
+bootstrap:
+  sec_lookback_days: 30
+  company_news_days: 30
+  market_history_days: 30
+  macro_history_observations: 5
+  max_sec_partitions: 90
+  max_run_summaries: 100
+```
+
+`--since YYYY-MM-DD` overrides the SEC bootstrap start date for that run. The
+complete partition manifest is stored atomically with the run header; each
+invocation processes at most `max_sec_partitions` and `--resume` continues the
+same immutable manifest with cumulative counts. Daily/hourly/all modes never
+read these history windows. Current
+universe memberships and their observation timestamps are populated by the
+three `universe_*` sources. SEC bootstrap is bounded to recent index/event
+partitions and does not trigger a broad full filing-text backfill.
+
+The operational commands are:
+
+```text
+python -m src.scheduler bootstrap [--source NAME] [--since YYYY-MM-DD] [--resume]
+python -m src.scheduler daily [--source NAME] [--scope SCOPE] [--force]
+python -m src.scheduler repair [--source NAME] [--limit N]
+python -m src.scheduler retention --preview
+python -m src.scheduler status [--source NAME] [--json]
+```
+
+`--force` only bypasses scheduler freshness. It never bypasses registry
+availability, provider circuit cooldowns, quotas, entitlements, or retention
+confirmation. Retention is preview-first; an apply must explicitly select the
+displayed family IDs. Status reads SQLite `cache_meta`, cursor, budget, run,
+and corpus tables only, so it performs no provider or embedding requests.
+Bounded query-tool refreshes execute per security through the scheduler's
+registry, durable request budgets, and provider circuit wrapper; unsupported
+or broad-universe requests are rejected.
+
+---
+
+## `configs/watchlist.yaml`
+
+Market-proxy tickers and the per-source ingestion schedule. Security selection
+now comes from `configs/coverage.yaml`. The deprecated `core`/`extended` mirror
+remains for one release so older readers keep working, but converted ingestors
+do not use it as policy. The `schedule` block remains the source of truth for
+TTLs used by both `UnifiedScheduler` and `Store` freshness logic.
+
+```yaml
+# Deprecated compatibility mirror only:
+core: [NVDA, AMD, AAPL, MSFT, META, CRWD]
+extended: [GOOGL, AMZN, TSLA, AVGO, ORCL, INTC, QCOM, PANW, PLTR, SNOW]
 macro_tickers: [SPY, QQQ, TLT, GLD]
 
 schedule:
   fundamentals: 24    # Re-fetch fundamentals daily
   news: 6             # Re-fetch news every 6 hours
+  finnhub_news: 6     # Re-fetch Finnhub publication windows every 6 hours
+  massive_market: 24  # Re-fetch grouped US market summaries daily
+  massive_actions: 24 # Re-fetch splits/dividends daily
   macro: 24           # Macro indicators daily
   sec_filings: 12     # Check for new SEC filings every 12 hours
   gdelt_news: 6       # GDELT global news every 6 hours
@@ -458,10 +817,71 @@ schedule:
 
 | Field | Meaning |
 |-------|---------|
-| `core` | Tickers that get full ingestion (fundamentals + news + documents). |
-| `extended` | Tickers that get fundamentals only, less frequently. |
+| `core` | Deprecated compatibility mirror of `coverage.yaml -> deep.tickers`. |
+| `extended` | Deprecated compatibility mirror of `coverage.yaml -> broad.additions`. |
 | `macro_tickers` | Market-proxy ETFs fetched but not tied to a single company. |
 | `schedule.<key>` | TTL in **hours** per logical source. Keys map to sources via `Store.FRESHNESS_SOURCES` and `UnifiedScheduler.SOURCES`. |
+
+Finnhub publication cursors are stored per ticker in SQLite `source_cursors`
+under `finnhub_news`; the adapter refetches a bounded overlap window and only
+advances the cursor after accepted rows have been stored. Massive market
+cursors are stored under `massive_market/US` and use a market-date overlap.
+`cache_meta` freshness and `source_cursors` progress are intentionally separate.
+
+### Official macro, regulatory, and sector feeds (2.3.2.3)
+
+`configs/official_sources.yaml` is the allowlisted catalog for first-party
+feeds. Each entry declares a stable internal metric/event name, the agency
+dataset or series identifier, unit, frequency, expected cadence, source
+category, applicable sectors, payload type, and endpoint. Adapters never crawl
+an agency outside this catalog.
+
+| Source | Module | Key | Payloads | Default scope |
+|---|---|---|---|---|
+| Federal Reserve | `src/ingestion/official/federal_reserve.py` | none | RSS/XML releases | global |
+| Treasury | `src/ingestion/official/treasury.py` | none | CSV/JSON rates | global |
+| BLS | `src/ingestion/official/bls.py` | `BLS_API_KEY` | JSON observations/releases | global |
+| BEA | `src/ingestion/official/bea.py` | `BEA_API_KEY` | JSON observations | global |
+| EIA | `src/ingestion/official/eia.py` | `EIA_API_KEY` | JSON observations | global |
+| New York Fed | `src/ingestion/official/ny_fed.py` | none | CSV/JSON rates/operations | global |
+| CFTC | `src/ingestion/official/cftc.py` | none | CSV/JSON COT | global |
+| openFDA | `src/ingestion/official/openfda.py` | `OPENFDA_API_KEY` | JSON events/releases | health care |
+| NHTSA | `src/ingestion/official/nhtsa.py` | none | JSON events/releases | automotive |
+| USAspending | `src/ingestion/official/usaspending.py` | none | JSON awards/releases | government contractors |
+
+Structured observations and agency events are stored in SQLite only. RSS and
+release context use the narrative path and therefore retain searchable
+provenance in SQLite plus Chroma. Every record keeps its official URL,
+provider/agency identifier, release date, observation period, and retrieval
+vintage. A later revision is a new `(metric, provider id, vintage)` observation
+and does not overwrite the earlier vintage; replaying the same vintage is
+idempotent.
+
+Sector events attach to securities only through exact registry identifiers
+(ticker, registered company/issuer name, manufacturer, or recipient UEI). An
+ambiguous exact name is deliberately left unattached for review; fuzzy text
+similarity is never used to attach a ticker. Missing keyed-agency credentials
+produce `disabled_missing_key`, while no-key feeds continue independently.
+
+### Company news, market data, and corporate actions (2.3.2.2)
+
+`FinnhubIngestor` stores only provider-supplied headline, summary, publisher,
+URL, publication timestamp, and provider identity through `Store.upsert_narrative`.
+The existing provider-identity → canonical-URL → conservative headline-window
+deduplication preserves syndicated provider origins on the surviving corpus item.
+
+`MassiveIngestor` calls the grouped US daily summary endpoint once per market
+date and filters the response against the active broad universe locally. OHLCV
+rows are `ObservationRecord` values in SQLite and are never sent to Chroma;
+corrected bars replace the same symbol/metric/market-date row. Splits and
+dividends are `EventRecord` values with applicable declaration, ex, record, and
+payable dates retained in bounded metadata.
+
+Provider states are explicit: `disabled_missing_key`,
+`disabled_authentication`, `disabled_entitlement`, `rate_limited`, `partial`,
+and `error`. Entitlement/authentication states are non-retryable and capability
+local. Yahoo remains a soft fallback/cross-check; SEC remains authoritative for
+filings; Twelve Data remains disabled unless a later source policy enables it.
 
 ---
 

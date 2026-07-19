@@ -192,7 +192,8 @@ def chunk_document(text: str, *, source: Optional[str] = None,
             (defaults to the legacy 150).
 
     Returns:
-        ``[{"text": str, "section": str, "chunk_index": int, "chunk_count": int}, ...]``.
+        ``[{"text": str, "section": str, "chunk_index": int,
+        "chunk_ordinal": int, "chunk_count": int}, ...]``.
         Empty/whitespace text → ``[]``.
     """
     text = (text or "").strip()
@@ -212,5 +213,6 @@ def chunk_document(text: str, *, source: Optional[str] = None,
     out = [c for c in out if c["text"]]
     for i, c in enumerate(out):
         c["chunk_index"] = i
+        c["chunk_ordinal"] = i
         c["chunk_count"] = len(out)
     return out

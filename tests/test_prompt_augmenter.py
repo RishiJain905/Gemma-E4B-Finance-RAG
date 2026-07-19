@@ -298,6 +298,38 @@ class TestEvidenceLedgerHeader:
         assert "## Retrieved Financial Facts" in prompt
         assert "## Retrieved Documents" in prompt
 
+    def test_ledger_and_document_header_are_self_describing(self):
+        from src.middleware.evidence import assign_evidence_ids, build_evidence_items
+        from src.middleware.evidence_taxonomy import normalize_evidence
+
+        retrieval = {
+            "facts": [],
+            "documents": [normalize_evidence({
+                "id": "sec-1",
+                "document": "Filed financing evidence.",
+                "metadata": {
+                    "ticker": "ORCL", "security_id": "sec-orcl", "source": "sec",
+                    "source_category": "regulatory_filing", "item_type": "sec_filing",
+                    "event_type": "debt_raise", "authority_tier": "direct_sec",
+                    "published_at": "2026-07-10T13:00:00Z", "coverage_tier": "broad",
+                },
+            })],
+            "ticker": "ORCL",
+        }
+        ledger = assign_evidence_ids(build_evidence_items([], retrieval["documents"]))
+        prompt = self._augmenter().build_prompt(
+            question="How did Oracle finance itself?",
+            intent={"ticker": "ORCL", "question_type": "news"},
+            retrieval=retrieval,
+            evidence_ledger=ledger,
+        )
+        for expected in (
+            "item:filing", "event:debt_raise", "authority:direct_sec",
+            "source:sec", "canonical:ORCL", "coverage:broad",
+            "published_at=2026-07-10T13:00:00Z",
+        ):
+            assert expected in prompt
+
     def test_empty_ledger_renders_no_header(self):
         prompt = self._augmenter().build_prompt(
             question="Test?",

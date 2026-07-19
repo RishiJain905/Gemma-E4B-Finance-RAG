@@ -55,6 +55,35 @@ server doesn't report a `capabilities` block.
 | `/help` | Show the full command list. |
 | `/quit` or `/exit` | Leave (stops the middleware if this script started it). |
 
+## Scheduler operational modes (Phase 2.3.4.3)
+
+`/refresh` in this client only drives `daily|hourly|weekly|all|status`
+(`SCHEDULER_MODES` in `scripts/chat.py`). Three additional operational modes
+exist but are **not** wired into `/refresh` — run them directly outside the
+chat session:
+
+```bash
+python -m src.scheduler bootstrap [--source NAME] [--since YYYY-MM-DD] [--resume]
+python -m src.scheduler repair [--source NAME] [--limit N]
+python -m src.scheduler retention --preview | --apply --confirm
+python -m src.scheduler status [--source NAME] [--scope SCOPE] [--json]
+```
+
+- `bootstrap` — explicit, resumable initial population of an empty/new
+  broad-universe source; never runs implicitly from `/refresh`.
+- `repair` — re-indexes stored pending/error narratives and SEC artifacts;
+  makes no provider download.
+- `retention` — previews, then explicitly applies, configured narrative
+  expiry; `/refresh` and the other modes never invoke it.
+- `status` — the mode behind `/refresh status` and the `/health` response's
+  `scheduler` block. It performs no network, provider, or embedding calls and
+  reports a **truthful** per-source terminal status (a disabled, rate-limited,
+  or circuit-open source is never reported as `fresh`) plus
+  denominator-explicit coverage health by index/scope/sector.
+
+See `docs/CONFIGURATION.md` for the full flag reference and
+`docs/ARCHITECTURE.md` for the source registry these modes operate on.
+
 ## Answer metadata
 
 After every answer, the renderer prints whatever the server response
@@ -248,3 +277,75 @@ evidence with source links, and the final answer, citations, and validation.
 middleware with `ENABLE_GRAPH_OBSERVER=1`. If the browser doesn't open
 automatically, the command prints the URL to open manually. The page is only
 reachable from `127.0.0.1`; a remote browser gets a 404 by design.
+
+## Runbook: first run after Phase 2.3 (one-time)
+
+All Phase 2.3 capabilities ship **off**, so nothing new is ingested until you
+run this once. The model server must be up first — embeddings happen at ingest
+time.
+
+```powershell
+# 1. Model server (chat + embeddings on :8087)
+scripts\serve_model.ps1 start
+
+# 2. Environment sanity — reports configured true/false per key, no values
+python scripts/validate_setup.py
+
+# 3. Migrate EXISTING data into the new Phase 2.3 tables: applies the new
+#    schema, then creates canonical securities from your current tickers and
+#    corpus_items metadata for existing Chroma families/SEC filings. Local
+#    only — no network, no re-embedding, nothing deleted. It processes
+#    EVERYTHING; --batch-size is rows per commit checkpoint (not a total),
+#    which is what makes an interrupted run resumable — just rerun the same
+#    command. (--max-batches N is the flag that actually limits a run.)
+python scripts/migrate_phase2_3.py --batch-size 100
+
+# 4. Enable capabilities by HAND-EDITING the YAML files — change false to
+#    true for each capability you want (all eight default to false, so
+#    bootstrap fetches nothing new until you do this):
+#    configs/universe.yaml    -> feature_flags.universe_refresh: true
+#                                (expands ~6 deep tickers to the ~550-name
+#                                S&P 500/Nasdaq-100 union)
+#    configs/sources.yaml     -> feature_flags: set sec_broad_events,
+#                                company_news, grouped_market_data,
+#                                official_feeds (and optionally sector_feeds)
+#                                to true
+#    configs/middleware.yaml  -> enable_phase2_3_retrieval: true
+#                                enable_phase2_3_corpus_projection: true
+
+# 5. AFTER steps 3 and 4, in that order: initial population of the sources
+#    you just enabled (bootstrap reads the step-4 flags and writes into the
+#    step-3 tables; run earlier it does almost nothing).
+python -m src.scheduler bootstrap
+#    interrupted? continue where it stopped:
+python -m src.scheduler bootstrap --resume
+
+# 6. Confirm truthful per-source status + coverage before first queries
+python -m src.scheduler status
+```
+
+Bootstrap history windows (SEC lookback, news/market days) come from the
+`bootstrap:` block in `configs/sources.yaml`; `--since YYYY-MM-DD` overrides
+the SEC start date for one run.
+
+## Runbook: daily, before querying
+
+```powershell
+scripts\serve_model.ps1 start          # if not already running
+python -m src.scheduler daily          # incremental refresh (TTL + cursor driven)
+python -m src.scheduler status         # optional: freshness, budgets, circuits
+python scripts/chat.py                 # auto-starts the middleware and chats
+```
+
+Notes:
+
+- `daily` only refetches what its TTLs/cursors say is due — running it twice
+  is cheap and duplicate-safe. Add `--force` to bypass freshness (it still
+  honors provider quotas and circuit cooldowns), or `--source NAME` /
+  `--scope SCOPE` to target one slice.
+- Intraday, `python -m src.scheduler hourly` refreshes the fast-moving
+  sources; `/refresh daily|hourly|status` works from inside the chat client
+  too.
+- If `status` shows an indexing backlog or error partitions, run
+  `python -m src.scheduler repair [--source NAME]` — it re-indexes stored
+  records without re-downloading from providers.

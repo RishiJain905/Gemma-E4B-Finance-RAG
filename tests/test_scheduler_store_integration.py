@@ -53,26 +53,31 @@ def test_scheduler_daily_updates_store(store):
         assert report["sources"][source]["status"] in ("fresh", "success")
 
 
-def test_scheduler_hourly_only_gdelt(store):
-    """run_hourly() only runs GDELT, skips others."""
+def test_scheduler_hourly_only_massive_news(store, monkeypatch):
+    """run_hourly() runs Massive news while GDELT remains disabled."""
+    monkeypatch.setenv("MASSIVE_API_KEY", "test-key")
     sched = UnifiedScheduler(store=store, inter_source_delay=0)
     sched.reset_schedule()
     sched._run_source = MagicMock(return_value={"ok": True})
 
     results = sched.run_hourly(force=True)
-    assert "gdelt" in results
+    assert set(results) == {"massive_news", "gdelt"}
+    assert results["gdelt"]["status"] == "skipped"
+    assert results["gdelt"]["reason"] == "configured_disabled"
+    sched._run_source.assert_called_once()
+    assert sched._run_source.call_args.args[0] == "massive_news"
     assert "yfinance" not in results
     assert "fred" not in results
 
 
 def test_scheduler_weekly_marks_store(store):
-    """run_weekly() runs earnings transcripts + SEC and records them fresh."""
+    """run_weekly() selects legacy deep sources plus weekly registry feeds."""
     sched = UnifiedScheduler(store=store, inter_source_delay=0)
     sched.reset_schedule()
     sched._run_source = MagicMock(return_value={"ok": True})
 
     results = sched.run_weekly(force=True)
-    assert set(results) == {"earnings_transcripts", "sec_filings"}
+    assert set(results) == {"earnings_transcripts", "sec_filings", "cftc"}
     report = sched.status_report()
     assert report["sources"]["earnings_transcripts"]["status"] in ("fresh", "success")
 
@@ -83,6 +88,17 @@ def test_scheduler_error_marks_source_stale(store):
     sched._run_source = MagicMock(side_effect=RuntimeError("kaboom"))
 
     sched.run_hourly(force=True)
-    cache = store.get_cache_status("SCHEDULER", "unified:gdelt")
+    cache = store.get_cache_status("SCHEDULER", "unified:massive_news")
     assert cache is not None
     assert cache["status"] == "stale"
+
+
+def test_scheduler_freshness_does_not_create_or_advance_a_cursor(store):
+    """Successful cadence bookkeeping remains separate from incremental state."""
+    sched = UnifiedScheduler(store=store, inter_source_delay=0)
+    sched._run_source = MagicMock(return_value={"ok": True})
+
+    sched.run_daily(force=True, source="fred")
+
+    assert store.get_cache_status("SCHEDULER", "unified:fred")["status"] == "fresh"
+    assert store.get_source_cursor("fred", "global") is None

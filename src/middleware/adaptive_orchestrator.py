@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 from time import perf_counter
 from dataclasses import dataclass, field
 from enum import Enum
@@ -68,8 +69,9 @@ logger = logging.getLogger(__name__)
 
 
 class Lane(str, Enum):
-    """The three adaptive cost tiers. ``str`` mixin keeps values log-friendly."""
+    """Catalog-first routing plus the three adaptive RAG cost tiers."""
 
+    CATALOG = "catalog"
     FAST = "fast"
     STANDARD = "standard"
     COMPLEX = "complex"
@@ -169,6 +171,7 @@ class ExecutionBudget:
 
 # Char caps per lane; the effective cap is min(lane cap, adaptive_max_context_chars).
 _LANE_CONTEXT_CAPS = {
+    Lane.CATALOG: 4000,
     Lane.FAST: 4000,
     Lane.STANDARD: 12000,
     Lane.COMPLEX: 18000,
@@ -248,7 +251,9 @@ def _doc_identities(doc: dict) -> list[tuple]:
 
 
 def _doc_score(doc: dict) -> float:
-    score = doc.get("rerank_score")
+    score = doc.get("ranking_score")
+    if score is None:
+        score = doc.get("rerank_score")
     if score is None:
         score = doc.get("fusion_score")
     try:
@@ -335,9 +340,42 @@ class ContextBudget:
             _pack_fact(f)
 
         # ── Documents: dedupe (any independent identity), drop blanks ──
+        # Apply policy at the final context boundary. Candidate retrieval stays
+        # complete and untruncated for adaptive merge and obligation coverage.
+        policy_documents = list(documents)
+        try:
+            from .evidence_taxonomy import normalize_evidence, pack_event_coverage, rank_evidence
+
+            taxonomy_enabled = bool(getattr(self.config, "enable_evidence_taxonomy", True))
+            ranking_enabled = bool(getattr(self.config, "enable_authority_ranking", True))
+            packing_enabled = bool(
+                getattr(self.config, "enable_duplicate_coverage_packing", True)
+            )
+            if taxonomy_enabled or ranking_enabled or packing_enabled:
+                policy_documents = [normalize_evidence(row) for row in policy_documents]
+            if ranking_enabled:
+                policy_documents = rank_evidence(
+                    policy_documents,
+                    query=plan.retrieval_query,
+                    filters=dict(getattr(plan, "evidence_filters", {}) or {}),
+                    authority_max_boost=max(0.0, min(0.025, float(
+                        getattr(self.config, "authority_max_boost", 0.025)
+                    ))),
+                )
+            if packing_enabled:
+                policy_documents = pack_event_coverage(
+                    policy_documents,
+                    limit=len(policy_documents),
+                    max_secondary_per_event=int(
+                        getattr(self.config, "max_secondary_per_event", 2)
+                    ),
+                )
+        except Exception:  # noqa: BLE001 - evidence policy is fail-soft
+            logger.warning("Final evidence policy failed; preserving merged pool", exc_info=True)
+
         seen: set = set()
         deduped: list[dict] = []
-        for d in documents:
+        for d in policy_documents:
             if not isinstance(d, dict):
                 continue
             if not document_body(d):
@@ -460,6 +498,8 @@ class OrchestrationResult:
     tool_execution: Optional["ExecutionResult"] = None
     calculations: list[dict] = field(default_factory=list)
     deterministic_answer: Optional[str] = None
+    answer_origin: Optional[str] = None
+    answer_metadata: Optional[dict] = None
     subqueries_executed: list[str] = field(default_factory=list)
     retrieval_rounds_used: int = 0
     planning_ran: bool = False
@@ -481,6 +521,8 @@ class OrchestrationResult:
     derived_subqueries: list[str] = field(default_factory=list)
     drift_reason_codes: list[str] = field(default_factory=list)
     proposed_subqueries: int = 0
+    set_complete: Optional[bool] = None
+    result_set_size: Optional[int] = None
 
     def add_reason(self, code: str) -> None:
         if code not in self.reason_codes:
@@ -611,7 +653,11 @@ def _run_adaptive(
     # (re-grade + context budget) still runs so hit and miss produce the same
     # response shape. An explicit refresh never looks up (but still stores the
     # fresh result). Any cache/revision error is a miss, never a failure.
-    cache_key = _retrieval_cache_key(
+    coverage_route = bool(
+        decision.tool_invocations
+        and decision.tool_invocations[0].reason_code == dr.REASON_COVERAGE
+    )
+    cache_key = None if coverage_route else _retrieval_cache_key(
         retrieval_cache, store, plan, config, lane, available_metrics)
     if cache_key is not None and not refresh:
         cached = retrieval_cache.get(cache_key)
@@ -626,7 +672,13 @@ def _run_adaptive(
         result.add_reason("retrieval_cache_miss")
 
     try:
-        if lane is Lane.FAST:
+        if lane is Lane.CATALOG:
+            fell_back = _execute_catalog(
+                result, plan, decision, store, config, budget, execute_fn, retriever
+            )
+            if fell_back is not None:
+                return fell_back
+        elif lane is Lane.FAST:
             fell_back = _execute_fast(
                 result, plan, decision, store, config, budget, execute_fn, retriever
             )
@@ -670,6 +722,15 @@ def _select_lane(
 ) -> tuple[Lane, list[str]]:
     """Pick the cheapest sufficient lane; return (lane, stable reason codes)."""
     complex_reasons = _complex_reasons(plan)
+    catalog_route = bool(
+        decision.matched
+        and decision.tool_invocations
+        and decision.tool_invocations[0].reason_code == dr.REASON_COVERAGE
+    )
+
+    if catalog_route and set(plan.obligations.evidence_modes) <= {"catalog"}:
+        reasons = ["lane_catalog", "catalog_route", *decision.reason_codes]
+        return Lane.CATALOG, _dedup(reasons)
 
     # Fast: a complete deterministic route with no qualitative doc obligation AND
     # no independent multi-obligation signal in the plan. The `not complex_reasons`
@@ -717,6 +778,22 @@ def _dedup(items: Iterable[str]) -> list[str]:
 # ── Fast lane ─────────────────────────────────────────────
 
 
+def _execute_catalog(
+    result: OrchestrationResult,
+    plan: QueryPlan,
+    decision: "RouteDecision",
+    store: Any,
+    config: "MiddlewareConfig",
+    budget: ExecutionBudget,
+    execute_fn: ExecuteFn,
+    retriever: Optional["Retriever"] = None,
+) -> Optional[OrchestrationResult]:
+    """Execute only the read-only coverage catalog; never create a retriever."""
+    return _execute_fast(
+        result, plan, decision, store, config, budget, execute_fn, retriever
+    )
+
+
 def _execute_fast(
     result: OrchestrationResult,
     plan: QueryPlan,
@@ -751,6 +828,15 @@ def _execute_fast(
     )
     result.tool_execution = execution
     result.calculations = list(execution.calculations)
+    for code in execution.incomplete_reason_codes:
+        result.add_reason(code)
+    if decision.tool_invocations and decision.tool_invocations[0].reason_code == dr.REASON_COVERAGE:
+        if execution.invocations:
+            payload = execution.answer_metadata or execution.invocations[0].result
+            result.set_complete = bool(payload.get("complete", False))
+            result.result_set_size = int(
+                payload.get("total_matching") or payload.get("result_count") or 0
+            )
 
     if execution.error:
         result.add_reason("deterministic_route_error")
@@ -762,6 +848,8 @@ def _execute_fast(
         )
 
     result.deterministic_answer = execution.answer
+    result.answer_origin = execution.answer_origin
+    result.answer_metadata = execution.answer_metadata
     result.merged_facts = _normalize_tool_facts(execution)
     result.merged_documents = []  # fast lane never retrieves documents
     result.subqueries_executed = _sq0_ids(plan)
@@ -785,8 +873,8 @@ def _execute_standard(
     retriever: Optional["Retriever"],
 ) -> None:
     """One coherent topic: existing hybrid retrieve() once, plus safe tool facts."""
-    tool_facts = _partial_route_facts(
-        result, decision, store, config, budget, execute_fn
+    tool_facts = _catalog_or_partial_route_facts(
+        result, plan, decision, store, config, budget, execute_fn
     )
 
     r = _get_retriever(retriever, store, config)
@@ -840,8 +928,8 @@ def _execute_complex(
         else:
             result.add_reason("planning_budget_exhausted")
 
-    tool_facts = _partial_route_facts(
-        result, decision, store, config, budget, execute_fn
+    tool_facts = _catalog_or_partial_route_facts(
+        result, active_plan, decision, store, config, budget, execute_fn
     )
 
     # Selective decomposition (2.2.4.2): when enabled, a genuinely compound plan
@@ -1106,6 +1194,21 @@ def _retrieve_derived_subquery(
     return facts, docs
 
 
+def _timed_rerank(r: "Retriever", query: str, docs: list[dict], *, top_n: int):
+    """Run one adaptive rerank and expose its duration through Retriever timings."""
+    started = time.perf_counter()
+    try:
+        return r.reranker.rerank(query, docs, top_n=top_n)
+    finally:
+        timings = getattr(r, "_timings", None)
+        if not isinstance(timings, dict):
+            timings = {}
+            r._timings = timings
+        timings["fusion_rerank"] = float(timings.get("fusion_rerank") or 0.0) + (
+            time.perf_counter() - started
+        ) * 1000
+
+
 def _maybe_rerank_fused_documents(
     r: "Retriever",
     plan: QueryPlan,
@@ -1129,7 +1232,9 @@ def _maybe_rerank_fused_documents(
         result.add_reason("rerank_budget_exhausted")
         return fused[:top_k]
     try:
-        reranked = r.reranker.rerank(plan.retrieval_query, list(fused), top_n=top_k)
+        reranked = _timed_rerank(
+            r, plan.retrieval_query, list(fused), top_n=top_k,
+        )
     except Exception:  # noqa: BLE001 - reranker should not raise
         logger.warning("Fused rerank failed; keeping fusion order", exc_info=True)
         result.add_reason("rerank_fallback")
@@ -1219,6 +1324,134 @@ def _run_derived_subqueries(
 # ── Shared retrieval + conditional rerank ─────────────────
 
 
+def _catalog_or_partial_route_facts(
+    result: OrchestrationResult,
+    plan: QueryPlan,
+    decision: "RouteDecision",
+    store: Any,
+    config: "MiddlewareConfig",
+    budget: ExecutionBudget,
+    execute_fn: ExecuteFn,
+) -> list[dict]:
+    """Resolve a catalog universe before one bounded structured comparison."""
+    is_catalog = bool(
+        decision.matched
+        and decision.tool_invocations
+        and decision.tool_invocations[0].reason_code == dr.REASON_COVERAGE
+    )
+    if not is_catalog or "facts" not in plan.obligations.evidence_modes:
+        return _partial_route_facts(
+            result, decision, store, config, budget, execute_fn
+        )
+
+    if not budget.consume(DETERMINISTIC_TOOL):
+        result.add_reason("deterministic_tool_budget_exhausted")
+        return []
+    catalog = execute_fn(decision, store, max_tools=1, build_answer=False)
+    result.tool_execution = catalog
+    for code in catalog.incomplete_reason_codes:
+        if code != dr.INCOMPLETE_MISSING_METRIC_COVERAGE:
+            result.add_reason(code)
+    if catalog.error or not catalog.invocations:
+        result.add_reason("partial_route_error_ignored")
+        return []
+
+    facts = _normalize_tool_facts(catalog)
+    payload = catalog.invocations[0].result
+    tickers = [
+        str(row.get("ticker"))
+        for row in payload.get("securities") or []
+        if isinstance(row, dict) and row.get("ticker")
+    ]
+    total = int(payload.get("total_matching") or len(tickers))
+    result.result_set_size = total
+    result.set_complete = bool(payload.get("complete", False))
+    result.add_reason("includes_deterministic_tool_evidence")
+
+    blocking_codes = {
+        dr.INCOMPLETE_PARTIAL_CATALOG_PAGE,
+        dr.INCOMPLETE_MISSING_COVERAGE_DIMENSION,
+        dr.INCOMPLETE_UNRESOLVED_UNIVERSE_SCOPE,
+        dr.INCOMPLETE_QUALITATIVE_EVIDENCE_REQUIRED,
+    }
+    if not result.set_complete or blocking_codes & set(catalog.incomplete_reason_codes):
+        return facts
+
+    cap = max(1, min(int(getattr(config, "top_k_facts", 10)), 100))
+    if total > cap or len(tickers) > cap:
+        result.set_complete = False
+        result.add_reason(dr.INCOMPLETE_RESULT_SET_TOO_LARGE)
+        facts.append({
+            "metric": "coverage_request_to_narrow",
+            "value": (
+                f"The catalog matched {total} securities, above the {cap}-security "
+                "comparison cap. Narrow by sector, index, coverage tier, or ticker."
+            ),
+            "ticker": "CATALOG",
+            "source_type": "catalog",
+            "kind": "tool_result",
+            "complete": False,
+            "total_matching": total,
+        })
+        return facts
+
+    metrics = list(plan.obligations.metrics or plan.metrics)
+    if len(metrics) != 1 or not tickers:
+        result.set_complete = False
+        result.add_reason(dr.INCOMPLETE_MISSING_METRIC_COVERAGE)
+        return facts
+    if not budget.consume(DETERMINISTIC_TOOL):
+        result.set_complete = False
+        result.add_reason("deterministic_tool_budget_exhausted")
+        result.add_reason(dr.INCOMPLETE_RESULT_SET_TOO_LARGE)
+        return facts
+
+    arguments = {
+        "metric": metrics[0],
+        "tickers": tickers,
+        "latest_only": plan.obligations.as_of in {None, "latest"},
+        "limit": len(tickers),
+    }
+    if plan.obligations.completeness == "top_n":
+        arguments.update(order="desc", limit=plan.obligations.limit or len(tickers))
+    elif plan.obligations.completeness == "bottom_n":
+        arguments.update(order="asc", limit=plan.obligations.limit or len(tickers))
+    invocation = dr.ToolInvocation(
+        "query_facts", arguments,
+        plan.subqueries[0].id if plan.subqueries else "sq0",
+        dr.REASON_COMPARE,
+    )
+    structured_decision = dr.RouteDecision(
+        matched=True,
+        complete=True,
+        tool_invocations=[invocation],
+        reason_codes=[dr.REASON_COMPARE],
+    )
+    structured = execute_fn(
+        structured_decision, store, max_tools=1, build_answer=False
+    )
+    catalog.invocations.extend(structured.invocations)
+    catalog.calculations.extend(structured.calculations)
+    catalog.error = catalog.error or structured.error
+    catalog.complete = catalog.complete and structured.complete
+    catalog.incomplete_reason_codes.extend(
+        code for code in structured.incomplete_reason_codes
+        if code not in catalog.incomplete_reason_codes
+    )
+    result.tool_execution = catalog
+    if structured.error:
+        result.set_complete = False
+        result.add_reason("partial_route_error_ignored")
+        return facts
+
+    structured_facts = _normalize_tool_facts(structured)
+    covered = {str(fact.get("ticker")) for fact in structured_facts if fact.get("ticker")}
+    if not set(tickers) <= covered:
+        result.set_complete = False
+        result.add_reason(dr.INCOMPLETE_MISSING_METRIC_COVERAGE)
+    return [*facts, *structured_facts]
+
+
 def _partial_route_facts(
     result: OrchestrationResult,
     decision: "RouteDecision",
@@ -1244,6 +1477,8 @@ def _partial_route_facts(
     if execution.error:
         result.add_reason("partial_route_error_ignored")
         return []
+    for code in execution.incomplete_reason_codes:
+        result.add_reason(code)
     result.tool_execution = execution
     result.calculations = list(execution.calculations)
     result.add_reason("includes_deterministic_tool_evidence")
@@ -1335,7 +1570,7 @@ def _conditional_rerank(
         return pool[:top_k]
 
     try:
-        reranked = r.reranker.rerank(plan.retrieval_query, pool, top_n=top_k)
+        reranked = _timed_rerank(r, plan.retrieval_query, pool, top_n=top_k)
     except Exception:  # noqa: BLE001 - defensive: reranker should not raise
         logger.warning("Conditional rerank failed; keeping RRF order", exc_info=True)
         result.add_reason("rerank_fallback")
@@ -1446,6 +1681,9 @@ def _plan_from_json(data: dict, base: QueryPlan) -> QueryPlan:
         periods=periods,
         subqueries=[sq0],
         primary_intent=intents[0],
+        evidence_topic=base.evidence_topic,
+        evidence_filters=dict(base.evidence_filters),
+        obligations=base.obligations,
         reason_codes=["planner"],
     )
 
@@ -1545,8 +1783,14 @@ def _retrieval_cache_key(
         # Drop the whole cache if the config/model fingerprint changed since the
         # last request (a redeploy that swapped the model or a retrieval toggle).
         cache.check_fingerprint(config_fingerprint(config))
+        revision = int(revision_fn())
+        corpus_revision_fn = getattr(store, "corpus_revision", None)
+        corpus_revision = (
+            int(corpus_revision_fn()) if callable(corpus_revision_fn) else revision
+        )
         return build_cache_key(
-            plan=plan, config=config, lane=lane, revision=int(revision_fn()),
+            plan=plan, config=config, lane=lane, revision=revision,
+            corpus_revision=corpus_revision,
             available_metrics=available_metrics,
             as_of=getattr(plan, "as_of", None),
         )
@@ -1639,6 +1883,42 @@ def _normalize_tool_facts(execution: "ExecutionResult") -> list[dict]:
         if inv.error:
             continue
 
+        if inv.name == "describe_coverage":
+            operation = str(inv.arguments.get("operation") or "summary")
+            values: list[str] = []
+            for key in ("securities", "sources", "item_types", "metrics"):
+                for value in res.get(key) or []:
+                    if isinstance(value, dict):
+                        label = value.get("ticker") or value.get("source")
+                    else:
+                        label = value
+                    if label is not None and str(label) not in values:
+                        values.append(str(label))
+            display = ", ".join(values) if values else str(
+                res.get("message") or res.get("total_matching") or 0
+            )
+            if res.get("complete") is False and res.get("status") != "unavailable":
+                display = (
+                    f"{display}. Returned {res.get('result_count', len(values))} of "
+                    f"{res.get('total_matching', len(values))}; narrow with a sector, "
+                    "index, coverage tier, source, item type, or ticker filter."
+                )
+            facts.append({
+                "metric": f"coverage_{operation}",
+                "value": display,
+                "ticker": (
+                    inv.arguments.get("ticker")
+                    if operation == "security_sources"
+                    else "CATALOG"
+                ),
+                "period": res.get("universe_snapshot_at"),
+                "source_type": "catalog",
+                "kind": "tool_result",
+                "complete": bool(res.get("complete", False)),
+                "total_matching": res.get("total_matching"),
+            })
+            continue
+
         fundamentals = res.get("fundamentals")
         if isinstance(fundamentals, dict):
             ticker = res.get("ticker")
@@ -1662,9 +1942,49 @@ def _normalize_tool_facts(execution: "ExecutionResult") -> list[dict]:
                     if isinstance(fact, dict) and fact.get("value") is not None:
                         facts.append({
                             "metric": metric, "value": fact.get("value"),
+                            "unit": fact.get("unit"),
                             "period": fact.get("period"), "ticker": res.get("ticker"),
                             "source_type": "estimates",
                         })
+
+        guidance = res.get("guidance")
+        if isinstance(guidance, dict):
+            for metric, fact in guidance.items():
+                if isinstance(fact, dict) and fact.get("value") is not None:
+                    facts.append({
+                        "metric": f"guidance_{metric}", "value": fact.get("value"),
+                        "unit": fact.get("unit"), "period": fact.get("period"),
+                        "ticker": res.get("ticker"), "source_type": "guidance",
+                    })
+
+        macro = res.get("macro")
+        if isinstance(macro, dict):
+            for metric, fact in macro.items():
+                if isinstance(fact, dict) and fact.get("value") is not None:
+                    facts.append({
+                        "metric": metric, "value": fact.get("value"),
+                        "unit": fact.get("unit"),
+                        "period": fact.get("period") or fact.get("as_of"),
+                        "ticker": "MACRO", "source_type": fact.get("source_type", "fred"),
+                    })
+                elif isinstance(fact, (int, float)):
+                    facts.append({
+                        "metric": metric, "value": fact, "ticker": "MACRO",
+                        "source_type": "fred",
+                    })
+
+        if inv.name == "check_freshness":
+            ticker = res.get("ticker") or inv.arguments.get("ticker")
+            for source, detail in (res.get("sources") or {}).items():
+                if isinstance(detail, dict):
+                    status = detail.get("status") or detail.get("freshness") or "unknown"
+                    period = detail.get("as_of") or detail.get("last_fetched")
+                else:
+                    status, period = detail, None
+                facts.append({
+                    "metric": f"freshness_{source}", "value": status,
+                    "period": period, "ticker": ticker, "source_type": "freshness",
+                })
     return facts
 
 

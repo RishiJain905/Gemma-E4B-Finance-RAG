@@ -1,0 +1,8 @@
+{
+  "meta": {"last_updated": "2026-07-14T10:00:00Z", "license": "public"},
+  "results": [
+    {"report_id": "FDA-REC-1", "event_type": "recall", "recall_number": "Z-100-2026", "product_description": "Cardiac monitor", "manufacturer": "Alpha Health Corp", "reason_for_recall": "Labeling issue", "status": "Ongoing", "report_date": "2026-07-10", "url": "https://www.fda.gov/recalls/fda-rec-1"},
+    {"report_id": "FDA-SAF-1", "event_type": "safety", "product_description": "Respiratory device", "manufacturer": "Ambiguous Health", "reason": "Safety report", "report_date": "2026-07-11", "url": "https://www.fda.gov/safety/fda-saf-1"},
+    {"report_id": "FDA-SHO-1", "event_type": "shortage", "product_description": "Injectable medicine", "manufacturer": "Alpha Health Corp", "status": "Shortage", "report_date": "2026-07-12", "url": "https://www.fda.gov/drugs/shortages/fda-sho-1"}
+  ]
+}

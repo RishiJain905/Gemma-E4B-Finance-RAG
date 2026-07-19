@@ -55,6 +55,19 @@
           <button id="btn-export" class="tool-btn" type="button">Export snapshot</button>
         </div>
         <div class="toolbar-group" id="corpus-controls" hidden>
+          <label class="field preset-field">
+            <span class="field-label">Preset</span>
+            <select id="corpus-presets" class="mono" aria-label="Jump to a saved entry point">
+              <option value="">—</option>
+              <option value="index-coverage">Index coverage overview</option>
+              <option value="financing-events">Financing &amp; capital-markets events</option>
+              <option value="latest-news">Latest company news</option>
+              <option value="macro-policy">Macro &amp; policy releases</option>
+              <option value="stale-sources">Stale / error sources</option>
+              <option value="indexing-backlog">Indexing backlog</option>
+              <option value="ticker-research">One-ticker research view</option>
+            </select>
+          </label>
           <label class="field search-field">
             <span class="field-label">Search</span>
             <input id="corpus-search" class="mono" type="search" autocomplete="off"
@@ -63,6 +76,8 @@
           </label>
           <button id="btn-corpus-search" class="tool-btn" type="button">Search</button>
           <button id="btn-corpus-overview" class="tool-btn" type="button">Overview</button>
+          <button id="btn-facets-toggle" class="tool-btn" type="button"
+                  aria-expanded="false" aria-controls="facet-rail" hidden>Facets</button>
           <button id="btn-corpus-more" class="tool-btn" type="button" hidden>Load next page</button>
         </div>
         <div class="toolbar-spacer"></div>
@@ -103,21 +118,50 @@
         <button id="btn-clear-filters" class="tool-btn subtle" type="button">Clear</button>
       </div>
 
-      <div class="canvas-wrap">
-        <div class="stage-rail" id="stage-rail" aria-hidden="true"></div>
-        <div id="graph-canvas" class="graph-canvas" tabindex="0" role="application"
-             aria-label="Interactive retrieval graph. Use the node list or arrow keys to inspect nodes."></div>
+      <div class="work-area" id="work-area">
+        <aside class="facet-rail" id="facet-rail" aria-label="Corpus facets" hidden>
+          <div class="facet-rail-head">
+            <span class="field-label">Facets</span>
+            <button id="btn-facets-clear" class="tool-btn subtle" type="button">Clear all</button>
+          </div>
+          <div class="facet-groups" id="facet-groups" role="group"
+               aria-label="Combinable corpus filters"></div>
+        </aside>
 
-        <div id="error-panel" class="error-panel" role="alert" hidden>
-          <h2 class="error-title">Graph view unavailable</h2>
-          <p id="error-detail" class="error-detail"></p>
-          <button id="btn-retry" class="tool-btn" type="button">Retry</button>
-          <p class="error-note">A read-only table of the current trace is shown below.</p>
+        <section class="inventory-pane" id="inventory-pane"
+                 aria-label="Corpus inventory and results" hidden>
+          <div class="inventory-head">
+            <span class="field-label">Inventory</span>
+            <span id="inventory-count" class="mono" role="status" aria-live="polite"></span>
+          </div>
+          <div class="inventory-scroll">
+            <ul id="inventory-list" class="inventory-list" role="listbox"
+                aria-label="Aggregate groups and corpus items" tabindex="0"></ul>
+            <p id="inventory-empty" class="inventory-empty" role="status">
+              Pick a source group or preset to explore the corpus.
+            </p>
+          </div>
+          <div class="inventory-foot">
+            <button id="btn-inventory-more" class="tool-btn" type="button" hidden>Load next page</button>
+          </div>
+        </section>
+
+        <div class="canvas-wrap">
+          <div class="stage-rail" id="stage-rail" aria-hidden="true"></div>
+          <div id="graph-canvas" class="graph-canvas" tabindex="0" role="application"
+               aria-label="Interactive retrieval graph. Use the node list or arrow keys to inspect nodes."></div>
+
+          <div id="error-panel" class="error-panel" role="alert" hidden>
+            <h2 class="error-title">Graph view unavailable</h2>
+            <p id="error-detail" class="error-detail"></p>
+            <button id="btn-retry" class="tool-btn" type="button">Retry</button>
+            <p class="error-note">A read-only table of the current trace is shown below.</p>
+          </div>
+
+          <p id="canvas-empty" class="canvas-empty" role="status">
+            No traces yet. Ask a question in chat and it appears here.
+          </p>
         </div>
-
-        <p id="canvas-empty" class="canvas-empty" role="status">
-          No traces yet. Ask a question in chat and it appears here.
-        </p>
       </div>
 
       <div class="scrubber-bar" id="scrubber-bar">

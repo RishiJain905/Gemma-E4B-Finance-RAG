@@ -89,7 +89,13 @@ class FREDIngestor:
 
     # ── Public API ─────────────────────────────────────
 
-    def fetch_indicator(self, series_id: str, limit: int = 5) -> Optional[float]:
+    def fetch_indicator(
+        self,
+        series_id: str,
+        limit: int = 5,
+        *,
+        store_history: bool = False,
+    ) -> Optional[float]:
         """
         Fetch the latest observation for a single FRED indicator.
 
@@ -128,17 +134,25 @@ class FREDIngestor:
             latest = series.iloc[-1]
             latest_date = series.index[-1]
 
-            # Store as a structured fact
-            self.store.save_fundamental(
-                ticker="MACRO",
-                metric=series_id,
-                value=float(latest),
-                unit=self._guess_unit(series_id),
-                period=str(latest_date.date()),
-                period_type="daily",
-                source_type="fred",
-                source_url=f"https://fred.stlouisfed.org/series/{series_id}",
-            )
+            # Store the current observation for the normal path. Bootstrap can
+            # explicitly retain the bounded history returned by the same call.
+            rows = series.items() if store_history else [(latest_date, latest)]
+            for observed_date, observed_value in rows:
+                period = (
+                    observed_date.date().isoformat()
+                    if hasattr(observed_date, "date")
+                    else str(observed_date)
+                )
+                self.store.save_fundamental(
+                    ticker="MACRO",
+                    metric=series_id,
+                    value=float(observed_value),
+                    unit=self._guess_unit(series_id),
+                    period=period,
+                    period_type="daily",
+                    source_type="fred",
+                    source_url=f"https://fred.stlouisfed.org/series/{series_id}",
+                )
 
             logger.info(
                 "FRED %s (%s): %.4f on %s",
@@ -152,7 +166,12 @@ class FREDIngestor:
             logger.error("Failed to fetch FRED series %s: %s", series_id, e)
             return None
 
-    def fetch_all_indicators(self) -> dict[str, Optional[float]]:
+    def fetch_all_indicators(
+        self,
+        limit: int = 5,
+        *,
+        store_history: bool = False,
+    ) -> dict[str, Optional[float]]:
         """
         Fetch all configured indicators.
 
@@ -163,7 +182,11 @@ class FREDIngestor:
         indicators = self.config.get("indicators", {})
 
         for series_id in indicators:
-            value = self.fetch_indicator(series_id)
+            value = self.fetch_indicator(
+                series_id,
+                limit=max(int(limit), 1),
+                store_history=store_history,
+            )
             results[series_id] = value
 
         return results
