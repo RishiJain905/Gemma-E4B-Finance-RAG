@@ -182,6 +182,9 @@ def test_dead_letter_count_surfaces_in_queues(store, capsys):
 def test_freshness_staleness_math(store):
     store.mark_cache_fresh("SCHEDULER", "unified:finnhub", 24)
     store.upsert_cache_stale("SCHEDULER", "unified:gdelt", "boom")
+    store.upsert_cache_stale("SCHEDULER", "unified:estimates", "boom")
+    store.mark_cache_fresh("SCHEDULER", "unified:massive", 24)
+    store.mark_cache_fresh("SCHEDULER", "unified:massive_news", 1)
     # sec_filings never fetched (no cache_meta row) but is known via a run
     _complete_run(store, sources=[{"source": "sec_filings", "status": "skipped"}])
 
@@ -191,12 +194,24 @@ def test_freshness_staleness_math(store):
     assert by_name["finnhub"]["state"] == "fresh"
     assert by_name["finnhub"]["age_hours"] is not None
     assert by_name["finnhub"]["ttl_hours"] == pytest.approx(24.0, abs=0.2)
-    assert by_name["gdelt"]["state"] == "stale"
+    assert by_name["gdelt"]["state"] == "disabled"
+    assert by_name["estimates"]["state"] == "stale"
     assert by_name["sec_filings"]["state"] == "never"
+    assert by_name["massive"]["ttl_hours"] == pytest.approx(24.0, abs=0.2)
+    assert by_name["massive_news"]["ttl_hours"] == pytest.approx(1.0, abs=0.2)
 
-    # stale-first ordering: stale, then never, then fresh
+    rendered = ws.render_freshness(snapshot)
+    assert "gdelt" in rendered and "state=disabled" in rendered
+    assert "massive" in rendered and "massive_news" in rendered
+
+    # stale-first ordering: stale, configured-disabled, never, then fresh
     states = [e["state"] for e in snapshot.freshness]
-    assert states.index("stale") < states.index("never") < states.index("fresh")
+    assert (
+        states.index("stale")
+        < states.index("disabled")
+        < states.index("never")
+        < states.index("fresh")
+    )
 
 
 def _write_fake_chroma(db_path, revision):

@@ -322,6 +322,78 @@ def test_massive_optional_news_and_vendor_filings_use_secondary_provenance(
     assert filing["metadata"]["accession"] == "0000000000-26-000001"
 
 
+def test_massive_news_uses_timestamp_cursor_with_overlap_and_oldest_first(
+    tmp_path: Path,
+) -> None:
+    from src.ingestion.massive_ingestor import MassiveIngestor
+
+    store, _chroma = _store(tmp_path)
+    store.set_source_cursor(
+        "massive_news",
+        "US",
+        "2026-07-14T11:30:00Z",
+        cursor_type="timestamp",
+        status="success",
+    )
+    payload = _load("news.json")
+    payload["results"][0]["published_utc"] = "2026-07-14T12:45:00Z"
+    params_seen: list[dict] = []
+
+    def http_get(_url: str, **kwargs) -> FakeResponse:
+        params_seen.append(kwargs["params"])
+        return FakeResponse(payload)
+
+    result = MassiveIngestor(
+        store=store,
+        coverage_resolver=_coverage(),
+        api_key="test-massive-key",
+        http_get=http_get,
+        news_overlap_hours=2,
+        now_fn=lambda: "2026-07-14T20:00:00Z",
+        sleep_fn=lambda _seconds: None,
+    ).ingest_news()
+
+    assert params_seen[0]["published_utc.gte"] == "2026-07-14T09:30:00Z"
+    assert params_seen[0]["published_utc.lte"] == "2026-07-14T20:00:00Z"
+    assert params_seen[0]["sort"] == "published_utc"
+    assert params_seen[0]["order"] == "asc"
+    assert result["cursor_before"] == "2026-07-14T11:30:00Z"
+    assert result["cursor_after"] == "2026-07-14T12:45:00Z"
+    assert store.get_source_cursor("massive_news", "US") == "2026-07-14T12:45:00Z"
+
+
+def test_massive_news_does_not_advance_cursor_when_indexing_fails(
+    tmp_path: Path,
+) -> None:
+    from src.ingestion.massive_ingestor import MassiveIngestor
+
+    store, chroma = _store(tmp_path)
+    store.set_source_cursor(
+        "massive_news",
+        "US",
+        "2026-07-14T11:30:00Z",
+        cursor_type="timestamp",
+        status="success",
+    )
+    payload = _load("news.json")
+    payload["results"][0]["published_utc"] = "2026-07-14T12:45:00Z"
+    chroma.add_document.side_effect = RuntimeError("embedding unavailable")
+
+    result = MassiveIngestor(
+        store=store,
+        coverage_resolver=_coverage(),
+        api_key="test-massive-key",
+        http_get=lambda *_args, **_kwargs: FakeResponse(payload),
+        news_overlap_hours=2,
+        now_fn=lambda: "2026-07-14T20:00:00Z",
+        sleep_fn=lambda _seconds: None,
+    ).ingest_news()
+
+    assert result["status"] == "partial"
+    assert result["cursor_after"] == "2026-07-14T11:30:00Z"
+    assert store.get_source_cursor("massive_news", "US") == "2026-07-14T11:30:00Z"
+
+
 def test_massive_429_exposes_retry_metadata_without_advancing_date_cursor(
     tmp_path: Path,
 ) -> None:

@@ -117,6 +117,18 @@ def _as_date(value: object, field_name: str) -> str:
     return parsed.isoformat()
 
 
+def _as_utc_timestamp(value: object, field_name: str) -> tuple[datetime, str]:
+    """Parse one provider timestamp and return a normalized UTC cursor value."""
+    text = str(value or "").strip()
+    if not text:
+        raise ValueError(f"{field_name} is required")
+    parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    parsed = parsed.astimezone(timezone.utc)
+    return parsed, parsed.isoformat().replace("+00:00", "Z")
+
+
 def _safe_identity(value: object, fallback: str) -> str:
     """Make a bounded provider identity suitable for a corpus/event id."""
     text = str(value or "").strip()
@@ -153,6 +165,7 @@ class MassiveIngestor:
         http_get: Optional[Callable[..., Any]] = None,
         timeout: float = 30.0,
         overlap_days: int = 3,
+        news_overlap_hours: int = 2,
         initial_lookback_days: int = 5,
         max_pages: int = 20,
         max_attempts: int = 3,
@@ -170,6 +183,7 @@ class MassiveIngestor:
         self.http_get = http_get or requests.get
         self.timeout = max(float(timeout), 0.1)
         self.overlap_days = max(int(overlap_days), 0)
+        self.news_overlap_hours = max(int(news_overlap_hours), 0)
         self.initial_lookback_days = max(int(initial_lookback_days), 1)
         self.max_pages = max(int(max_pages), 1)
         self.max_attempts = max(int(max_attempts), 1)
@@ -429,14 +443,34 @@ class MassiveIngestor:
         if not self.api_key:
             self._set_status(self.NEWS_STATUS_SOURCE, "US", "disabled_missing_key", "authentication", "MASSIVE_API_KEY is not configured")
             return self._finish(result, "disabled_missing_key", error_class="authentication")
-        today = self._now_date()
-        first = start_date or (today - timedelta(days=self.initial_lookback_days)).isoformat()
-        last = end_date or today.isoformat()
+        now_timestamp = self._now_timestamp()
+        now_dt, _ = _as_utc_timestamp(now_timestamp, "current time")
+        cursor_before = self.store.get_source_cursor(self.NEWS_STATUS_SOURCE, "US")
+        result["cursor_before"] = cursor_before
+        if start_date:
+            first = start_date
+        elif cursor_before:
+            cursor_dt, _ = _as_utc_timestamp(cursor_before, "news cursor")
+            first = (cursor_dt - timedelta(hours=self.news_overlap_hours)).isoformat().replace(
+                "+00:00", "Z"
+            )
+        else:
+            first = (now_dt - timedelta(days=self.initial_lookback_days)).isoformat().replace(
+                "+00:00", "Z"
+            )
+        last = end_date or now_timestamp
         url = f"{self.base_url}{self.NEWS_PATH}"
         try:
             payload = self._request_json(
                 url,
-                {"published_utc.gte": first, "published_utc.lte": last, "limit": 1_000, "apiKey": self.api_key},
+                {
+                    "published_utc.gte": first,
+                    "published_utc.lte": last,
+                    "sort": "published_utc",
+                    "order": "asc",
+                    "limit": 1_000,
+                    "apiKey": self.api_key,
+                },
             )
             self._record_request(result)
         except MassiveProviderError as exc:
@@ -446,11 +480,38 @@ class MassiveIngestor:
             return self._finish(
                 result, status, error_class=exc.error_class,
                 retry_after=exc.retry_after, reset_at=exc.reset_at,
+                cursor_after=cursor_before,
             )
         rows = self._rows_from_payload(payload)
         if rows is None:
-            return self._finish(result, "error", error_class="contract")
+            self._set_status(
+                self.NEWS_STATUS_SOURCE,
+                "US",
+                "error",
+                "contract",
+                "news response has no results list",
+            )
+            return self._finish(
+                result,
+                "error",
+                error_class="contract",
+                cursor_after=cursor_before,
+            )
+        result["pages"] += 1
+        newest: Optional[tuple[datetime, str]] = None
         for row in rows:
+            try:
+                if not isinstance(row, dict):
+                    raise ValueError("row must be an object")
+                row_timestamp = _as_utc_timestamp(
+                    row.get("published_utc") or row.get("published_at"),
+                    "published_utc",
+                )
+                if newest is None or row_timestamp[0] > newest[0]:
+                    newest = row_timestamp
+            except (TypeError, ValueError):
+                result["malformed"] += 1
+                continue
             try:
                 record = self._news_record(row, selected, url)
             except (TypeError, ValueError, KeyError):
@@ -475,8 +536,28 @@ class MassiveIngestor:
             else:
                 result["duplicates"] += 1
         status = "partial" if result["malformed"] else "ok"
-        self._set_status(self.NEWS_STATUS_SOURCE, "US", status)
-        return self._finish(result, status)
+        cursor_after = cursor_before
+        if status == "ok" and newest is not None:
+            should_advance = True
+            if cursor_before:
+                try:
+                    cursor_dt, _ = _as_utc_timestamp(cursor_before, "news cursor")
+                    should_advance = newest[0] > cursor_dt
+                except ValueError:
+                    should_advance = True
+            if should_advance:
+                cursor_after = newest[1]
+            self.store.set_source_cursor(
+                self.NEWS_STATUS_SOURCE,
+                "US",
+                cursor_after,
+                cursor_type="timestamp",
+                overlap_value=f"{self.news_overlap_hours}h",
+                status="success",
+            )
+        else:
+            self._set_status(self.NEWS_STATUS_SOURCE, "US", status)
+        return self._finish(result, status, cursor_after=cursor_after)
 
     def ingest_vendor_filings(
         self,

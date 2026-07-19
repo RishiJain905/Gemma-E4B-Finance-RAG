@@ -108,14 +108,14 @@ def _seed_forward_pe(store, ticker, value):
     )
 
 
-def _mark_only_gdelt_stale(store, ticker="NVDA"):
+def _mark_only_news_stale(store, ticker="NVDA"):
     for cfg in StoreClass.FRESHNESS_SOURCES.values():
         store.mark_source_fresh(ticker, cfg["cache_source"], 24)
-    store.mark_source_stale(ticker, "gdelt_news")
+    store.mark_source_stale(ticker, "yfinance_news")
 
 
 def test_refresh_tool_guarded(tmp_store, monkeypatch):
-    called = MagicMock(return_value=(["gdelt_news"], []))
+    called = MagicMock(return_value=(["yfinance_news"], []))
     monkeypatch.setattr(middleware_app, "store", tmp_store)
     monkeypatch.setattr(middleware_app, "_refresh_ticker_sources", called)
 
@@ -128,7 +128,7 @@ def test_refresh_tool_guarded(tmp_store, monkeypatch):
     assert denied == {"error": "write tools disabled"}
     called.assert_not_called()
 
-    _mark_only_gdelt_stale(tmp_store)
+    _mark_only_news_stale(tmp_store)
     allowed = dispatch_tool(
         {"function": {"name": "refresh_data", "arguments": '{"ticker":"nvda"}'}},
         tmp_store,
@@ -136,15 +136,15 @@ def test_refresh_tool_guarded(tmp_store, monkeypatch):
     )
 
     assert allowed["ticker"] == "NVDA"
-    assert allowed["refreshed"] == ["gdelt_news"]
-    called.assert_called_once_with("NVDA", ["gdelt_news"])
+    assert allowed["refreshed"] == ["yfinance_news"]
+    called.assert_called_once_with("NVDA", ["yfinance_news"])
 
 
 def test_refresh_rate_limit(tmp_store, monkeypatch):
-    called = MagicMock(return_value=(["gdelt_news"], []))
+    called = MagicMock(return_value=(["yfinance_news"], []))
     monkeypatch.setattr(middleware_app, "store", tmp_store)
     monkeypatch.setattr(middleware_app, "_refresh_ticker_sources", called)
-    _mark_only_gdelt_stale(tmp_store)
+    _mark_only_news_stale(tmp_store)
     ctx = ToolContext(allow_write=True, max_refreshes=2)
     call = {"function": {"name": "refresh_data", "arguments": '{"ticker":"NVDA"}'}}
 
@@ -159,14 +159,14 @@ def test_refresh_rate_limit(tmp_store, monkeypatch):
 def test_refresh_cannot_trigger_full_scheduler(tmp_store, monkeypatch):
     assert middleware_app._normalize_sources(["all"]) == []
 
-    called = MagicMock(return_value=(["gdelt_news"], []))
+    called = MagicMock(return_value=(["yfinance_news"], []))
     scheduler_refresh = MagicMock()
     scheduler_cls = MagicMock()
     monkeypatch.setattr(middleware_app, "store", tmp_store)
     monkeypatch.setattr(middleware_app, "_refresh_ticker_sources", called)
     monkeypatch.setattr(middleware_app, "_refresh_via_scheduler", scheduler_refresh)
     monkeypatch.setattr("src.scheduler.UnifiedScheduler", scheduler_cls)
-    _mark_only_gdelt_stale(tmp_store)
+    _mark_only_news_stale(tmp_store)
 
     # Explicitly invalid sources (e.g. "all") are a structured error, not a
     # fallback into refreshing everything stale.
@@ -190,15 +190,15 @@ def test_refresh_cannot_trigger_full_scheduler(tmp_store, monkeypatch):
         {
             "function": {
                 "name": "refresh_data",
-                "arguments": '{"ticker":"NVDA","sources":["sec","gdelt"]}',
+                "arguments": '{"ticker":"NVDA","sources":["sec","news"]}',
             }
         },
         tmp_store,
         ToolContext(allow_write=True, max_refreshes=2),
     )
-    assert result["refreshed"] == ["gdelt_news"]
+    assert result["refreshed"] == ["yfinance_news"]
     assert result["skipped_scheduler_managed"] == ["sec_filings"]
-    called.assert_called_once_with("NVDA", ["gdelt_news"])
+    called.assert_called_once_with("NVDA", ["yfinance_news"])
 
     # Only scheduler-managed sources requested -> nothing is refreshed.
     result = dispatch_tool(

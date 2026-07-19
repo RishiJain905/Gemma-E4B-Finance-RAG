@@ -252,6 +252,22 @@ sources:
     assert registry.select("daily", source="deep_docs") == []
 
 
+def test_default_hourly_registry_uses_massive_news_and_disables_gdelt():
+    registry = SourceRegistry.load(environ={"MASSIVE_API_KEY": "test-key"})
+
+    assert [spec.name for spec in registry.select("hourly")] == ["massive_news"]
+    news = registry.get("massive_news")
+    assert news.capability_group == "company_news"
+    assert news.cursor_kind == "timestamp"
+    assert news.overlap == "2h"
+    assert news.requests_per_run == 1
+    assert news.ttl_hours == 1
+
+    gdelt = registry.get("gdelt")
+    assert gdelt.status == "configured_disabled"
+    assert gdelt.disabled_reason == "disabled by configuration"
+
+
 @pytest.mark.parametrize(
     "override, expected_error",
     [

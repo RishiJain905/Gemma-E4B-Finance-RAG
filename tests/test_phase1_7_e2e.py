@@ -86,7 +86,7 @@ def test_scenario_1_full_daily_run(store):
     # status_report reflects the run.
     report = scheduler.status_report()
     assert report["sources"]["yfinance"]["status"] == "fresh"
-    assert report["sources"]["gdelt"]["status"] == "never_fetched"
+    assert report["sources"]["gdelt"]["status"] == "configured_disabled"
 
 
 # ════════════════════════════════════════════════════════
@@ -160,7 +160,7 @@ def test_scenario_4_dead_letter_queue(store):
     pending = dlq.get_pending()
     pending_sources = {p["source"] for p in pending}
     assert "fred" in pending_sources
-    assert "gdelt" in pending_sources
+    assert "gdelt" not in pending_sources
     assert len(pending) == sum(
         spec.is_available for spec in scheduler.SOURCES.values()
     )

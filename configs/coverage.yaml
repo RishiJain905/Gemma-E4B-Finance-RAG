@@ -1,6 +1,6 @@
 # configs/coverage.yaml
 # Source-aware security coverage policy. This file contains no provider credentials.
-revision: "2.3.2.3-r1"
+revision: "2.3.2.3-r2"
 fallback_when_registry_empty: deep
 
 # The former watchlist `core` set is preserved as explicit deep coverage.
@@ -63,6 +63,12 @@ sources:
     required_env: MASSIVE_API_KEY
     scopes: [broad]
     capabilities: [market_summary, corporate_actions, company_news, vendor_filing_metadata]
+  massive_news:
+    enabled: true
+    optional: true
+    required_env: MASSIVE_API_KEY
+    scopes: [broad]
+    capabilities: [company_news]
   twelve_data:
     enabled: false
     optional: true
