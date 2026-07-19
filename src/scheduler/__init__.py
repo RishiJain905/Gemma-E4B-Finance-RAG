@@ -1648,6 +1648,15 @@ class UnifiedScheduler:
                 return discovery.discover_dates([partition])
             return sched.run_discovery(force=True, allow_bootstrap=False)
 
+        if source == "federal_reserve":
+            from src.ingestion.official.federal_reserve import FederalReserveIngestor
+
+            return FederalReserveIngestor(
+                store=self.store,
+                coverage_resolver=self.coverage,
+                http_get=self._budgeted_http_get(source),
+            ).ingest_history(run_id=run_id)
+
         self._bootstrap_context = {
             "source": source,
             "since": since,
@@ -1834,11 +1843,17 @@ class UnifiedScheduler:
                             )
                             updated_items = self._result_metric(detail, ("updated",))
                             duplicate_items = self._result_metric(detail, ("duplicates",))
+                            checkpoint_status = (
+                                "partial"
+                                if spec.name == "federal_reserve"
+                                and part_status == "partial"
+                                else "completed"
+                            )
                             self.store.record_bootstrap_partition(
                                 run_id,
                                 spec.name,
                                 partition,
-                                status="completed",
+                                status=checkpoint_status,
                                 started_at=part_started,
                                 ended_at=self._status_now(),
                                 attempts=attempts,
@@ -1847,7 +1862,8 @@ class UnifiedScheduler:
                                 updated_items=updated_items,
                                 duplicates=duplicate_items,
                             )
-                            source_result["partitions"] = int(source_result["partitions"]) + 1
+                            if checkpoint_status == "completed":
+                                source_result["partitions"] = int(source_result["partitions"]) + 1
                             source_result["items"] = int(source_result["items"]) + accepted
                             source_result["new"] = int(source_result["new"]) + new_items
                             source_result["updated"] = int(source_result["updated"]) + updated_items

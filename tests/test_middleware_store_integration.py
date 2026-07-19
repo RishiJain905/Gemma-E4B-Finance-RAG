@@ -55,9 +55,14 @@ def live_store(tmp_path):
 @pytest.fixture
 def client_with_store(live_store, monkeypatch):
     from src.middleware import app as middleware_app
-    with TestClient(middleware_app.app) as client:
-        monkeypatch.setattr(middleware_app, "store", live_store)
+    monkeypatch.setattr(middleware_app, "store", live_store)
+    monkeypatch.setattr(middleware_app, "config", middleware_app.MiddlewareConfig())
+    monkeypatch.setattr(middleware_app, "retriever", None)
+    client = TestClient(middleware_app.app)
+    try:
         yield client, live_store
+    finally:
+        client.close()
 
 
 def test_query_with_fresh_data(client_with_store):

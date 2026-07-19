@@ -257,3 +257,38 @@ def test_same_symbol_on_different_exchanges_does_not_overwrite_security(store) -
         ("SAME", "NASDAQ"),
         ("SAME", "NYSE"),
     ]
+
+
+def test_unique_cik_preference_is_explicit_for_ambiguous_ticker(store) -> None:
+    registry = UniverseRegistry(store, minimums={"sec": 1, "sp500": 1})
+    registry.refresh(
+        "sec",
+        "2026-07-01T00:00:00Z",
+        [
+            row(
+                "CBOE",
+                source="sec",
+                cik="0001374310",
+                exchange="CBOE",
+                name="Cboe Global Markets, Inc.",
+            )
+        ],
+    )
+    registry.refresh(
+        "ivv",
+        "2026-07-02T00:00:00Z",
+        [
+            row(
+                "CBOE",
+                source="ivv",
+                index_code="sp500",
+                exchange="CBOE BZX",
+                name="CBOE GLOBAL MARKETS INC",
+            )
+        ],
+    )
+
+    assert store.resolve_security("CBOE") is None
+    preferred = store.resolve_security("CBOE", prefer_cik=True)
+    assert preferred is not None
+    assert preferred["cik"] == "0001374310"

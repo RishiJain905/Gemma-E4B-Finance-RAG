@@ -263,6 +263,46 @@ def test_bootstrap_preserves_partial_adapter_status(scheduler):
     assert persisted["status"] == "partial"
 
 
+def test_federal_reserve_bootstrap_uses_resumable_history_path(scheduler, monkeypatch):
+    from src.ingestion.official.federal_reserve import FederalReserveIngestor
+
+    history = MagicMock(return_value={"status": "complete", "stored": 75})
+    monkeypatch.setattr(FederalReserveIngestor, "ingest_history", history)
+
+    result = scheduler.run_bootstrap(source="federal_reserve")
+
+    assert result["status"] == "success"
+    history.assert_called_once()
+    assert history.call_args.kwargs["run_id"] == result["run_id"]
+
+
+def test_federal_reserve_partial_history_is_retried_on_bootstrap_resume(
+    scheduler, monkeypatch,
+):
+    from src.ingestion.official.federal_reserve import FederalReserveIngestor
+
+    history = MagicMock(
+        side_effect=[
+            {
+                "status": "partial",
+                "stored": 50,
+                "remaining": 25,
+                "errors": ["one indexing failure"],
+            },
+            {"status": "complete", "stored": 25, "remaining": 0},
+        ]
+    )
+    monkeypatch.setattr(FederalReserveIngestor, "ingest_history", history)
+
+    first = scheduler.run_bootstrap(source="federal_reserve")
+    resumed = scheduler.run_bootstrap(source="federal_reserve", resume=True)
+
+    assert first["status"] == "partial"
+    assert resumed["status"] == "success"
+    assert resumed["run_id"] == first["run_id"]
+    assert history.call_count == 2
+
+
 def test_bootstrap_sums_nested_capability_item_metrics(scheduler):
     scheduler._bootstrap_partitions = MagicMock(return_value=["__global__"])
     scheduler._run_bootstrap_partition = MagicMock(

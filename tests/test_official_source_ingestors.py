@@ -234,6 +234,185 @@ def test_missing_api_keys_disable_only_keyed_agencies_and_no_key_feeds_continue(
     assert TreasuryIngestor(store=store, http_get=MagicMock(return_value=FakeResponse(_load_text("treasury_daily.csv")))).ingest()["status"] == "ok"
 
 
+def test_federal_reserve_http_path_decodes_utf8_bom_from_response_bytes(
+    tmp_path: Path,
+) -> None:
+    from src.ingestion.official.federal_reserve import FederalReserveIngestor
+
+    store, _chroma = _store(tmp_path)
+    content = b"\xef\xbb\xbf" + _load_text("federal_reserve_rss.xml").encode("utf-8")
+    response = MagicMock()
+    response.status_code = 200
+    response.headers = {"Content-Type": "text/xml"}
+    response.content = content
+    response.text = content.decode("latin-1")
+
+    result = FederalReserveIngestor(
+        store=store,
+        http_get=MagicMock(return_value=response),
+    ).ingest(entry_names=["federal_reserve_minutes"])
+
+    assert result["status"] == "ok"
+    assert result["stored"] == 1
+
+
+def test_federal_reserve_matches_entry_selector_against_item_title(
+    tmp_path: Path,
+) -> None:
+    from src.ingestion.official.federal_reserve import FederalReserveIngestor
+
+    store, _chroma = _store(tmp_path)
+    payload = """<?xml version="1.0" encoding="utf-8"?>
+    <rss version="2.0"><channel>
+      <item>
+        <guid>fed-minutes-2026-07-08</guid>
+        <title>Minutes of the Federal Open Market Committee, June 16-17, 2026</title>
+        <link>https://www.federalreserve.gov/monetarypolicy/fomcminutes20260617.htm</link>
+        <description>Participants discussed economic conditions.</description>
+        <pubDate>Wed, 08 Jul 2026 18:00:00 GMT</pubDate>
+        <category>Monetary Policy</category>
+      </item>
+    </channel></rss>"""
+
+    records = FederalReserveIngestor(store=store).parse(
+        payload,
+        entry_name="federal_reserve_minutes",
+    )
+
+    assert len(records) == 1
+
+
+def test_federal_reserve_statistical_rdf_accepts_dc_date(tmp_path: Path) -> None:
+    from src.ingestion.official.federal_reserve import FederalReserveIngestor
+
+    store, _chroma = _store(tmp_path)
+    payload = """<?xml version="1.0" encoding="utf-8"?>
+    <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"
+             xmlns="http://purl.org/rss/1.0/"
+             xmlns:dc="http://purl.org/dc/elements/1.1/">
+      <item rdf:about="https://www.federalreserve.gov/feeds/DataDownload.html#3932">
+        <title>G17: Industrial production data are now available</title>
+        <link>https://www.federalreserve.gov/releases/g17/current/</link>
+        <description>Current G.17 data release.</description>
+        <dc:date>2026-07-16T09:15:00-04:00</dc:date>
+      </item>
+    </rdf:RDF>"""
+
+    records = FederalReserveIngestor(store=store).parse(
+        payload,
+        entry_name="federal_reserve_statistical_releases",
+    )
+
+    assert len(records) == 1
+
+
+def test_federal_reserve_statistical_feed_is_bounded_to_newest_items(
+    tmp_path: Path,
+) -> None:
+    from src.ingestion.official.federal_reserve import FederalReserveIngestor
+
+    store, _chroma = _store(tmp_path)
+    items = "".join(
+        f"""
+        <item rdf:about="https://www.federalreserve.gov/feeds/DataDownload.html#{index}">
+          <title>Statistical release {index}</title>
+          <link>https://www.federalreserve.gov/releases/example/{index}</link>
+          <description>Release {index}</description>
+          <dc:date>2026-07-{(index % 28) + 1:02d}T09:15:00-04:00</dc:date>
+        </item>
+        """
+        for index in range(55)
+    )
+    payload = f"""<?xml version="1.0" encoding="utf-8"?>
+    <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"
+             xmlns="http://purl.org/rss/1.0/"
+             xmlns:dc="http://purl.org/dc/elements/1.1/">
+      {items}
+    </rdf:RDF>"""
+
+    records = FederalReserveIngestor(store=store).parse(
+        payload,
+        entry_name="federal_reserve_statistical_releases",
+    )
+
+    assert len(records) == 50
+    assert records[0].provider_record_id.endswith("#0")
+    assert records[-1].provider_record_id.endswith("#49")
+
+
+def test_federal_reserve_history_backfill_resumes_after_each_committed_batch(
+    tmp_path: Path,
+) -> None:
+    from src.ingestion.official.federal_reserve import FederalReserveIngestor
+
+    store, _chroma = _store(tmp_path)
+    items = "".join(
+        f"""
+        <item rdf:about="https://www.federalreserve.gov/feeds/DataDownload.html#{index}">
+          <title>Statistical release {index}</title>
+          <link>https://www.federalreserve.gov/releases/example/{index}</link>
+          <description>Release {index}</description>
+          <dc:date>2026-07-{(index % 28) + 1:02d}T09:15:00-04:00</dc:date>
+        </item>
+        """
+        for index in range(125)
+    )
+    payload = f"""<?xml version="1.0" encoding="utf-8"?>
+    <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"
+             xmlns="http://purl.org/rss/1.0/"
+             xmlns:dc="http://purl.org/dc/elements/1.1/">
+      {items}
+    </rdf:RDF>"""
+    get = MagicMock(return_value=FakeResponse(payload))
+    ingestor = FederalReserveIngestor(store=store, http_get=get)
+
+    first = ingestor.ingest_history(batch_size=25, max_batches=1, run_id="run-1")
+    second = ingestor.ingest_history(batch_size=25, run_id="run-2")
+    third = ingestor.ingest_history(batch_size=25, run_id="run-3")
+
+    assert first["status"] == "partial"
+    assert first["stored"] == 25
+    assert first["remaining"] == 50
+    assert first["cursor_after"].endswith("#74")
+    assert second["status"] == "complete"
+    assert second["stored"] == 50
+    assert second["cursor_after"].endswith("#124")
+    assert third["status"] == "complete"
+    assert third["requests"] == 0
+    assert store.get_source_cursor_state(
+        "federal_reserve", "historical_statistical_releases"
+    )["last_successful_run_id"] == "run-2"
+    assert store.sqlite.count_corpus_items() == 75
+
+
+def test_federal_reserve_catalog_uses_dedicated_official_feeds() -> None:
+    catalog = yaml.safe_load(
+        (Path("configs") / "official_sources.yaml").read_text(encoding="utf-8")
+    )
+    entries = {
+        entry["name"]: entry
+        for entry in catalog["entries"]
+        if entry["agency"] == "federal_reserve"
+    }
+
+    assert entries["federal_reserve_policy_statements"]["endpoint"].endswith(
+        "/feeds/press_monetary.xml"
+    )
+    assert entries["federal_reserve_minutes"]["endpoint"].endswith(
+        "/feeds/press_monetary.xml"
+    )
+    assert entries["federal_reserve_speeches"]["endpoint"].endswith(
+        "/feeds/speeches.xml"
+    )
+    assert entries["federal_reserve_regulation"]["endpoint"].endswith(
+        "/feeds/press_bcreg.xml"
+    )
+    assert entries["federal_reserve_statistical_releases"]["endpoint"].endswith(
+        "/feeds/datadownload.xml"
+    )
+    assert entries["federal_reserve_statistical_releases"]["max_items"] == 50
+
+
 @pytest.mark.parametrize(
     ("module", "class_name", "fixture", "needs_key"),
     [

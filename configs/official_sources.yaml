@@ -17,8 +17,8 @@ entries:
     source_category: official_release
     sectors: [global]
     payload_type: narrative
-    endpoint: https://www.federalreserve.gov/feeds/press_all.xml
-    category: policy
+    endpoint: https://www.federalreserve.gov/feeds/press_monetary.xml
+    category: fomc statement
   - name: federal_reserve_minutes
     agency: federal_reserve
     dataset_id: federal-reserve-rss-minutes
@@ -28,7 +28,7 @@ entries:
     source_category: official_release
     sectors: [global]
     payload_type: narrative
-    endpoint: https://www.federalreserve.gov/feeds/press_all.xml
+    endpoint: https://www.federalreserve.gov/feeds/press_monetary.xml
     category: minutes
   - name: federal_reserve_speeches
     agency: federal_reserve
@@ -39,7 +39,7 @@ entries:
     source_category: official_release
     sectors: [global]
     payload_type: narrative
-    endpoint: https://www.federalreserve.gov/feeds/press_all.xml
+    endpoint: https://www.federalreserve.gov/feeds/speeches.xml
     category: speech
   - name: federal_reserve_regulation
     agency: federal_reserve
@@ -50,8 +50,8 @@ entries:
     source_category: official_regulatory
     sectors: [financials]
     payload_type: narrative
-    endpoint: https://www.federalreserve.gov/feeds/press_all.xml
-    category: regulation
+    endpoint: https://www.federalreserve.gov/feeds/press_bcreg.xml
+    category: regulat
   - name: federal_reserve_statistical_releases
     agency: federal_reserve
     dataset_id: federal-reserve-rss-statistical-releases
@@ -61,8 +61,9 @@ entries:
     source_category: official_release
     sectors: [global]
     payload_type: narrative
-    endpoint: https://www.federalreserve.gov/feeds/press_all.xml
-    category: statistical
+    endpoint: https://www.federalreserve.gov/feeds/datadownload.xml
+    category: ""
+    max_items: 50
 
   - name: treasury_nominal_yield_10y
     agency: treasury

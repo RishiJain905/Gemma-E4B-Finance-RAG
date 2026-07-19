@@ -605,9 +605,22 @@ class Store:
         symbol: str,
         provider: Optional[str] = None,
         as_of: Optional[str] = None,
+        *,
+        prefer_cik: bool = False,
     ) -> Optional[dict]:
         """Resolve canonical, vendor, or historical security symbols."""
-        return self.sqlite.resolve_security(symbol, provider=provider, as_of=as_of)
+        if prefer_cik:
+            return self.sqlite.resolve_security(
+                symbol,
+                provider=provider,
+                as_of=as_of,
+                prefer_cik=True,
+            )
+        return self.sqlite.resolve_security(
+            symbol,
+            provider=provider,
+            as_of=as_of,
+        )
 
     def resolve_exact_security(self, identifier: str) -> Optional[dict]:
         """Resolve one exact registry identity; ambiguous names never attach."""

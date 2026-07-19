@@ -122,6 +122,64 @@ def test_grouped_market_summary_filters_locally_and_corrected_bars_upsert(
     assert metadata["provider_revision"] == "rev-2"
 
 
+def test_grouped_market_prefers_unique_cik_identity_for_ambiguous_ticker(
+    tmp_path: Path,
+) -> None:
+    """Massive US bars use the SEC-backed identity without relaxing defaults."""
+    from src.ingestion.massive_ingestor import MassiveIngestor
+
+    with patch("src.storage.store.ChromaStore") as chroma_class:
+        chroma_class.return_value = MagicMock()
+        store = Store(
+            db_path=tmp_path / "massive-cboe.db",
+            chroma_path=tmp_path / "chroma",
+        )
+    store.upsert_universe_snapshot(
+        "sec",
+        "2026-07-01T00:00:00Z",
+        [
+            {
+                "symbol": "CBOE",
+                "company_name": "Cboe Global Markets, Inc.",
+                "exchange": "CBOE",
+                "cik": "0001374310",
+            }
+        ],
+    )
+    store.upsert_universe_snapshot(
+        "ivv",
+        "2026-07-02T00:00:00Z",
+        [
+            {
+                "symbol": "CBOE",
+                "company_name": "CBOE GLOBAL MARKETS INC",
+                "exchange": "CBOE BZX",
+                "index_code": "sp500",
+            }
+        ],
+    )
+    coverage = MagicMock()
+    coverage.tickers_for.return_value = ["CBOE"]
+    payload = {
+        "status": "OK",
+        "results": [
+            {"T": "CBOE", "o": 239.0, "h": 241.0, "l": 238.0, "c": 240.0, "v": 12345}
+        ],
+    }
+
+    result = MassiveIngestor(
+        store=store,
+        coverage_resolver=coverage,
+        api_key="test-massive-key",
+        http_get=lambda _url, **_kwargs: FakeResponse(payload),
+        now_fn=lambda: "2026-07-14T20:00:00Z",
+    ).ingest_market_data(start_date="2026-07-13", end_date="2026-07-13")
+
+    assert result["status"] == "ok"
+    assert result["malformed"] == 0
+    assert store.sqlite.count_observations() == 5
+
+
 def test_grouped_market_zero_result_envelope_is_an_empty_market_day() -> None:
     from src.ingestion.massive_ingestor import MassiveIngestor
 

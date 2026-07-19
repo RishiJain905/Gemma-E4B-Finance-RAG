@@ -664,7 +664,11 @@ class MassiveIngestor:
             raise ValueError("low/close must be numeric")
         if not isinstance(row.get("v"), (int, float)):
             raise ValueError("volume must be numeric")
-        security = self.store.resolve_security(ticker, provider=self.SOURCE_NAME)
+        security = self.store.resolve_security(
+            ticker,
+            provider=self.SOURCE_NAME,
+            prefer_cik=True,
+        )
         security_id = security.get("security_id") if isinstance(security, dict) else None
         if not security_id:
             raise ValueError(f"no canonical security for {ticker}")
