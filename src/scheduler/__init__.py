@@ -447,7 +447,7 @@ class UnifiedScheduler:
             return MassiveIngestor(
                 store=self.store,
                 coverage_resolver=self.coverage,
-                http_get=self._budgeted_http_get(name),
+                http_get=self._budgeted_http_get(name, wait_for_minute=True),
                 overlap_days=int((self.SOURCES[name].overlap or "0d")[:-1]),
             ).ingest_all()
 

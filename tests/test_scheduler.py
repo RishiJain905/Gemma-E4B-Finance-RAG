@@ -429,6 +429,8 @@ class TestUnifiedSchedulerPartialFailure:
     def test_massive_overlap_is_taken_from_registry(self, scheduler, monkeypatch):
         ingestor_class = MagicMock()
         ingestor_class.return_value.ingest_all.return_value = {"market": {"status": "ok"}}
+        budgeted_get = MagicMock(return_value=MagicMock())
+        scheduler._budgeted_http_get = budgeted_get
         monkeypatch.setattr(
             "src.ingestion.massive_ingestor.MassiveIngestor", ingestor_class
         )
@@ -439,6 +441,7 @@ class TestUnifiedSchedulerPartialFailure:
         scheduler._run_source("massive")
 
         assert ingestor_class.call_args.kwargs["overlap_days"] == 2
+        budgeted_get.assert_called_once_with("massive", wait_for_minute=True)
 
     def test_stagger_delay(self, store):
         registry = SourceRegistry.load(
