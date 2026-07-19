@@ -4,7 +4,9 @@ Federal Reserve RSS ingestion for policy, minutes, speeches, regulation, and rel
 
 from __future__ import annotations
 
+import html
 import logging
+import re
 import xml.etree.ElementTree as ET
 from typing import Any, Callable, Optional
 
@@ -27,6 +29,21 @@ from . import (
 )
 
 logger = logging.getLogger(__name__)
+
+_HTML_ENTITY = re.compile(r"&([A-Za-z][A-Za-z0-9]+);")
+_XML_ENTITIES = frozenset({"amp", "apos", "gt", "lt", "quot"})
+
+
+def _decode_html_entities(payload: str | bytes) -> str:
+    """Decode HTML-only named entities without corrupting valid XML entities."""
+    text = payload.decode("utf-8-sig") if isinstance(payload, bytes) else payload
+
+    def replace(match: re.Match[str]) -> str:
+        if match.group(1) in _XML_ENTITIES:
+            return match.group(0)
+        return html.unescape(match.group(0))
+
+    return _HTML_ENTITY.sub(replace, text)
 
 
 class FederalReserveIngestor:
@@ -62,7 +79,7 @@ class FederalReserveIngestor:
     ) -> list[object]:
         """Parse RSS items into narrative records without contacting the provider."""
         entries = catalog_entries(self.SOURCE_NAME, [entry_name] if entry_name else None)
-        root = ET.fromstring(payload)
+        root = ET.fromstring(_decode_html_entities(payload))
         accessed = accessed_at or self._now_timestamp()
         records: list[object] = []
         for entry in entries:

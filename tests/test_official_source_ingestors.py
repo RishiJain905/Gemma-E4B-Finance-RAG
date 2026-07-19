@@ -306,6 +306,34 @@ def test_federal_reserve_statistical_rdf_accepts_dc_date(tmp_path: Path) -> None
     assert len(records) == 1
 
 
+def test_federal_reserve_statistical_rdf_decodes_html_named_entities(
+    tmp_path: Path,
+) -> None:
+    from src.ingestion.official.federal_reserve import FederalReserveIngestor
+
+    store, _chroma = _store(tmp_path)
+    payload = """<?xml version="1.0" encoding="utf-8"?>
+    <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"
+             xmlns="http://purl.org/rss/1.0/"
+             xmlns:dc="http://purl.org/dc/elements/1.1/">
+      <item rdf:about="https://www.federalreserve.gov/feeds/DataDownload.html#3932">
+        <title>Industrial production &amp; capacity</title>
+        <link>https://www.federalreserve.gov/releases/g17/current/</link>
+        <description>Long-run (1972&ndash;2025) average.</description>
+        <dc:date>2026-07-16T09:15:00-04:00</dc:date>
+      </item>
+    </rdf:RDF>"""
+
+    records = FederalReserveIngestor(store=store).parse(
+        payload,
+        entry_name="federal_reserve_statistical_releases",
+    )
+
+    assert len(records) == 1
+    assert "Industrial production & capacity" in records[0].body
+    assert "1972\N{EN DASH}2025" in records[0].body
+
+
 def test_federal_reserve_statistical_feed_is_bounded_to_newest_items(
     tmp_path: Path,
 ) -> None:
