@@ -4,7 +4,9 @@ Federal Reserve RSS ingestion for policy, minutes, speeches, regulation, and rel
 
 from __future__ import annotations
 
+import html
 import logging
+import re
 import xml.etree.ElementTree as ET
 from typing import Any, Callable, Optional
 
@@ -27,6 +29,21 @@ from . import (
 )
 
 logger = logging.getLogger(__name__)
+
+_HTML_ENTITY = re.compile(r"&([A-Za-z][A-Za-z0-9]+);")
+_XML_ENTITIES = frozenset({"amp", "apos", "gt", "lt", "quot"})
+
+
+def _decode_html_entities(payload: str | bytes) -> str:
+    """Decode HTML-only named entities without corrupting valid XML entities."""
+    text = payload.decode("utf-8-sig") if isinstance(payload, bytes) else payload
+
+    def replace(match: re.Match[str]) -> str:
+        if match.group(1) in _XML_ENTITIES:
+            return match.group(0)
+        return html.unescape(match.group(0))
+
+    return _HTML_ENTITY.sub(replace, text)
 
 
 class FederalReserveIngestor:
@@ -58,14 +75,21 @@ class FederalReserveIngestor:
         *,
         entry_name: Optional[str] = None,
         accessed_at: Optional[str] = None,
+        ignore_max_items: bool = False,
     ) -> list[object]:
         """Parse RSS items into narrative records without contacting the provider."""
         entries = catalog_entries(self.SOURCE_NAME, [entry_name] if entry_name else None)
-        root = ET.fromstring(payload)
+        root = ET.fromstring(_decode_html_entities(payload))
         accessed = accessed_at or self._now_timestamp()
         records: list[object] = []
         for entry in entries:
             category_key = str(entry.get("category") or "").lower()
+            max_items = (
+                0
+                if ignore_max_items
+                else max(int(entry.get("max_items") or 0), 0)
+            )
+            matched_items = 0
             for item in root.iter():
                 if item.tag.rsplit("}", 1)[-1].lower() != "item":
                     continue
@@ -74,14 +98,26 @@ class FederalReserveIngestor:
                     for child in list(item)
                 }
                 category = values.get("category", "").lower()
-                if category_key not in category and not category_key.startswith(category):
-                    continue
                 title = values.get("title", "").strip()
+                if category_key and category_key not in f"{category} {title.lower()}":
+                    continue
                 link = values.get("link", "").strip()
                 description = values.get("description", "").strip()
-                provider_id = values.get("guid") or link
-                if not title or not provider_id or not link or not values.get("pubdate"):
-                    raise ValueError("Federal Reserve RSS item requires guid, title, link, and pubDate")
+                rdf_about = next(
+                    (
+                        str(value).strip()
+                        for key, value in item.attrib.items()
+                        if key.rsplit("}", 1)[-1].lower() == "about"
+                    ),
+                    "",
+                )
+                provider_id = values.get("guid") or rdf_about or link
+                published_at = values.get("pubdate") or values.get("date")
+                if not title or not provider_id or not link or not published_at:
+                    raise ValueError(
+                        "Federal Reserve RSS item requires an identity, title, link, "
+                        "and publication date"
+                    )
                 records.append(
                     make_narrative(
                         source_name=self.SOURCE_NAME,
@@ -90,7 +126,7 @@ class FederalReserveIngestor:
                         title=title,
                         body="\n\n".join(value for value in (title, description) if value),
                         source_url_value=source_url(link, str(entry["endpoint"])),
-                        published_at=values["pubdate"],
+                        published_at=published_at,
                         accessed_at=accessed,
                         metadata=metadata_values(
                             category=category or category_key,
@@ -99,6 +135,9 @@ class FederalReserveIngestor:
                         ),
                     )
                 )
+                matched_items += 1
+                if max_items and matched_items >= max_items:
+                    break
         return records
 
     def ingest(
@@ -138,6 +177,108 @@ class FederalReserveIngestor:
             output["malformed"] = int(output["malformed"]) + 1
             output["errors"].append(str(exc))
         return finish(self.store, output)
+
+    def ingest_history(
+        self,
+        *,
+        batch_size: int = 50,
+        max_batches: Optional[int] = None,
+        run_id: Optional[str] = None,
+    ) -> dict[str, object]:
+        """Backfill older statistical releases with durable batch checkpoints."""
+        if not 1 <= int(batch_size) <= 200:
+            raise ValueError("batch_size must be between 1 and 200")
+        if max_batches is not None and int(max_batches) < 1:
+            raise ValueError("max_batches must be positive")
+
+        partition = "historical_statistical_releases"
+        entry = catalog_entries(
+            self.SOURCE_NAME,
+            ["federal_reserve_statistical_releases"],
+        )[0]
+        output = result(self.SOURCE_NAME, "official_release_history")
+        state = self.store.get_source_cursor_state(self.SOURCE_NAME, partition)
+        if state and state.get("status") == "complete":
+            output.update(
+                {
+                    "status": "complete",
+                    "cursor_after": state.get("cursor_value"),
+                    "remaining": 0,
+                }
+            )
+            return output
+
+        try:
+            text = request_text(
+                self.http_get,
+                str(entry["endpoint"]),
+                timeout=self.timeout,
+            )
+            output["requests"] = 1
+            output["pages"] = 1
+            records = self.parse(
+                text,
+                entry_name=str(entry["name"]),
+                accessed_at=self._now_timestamp(),
+                ignore_max_items=True,
+            )
+
+            cursor = str(state.get("cursor_value") or "") if state else ""
+            if cursor:
+                cursor_index = next(
+                    (
+                        index
+                        for index, record in enumerate(records)
+                        if str(record.provider_record_id) == cursor
+                    ),
+                    None,
+                )
+                if cursor_index is None:
+                    raise ValueError("Federal Reserve history cursor is no longer in the feed")
+                start = cursor_index + 1
+            else:
+                start = max(int(entry.get("max_items") or 0), 0)
+
+            batches = 0
+            while start < len(records):
+                if max_batches is not None and batches >= int(max_batches):
+                    break
+                batch = records[start : start + int(batch_size)]
+                malformed_before = int(output["malformed"])
+                persist_records(self.store, batch, output)
+                if int(output["malformed"]) != malformed_before:
+                    output["status"] = "partial"
+                    break
+
+                start += len(batch)
+                batches += 1
+                cursor = str(batch[-1].provider_record_id)
+                complete = start >= len(records)
+                self.store.set_source_cursor(
+                    self.SOURCE_NAME,
+                    partition,
+                    cursor,
+                    cursor_type="page_token",
+                    last_successful_run_id=run_id,
+                    status="complete" if complete else "partial",
+                )
+
+            output["cursor_after"] = cursor or None
+            output["remaining"] = max(len(records) - start, 0)
+            if output["status"] == "ok":
+                output["status"] = (
+                    "complete" if int(output["remaining"]) == 0 else "partial"
+                )
+        except OfficialProviderError as exc:
+            output["status"] = status_for_error(exc)
+            output["error_class"] = exc.error_class
+            output["retry_after"] = exc.retry_after
+            output["errors"].append(str(exc))
+        except (ET.ParseError, TypeError, ValueError) as exc:
+            output["status"] = "partial"
+            output["malformed"] = int(output["malformed"]) + 1
+            output["errors"].append(str(exc))
+        return finish(self.store, output, partition=partition)
 
     def _now_timestamp(self) -> str:
         value = self.now_fn()

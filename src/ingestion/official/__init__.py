@@ -257,11 +257,16 @@ def request_text(
             status_code=status_code,
             retry_after=retry_after(response),
         )
+    content = getattr(response, "content", None)
+    if isinstance(content, bytes):
+        try:
+            return content.decode("utf-8-sig")
+        except UnicodeDecodeError:
+            pass
     text = getattr(response, "text", None)
     if text is not None:
         return str(text)
-    content = getattr(response, "content", b"")
-    return content.decode("utf-8") if isinstance(content, bytes) else str(content)
+    return str(content or "")
 
 
 def provider_error_class(status_code: int, message: str = "") -> str:

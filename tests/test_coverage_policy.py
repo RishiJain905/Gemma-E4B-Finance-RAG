@@ -369,7 +369,7 @@ def test_scheduler_skips_disabled_policy_and_exposes_coverage_status(store: Stor
     from src.scheduler import UnifiedScheduler
 
     coverage = _fake_coverage()
-    coverage.is_enabled.side_effect = lambda source: source != "gdelt"
+    coverage.is_enabled.side_effect = lambda source: source != "estimates"
     scheduler = UnifiedScheduler(
         store=store,
         inter_source_delay=0,
@@ -380,9 +380,11 @@ def test_scheduler_skips_disabled_policy_and_exposes_coverage_status(store: Stor
     result = scheduler.run_all_stale(force=True)
     report = scheduler.status_report()
 
-    assert result["gdelt"]["status"] == "skipped"
-    assert result["gdelt"]["reason"] == "policy_disabled"
-    assert result["gdelt"]["terminal_status"] == "skipped"
-    assert result["gdelt"]["requests"] == 0
-    assert "gdelt" not in [call.args[0] for call in scheduler._run_source.call_args_list]
+    assert result["estimates"]["status"] == "skipped"
+    assert result["estimates"]["reason"] == "policy_disabled"
+    assert result["estimates"]["terminal_status"] == "skipped"
+    assert result["estimates"]["requests"] == 0
+    assert "estimates" not in [
+        call.args[0] for call in scheduler._run_source.call_args_list
+    ]
     assert report["sources"]["yfinance"]["coverage"]["policy_revision"] == "test-r1"

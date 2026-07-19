@@ -3998,6 +3998,8 @@ CREATE INDEX IF NOT EXISTS idx_securities_industry ON securities(industry);
         symbol: str,
         provider: Optional[str] = None,
         as_of: Optional[str] = None,
+        *,
+        prefer_cik: bool = False,
     ) -> Optional[dict]:
         """Resolve a canonical or aliased symbol, optionally at a historical date."""
         normalized = self._normalize_universe_symbol(symbol)
@@ -4041,6 +4043,13 @@ CREATE INDEX IF NOT EXISTS idx_securities_industry ON securities(industry);
             direct_candidates = self._security_candidates(direct)
             if len(direct_candidates) == 1:
                 return direct_candidates[0]
+            preferred_cik_candidate = None
+            if prefer_cik and len(direct_candidates) > 1:
+                cik_candidates = [
+                    candidate for candidate in direct_candidates if candidate.get("cik")
+                ]
+                if len(cik_candidates) == 1:
+                    preferred_cik_candidate = cik_candidates[0]
 
             conditions = ["a.normalized_alias = ?"]
             params: list = [normalized]
@@ -4071,7 +4080,9 @@ CREATE INDEX IF NOT EXISTS idx_securities_industry ON securities(industry);
                 params,
             ).fetchall()
         candidates = self._security_candidates(alias_rows)
-        return candidates[0] if len(candidates) == 1 else None
+        if len(candidates) == 1:
+            return candidates[0]
+        return preferred_cik_candidate
 
     def resolve_exact_security(self, identifier: str) -> Optional[dict]:
         """Resolve one exact ticker, registry alias, or company-name identifier.

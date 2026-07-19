@@ -87,11 +87,12 @@ class TestUnifiedSchedulerInit:
         assert {
             "yfinance", "sec_filings", "sec_companyfacts", "fred", "gdelt",
             "earnings_transcripts", "ir_pages", "estimates", "finnhub", "massive",
+            "massive_news",
             "universe_nasdaq100", "universe_ivv", "universe_sec", "federal_reserve",
             "treasury", "bls", "bea", "eia", "ny_fed", "cftc", "openfda",
             "nhtsa", "usaspending",
         } <= set(scheduler.SOURCES)
-        assert scheduler.registry.version == "2.3.4.1-r1"
+        assert scheduler.registry.version == "2.3.4.1-r2"
 
     def test_source_ordering(self, scheduler):
         ordered = [name for name, _ in scheduler._ordered_sources()]
@@ -126,8 +127,11 @@ class TestUnifiedSchedulerRunModes:
         m = _stub_run_source(scheduler)
         result = scheduler.run_all_stale()
         assert set(result) == set(scheduler.SOURCES)
-        assert all(r["status"] == "success" for r in result.values())
-        assert m.call_count == len(scheduler.SOURCES)
+        assert result["gdelt"]["status"] == "skipped"
+        assert all(
+            r["status"] == "success" for name, r in result.items() if name != "gdelt"
+        )
+        assert m.call_count == len(scheduler.SOURCES) - 1
 
     def test_run_all_stale_force(self, scheduler):
         # Mark everything fresh; force=True must still run all.
@@ -137,8 +141,11 @@ class TestUnifiedSchedulerRunModes:
             )
         m = _stub_run_source(scheduler)
         result = scheduler.run_all_stale(force=True)
-        assert m.call_count == len(scheduler.SOURCES)
-        assert all(r["status"] == "success" for r in result.values())
+        assert m.call_count == len(scheduler.SOURCES) - 1
+        assert result["gdelt"]["status"] == "skipped"
+        assert all(
+            r["status"] == "success" for name, r in result.items() if name != "gdelt"
+        )
 
     def test_run_daily(self, scheduler):
         m = _stub_run_source(scheduler)
@@ -157,8 +164,10 @@ class TestUnifiedSchedulerRunModes:
     def test_run_hourly(self, scheduler):
         m = _stub_run_source(scheduler)
         result = scheduler.run_hourly()
-        assert set(result) == {"gdelt"}
+        assert set(result) == {"massive_news", "gdelt"}
+        assert result["gdelt"]["status"] == "skipped"
         assert m.call_count == 1
+        assert m.call_args.args[0] == "massive_news"
 
     def test_run_weekly(self, scheduler):
         m = _stub_run_source(scheduler)
@@ -195,34 +204,37 @@ class TestUnifiedSchedulerPartialFailure:
         assert result["fred"]["status"] == "error"
         assert "FRED down" in result["fred"]["error"]
         # Sources after the failing one still ran.
-        assert result["gdelt"]["status"] == "success"
+        assert result["gdelt"]["status"] == "skipped"
         assert result["earnings_transcripts"]["status"] == "success"
 
     def test_all_sources_fail(self, scheduler):
         _stub_run_source(scheduler, side_effect=RuntimeError("boom"))
         result = scheduler.run_all_stale()
-        assert all(r["status"] == "error" for r in result.values())
+        assert result["gdelt"]["status"] == "skipped"
+        assert all(
+            r["status"] == "error" for name, r in result.items() if name != "gdelt"
+        )
 
-    def test_gdelt_rate_limit_does_not_stop_other_sources(self, scheduler):
-        """A failed GDELT run is stale while later sources still execute."""
+    def test_massive_news_rate_limit_does_not_stop_other_sources(self, scheduler):
+        """A failed Massive news run is stale while later sources still execute."""
         def side(name, deep=False, force=False):
-            if name == "gdelt":
-                raise RuntimeError("GDELT rate limit exhausted")
+            if name == "massive_news":
+                raise RuntimeError("Massive rate limit exhausted")
             return {"ok": True}
 
         mock_run = _stub_run_source(scheduler, side_effect=side)
         result = scheduler.run_all_stale()
 
-        assert result["gdelt"]["status"] == "error"
-        assert "rate limit" in result["gdelt"]["error"]
+        assert result["massive_news"]["status"] == "error"
+        assert "rate limit" in result["massive_news"]["error"]
         assert result["earnings_transcripts"]["status"] == "success"
         assert result["ir_pages"]["status"] == "success"
         assert result["estimates"]["status"] == "success"
         ran_sources = [call.args[0] for call in mock_run.call_args_list]
         assert ran_sources[-3:] == ["earnings_transcripts", "ir_pages", "estimates"]
-        gdelt_status = scheduler.status_report()["sources"]["gdelt"]
-        assert gdelt_status["status"] == "stale"
-        assert "rate limit" in gdelt_status["error"]
+        news_status = scheduler.status_report()["sources"]["massive_news"]
+        assert news_status["status"] == "stale"
+        assert "rate limit" in news_status["error"]
 
     def test_provider_circuit_failure_is_observable_and_next_source_runs(
         self, scheduler
@@ -230,7 +242,7 @@ class TestUnifiedSchedulerPartialFailure:
         reset_at = "2026-07-14T12:05:00Z"
 
         def side(name, deep=False, force=False):
-            if name == "gdelt":
+            if name == "massive_news":
                 raise ProviderError(
                     "token=secret provider throttled",
                     error_class=ErrorClass.RATE_LIMITED,
@@ -244,19 +256,19 @@ class TestUnifiedSchedulerPartialFailure:
         mock_run = _stub_run_source(scheduler, side_effect=side)
         result = scheduler.run_all_stale(force=True)
 
-        gdelt = result["gdelt"]
-        assert gdelt["terminal_status"] == "skipped"
-        assert gdelt["error_class"] == "rate_limited"
-        assert gdelt["attempts"] == 3
-        assert gdelt["reset_at"] == reset_at
-        assert gdelt["remaining_work_skipped"] is True
-        assert "secret" not in gdelt["error"]
+        massive_news = result["massive_news"]
+        assert massive_news["terminal_status"] == "skipped"
+        assert massive_news["error_class"] == "rate_limited"
+        assert massive_news["attempts"] == 3
+        assert massive_news["reset_at"] == reset_at
+        assert massive_news["remaining_work_skipped"] is True
+        assert "secret" not in massive_news["error"]
         assert result["earnings_transcripts"]["status"] == "success"
         assert "earnings_transcripts" in [
             call.args[0] for call in mock_run.call_args_list
         ]
-        provider_status = scheduler.status_report(source="gdelt")["sources"][
-            "gdelt"
+        provider_status = scheduler.status_report(source="massive_news")["sources"][
+            "massive_news"
         ]["provider"]
         assert provider_status["error_class"] == "rate_limited"
         assert provider_status["reset_at"] == reset_at
@@ -303,7 +315,7 @@ class TestUnifiedSchedulerPartialFailure:
 
     def test_returned_rate_limit_is_skipped_and_remains_stale(self, scheduler):
         def side(name, deep=False, force=False):
-            if name == "gdelt":
+            if name == "massive_news":
                 return {
                     "status": "rate_limited",
                     "requests": 1,
@@ -314,11 +326,11 @@ class TestUnifiedSchedulerPartialFailure:
         mock_run = _stub_run_source(scheduler, side_effect=side)
         result = scheduler.run_all_stale(force=True)
 
-        assert result["gdelt"]["status"] == "skipped"
-        assert result["gdelt"]["reason"] == "rate_limited"
+        assert result["massive_news"]["status"] == "skipped"
+        assert result["massive_news"]["reason"] == "rate_limited"
         assert result["earnings_transcripts"]["status"] == "success"
         assert scheduler.store.get_cache_status(
-            "SCHEDULER", "unified:gdelt"
+            "SCHEDULER", "unified:massive_news"
         )["status"] == "stale"
         assert "earnings_transcripts" in [
             call.args[0] for call in mock_run.call_args_list
@@ -429,6 +441,8 @@ class TestUnifiedSchedulerPartialFailure:
     def test_massive_overlap_is_taken_from_registry(self, scheduler, monkeypatch):
         ingestor_class = MagicMock()
         ingestor_class.return_value.ingest_all.return_value = {"market": {"status": "ok"}}
+        budgeted_get = MagicMock(return_value=MagicMock())
+        scheduler._budgeted_http_get = budgeted_get
         monkeypatch.setattr(
             "src.ingestion.massive_ingestor.MassiveIngestor", ingestor_class
         )
@@ -439,6 +453,55 @@ class TestUnifiedSchedulerPartialFailure:
         scheduler._run_source("massive")
 
         assert ingestor_class.call_args.kwargs["overlap_days"] == 2
+        budgeted_get.assert_called_once_with("massive", wait_for_minute=True)
+
+    def test_massive_news_shares_daily_massive_provider_usage(self, scheduler):
+        now = datetime(2026, 7, 18, 15, 30, tzinfo=timezone.utc)
+        scheduler._now_fn = lambda: now
+        scheduler.store.record_source_budget_usage(
+            "massive",
+            day_start=now.date().isoformat(),
+            minute_start="2026-07-18T15:29Z",
+            attempted_requests=7,
+            successful_requests=7,
+        )
+
+        budget = scheduler._new_budget(scheduler.registry.get("massive_news"))
+
+        assert budget.day_requests == 7
+        assert budget.reserve(requests=1, work_items=1)
+        scheduler._remember_budget("massive_news", budget)
+        shared = scheduler.store.get_source_budget_usage(
+            "massive",
+            day_start=now.date().isoformat(),
+            minute_start=now.strftime("%Y-%m-%dT%H:%MZ"),
+        )
+        separate = scheduler.store.get_source_budget_usage(
+            "massive_news",
+            day_start=now.date().isoformat(),
+            minute_start=now.strftime("%Y-%m-%dT%H:%MZ"),
+        )
+        assert shared["day_requests"] == 8
+        assert separate["day_requests"] == 0
+
+    def test_massive_news_dispatch_is_separate_from_daily_massive(
+        self, scheduler, monkeypatch
+    ):
+        ingestor_class = MagicMock()
+        ingestor_class.return_value.ingest_news.return_value = {"status": "ok"}
+        budgeted_get = MagicMock(return_value=MagicMock())
+        scheduler._budgeted_http_get = budgeted_get
+        monkeypatch.setattr(
+            "src.ingestion.massive_ingestor.MassiveIngestor", ingestor_class
+        )
+
+        result = scheduler._run_source("massive_news")
+
+        assert result == {"status": "ok"}
+        assert ingestor_class.call_args.kwargs["news_overlap_hours"] == 2
+        ingestor_class.return_value.ingest_news.assert_called_once_with()
+        ingestor_class.return_value.ingest_all.assert_not_called()
+        budgeted_get.assert_called_once_with("massive_news", wait_for_minute=True)
 
     def test_stagger_delay(self, store):
         registry = SourceRegistry.load(
@@ -453,8 +516,8 @@ class TestUnifiedSchedulerPartialFailure:
         _stub_run_source(sched)
         with patch("src.scheduler.time.sleep") as mock_sleep:
             sched.run_all_stale()
-        # N sources => N-1 inter-source delays.
-        assert mock_sleep.call_count == len(sched.SOURCES) - 1
+        available = sum(spec.is_available for spec in sched.SOURCES.values())
+        assert mock_sleep.call_count == available - 1
 
     def test_partial_finnhub_run_resumes_never_fetched_tickers(
         self, scheduler, monkeypatch
@@ -520,7 +583,12 @@ class TestUnifiedSchedulerStatus:
 
     def test_status_never_run(self, scheduler):
         report = scheduler.status_report()
-        assert all(s["status"] == "never_fetched" for s in report["sources"].values())
+        assert report["sources"]["gdelt"]["status"] == "configured_disabled"
+        assert all(
+            source["status"] == "never_fetched"
+            for name, source in report["sources"].items()
+            if name != "gdelt"
+        )
 
     def test_status_with_errors(self, scheduler):
         _stub_run_source(scheduler, side_effect=RuntimeError("kaboom"))

@@ -122,6 +122,64 @@ def test_grouped_market_summary_filters_locally_and_corrected_bars_upsert(
     assert metadata["provider_revision"] == "rev-2"
 
 
+def test_grouped_market_prefers_unique_cik_identity_for_ambiguous_ticker(
+    tmp_path: Path,
+) -> None:
+    """Massive US bars use the SEC-backed identity without relaxing defaults."""
+    from src.ingestion.massive_ingestor import MassiveIngestor
+
+    with patch("src.storage.store.ChromaStore") as chroma_class:
+        chroma_class.return_value = MagicMock()
+        store = Store(
+            db_path=tmp_path / "massive-cboe.db",
+            chroma_path=tmp_path / "chroma",
+        )
+    store.upsert_universe_snapshot(
+        "sec",
+        "2026-07-01T00:00:00Z",
+        [
+            {
+                "symbol": "CBOE",
+                "company_name": "Cboe Global Markets, Inc.",
+                "exchange": "CBOE",
+                "cik": "0001374310",
+            }
+        ],
+    )
+    store.upsert_universe_snapshot(
+        "ivv",
+        "2026-07-02T00:00:00Z",
+        [
+            {
+                "symbol": "CBOE",
+                "company_name": "CBOE GLOBAL MARKETS INC",
+                "exchange": "CBOE BZX",
+                "index_code": "sp500",
+            }
+        ],
+    )
+    coverage = MagicMock()
+    coverage.tickers_for.return_value = ["CBOE"]
+    payload = {
+        "status": "OK",
+        "results": [
+            {"T": "CBOE", "o": 239.0, "h": 241.0, "l": 238.0, "c": 240.0, "v": 12345}
+        ],
+    }
+
+    result = MassiveIngestor(
+        store=store,
+        coverage_resolver=coverage,
+        api_key="test-massive-key",
+        http_get=lambda _url, **_kwargs: FakeResponse(payload),
+        now_fn=lambda: "2026-07-14T20:00:00Z",
+    ).ingest_market_data(start_date="2026-07-13", end_date="2026-07-13")
+
+    assert result["status"] == "ok"
+    assert result["malformed"] == 0
+    assert store.sqlite.count_observations() == 5
+
+
 def test_grouped_market_zero_result_envelope_is_an_empty_market_day() -> None:
     from src.ingestion.massive_ingestor import MassiveIngestor
 
@@ -262,6 +320,78 @@ def test_massive_optional_news_and_vendor_filings_use_secondary_provenance(
     assert filing["source_category"] == "vendor_filing_metadata"
     assert filing["evidence_authority"] == "provider"
     assert filing["metadata"]["accession"] == "0000000000-26-000001"
+
+
+def test_massive_news_uses_timestamp_cursor_with_overlap_and_oldest_first(
+    tmp_path: Path,
+) -> None:
+    from src.ingestion.massive_ingestor import MassiveIngestor
+
+    store, _chroma = _store(tmp_path)
+    store.set_source_cursor(
+        "massive_news",
+        "US",
+        "2026-07-14T11:30:00Z",
+        cursor_type="timestamp",
+        status="success",
+    )
+    payload = _load("news.json")
+    payload["results"][0]["published_utc"] = "2026-07-14T12:45:00Z"
+    params_seen: list[dict] = []
+
+    def http_get(_url: str, **kwargs) -> FakeResponse:
+        params_seen.append(kwargs["params"])
+        return FakeResponse(payload)
+
+    result = MassiveIngestor(
+        store=store,
+        coverage_resolver=_coverage(),
+        api_key="test-massive-key",
+        http_get=http_get,
+        news_overlap_hours=2,
+        now_fn=lambda: "2026-07-14T20:00:00Z",
+        sleep_fn=lambda _seconds: None,
+    ).ingest_news()
+
+    assert params_seen[0]["published_utc.gte"] == "2026-07-14T09:30:00Z"
+    assert params_seen[0]["published_utc.lte"] == "2026-07-14T20:00:00Z"
+    assert params_seen[0]["sort"] == "published_utc"
+    assert params_seen[0]["order"] == "asc"
+    assert result["cursor_before"] == "2026-07-14T11:30:00Z"
+    assert result["cursor_after"] == "2026-07-14T12:45:00Z"
+    assert store.get_source_cursor("massive_news", "US") == "2026-07-14T12:45:00Z"
+
+
+def test_massive_news_does_not_advance_cursor_when_indexing_fails(
+    tmp_path: Path,
+) -> None:
+    from src.ingestion.massive_ingestor import MassiveIngestor
+
+    store, chroma = _store(tmp_path)
+    store.set_source_cursor(
+        "massive_news",
+        "US",
+        "2026-07-14T11:30:00Z",
+        cursor_type="timestamp",
+        status="success",
+    )
+    payload = _load("news.json")
+    payload["results"][0]["published_utc"] = "2026-07-14T12:45:00Z"
+    chroma.add_document.side_effect = RuntimeError("embedding unavailable")
+
+    result = MassiveIngestor(
+        store=store,
+        coverage_resolver=_coverage(),
+        api_key="test-massive-key",
+        http_get=lambda *_args, **_kwargs: FakeResponse(payload),
+        news_overlap_hours=2,
+        now_fn=lambda: "2026-07-14T20:00:00Z",
+        sleep_fn=lambda _seconds: None,
+    ).ingest_news()
+
+    assert result["status"] == "partial"
+    assert result["cursor_after"] == "2026-07-14T11:30:00Z"
+    assert store.get_source_cursor("massive_news", "US") == "2026-07-14T11:30:00Z"
 
 
 def test_massive_429_exposes_retry_metadata_without_advancing_date_cursor(

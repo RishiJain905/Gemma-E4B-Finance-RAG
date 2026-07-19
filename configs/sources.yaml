@@ -1,6 +1,6 @@
 # configs/sources.yaml
 # Scheduler-owned source cadence, cursor, quota, and bounded-work registry.
-version: "2.3.4.1-r1"
+version: "2.3.4.1-r2"
 
 # Phase 2.3 capability rollout gates. These are intentionally independent of
 # per-source definitions so schema/config can ship before network work starts.
@@ -176,6 +176,26 @@ sources:
     retry_policy: vendor_market
     ttl_key: massive_market
     ttl_hours: 24
+
+  massive_news:
+    capability_group: company_news
+    enabled: true
+    required_env: MASSIVE_API_KEY
+    scope: broad
+    cadence: hourly
+    run_modes: [hourly, all]
+    priority: 46
+    dependencies: []
+    cursor_kind: timestamp
+    overlap: 2h
+    requests_per_minute: 4
+    requests_per_day: 1000
+    requests_per_run: 1
+    batch_size: 1
+    max_work_items_per_run: 1
+    retry_policy: vendor_news
+    ttl_key: massive_news
+    ttl_hours: 1
 
   fred:
     capability_group: macro
@@ -392,7 +412,7 @@ sources:
 
   gdelt:
     capability_group: company_news
-    enabled: true
+    enabled: false
     scope: deep
     cadence: hourly
     run_modes: [hourly, all]

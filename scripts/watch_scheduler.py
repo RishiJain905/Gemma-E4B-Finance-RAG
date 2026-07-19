@@ -30,6 +30,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Optional
 
+import yaml
+
+
+DEFAULT_SOURCES_PATH = Path(__file__).resolve().parents[1] / "configs" / "sources.yaml"
+
 # ── ANSI colors (safe on Windows Terminal once VT processing is enabled) ──
 
 RESET = "\x1b[0m"
@@ -215,7 +220,34 @@ def _collect_last_run(conn: sqlite3.Connection) -> Optional[dict]:
     return run
 
 
-def _freshness_entry(name: str, cache_row: Optional[dict], now: datetime) -> dict:
+def _configured_disabled_sources(path: Path = DEFAULT_SOURCES_PATH) -> set[str]:
+    """Return sources explicitly disabled in configuration without loading secrets."""
+    loaded = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    sources = loaded.get("sources") if isinstance(loaded, dict) else None
+    if not isinstance(sources, dict):
+        return set()
+    return {
+        str(name)
+        for name, config in sources.items()
+        if isinstance(config, dict) and config.get("enabled") is False
+    }
+
+
+def _freshness_entry(
+    name: str,
+    cache_row: Optional[dict],
+    now: datetime,
+    *,
+    configured_disabled: bool = False,
+) -> dict:
+    if configured_disabled:
+        return {
+            "name": name,
+            "state": "disabled",
+            "age_hours": None,
+            "ttl_hours": None,
+            "error_message": "disabled by configuration",
+        }
     if not cache_row:
         return {"name": name, "state": "never", "age_hours": None, "ttl_hours": None}
     last_updated = _parse_dt(cache_row.get("last_updated"))
@@ -240,8 +272,13 @@ def _freshness_entry(name: str, cache_row: Optional[dict], now: datetime) -> dic
     }
 
 
-def _collect_freshness(conn: sqlite3.Connection, now: datetime) -> list:
-    names: set[str] = set()
+def _collect_freshness(
+    conn: sqlite3.Connection,
+    now: datetime,
+    disabled_sources: Optional[set[str]] = None,
+) -> list:
+    disabled_sources = disabled_sources or set()
+    names: set[str] = set(disabled_sources)
     for row in conn.execute(
         "SELECT DISTINCT source FROM cache_meta WHERE ticker='SCHEDULER'"
     ).fetchall():
@@ -258,9 +295,16 @@ def _collect_freshness(conn: sqlite3.Connection, now: datetime) -> list:
             "SELECT * FROM cache_meta WHERE ticker='SCHEDULER' AND source=?",
             (_scheduler_cache_source(name),),
         ).fetchone()
-        entries.append(_freshness_entry(name, dict(cache_row) if cache_row else None, now))
+        entries.append(
+            _freshness_entry(
+                name,
+                dict(cache_row) if cache_row else None,
+                now,
+                configured_disabled=name in disabled_sources,
+            )
+        )
 
-    rank = {"stale": 0, "never": 1, "fresh": 2}
+    rank = {"stale": 0, "disabled": 1, "never": 2, "fresh": 3}
     entries.sort(key=lambda e: (rank.get(e["state"], 1), -(e["age_hours"] or -1.0)))
     return entries
 
@@ -353,6 +397,11 @@ def collect_snapshot(db_path: Path) -> Snapshot:
 
     try:
         snapshot.available = True
+        disabled_sources = _safe(
+            snapshot.errors,
+            "source_config",
+            _configured_disabled_sources,
+        ) or set()
         snapshot.active_run = _safe(
             snapshot.errors, "active_run", lambda: _collect_active_run(conn, now)
         )
@@ -360,7 +409,9 @@ def collect_snapshot(db_path: Path) -> Snapshot:
             snapshot.errors, "last_run", lambda: _collect_last_run(conn)
         )
         snapshot.freshness = _safe(
-            snapshot.errors, "freshness", lambda: _collect_freshness(conn, now)
+            snapshot.errors,
+            "freshness",
+            lambda: _collect_freshness(conn, now, disabled_sources),
         ) or []
         snapshot.queues = _safe(
             snapshot.errors, "queues", lambda: _collect_queues(conn)
@@ -454,7 +505,7 @@ def render_freshness(snapshot: Snapshot) -> str:
         text = f"  {entry['name']:<28} age={age:<8} ttl={ttl:<8} state={entry['state']}"
         if entry["state"] == "stale":
             lines.append(red(text))
-        elif entry["state"] == "never":
+        elif entry["state"] in {"never", "disabled"}:
             lines.append(dim(text))
         else:
             lines.append(green(text))

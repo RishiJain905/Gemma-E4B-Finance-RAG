@@ -64,6 +64,7 @@ class UnifiedScheduler:
         {
             "finnhub",
             "massive",
+            "massive_news",
             "federal_reserve",
             "treasury",
             "bls",
@@ -76,6 +77,7 @@ class UnifiedScheduler:
             "usaspending",
         }
     )
+    PROVIDER_BUDGET_SOURCE = {"massive_news": "massive"}
 
     SOURCES = {
         "yfinance": {
@@ -268,8 +270,9 @@ class UnifiedScheduler:
             now = now.replace(tzinfo=timezone.utc)
         day_start = now.date().isoformat()
         minute_start = now.strftime("%Y-%m-%dT%H:%MZ")
+        provider_source = self.PROVIDER_BUDGET_SOURCE.get(spec.name, spec.name)
         usage = self.store.get_source_budget_usage(
-            spec.name,
+            provider_source,
             day_start=day_start,
             minute_start=minute_start,
         )
@@ -315,7 +318,7 @@ class UnifiedScheduler:
         """Persist request attempts and provider limits for later processes."""
         day_start, minute_start = self._budget_windows[name]
         self.store.record_source_budget_usage(
-            name,
+            self.PROVIDER_BUDGET_SOURCE.get(name, name),
             day_start=day_start,
             minute_start=minute_start,
             attempted_requests=budget.attempted_requests,
@@ -447,9 +450,19 @@ class UnifiedScheduler:
             return MassiveIngestor(
                 store=self.store,
                 coverage_resolver=self.coverage,
-                http_get=self._budgeted_http_get(name),
+                http_get=self._budgeted_http_get(name, wait_for_minute=True),
                 overlap_days=int((self.SOURCES[name].overlap or "0d")[:-1]),
             ).ingest_all()
+
+        if name == "massive_news":
+            from src.ingestion.massive_ingestor import MassiveIngestor
+
+            return MassiveIngestor(
+                store=self.store,
+                coverage_resolver=self.coverage,
+                http_get=self._budgeted_http_get(name, wait_for_minute=True),
+                news_overlap_hours=int((self.SOURCES[name].overlap or "0h")[:-1]),
+            ).ingest_news()
 
         official = self._official_ingestor(name)
         if official is not None:
@@ -1648,6 +1661,15 @@ class UnifiedScheduler:
                 return discovery.discover_dates([partition])
             return sched.run_discovery(force=True, allow_bootstrap=False)
 
+        if source == "federal_reserve":
+            from src.ingestion.official.federal_reserve import FederalReserveIngestor
+
+            return FederalReserveIngestor(
+                store=self.store,
+                coverage_resolver=self.coverage,
+                http_get=self._budgeted_http_get(source),
+            ).ingest_history(run_id=run_id)
+
         self._bootstrap_context = {
             "source": source,
             "since": since,
@@ -1834,11 +1856,17 @@ class UnifiedScheduler:
                             )
                             updated_items = self._result_metric(detail, ("updated",))
                             duplicate_items = self._result_metric(detail, ("duplicates",))
+                            checkpoint_status = (
+                                "partial"
+                                if spec.name == "federal_reserve"
+                                and part_status == "partial"
+                                else "completed"
+                            )
                             self.store.record_bootstrap_partition(
                                 run_id,
                                 spec.name,
                                 partition,
-                                status="completed",
+                                status=checkpoint_status,
                                 started_at=part_started,
                                 ended_at=self._status_now(),
                                 attempts=attempts,
@@ -1847,7 +1875,8 @@ class UnifiedScheduler:
                                 updated_items=updated_items,
                                 duplicates=duplicate_items,
                             )
-                            source_result["partitions"] = int(source_result["partitions"]) + 1
+                            if checkpoint_status == "completed":
+                                source_result["partitions"] = int(source_result["partitions"]) + 1
                             source_result["items"] = int(source_result["items"]) + accepted
                             source_result["new"] = int(source_result["new"]) + new_items
                             source_result["updated"] = int(source_result["updated"]) + updated_items
