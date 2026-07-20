@@ -1139,6 +1139,25 @@ def test_health_reports_adaptive_capabilities(monkeypatch):
     assert caps["deterministic_tool_routing"] is True
 
 
+def test_health_can_skip_expensive_scheduler_details(monkeypatch):
+    cfg = _adaptive_config(enable_deterministic_tool_routing=True)
+    monkeypatch.setattr(_app, "config", cfg)
+    monkeypatch.setattr(
+        _app, "store", _NS(heartbeat=lambda: {"sqlite": True, "chroma": True}))
+    monkeypatch.setattr(_app, "_check_model_health", _AsyncMock(return_value=True))
+    monkeypatch.setattr(
+        _app,
+        "_cached_health_summary",
+        lambda: (_ for _ in ()).throw(AssertionError("scheduler details were loaded")),
+    )
+
+    data = TestClient(_app.app).get("/health?details=false").json()
+
+    assert data["status"] == "ok"
+    assert data["scheduler"] is None
+    assert data["freshness"] == {}
+
+
 def test_old_client_tolerates_omitted_orchestration_metadata():
     """A QueryResponse without orchestration validates and dumps to null; the
     chat renderer tolerates a response dict missing the field entirely."""

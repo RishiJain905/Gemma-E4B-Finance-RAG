@@ -1050,14 +1050,17 @@ def _guidance_data(ticker: str) -> dict:
 # ── Health ─────────────────────────────────────────────
 
 @app.get("/health", response_model=HealthResponse)
-async def health(request: Request):
-    """Enhanced health check with storage, model, scheduler, and freshness."""
+async def health(request: Request, details: bool = True):
+    """Health check; callers may skip the expensive scheduler detail report."""
     if not store:
         raise HTTPException(status_code=503, detail="Store not initialized")
 
     storage_health = store.heartbeat()
     model_ok = await _check_model_health()
-    summary = _cached_health_summary()
+    summary = (
+        _cached_health_summary()
+        if details else {"scheduler": None, "freshness": {}}
+    )
 
     capabilities = None
     if config:

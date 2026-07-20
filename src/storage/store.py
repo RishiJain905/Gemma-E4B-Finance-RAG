@@ -338,12 +338,31 @@ class Store:
 
     # ── Health ─────────────────────────────────────────
 
+    def _indexed_document_count(self) -> Optional[int]:
+        """Return the revision-consistent corpus count without loading HNSW."""
+        try:
+            state = self.sqlite.get_lexical_index_state()
+            indexed_revision = int(state["indexed_revision"])
+            row_count = int(state["row_count"])
+            if int(state.get("rebuild_cursor", 0) or 0) != 0:
+                return None
+
+            chroma_revision = self.chroma.corpus_revision()
+            if chroma_revision is None:
+                return 0 if indexed_revision == 0 and row_count == 0 else None
+            if int(chroma_revision) != indexed_revision:
+                return None
+            return row_count
+        except Exception:  # noqa: BLE001 - health metadata must fail soft
+            logger.warning("Indexed document count unavailable", exc_info=True)
+            return None
+
     def heartbeat(self) -> dict:
         """Check both storage backends are responsive."""
         return {
             "sqlite": self._check_sqlite(),
             "chroma": self.chroma.heartbeat(),
-            "chroma_doc_count": self.chroma.count(),
+            "chroma_doc_count": self._indexed_document_count(),
         }
 
     def migrate_phase2_3(

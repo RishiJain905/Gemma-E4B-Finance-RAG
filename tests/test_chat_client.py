@@ -116,6 +116,37 @@ def test_uses_persistent_client(monkeypatch, capsys):
     assert "persistent answer" in capsys.readouterr().out
 
 
+def test_startup_checks_request_lightweight_health(monkeypatch):
+    requested_paths = []
+
+    class RecordingClient:
+        def __init__(self, *args, **kwargs):
+            self.base_url = kwargs.get("base_url") or (args[0] if args else "http://test")
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return None
+
+        def get(self, path):
+            requested_paths.append(path)
+            return FakeResponse(data={"status": "ok", "capabilities": {}})
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(chat.httpx, "Client", RecordingClient)
+    session = chat.ChatSession("http://test")
+
+    assert session.middleware_up() is True
+    session.load_capabilities()
+    chat.print_capabilities(session.client)
+    assert chat.middleware_up("http://test") is True
+
+    assert requested_paths == ["/health?details=false"] * 4
+
+
 def test_streaming_prints_incrementally(capsys):
     class FakeClient:
         def stream(self, method, path, json=None):

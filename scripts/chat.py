@@ -32,6 +32,7 @@ import httpx
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 MODEL_HEALTH_URL = "http://127.0.0.1:8087/health"
+STARTUP_HEALTH_PATH = "/health?details=false"
 SCHEDULER_MODES = {"daily", "hourly", "weekly", "all", "status"}
 
 # Local fallback for the current-question ceiling when the server does not
@@ -622,7 +623,7 @@ class ChatSession:
         Missing or partial blocks (older middleware) leave the local defaults
         in place, so the client stays usable. Returns the block for display."""
         try:
-            caps = self.client.get("/health").json().get("capabilities")
+            caps = self.client.get(STARTUP_HEALTH_PATH).json().get("capabilities")
         except Exception:
             return None
         if not isinstance(caps, dict):
@@ -657,7 +658,7 @@ class ChatSession:
 
     def middleware_up(self) -> bool:
         try:
-            return self.client.get("/health").status_code == 200
+            return self.client.get(STARTUP_HEALTH_PATH).status_code == 200
         except Exception:
             return False
 
@@ -926,7 +927,7 @@ class ChatSession:
 def middleware_up(base: str) -> bool:
     try:
         with httpx.Client(base_url=base, timeout=3) as client:
-            return client.get("/health").status_code == 200
+            return client.get(STARTUP_HEALTH_PATH).status_code == 200
     except Exception:
         return False
 
@@ -1142,7 +1143,7 @@ def do_eval(limit: int = 5, *, conversations: bool = False, runner=None) -> None
 def print_capabilities(client: httpx.Client) -> None:
     """Fetch /health once at startup and show the active deployment capabilities."""
     try:
-        data = client.get("/health").json()
+        data = client.get(STARTUP_HEALTH_PATH).json()
     except Exception:
         return
     caps = data.get("capabilities")

@@ -69,18 +69,42 @@ def test_store_init(tmp_path: Path):
 
 # ── Health ───────────────────────────────────────────
 
-def test_heartbeat(store, mock_chroma):
-    mock_chroma.heartbeat.return_value = True
-    mock_chroma.count.return_value = 7
+def test_heartbeat_uses_indexed_count_without_loading_chroma(fully_mocked_store):
+    store, sqlite, chroma = fully_mocked_store
+    chroma.heartbeat.return_value = True
+    chroma.corpus_revision.return_value = 12
+    chroma.count.side_effect = AssertionError("health must not load the vector index")
+    sqlite.get_lexical_index_state.return_value = {
+        "indexed_revision": 12,
+        "row_count": 7,
+        "rebuild_cursor": 0,
+    }
 
     health = store.heartbeat()
 
     assert health == {"sqlite": True, "chroma": True, "chroma_doc_count": 7}
-    mock_chroma.heartbeat.assert_called_once()
-    mock_chroma.count.assert_called_once()
+    chroma.heartbeat.assert_called_once()
+    chroma.count.assert_not_called()
 
 
 # ── Fundamentals ─────────────────────────────────────
+
+def test_heartbeat_hides_count_when_corpus_revisions_differ(fully_mocked_store):
+    store, sqlite, chroma = fully_mocked_store
+    chroma.heartbeat.return_value = True
+    chroma.corpus_revision.return_value = 13
+    chroma.count.side_effect = AssertionError("health must not load the vector index")
+    sqlite.get_lexical_index_state.return_value = {
+        "indexed_revision": 12,
+        "row_count": 7,
+        "rebuild_cursor": 0,
+    }
+
+    health = store.heartbeat()
+
+    assert health == {"sqlite": True, "chroma": True, "chroma_doc_count": None}
+    chroma.count.assert_not_called()
+
 
 def test_save_and_get_fundamental(store):
     assert store.save_fundamental(
