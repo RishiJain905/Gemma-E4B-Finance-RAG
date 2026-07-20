@@ -421,7 +421,7 @@ class UnifiedScheduler:
             return FinnhubIngestor(
                 store=self.store,
                 coverage_resolver=self.coverage,
-                http_get=self._budgeted_http_get(name),
+                http_get=self._budgeted_http_get(name, wait_for_minute=True),
                 overlap_hours=int((self.SOURCES[name].overlap or "0h")[:-1]),
                 initial_lookback_days=lookback_days,
             ).ingest_news(tickers=tickers)

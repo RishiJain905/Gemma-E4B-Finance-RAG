@@ -268,6 +268,12 @@ def test_default_hourly_registry_uses_massive_news_and_disables_gdelt():
     assert gdelt.disabled_reason == "disabled by configuration"
 
 
+def test_default_finnhub_registry_uses_paced_rate_limit():
+    registry = SourceRegistry.load(environ={"FINNHUB_API_KEY": "test-key"})
+
+    assert registry.get("finnhub").requests_per_minute == 55
+
+
 @pytest.mark.parametrize(
     "override, expected_error",
     [

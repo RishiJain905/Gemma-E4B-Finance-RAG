@@ -455,6 +455,22 @@ class TestUnifiedSchedulerPartialFailure:
         assert ingestor_class.call_args.kwargs["overlap_days"] == 2
         budgeted_get.assert_called_once_with("massive", wait_for_minute=True)
 
+    def test_finnhub_dispatch_waits_for_minute_capacity(self, scheduler, monkeypatch):
+        ingestor_class = MagicMock()
+        ingestor_class.return_value.ingest_news.return_value = {"status": "ok"}
+        budgeted_get = MagicMock(return_value=MagicMock())
+        scheduler._budgeted_http_get = budgeted_get
+        monkeypatch.setattr(
+            "src.ingestion.finnhub_ingestor.FinnhubIngestor", ingestor_class
+        )
+        scheduler._active_budgets["finnhub"] = scheduler._new_budget(
+            scheduler.registry.get("finnhub")
+        )
+
+        scheduler._run_source("finnhub")
+
+        budgeted_get.assert_called_once_with("finnhub", wait_for_minute=True)
+
     def test_massive_news_shares_daily_massive_provider_usage(self, scheduler):
         now = datetime(2026, 7, 18, 15, 30, tzinfo=timezone.utc)
         scheduler._now_fn = lambda: now
