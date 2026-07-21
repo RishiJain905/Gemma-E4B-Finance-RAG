@@ -77,7 +77,9 @@
           <button id="btn-corpus-search" class="tool-btn" type="button">Search</button>
           <button id="btn-corpus-overview" class="tool-btn" type="button">Overview</button>
           <button id="btn-facets-toggle" class="tool-btn" type="button"
-                  aria-expanded="false" aria-controls="facet-rail" hidden>Facets</button>
+                  aria-expanded="false" aria-controls="facet-rail">Facets</button>
+          <button id="btn-inventory-toggle" class="tool-btn" type="button"
+                  aria-pressed="true" aria-controls="inventory-pane">Inventory</button>
           <button id="btn-corpus-more" class="tool-btn" type="button" hidden>Load next page</button>
         </div>
         <div class="toolbar-spacer"></div>
@@ -123,6 +125,8 @@
           <div class="facet-rail-head">
             <span class="field-label">Facets</span>
             <button id="btn-facets-clear" class="tool-btn subtle" type="button">Clear all</button>
+            <button id="btn-facets-collapse" class="icon-btn" type="button"
+                    aria-label="Collapse facet rail" aria-expanded="true">«</button>
           </div>
           <div class="facet-groups" id="facet-groups" role="group"
                aria-label="Combinable corpus filters"></div>
@@ -133,6 +137,8 @@
           <div class="inventory-head">
             <span class="field-label">Inventory</span>
             <span id="inventory-count" class="mono" role="status" aria-live="polite"></span>
+            <button id="btn-inventory-collapse" class="icon-btn" type="button"
+                    aria-label="Collapse inventory pane" aria-pressed="true">«</button>
           </div>
           <div class="inventory-scroll">
             <ul id="inventory-list" class="inventory-list" role="listbox"
@@ -152,7 +158,7 @@
                aria-label="Interactive retrieval graph. Use the node list or arrow keys to inspect nodes."></div>
 
           <div id="error-panel" class="error-panel" role="alert" hidden>
-            <h2 class="error-title">Graph view unavailable</h2>
+            <h2 id="error-title" class="error-title">Graph view unavailable</h2>
             <p id="error-detail" class="error-detail"></p>
             <button id="btn-retry" class="tool-btn" type="button">Retry</button>
             <p class="error-note">A read-only table of the current trace is shown below.</p>

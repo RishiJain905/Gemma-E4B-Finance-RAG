@@ -515,6 +515,18 @@ if (typeof document !== "undefined" && document.getElementById("graph-canvas")) 
         { selector: 'node[freshWorst="pending"]', style: { "border-color": COL.pending, "border-width": 2.4 } },
         { selector: 'node[freshWorst="dropped"]', style: { "border-color": COL.steel, "border-width": 2.4 } },
         { selector: 'node[freshWorst="error"]', style: { "border-color": COL.conflict, "border-width": 2.4, "border-style": "dashed" } },
+        // Synthetic per-group cluster hubs (T5): canvas-only anchors that pull an
+        // otherwise-edgeless result set into readable per-ticker/source
+        // constellations. Larger, always-labelled (LOD-exempt), distinct border.
+        { selector: "node[hub]", style: {
+            shape: "round-rectangle", width: 58, height: 34,
+            "background-color": COL.surface, "border-color": COL.flow,
+            "border-width": 2.4, "border-style": "double", "font-size": 12,
+            "font-weight": 700, "text-valign": "center", "text-margin-y": 0,
+            "text-max-width": 96, "z-index": 15 } },
+        { selector: 'edge[relation="grouped"]', style: {
+            "line-color": COL.hairline, "target-arrow-shape": "none",
+            "line-style": "dashed", "opacity": 0.45, "width": 1 } },
       ];
     }
 
@@ -579,6 +591,9 @@ if (typeof document !== "undefined" && document.getElementById("graph-canvas")) 
 
     function renderLive() {
       if (!cy) return;
+      // Hard guard (T3): a background trace arrival must never repaint the shared
+      // canvas while the user is in Corpus Explorer.
+      if (app.mode !== "live") return;
       const trace = activeTrace();
       $("canvas-empty").hidden = !!(trace && trace.nodes.size);
       if (!trace) { cy.elements().remove(); syncSecondaryViews([], []); return; }
@@ -741,6 +756,15 @@ if (typeof document !== "undefined" && document.getElementById("graph-canvas")) 
     }
     function clearBeam() { if (cy) cy.elements().removeClass("beam dimmed"); }
 
+    // Fit the viewport to a cluster hub and its members (T5): a hub click is a
+    // "zoom to this group" gesture, never a node selection.
+    function fitCluster(hub) {
+      if (!cy || hub.empty()) return;
+      const cluster = hub.closedNeighborhood();
+      if (reduceMotion) cy.fit(cluster, 60);
+      else cy.animate({ fit: { eles: cluster, padding: 60 } }, { duration: 250, easing: "ease-out" });
+    }
+
     /* ══ Corpus Explorer ══════════════════════════════════════════════════ */
     // Freshness leaf status -> node status colour; worst wins per ticker.
     const FRESH_RANK = { complete: 0, pending: 1, dropped: 2, error: 3 };
@@ -807,29 +831,113 @@ if (typeof document !== "undefined" && document.getElementById("graph-canvas")) 
       cy.batch(() => {
         cy.nodes().forEach((ele) => {
           const kind = ele.data("kind");
-          if (kind === "source" || kind === "ticker") return;
+          if (kind === "source" || kind === "ticker" || ele.data("hub")) return;
           ele.style("text-opacity", show ? 1 : 0);
         });
       });
+    }
+
+    // Group a mostly-edgeless canvas set (search/facet results usually arrive with
+    // zero edges) into per-ticker/source mini-graphs by synthesizing one hub node
+    // per group plus subtle hub->member edges. Hubs are canvas-only: they are never
+    // stored in app.corpus.nodes, so the list/table/inspector/export never see them.
+    function clusterCorpusHubs(folded) {
+      const { nodes, edges } = folded;
+      if (!(edges.length < nodes.length / 4 && nodes.length > 6)) return folded;
+      const groups = new Map();   // group key -> [member node id, …]
+      for (const n of nodes) {
+        const m = (n.data.raw && n.data.raw.metadata) || {};
+        const key = m.ticker || m.source_category || m.source || "other";
+        if (!groups.has(key)) groups.set(key, []);
+        groups.get(key).push(n.data.id);
+      }
+      if (groups.size < 2 && nodes.length <= 12) return folded;  // one blob needs no hub
+      const hubNodes = [];
+      const hubEdges = [];
+      for (const [key, members] of groups) {
+        const hubId = `hub:${key}`;
+        hubNodes.push({ group: "nodes", data: {
+          id: hubId, label: `${key} (${members.length})`, kind: "cluster_hub",
+          status: "complete", hub: true,
+        } });
+        for (const mid of members) {
+          hubEdges.push({ group: "edges", data: {
+            id: `hubedge:${hubId}:${mid}`, source: hubId, target: mid, relation: "grouped",
+          } });
+        }
+      }
+      return {
+        nodes: nodes.concat(hubNodes), edges: edges.concat(hubEdges),
+        foldedCount: folded.foldedCount, clusterGroups: groups,
+      };
+    }
+
+    // Deterministic layout for hub mode: cose packs disconnected components into
+    // a single column, so hub groups are placed on a grid sized to the canvas
+    // aspect, with members on concentric rings around their hub.
+    function ringFor(index) {
+      let placed = 0, ring = 0;
+      for (;;) {
+        const cap = 10 + ring * 8;
+        if (index < placed + cap) return { ring, slot: index - placed, cap };
+        placed += cap; ring += 1;
+      }
+    }
+    function clusterOuterRadius(count) {
+      return 52 + ringFor(Math.max(0, count - 1)).ring * 40;
+    }
+    function layoutClusters(groups) {
+      const w = cy.width() || 900;
+      const h = cy.height() || 600;
+      const keys = Array.from(groups.keys());
+      let maxR = 52;
+      for (const key of keys) maxR = Math.max(maxR, clusterOuterRadius(groups.get(key).length));
+      const cell = maxR * 2 + 120;
+      const cols = Math.max(1, Math.round(Math.sqrt(keys.length * (w / Math.max(h, 1)))));
+      cy.batch(() => {
+        keys.forEach((key, gi) => {
+          const cx = (gi % cols) * cell + cell / 2;
+          const cyy = Math.floor(gi / cols) * cell + cell / 2;
+          const hub = cy.getElementById(`hub:${key}`);
+          if (hub.nonempty()) hub.position({ x: cx, y: cyy });
+          const members = groups.get(key);
+          members.forEach((mid, i) => {
+            const ele = cy.getElementById(mid);
+            if (ele.empty()) return;
+            const { ring, slot, cap } = ringFor(i);
+            const count = Math.min(cap, members.length - (i - slot));
+            const r = 52 + ring * 40;
+            const angle = (2 * Math.PI * slot) / count - Math.PI / 2 + (ring % 2 ? Math.PI / count : 0);
+            ele.position({ x: cx + r * Math.cos(angle), y: cyy + r * Math.sin(angle) });
+          });
+        });
+      });
+      cy.fit(cy.elements(), 60);
     }
 
     function renderCorpus() {
       if (!cy) return;
       const rawNodes = Array.from(app.corpus.nodes.values());
       const rawEdges = Array.from(app.corpus.edges.values());
-      const { nodes, edges } = foldCorpusForCanvas(rawNodes, rawEdges);
-      $("canvas-empty").hidden = nodes.length > 0;
-      if (!nodes.length) $("canvas-empty").textContent = "Search the corpus or pick a source group to expand.";
+      const folded = foldCorpusForCanvas(rawNodes, rawEdges);
+      const { nodes, edges, clusterGroups } = clusterCorpusHubs(folded);
+      // Emptiness tracks the real (folded) node set, never the synthetic hubs.
+      $("canvas-empty").hidden = folded.nodes.length > 0;
+      if (!folded.nodes.length) $("canvas-empty").textContent = "Search the corpus or pick a source group to expand.";
       cy.elements().remove();
       cy.add(nodes);
       cy.add(edges);
       if (nodes.length) {
-        const layout = cy.layout({
-          name: "cose", animate: !reduceMotion, animationDuration: 400, fit: true,
-          padding: 60, nodeRepulsion: 14000, idealEdgeLength: 140, edgeElasticity: 100,
-          gravity: 0.22, componentSpacing: 140, nodeOverlap: 20, randomize: false,
-        });
-        layout.run();
+        if (clusterGroups) {
+          layoutClusters(clusterGroups);
+        } else {
+          const layout = cy.layout({
+            name: "cose", animate: !reduceMotion, animationDuration: 400, fit: true,
+            padding: 60, nodeRepulsion: 16000, idealEdgeLength: 110, edgeElasticity: 120,
+            gravity: 0.18, componentSpacing: 220, nodeOverlap: 24, randomize: false,
+          });
+          layout.run();
+        }
         corpusLeafLabelsShown = true;   // force LOD to re-evaluate against post-fit zoom
         updateCorpusLabelLOD(true);
       }
@@ -930,8 +1038,48 @@ if (typeof document !== "undefined" && document.getElementById("graph-canvas")) 
       updateFacetToggleBadge(state);
       await refreshAggregates(state);
       renderFacetRail(state);
-      if (state.view === "results") renderResults(state);
-      else renderAggregatesInventory(state);
+      const scoped = !!state.q || CI.activeFacetCount(state) > 0;
+      if (state.view === "results") {
+        // Results view fetches search once and feeds both the inventory rows and
+        // the canvas (loadCorpusPage inside renderResults) — one fetch, no double.
+        renderResults(state);
+      } else {
+        renderAggregatesInventory(state);
+        // Aggregates view: renderResults doesn't run, so drive the canvas here —
+        // scope it to the matching subgraph when filtered, else restore overview.
+        if (scoped) scopeCanvasToSelection(state);
+        else restoreOverviewCanvas();
+      }
+    }
+
+    // Canvas-only scoping for the aggregates view: reuse the exact search URL that
+    // renderResults builds, but only repaint the canvas (the inventory keeps its
+    // aggregate rows). Fail-soft and abort-aware like every corpus view request.
+    async function scopeCanvasToSelection(state) {
+      const q = state.q || "";
+      const ticker = (state.facets.ticker || [])[0] || "";
+      let url = `${API}/corpus/search?q=${encodeURIComponent(q)}`;
+      if (ticker) url += `&ticker=${encodeURIComponent(ticker)}`;
+      const kinds = catKinds(state.facets.source_category || []);
+      if (kinds.length) url += `&kinds=${encodeURIComponent(kinds.join(","))}`;
+      try {
+        const data = await getJSON(url, corpusSignal());
+        loadCorpusPage(data, true);   // replaces the canvas node/edge set + renders
+      } catch (err) { if (!isAbortError(err)) showError("Corpus scope failed", err); }
+    }
+
+    // No q and no active facets (Overview button, or the last facet cleared):
+    // restore the full overview subgraph from the snapshot taken in enterCorpus,
+    // falling back to a fresh overview fetch if the snapshot is unavailable.
+    function restoreOverviewCanvas() {
+      if (app.corpus.overviewNodes && app.corpus.overviewNodes.size) {
+        app.corpus.nodes = new Map(app.corpus.overviewNodes);
+        app.corpus.edges = new Map(app.corpus.overviewEdges || app.corpus.edges);
+        app.corpus.cursor = null;
+        renderCorpus();
+      } else {
+        corpusOverview();
+      }
     }
 
     function updateFacetToggleBadge(state) {
@@ -1531,10 +1679,15 @@ if (typeof document !== "undefined" && document.getElementById("graph-canvas")) 
         st.complete = snap.complete;
         app.traces.set(queryId, st);
       } catch (err) { /* keep any streamed state */ }
-      app.selectedId = null;
       recomputeScrubber();
-      renderLive();
-      clearInspector();
+      // Only the Live view reacts visually to a (re)selected trace. In Corpus mode
+      // we keep the state bookkeeping above but leave the corpus canvas and the
+      // corpus inspector selection untouched (T3).
+      if (app.mode === "live") {
+        app.selectedId = null;
+        renderLive();
+        clearInspector();
+      }
     }
     async function reloadSnapshot() {
       announce("Stream reset — reloading snapshot.");
@@ -1802,6 +1955,54 @@ if (typeof document !== "undefined" && document.getElementById("graph-canvas")) 
 
     function announce(msg) { $("live-status").textContent = msg; }
 
+    /* ══ Corpus panel collapse (T1): facet rail + inventory pane ══════════ */
+    // State is in-memory only (this app deliberately uses no browser storage);
+    // data-facets / data-inventory on <html> drive the CSS. Wide (>1280px)
+    // defaults: rail open, inventory open. Narrow default: rail closed (an overlay
+    // drawer opened via data-facets="open"), inventory open.
+    function isWideViewport() { return window.matchMedia("(min-width: 1281px)").matches; }
+    function facetsOpen() {
+      const attr = document.documentElement.getAttribute("data-facets");
+      if (attr === "open") return true;
+      if (attr === "closed") return false;
+      return isWideViewport();   // default: open on wide, closed (drawer) on narrow
+    }
+    function inventoryOpen() {
+      return document.documentElement.getAttribute("data-inventory") !== "closed";
+    }
+    // After a panel collapses/expands the canvas gains or loses width; let
+    // Cytoscape re-measure and re-center on the next frame so the graph re-fits.
+    function refitCanvasSoon() {
+      if (!cy) return;
+      requestAnimationFrame(() => { cy.resize(); cy.fit(cy.elements(), 48); });
+    }
+    function setFacetsOpen(open) {
+      document.documentElement.setAttribute("data-facets", open ? "open" : "closed");
+      $("btn-facets-toggle").setAttribute("aria-expanded", String(open));
+      const railBtn = $("btn-facets-collapse");
+      if (railBtn) railBtn.setAttribute("aria-expanded", String(open));
+      refitCanvasSoon();
+    }
+    function setInventoryOpen(open) {
+      document.documentElement.setAttribute("data-inventory", open ? "open" : "closed");
+      $("btn-inventory-toggle").setAttribute("aria-pressed", String(open));
+      const paneBtn = $("btn-inventory-collapse");
+      if (paneBtn) paneBtn.setAttribute("aria-pressed", String(open));
+      refitCanvasSoon();
+    }
+    // Reflect the current (possibly default) open state onto the toolbar + head
+    // buttons without forcing an attribute, so entering corpus shows correct
+    // control state at the active breakpoint.
+    function syncCorpusToggleButtons() {
+      const fo = facetsOpen(), io = inventoryOpen();
+      $("btn-facets-toggle").setAttribute("aria-expanded", String(fo));
+      $("btn-inventory-toggle").setAttribute("aria-pressed", String(io));
+      const railBtn = $("btn-facets-collapse");
+      if (railBtn) railBtn.setAttribute("aria-expanded", String(fo));
+      const paneBtn = $("btn-inventory-collapse");
+      if (paneBtn) paneBtn.setAttribute("aria-pressed", String(io));
+    }
+
     /* ══ mode switching ═══════════════════════════════════════════════════ */
     function setMode(mode) {
       app.mode = mode;
@@ -1817,9 +2018,13 @@ if (typeof document !== "undefined" && document.getElementById("graph-canvas")) 
       $("inventory-pane").hidden = mode !== "corpus";
       clearInspector();
       if (mode === "corpus") {
+        syncCorpusToggleButtons();
         enterCorpus();
       } else {
+        // Live mode is unaffected by the corpus panels: clear the corpus-only
+        // collapse attributes so nothing lingers on the shared <html> element.
         document.documentElement.removeAttribute("data-facets");
+        document.documentElement.removeAttribute("data-inventory");
         renderLive();
         syncStageRail();
       }
@@ -1834,6 +2039,7 @@ if (typeof document !== "undefined" && document.getElementById("graph-canvas")) 
       // Snapshot the bounded overview projection so the facet rail's freshness
       // and ticker derivations survive a later search replacing the canvas nodes.
       app.corpus.overviewNodes = new Map(app.corpus.nodes);
+      app.corpus.overviewEdges = new Map(app.corpus.edges);
       app.corpus.overviewFresh = new Map(app.corpus.freshAgg);
       const state = CI.parseCorpusHash(window.location.hash);
       app.corpus.state = state;
@@ -1883,9 +2089,18 @@ if (typeof document !== "undefined" && document.getElementById("graph-canvas")) 
           minZoom: 0.2, maxZoom: 3,
           boxSelectionEnabled: false,
         });
-        cy.on("tap", "node", (evt) => selectNode(evt.target.id(), true));
+        cy.on("tap", "node", (evt) => {
+          const id = evt.target.id();
+          // Synthetic hubs (T5) aren't real corpus nodes: tapping one fits its
+          // cluster instead of routing into selectNode's corpus lookup.
+          if (String(id).startsWith("hub:")) { fitCluster(evt.target); return; }
+          selectNode(id, true);
+        });
         cy.on("tap", (evt) => { if (evt.target === cy) clearInspector(); });
-        cy.on("dbltap", "node", (evt) => { if (app.mode === "corpus") corpusExpand(evt.target.id()); });
+        cy.on("dbltap", "node", (evt) => {
+          const id = evt.target.id();
+          if (app.mode === "corpus" && !String(id).startsWith("hub:")) corpusExpand(id);
+        });
         cy.on("grab", () => { app.dragging = true; });
         cy.on("free", () => { app.dragging = false; });
         // Reproject the stage rail whenever the viewport moves so lanes track
@@ -2006,11 +2221,13 @@ if (typeof document !== "undefined" && document.getElementById("graph-canvas")) 
         if (e.target.value) navigateCorpus(CI.applyPreset(corpusState(), e.target.value));
       });
       $("btn-facets-clear").addEventListener("click", () => navigateCorpus(CI.emptyCorpusState()));
-      $("btn-facets-toggle").addEventListener("click", () => {
-        const open = document.documentElement.getAttribute("data-facets") === "open";
-        document.documentElement.setAttribute("data-facets", open ? "closed" : "open");
-        $("btn-facets-toggle").setAttribute("aria-expanded", String(!open));
-      });
+      // Facet rail + inventory pane collapse (T1). Toolbar buttons toggle; the
+      // in-panel "«" buttons collapse (they vanish with the panel, so re-open is
+      // always via the toolbar). setFacetsOpen/setInventoryOpen keep both in sync.
+      $("btn-facets-toggle").addEventListener("click", () => setFacetsOpen(!facetsOpen()));
+      $("btn-facets-collapse").addEventListener("click", () => setFacetsOpen(false));
+      $("btn-inventory-toggle").addEventListener("click", () => setInventoryOpen(!inventoryOpen()));
+      $("btn-inventory-collapse").addEventListener("click", () => setInventoryOpen(false));
       $("btn-inventory-more").addEventListener("click", loadMoreResults);
       wireInventoryKeyboard();
 

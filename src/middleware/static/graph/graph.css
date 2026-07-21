@@ -48,6 +48,11 @@
 
 * { box-sizing: border-box; }
 
+/* The [hidden] attribute must always win: several hidden-toggled containers
+   (toolbar groups, filter rows, header fields) carry classes whose display
+   rules would otherwise override the UA's [hidden] { display: none }. */
+[hidden] { display: none !important; }
+
 html, body {
   height: 100%;
   margin: 0;
@@ -386,7 +391,12 @@ td.mono, td .mono { font-family: var(--mono); }
 
 .inspector-empty { padding: 14px; color: var(--ink-dim); margin: 0; }
 .inspector-empty[hidden] { display: none; }
-.inspector-body { padding: 12px 14px; overflow: auto; flex: 0 1 auto; }
+/* When a node is selected the detail body claims the upper share of the aside
+   and scrolls internally, so a long metadata list can never crush it against the
+   node list below (which keeps its own bounded, scrollable share — see
+   .node-list-wrap). While nothing is selected the body is hidden and the node
+   list fills the aside. */
+.inspector-body { padding: 12px 14px; overflow: auto; flex: 1 1 58%; min-height: 180px; }
 .inspector-body[hidden] { display: none; }
 
 .chip-row { display: flex; gap: 8px; margin-bottom: 8px; flex-wrap: wrap; }
@@ -430,7 +440,7 @@ td.mono, td .mono { font-family: var(--mono); }
 /* ── Node list ─────────────────────────────────────────────────────────── */
 .node-list-wrap {
   border-top: 1px solid var(--hairline);
-  flex: 1 1 auto; display: flex; flex-direction: column; min-height: 0;
+  flex: 1 1 42%; min-height: 140px; display: flex; flex-direction: column;
 }
 .node-list-head { display: flex; justify-content: space-between; padding: 8px 14px 4px; }
 #node-count { color: var(--ink-dim); }
@@ -578,7 +588,10 @@ td.mono, td .mono { font-family: var(--mono); }
     flex-direction: column;
   }
   .stage-region { border-right: 0; }
-  .node-list-wrap { max-height: 24vh; }
+  /* Bottom-sheet inspector: keep the same don't-crush split, scaled down so the
+     detail body and node list both stay scrollable inside the 42vh sheet. */
+  .inspector-body { flex: 1 1 55%; min-height: 120px; }
+  .node-list-wrap { flex: 1 1 45%; min-height: 100px; }
 
   /* Corpus: facet rail becomes an independently accessible left drawer, the
      inventory pane stays usable full-width, and the canvas collapses below. */
@@ -596,10 +609,22 @@ td.mono, td .mono { font-family: var(--mono); }
   [data-mode="corpus"][data-facets="open"] .facet-rail { transform: translateX(0); }
 }
 
-/* Wide layouts never need the in-toolbar facet toggle: the rail is persistent. */
+/* Wide layouts: the rail is persistent, but the Facets button can collapse it
+   fully (display:none) to hand the freed width to the canvas. The narrow-screen
+   drawer behaviour (translateX slide via [data-facets="open"]) lives in the
+   ≤1280px block above; here "closed" hides the persistent rail outright. */
 @media (min-width: 1281px) {
-  #btn-facets-toggle { display: none !important; }
+  [data-mode="corpus"][data-facets="closed"] .facet-rail { display: none; }
 }
+
+/* Inventory pane is collapsible at every width so the canvas can take the room.
+   Default open; #btn-inventory-toggle stamps data-inventory="closed" to hide it. */
+[data-mode="corpus"][data-inventory="closed"] .inventory-pane { display: none; }
+
+/* Small "«" collapse buttons in the panel heads mirror the toolbar toggles.
+   The label takes the auto margin so the remaining controls group at the right. */
+.facet-rail-head .field-label, .inventory-head .field-label { margin-right: auto; }
+.facet-rail-head .icon-btn, .inventory-head .icon-btn { flex: 0 0 auto; margin-left: 4px; }
 
 /* ── Reduced motion ────────────────────────────────────────────────────── */
 @media (prefers-reduced-motion: reduce) {

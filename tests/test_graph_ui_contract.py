@@ -500,3 +500,50 @@ def test_reduced_motion_disables_looping_graph_effects():
     css = CSS.read_text(encoding="utf-8")
     assert "if (reduceMotion) return;" in js
     assert "@media (prefers-reduced-motion: reduce)" in css
+
+
+# ── 2.3.5.4: collapsible corpus panels, canvas scoping, hub clustering ───────
+
+def test_corpus_panels_have_collapse_controls():
+    """Facets/Inventory are collapsible from both the toolbar and the panel heads;
+    the error panel title now carries an id so showError() can address it."""
+    html = INDEX.read_text(encoding="utf-8")
+    for token in (
+        'id="btn-facets-toggle"', 'id="btn-inventory-toggle"',
+        'id="btn-facets-collapse"', 'id="btn-inventory-collapse"',
+        'id="error-title"',
+    ):
+        assert token in html, f"index.html missing {token}"
+    # The wide-screen kill-switch that made the facets button unreachable is gone.
+    assert "#btn-facets-toggle { display: none !important; }" not in CSS.read_text(encoding="utf-8")
+
+
+def test_corpus_panel_collapse_state_is_attribute_driven_no_storage():
+    """Collapse state lives on <html> data-attributes and in memory only — never
+    in browser storage — and both panels re-fit the canvas after a toggle."""
+    js = JS.read_text(encoding="utf-8")
+    css = CSS.read_text(encoding="utf-8")
+    assert "setFacetsOpen" in js and "setInventoryOpen" in js
+    assert "data-inventory" in js and "data-inventory" in css
+    assert "refitCanvasSoon" in js and "cy.resize()" in js
+    for banned in ("localStorage", "sessionStorage", "document.cookie"):
+        assert banned not in js, f"collapse state must not use {banned}"
+
+
+def test_corpus_canvas_scopes_to_selection_and_restores_overview():
+    """Facet/search selection scopes the canvas subgraph; clearing restores the
+    overview snapshot. Live traces never repaint the corpus canvas (mode guard)."""
+    js = JS.read_text(encoding="utf-8")
+    assert "scopeCanvasToSelection" in js and "restoreOverviewCanvas" in js
+    assert "overviewEdges" in js
+    assert 'if (app.mode !== "live") return;' in js
+
+
+def test_corpus_edgeless_results_group_into_hub_miniature_graphs():
+    """Edgeless result sets synthesize per-ticker/source canvas-only hubs; hubs are
+    LOD-exempt and their clicks fit the cluster instead of selecting a node."""
+    js = JS.read_text(encoding="utf-8")
+    assert "clusterCorpusHubs" in js
+    assert "fitCluster" in js
+    assert 'startsWith("hub:")' in js
+    assert 'node[hub]' in js
