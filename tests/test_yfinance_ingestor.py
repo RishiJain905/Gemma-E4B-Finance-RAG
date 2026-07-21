@@ -34,14 +34,14 @@ def test_import_and_init():
 # ── 2. _load_watchlist with real config file ──
 
 def test_load_watchlist_real_config():
-    """Loads the committed watchlist YAML and returns expected 20 tickers."""
+    """Loads the committed watchlist YAML (2026-07-20 tech watchlist)."""
     ingestor = YFinanceIngestor()
     wl = ingestor.watchlist
     assert "core" in wl
     assert "extended" in wl
     assert "macro_tickers" in wl
     assert "schedule" in wl
-    assert len(wl["core"]) == 6
+    assert len(wl["core"]) == 16
     assert len(wl["extended"]) == 10
     assert len(wl["macro_tickers"]) == 4
 
@@ -80,10 +80,13 @@ def test_ticker_properties(tmp_path: Path):
 
 
 def test_ticker_properties_with_real_config():
-    """Real config yields exactly 20 tickers in all_tickers."""
+    """Real config yields the 2026-07-20 tech watchlist in all_tickers."""
     ingestor = YFinanceIngestor()
-    assert len(ingestor.all_tickers) == 20
-    assert ingestor.core_tickers == ["NVDA", "AMD", "AAPL", "MSFT", "META", "CRWD"]
+    assert len(ingestor.all_tickers) == 30
+    assert ingestor.core_tickers == [
+        "SNDK", "PLTR", "NVDA", "MU", "INTC", "NBIS", "BB", "AMD",
+        "AAPL", "MSFT", "GOOGL", "AMZN", "META", "TSLA", "AVGO", "ORCL",
+    ]
     # Ensure no duplicates by uniqueness check
     assert len(set(ingestor.all_tickers)) == len(ingestor.all_tickers)
 

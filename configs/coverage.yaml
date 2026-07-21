@@ -1,23 +1,25 @@
 # configs/coverage.yaml
 # Source-aware security coverage policy. This file contains no provider credentials.
-revision: "2.3.2.3-r2"
+revision: "2.3.2.3-r3"
 fallback_when_registry_empty: deep
 
-# The former watchlist `core` set is preserved as explicit deep coverage.
-# Rollout flags live with the owning universe/source/middleware configuration;
-# disabling them does not alter this policy or stored evidence.
+# 2026-07-20 watchlist refresh (user-directed): deep coverage is the active
+# tech watchlist (full filing text, transcripts, IR, estimates, GDELT);
+# former deep/broad members not in the new list stay in broad so their
+# already-ingested evidence keeps being maintained.
 
 deep:
-  tickers: [NVDA, AMD, AAPL, MSFT, META, CRWD]
-  # Transitional opt-in: after the Phase 2.3 backfill populates the registry
-  # but before the first universe snapshot lands, the active index union is
-  # empty and these members would otherwise fail off-index validation. All
-  # six are S&P 500/Nasdaq-100 members, so this becomes inert once
-  # universe bootstrap records memberships.
-  allow_outside_indexes: [NVDA, AMD, AAPL, MSFT, META, CRWD]
+  tickers: [SNDK, PLTR, NVDA, MU, INTC, NBIS, BB, AMD,
+            AAPL, MSFT, GOOGL, AMZN, META, TSLA, AVGO, ORCL]
+  # Off-index opt-in for the full deep set (matches the original policy's
+  # pattern): inert for any ticker the universe snapshots record as an index
+  # member, and prevents hard validation failures for genuinely off-index
+  # names (SNDK post-spinoff, NBIS, BB) or partial registries.
+  allow_outside_indexes: [SNDK, PLTR, NVDA, MU, INTC, NBIS, BB, AMD,
+                          AAPL, MSFT, GOOGL, AMZN, META, TSLA, AVGO, ORCL]
 
 broad:
-  additions: [GOOGL, AMZN, TSLA, AVGO, ORCL, INTC, QCOM, PANW, PLTR, SNOW]
+  additions: [CRWD, QCOM, PANW, SNOW, CRM, NFLX, ADBE, TXN, SMCI, DELL]
 
 sector:
   rules:

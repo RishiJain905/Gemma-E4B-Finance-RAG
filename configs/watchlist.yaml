@@ -4,8 +4,9 @@
 
 # Deprecated compatibility mirror. CoverageResolver does not use these when
 # coverage.yaml is present.
-core: [NVDA, AMD, AAPL, MSFT, META, CRWD]
-extended: [GOOGL, AMZN, TSLA, AVGO, ORCL, INTC, QCOM, PANW, PLTR, SNOW]
+core: [SNDK, PLTR, NVDA, MU, INTC, NBIS, BB, AMD,
+       AAPL, MSFT, GOOGL, AMZN, META, TSLA, AVGO, ORCL]
+extended: [CRWD, QCOM, PANW, SNOW, CRM, NFLX, ADBE, TXN, SMCI, DELL]
 
 # Macro indicators fetched as market proxies, not as company securities.
 macro_tickers:
