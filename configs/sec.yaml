@@ -1,10 +1,17 @@
 # SEC discovery, event evidence, and filing-text controls (Phase 2.3.2.1).
 sec:
-  index_filing_text: false
+  # Enabled 2026-07-20: index full 10-K/10-Q section text at ingestion so the
+  # deep watchlist's substantive filings are retrievable (get_filing_overview,
+  # hierarchical seams). Ingestion-time indexing is read by
+  # FilingProcessor._load_sec_config(); MiddlewareConfig._sec_filing_text_indexed()
+  # reads the same key to gate enable_hierarchical_retrieval (kept off).
+  index_filing_text: true
   index_event_filings: true
   max_sections_per_filing: 200
   max_section_chars: 2000000
-  index_forms: [10-K, 10-Q, 8-K]
+  # 20-F (foreign private issuer annual report) is indexed full-text like a
+  # 10-K; 6-K interim/event reports stay on the event path (not listed here).
+  index_forms: [10-K, 10-Q, 20-F, 8-K]
   daily_index_overlap_days: 3
   daily_index_bootstrap_days: 7
   # Max queued filings parsed per weekly pipeline run. Raised from the

@@ -239,9 +239,12 @@ class FilingScheduler:
                     processing_result["failed"] += int(ticker_result.get("failed", 0))
                     processing_result["errors"].extend(ticker_result.get("errors", []) or [])
 
+        onboarding_result = self._run_onboarding_backfill()
+
         report = {
             "discovery": discovery_result,
             "processing": processing_result,
+            "onboarding": onboarding_result,
             "timestamp": datetime.now(timezone.utc).isoformat(),
         }
 
@@ -257,6 +260,49 @@ class FilingScheduler:
             processing_result.get("index_pending", 0),
         )
         return report
+
+    # ── Onboarding self-heal ──────────────────────────
+
+    def _run_onboarding_backfill(self) -> dict:
+        """Backfill deep tickers that have no substantive 10-K/10-Q stored.
+
+        Bounded self-heal: at most one onboarding backfill per deep ticker per
+        run (one pass over the deep list). Gated to environments with a live
+        per-company discovery path (a populated security registry, the same
+        condition that constructs ``daily_index_discovery``), so unit fixtures
+        with an empty registry stay inert. Per-ticker failures are isolated —
+        the ticker is marked stale and the pipeline continues.
+        """
+        if self.daily_index_discovery is None:
+            return {"triggered": 0, "tickers": {}}
+
+        from .backfill import FilingBackfiller
+
+        try:
+            deep_tickers = self._tickers_for("sec_filing_text")
+        except Exception as exc:  # noqa: BLE001 - onboarding cannot break the run
+            logger.error("Onboarding could not resolve deep tickers: %s", exc)
+            return {"triggered": 0, "tickers": {}}
+
+        backfiller = FilingBackfiller(
+            store=self.store, processor=self.processor, coverage=self.coverage,
+        )
+        results: dict[str, dict] = {}
+        for ticker in deep_tickers:
+            try:
+                if backfiller.has_substantive_filing(ticker):
+                    continue
+                results[ticker] = backfiller.onboard_ticker(ticker)
+            except Exception as exc:  # noqa: BLE001 - per-ticker isolation
+                logger.error("Onboarding backfill failed for %s: %s", ticker, exc)
+                try:
+                    self.store.upsert_cache_stale(
+                        ticker, self.DISCOVERY_SOURCE, str(exc),
+                    )
+                except Exception:  # noqa: BLE001 - staleness marking is best-effort
+                    logger.debug("Could not mark %s onboarding stale", ticker)
+                results[ticker] = {"ticker": ticker, "error": str(exc)}
+        return {"triggered": len(results), "tickers": results}
 
     # ── Status ─────────────────────────────────────────
 

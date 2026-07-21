@@ -23,7 +23,13 @@ from src.universe.coverage import CoverageResolver
 
 logger = logging.getLogger(__name__)
 _ARCHIVES = "https://www.sec.gov/Archives"
-_DEEP_PERIODIC_FORMS = frozenset({"10-K", "10-K/A", "10-Q", "10-Q/A", "6-K", "6-K/A"})
+# 20-F is the annual report of a foreign private issuer (e.g. NBIS); treat it
+# as a deep periodic form end-to-end so its full section text is indexed like a
+# domestic 10-K. 6-K (foreign interim/event report) stays here for scope tagging
+# but remains off the full-text index_forms set (event path).
+_DEEP_PERIODIC_FORMS = frozenset({
+    "10-K", "10-K/A", "10-Q", "10-Q/A", "20-F", "20-F/A", "6-K", "6-K/A",
+})
 
 
 @dataclass(frozen=True)

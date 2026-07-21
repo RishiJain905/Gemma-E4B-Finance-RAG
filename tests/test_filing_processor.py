@@ -46,6 +46,10 @@ def mock_processor():
     fetcher = MagicMock()
     parser = MagicMock()
     proc = FilingProcessor(store=store, fetcher=fetcher, parser=parser)
+    # These tests exercise the legacy whole-document orchestration; the section
+    # index path (default-on since 2026-07-20) is covered separately. Tests that
+    # want it set proc.index_filing_text = True explicitly.
+    proc.index_filing_text = False
     return proc
 
 
@@ -270,6 +274,164 @@ def test_index_pending_rows_remain_retryable(tmp_path):
     assert [row["accession"] for row in rows] == ["ACC-P"]
     assert rows[0]["status"] == "index_pending"
     assert rows[0]["index_error"] == "offline"
+
+
+def _indexing_processor(store, fetcher, parser, tmp_path, *, index_forms=("10-K",)):
+    """A deep-index FilingProcessor (index_filing_text on) with a mocked store."""
+    return FilingProcessor(
+        store=store, fetcher=fetcher, parser=parser,
+        sec_config={
+            "index_filing_text": True,
+            "max_sections_per_filing": 100,
+            "max_section_chars": 1_000_000,
+            "index_forms": list(index_forms),
+        },
+        parsed_dir=tmp_path / "parsed",
+    )
+
+
+def test_zero_facts_with_sections_indexes_and_marks_parsed(tmp_path):
+    """Decoupling: no facts but usable sections -> success, sections indexed,
+    filing marked parsed (the tonight's-backfill failure case)."""
+    store = MagicMock()
+    store.add_filing_sections.return_value = {
+        "sections_written": 2, "chunks_written": 3, "replacements": 0, "skipped": 0,
+    }
+    store.count_filing_sections.return_value = 2
+    fetcher = MagicMock()
+    fetcher.download_filing_text.return_value = (
+        "Item 1. Business\nWe sell products.\n"
+        "Item 7. Management's Discussion and Analysis\nRevenue grew a lot.\n"
+    )
+    parser = MagicMock()
+    parser.extract_facts_from_filing.return_value = []  # zero facts
+    processor = _indexing_processor(store, fetcher, parser, tmp_path)
+
+    assert processor._process_single_filing(_make_filing(accession="ACC-NOFACTS")) is True
+
+    store.add_filing_sections.assert_called_once()
+    artifact = tmp_path / "parsed" / "ACC-NOFACTS.txt"
+    store.sqlite.mark_filing_parsed.assert_called_once_with(
+        "ACC-NOFACTS", embedding_id="sec:ACC-NOFACTS", file_path=str(artifact),
+        section_count=2, chunk_count=3,
+    )
+    # Facts stream empty: process_filing still runs for the section path but
+    # stores no facts and does not index the whole document.
+    kwargs = store.process_filing.call_args.kwargs
+    assert kwargs["extracted_facts"] == []
+    assert kwargs["index_document"] is False
+    assert kwargs["mark_parsed"] is False
+    store.sqlite.mark_filing_index_pending.assert_not_called()
+
+
+def test_facts_without_sections_stored_legacy_style(tmp_path):
+    """Decoupling: facts but no usable sections -> facts stored legacy-style,
+    success, no index_pending."""
+    store = MagicMock()
+    fetcher = MagicMock()
+    # No recognizable SEC item/all-caps headings -> zero usable sections.
+    fetcher.download_filing_text.return_value = (
+        "Plain narrative prose with no filing structure at all."
+    )
+    parser = MagicMock()
+    parser.extract_facts_from_filing.return_value = [
+        {"metric": "revenue", "value": 42.0, "unit": "usd"}
+    ]
+    processor = _indexing_processor(store, fetcher, parser, tmp_path)
+
+    assert processor._process_single_filing(_make_filing(accession="ACC-FACTSONLY")) is True
+
+    # Legacy-style storage: process_filing with defaults (whole-doc + parsed).
+    store.process_filing.assert_called_once()
+    kwargs = store.process_filing.call_args.kwargs
+    assert kwargs["extracted_facts"][0]["metric"] == "revenue"
+    assert "index_document" not in kwargs  # defaults -> legacy whole-doc index
+    assert "mark_parsed" not in kwargs
+    store.add_filing_sections.assert_not_called()
+    store.sqlite.mark_filing_index_pending.assert_not_called()
+    store.sqlite.mark_filing_parsed.assert_not_called()
+
+
+def test_zero_facts_zero_sections_marks_index_pending(tmp_path):
+    """Decoupling: neither facts nor usable sections -> failure, retryable
+    index_pending, nothing stored."""
+    store = MagicMock()
+    fetcher = MagicMock()
+    fetcher.download_filing_text.return_value = (
+        "Plain prose without any filing structure."
+    )
+    parser = MagicMock()
+    parser.extract_facts_from_filing.return_value = []
+    processor = _indexing_processor(store, fetcher, parser, tmp_path)
+
+    assert processor._process_single_filing(_make_filing(accession="ACC-EMPTY")) is False
+
+    artifact = tmp_path / "parsed" / "ACC-EMPTY.txt"
+    store.sqlite.mark_filing_index_pending.assert_called_once()
+    call = store.sqlite.mark_filing_index_pending.call_args
+    assert call.args[0] == "ACC-EMPTY"
+    assert call.kwargs["file_path"] == str(artifact)
+    store.process_filing.assert_not_called()
+    store.sqlite.mark_filing_parsed.assert_not_called()
+
+
+def test_fact_extraction_failure_still_indexes_sections(tmp_path):
+    """A parser exception on the deep path is fail-soft: section indexing
+    still proceeds and the filing is stored on its sections alone."""
+    store = MagicMock()
+    store.add_filing_sections.return_value = {
+        "sections_written": 1, "chunks_written": 1, "replacements": 0, "skipped": 0,
+    }
+    store.count_filing_sections.return_value = 1
+    fetcher = MagicMock()
+    fetcher.download_filing_text.return_value = "Item 1. Business\nUsable filing prose."
+    parser = MagicMock()
+    parser.extract_facts_from_filing.side_effect = RuntimeError("parser blew up")
+    processor = _indexing_processor(store, fetcher, parser, tmp_path)
+
+    assert processor._process_single_filing(_make_filing(accession="ACC-PARSEFAIL")) is True
+
+    store.add_filing_sections.assert_called_once()
+    store.sqlite.mark_filing_parsed.assert_called_once()
+    assert store.process_filing.call_args.kwargs["extracted_facts"] == []
+
+
+def test_split_filing_sections_handles_20f_structure():
+    """20-F item headings split into usable sections (no new parser needed)."""
+    from src.sec.filing_sections import split_filing_sections
+
+    text = (
+        "Item 3. Key Information\n"
+        "Selected financial data for the foreign private issuer follows.\n"
+        "Item 5. Operating and Financial Review and Prospects\n"
+        "Revenue increased year over year across all reportable segments.\n"
+        "Item 18. Financial Statements\n"
+        "The audited consolidated statements are included in this report.\n"
+    )
+    sections = split_filing_sections(
+        text,
+        {"accession": "acc-20f", "ticker": "NBIS", "filing_type": "20-F",
+         "filing_date": "2026-04-30", "period": "2025"},
+    )
+
+    assert len(sections) >= 1
+    assert all(section.form == "20-F" for section in sections)
+    assert any(section.section_key.startswith("item_") for section in sections)
+
+
+def test_legacy_path_zero_facts_stores_nothing(mock_processor):
+    """Flag off: the fact gate is preserved byte-for-byte — zero facts returns
+    False and touches neither the legacy nor the section-index store paths."""
+    mock_processor.index_filing_text = False
+    filing = _make_filing(ticker="AAPL", filing_type="10-K", accession="ACC-LEG")
+    mock_processor.fetcher.download_filing_text.return_value = "Item 1. Business\nText."
+    mock_processor.parser.extract_facts_from_filing.return_value = []
+
+    assert mock_processor._process_single_filing(filing) is False
+
+    mock_processor.store.process_filing.assert_not_called()
+    mock_processor.store.add_filing_sections.assert_not_called()
+    mock_processor.store.sqlite.mark_filing_index_pending.assert_not_called()
 
 
 # ── 4. Discovery delegation ─────────────────────────

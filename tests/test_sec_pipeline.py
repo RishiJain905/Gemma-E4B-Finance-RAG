@@ -904,7 +904,11 @@ class TestPhase14Integration:
             source_url="https://sec.gov/...",
         )
 
-        processor = FilingProcessor(store=store)
+        # Legacy whole-document coexistence path (section indexing is covered
+        # separately); the synthetic text is too small to section.
+        processor = FilingProcessor(
+            store=store, sec_config={"index_filing_text": False},
+        )
         processor.fetcher.download_filing_text = MagicMock(
             return_value="NVIDIA filing text for embedding storage.",
         )

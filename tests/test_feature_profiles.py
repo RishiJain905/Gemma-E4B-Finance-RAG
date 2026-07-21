@@ -232,10 +232,15 @@ def test_explicit_profile_argument_selects_complete_profile() -> None:
 def test_invalid_explicit_yaml_dependencies_clamp_with_warning(
     tmp_path: Path,
     caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
     key: str,
     values: dict[str, object],
     clamped: str,
 ) -> None:
+    # Force the SEC filing-text prerequisite off so the enable_hierarchical_retrieval
+    # case still exercises the clamp path regardless of the committed sec.yaml
+    # default (index_filing_text is on repo-wide since 2026-07-20).
+    monkeypatch.setenv("SEC_INDEX_FILING_TEXT", "0")
     path = tmp_path / "middleware.yaml"
     path.write_text(yaml.safe_dump(values), encoding="utf-8")
 
@@ -274,6 +279,9 @@ def test_env_dependency_violations_clamp_and_log(
     monkeypatch.setenv("ADAPTIVE_ENABLE_PLANNING_CALL", "1")
     monkeypatch.setenv("ENABLE_LLM_REWRITE_FALLBACK", "1")
     monkeypatch.setenv("ENABLE_HIERARCHICAL_RETRIEVAL", "1")
+    # Prerequisite off so hierarchical still clamps despite the repo-wide
+    # sec.index_filing_text default being on (2026-07-20).
+    monkeypatch.setenv("SEC_INDEX_FILING_TEXT", "0")
 
     with caplog.at_level(logging.WARNING, logger="src.middleware.config"):
         config = MiddlewareConfig(config_path=Path("missing-middleware.yaml"))

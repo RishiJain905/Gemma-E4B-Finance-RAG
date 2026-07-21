@@ -72,7 +72,7 @@ class FilingProcessor:
         )
         self.index_forms = {
             str(form).upper()
-            for form in self.sec_config.get("index_forms", ["10-K", "10-Q", "8-K"])
+            for form in self.sec_config.get("index_forms", ["10-K", "10-Q", "20-F", "8-K"])
         }
         self.index_event_filings = bool(self.sec_config.get("index_event_filings", True))
         raw_db_path = getattr(self.store.sqlite, "db_path", None)
@@ -99,7 +99,7 @@ class FilingProcessor:
             "index_filing_text": False,
             "max_sections_per_filing": 200,
             "max_section_chars": 2_000_000,
-            "index_forms": ["10-K", "10-Q", "8-K"],
+            "index_forms": ["10-K", "10-Q", "20-F", "8-K"],
             "index_event_filings": True,
         }
         config_path = Path(__file__).parents[2] / "configs" / "sec.yaml"
@@ -270,12 +270,14 @@ class FilingProcessor:
 
         Steps:
           1. Download the filing text from EDGAR
-          2. Run TraceAlchemy parser to extract facts
-          3. Store via Store.process_filing()
-          4. Log completion
+          2. Legacy path (indexing off / non-indexable form): parse facts and
+             store via Store.process_filing() — facts are the only value stream.
+          3. Deep-index path: attempt fact extraction and section text indexing
+             as independent, fail-soft value streams (see _process_indexed_filing).
 
         Returns:
-            True if at least one fact was extracted and stored
+            True if the filing was stored (facts, sections, or both); False if
+            neither value stream produced anything storable.
         """
         accession = filing.get("accession", "unknown")
         ticker = filing.get("ticker", "")
@@ -290,7 +292,7 @@ class FilingProcessor:
             ticker, filing_type, period, accession,
         )
 
-        # Step 1: Download
+        # Step 1: Download once — both value streams share this text.
         text = self.fetcher.download_filing_text(filing)
         if not text:
             logger.warning("No text downloaded for filing %s, marking as error", accession)
@@ -300,27 +302,26 @@ class FilingProcessor:
             )
             return False
 
-        # Step 2: Parse
-        facts = self.parser.extract_facts_from_filing(
-            ticker=ticker,
-            filing_type=filing_type,
-            filing_text=text,
-            period=period,
-        )
-
-        if not facts:
-            logger.warning(
-                "No facts extracted from %s %s (%s)",
-                ticker, filing_type, accession,
-            )
-            return False
-
         filing_record = {
             **filing,
             "source_type": f"sec_{filing_type.lower()}",
         }
+
         if not self.index_filing_text or filing_type.upper() not in self.index_forms:
-            # Rollout disabled/form excluded: preserve the legacy path exactly.
+            # Legacy path (rollout disabled / non-indexable form): unchanged.
+            # Fact extraction is the sole value stream and gates storage.
+            facts = self.parser.extract_facts_from_filing(
+                ticker=ticker,
+                filing_type=filing_type,
+                filing_text=text,
+                period=period,
+            )
+            if not facts:
+                logger.warning(
+                    "No facts extracted from %s %s (%s)",
+                    ticker, filing_type, accession,
+                )
+                return False
             self.store.process_filing(
                 filing_record=filing_record,
                 extracted_text=text,
@@ -332,8 +333,154 @@ class FilingProcessor:
             )
             return True
 
+        # Deep-index path: fact extraction and section text indexing are
+        # independent value streams — either can succeed on its own.
+        return self._process_indexed_filing(
+            filing, filing_record, text, accession, ticker, filing_type, period,
+        )
+
+    def _process_indexed_filing(
+        self,
+        filing: dict,
+        filing_record: dict,
+        text: str,
+        accession: str,
+        ticker: str,
+        filing_type: str,
+        period: str,
+    ) -> bool:
+        """Decouple fact extraction from section indexing on the deep path.
+
+        The two value streams are attempted independently, each fail-soft:
+
+            facts   sections   outcome
+            -----   --------   -------------------------------------------
+            > 0     > 0        full success (facts stored + sections indexed)
+            0       > 0        success: sections indexed, zero-facts warning
+            > 0     0          success: facts stored legacy-style, zero-sections warning
+            0       0          failure: marked index_pending (retryable), as before
+
+        A section-indexing *infrastructure* failure (Chroma down / verification
+        mismatch) is distinct from "zero sections": it stays retryable via
+        ``index_pending`` regardless of facts, preserving per-filing retry.
+        """
         started = time.monotonic()
+
+        # (a) Fact extraction — fail-soft; a parser error cannot abort indexing.
+        facts: list = []
+        try:
+            facts = self.parser.extract_facts_from_filing(
+                ticker=ticker,
+                filing_type=filing_type,
+                filing_text=text,
+                period=period,
+            ) or []
+        except Exception:  # noqa: BLE001 - fact extraction is isolated from indexing
+            logger.warning(
+                "Fact extraction failed for %s %s (%s); continuing to section indexing",
+                ticker, filing_type, accession, exc_info=True,
+            )
+
+        # (b) Section split + indexing — fail-soft; independent of facts.
         artifact_path = self._persist_parsed_artifact(accession, text)
+        usable_sections, skipped = self._select_usable_sections(
+            text, filing, artifact_path,
+        )
+
+        if usable_sections:
+            try:
+                counts = self.store.add_filing_sections(usable_sections)
+                if counts["sections_written"] != len(usable_sections):
+                    raise RuntimeError(
+                        f"Expected {len(usable_sections)} section parents, "
+                        f"stored {counts['sections_written']}"
+                    )
+                indexed_total = self.store.count_filing_sections(accession)
+                if indexed_total < len(usable_sections):
+                    raise RuntimeError(
+                        f"Expected at least {len(usable_sections)} indexed sections, "
+                        f"found {indexed_total}"
+                    )
+            except Exception as error:  # noqa: BLE001 - retryable per-filing isolation
+                self.store.sqlite.mark_filing_index_pending(
+                    accession, file_path=str(artifact_path), error=str(error),
+                )
+                logger.error(
+                    "SEC filing %s index pending after %.2fs: %s",
+                    accession, time.monotonic() - started, error,
+                )
+                self._index_run_counts["skipped"] += skipped
+                self._index_run_counts["index_pending"] += 1
+                return False
+
+            # Sections indexed: persist facts (if any) WITHOUT the legacy
+            # whole-document vector or parsed mark; the parsed mark follows the
+            # verified section indexing below.
+            self.store.process_filing(
+                filing_record=filing_record,
+                extracted_text=text,
+                extracted_facts=facts,
+                index_document=False,
+                mark_parsed=False,
+            )
+            self.store.sqlite.mark_filing_parsed(
+                accession,
+                embedding_id=f"sec:{accession}",
+                file_path=str(artifact_path),
+                section_count=counts["sections_written"],
+                chunk_count=counts["chunks_written"],
+            )
+            for key in ("sections_written", "chunks_written", "replacements"):
+                self._index_run_counts[key] += counts[key]
+            self._index_run_counts["skipped"] += skipped + counts["skipped"]
+            if not facts:
+                logger.warning(
+                    "No facts extracted from %s %s (%s); indexed %d section(s) only",
+                    ticker, filing_type, accession, counts["sections_written"],
+                )
+            logger.info(
+                "Indexed SEC filing %s: %d facts, %d sections, %d chunks, "
+                "%d replacements, %d skips in %.2fs",
+                accession, len(facts), counts["sections_written"],
+                counts["chunks_written"], counts["replacements"],
+                skipped + counts["skipped"], time.monotonic() - started,
+            )
+            return True
+
+        # No usable sections were produced by the deterministic splitter.
+        self._index_run_counts["skipped"] += skipped
+        if facts:
+            # facts > 0, sections = 0 → store facts the legacy way (whole-doc
+            # vector + parsed mark) so the filing is still answerable.
+            logger.warning(
+                "No usable sections for %s %s (%s); storing %d fact(s) legacy-style",
+                ticker, filing_type, accession, len(facts),
+            )
+            self.store.process_filing(
+                filing_record=filing_record,
+                extracted_text=text,
+                extracted_facts=facts,
+            )
+            return True
+
+        # facts = 0, sections = 0 → retryable failure, marked as before.
+        reason = "No facts extracted and no usable filing sections"
+        self.store.sqlite.mark_filing_index_pending(
+            accession, file_path=str(artifact_path), error=reason,
+        )
+        self._index_run_counts["index_pending"] += 1
+        logger.warning("SEC filing %s index pending: %s", accession, reason)
+        return False
+
+    def _select_usable_sections(
+        self, text: str, filing: dict, artifact_path: Path,
+    ) -> tuple[list, int]:
+        """Split parsed text into sections and drop oversized ones.
+
+        Returns ``(usable_sections, skipped_count)``. Never raises for empty or
+        unrecognized structure — an unmatched filing simply yields no usable
+        sections (the caller decides the outcome).
+        """
         candidates = split_filing_sections(
             text, {**filing, "file_path": str(artifact_path)},
         )
@@ -348,70 +495,7 @@ class FilingProcessor:
                 )
                 continue
             usable_sections.append(section)
-
-        if not usable_sections:
-            reason = "No usable filing sections after validation"
-            self.store.sqlite.mark_filing_index_pending(
-                accession, file_path=str(artifact_path), error=reason,
-            )
-            logger.warning("SEC filing %s index pending: %s", accession, reason)
-            self._index_run_counts["skipped"] += skipped
-            self._index_run_counts["index_pending"] += 1
-            return False
-
-        # Save structured facts without the legacy whole-document vector or
-        # parsed mark. The final mark follows verified section indexing.
-        self.store.process_filing(
-            filing_record=filing_record,
-            extracted_text=text,
-            extracted_facts=facts,
-            index_document=False,
-            mark_parsed=False,
-        )
-
-        try:
-            counts = self.store.add_filing_sections(usable_sections)
-            if counts["sections_written"] != len(usable_sections):
-                raise RuntimeError(
-                    f"Expected {len(usable_sections)} section parents, "
-                    f"stored {counts['sections_written']}"
-                )
-            indexed_total = self.store.count_filing_sections(accession)
-            if indexed_total < len(usable_sections):
-                raise RuntimeError(
-                    f"Expected at least {len(usable_sections)} indexed sections, "
-                    f"found {indexed_total}"
-                )
-        except Exception as error:  # noqa: BLE001 - retryable per-filing isolation
-            self.store.sqlite.mark_filing_index_pending(
-                accession, file_path=str(artifact_path), error=str(error),
-            )
-            logger.error(
-                "SEC filing %s index pending after %.2fs: %s",
-                accession, time.monotonic() - started, error,
-            )
-            self._index_run_counts["skipped"] += skipped
-            self._index_run_counts["index_pending"] += 1
-            return False
-
-        self.store.sqlite.mark_filing_parsed(
-            accession,
-            embedding_id=f"sec:{accession}",
-            file_path=str(artifact_path),
-            section_count=counts["sections_written"],
-            chunk_count=counts["chunks_written"],
-        )
-        for key in ("sections_written", "chunks_written", "replacements"):
-            self._index_run_counts[key] += counts[key]
-        self._index_run_counts["skipped"] += skipped + counts["skipped"]
-        logger.info(
-            "Indexed SEC filing %s: %d sections, %d chunks, %d replacements, "
-            "%d skips in %.2fs",
-            accession, counts["sections_written"], counts["chunks_written"],
-            counts["replacements"], skipped + counts["skipped"],
-            time.monotonic() - started,
-        )
-        return True
+        return usable_sections, skipped
 
     def _process_event_filing(self, filing: dict) -> bool:
         """Persist selected broad filing evidence and deterministic events."""
