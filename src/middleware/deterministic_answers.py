@@ -17,7 +17,7 @@ GENERATION_SKIP_REASON = "complete_deterministic_route"
 
 _WRITE_TOOLS = frozenset({"refresh_data"})
 _PROJECTION_CAVEAT = (
-    "These figures are estimates, not guarantees, and are not financial advice."
+    "These are analyst estimates, not guarantees."
 )
 
 

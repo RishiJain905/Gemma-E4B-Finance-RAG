@@ -286,6 +286,14 @@ class ContextBudget:
         self.config = config
 
     def cap_for(self, lane: Lane) -> int:
+        # Analyst mode (mode="analysis") sets ``analysis_context_override`` on a
+        # read-through config view to pack a larger context window than the
+        # per-lane defaults allow — the point of the mode is deeper reasoning over
+        # more evidence. qa requests never set it, so the per-lane cap is used
+        # exactly as before. The override is still bounded by a hard ceiling.
+        override = getattr(self.config, "analysis_context_override", None)
+        if override:
+            return max(0, min(int(override), 64000))
         lane_cap = _LANE_CONTEXT_CAPS.get(lane, _LANE_CONTEXT_CAPS[Lane.COMPLEX])
         hard = int(getattr(self.config, "adaptive_max_context_chars", 18000))
         return max(0, min(lane_cap, hard))

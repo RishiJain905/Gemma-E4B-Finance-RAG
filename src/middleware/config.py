@@ -29,6 +29,13 @@ _ADAPTIVE_MAX_RETRIEVAL_ROUNDS_RANGE = (1, 2)
 _ADAPTIVE_MAX_PLANNING_CALLS_RANGE = (0, 1)
 _ADAPTIVE_MAX_CONTEXT_CHARS_RANGE = (1000, 64000)
 
+# Analyst mode (mode="analysis") budgets. Analysis requests reason to a verdict
+# over a wider tool loop and context window than ordinary Q&A, so these are
+# separate from the qa-path max_tool_iterations / adaptive_max_context_chars and
+# clamped to their own safe ranges.
+_ANALYSIS_MAX_TOOL_ITERATIONS_RANGE = (1, 8)
+_ANALYSIS_MAX_CONTEXT_CHARS_RANGE = (4000, 64000)
+
 # Safe query-graph observer budgets (2.2.7.4). The in-memory TraceHub also
 # clamps these internally; enforcing them here keeps a bad config from ever
 # requesting an unbounded trace/element/excerpt footprint for the local UI.
@@ -212,6 +219,13 @@ class MiddlewareConfig:
         self.allow_write_tools: bool = False
         self.max_refreshes_per_query: int = 2
 
+        # Analyst mode (mode="analysis") budgets. Separate from the qa-path
+        # limits so an analysis request can run a longer tool loop and pack a
+        # larger context window without changing ordinary Q&A. Clamped to the
+        # ranges above. Env: ANALYSIS_MAX_TOOL_ITERATIONS, ANALYSIS_MAX_CONTEXT_CHARS.
+        self.analysis_max_tool_iterations: int = 5
+        self.analysis_max_context_chars: int = 24000
+
         # Phase 2.2.3.2 — deterministic finance tool routing. When
         # enable_deterministic_tool_routing is on, safe analytical/comparison/
         # projection/calculation requests are routed to the existing read tools
@@ -321,6 +335,13 @@ class MiddlewareConfig:
         self.fetch_on_miss_timeout_s: float = 10.0
         self.fetch_on_miss_per_query: int = 1
 
+        # In-query freshness-refresh wall-clock budget (seconds). When a query
+        # auto-refreshes stale sources, they run in parallel off the event loop;
+        # sources that finish within this budget are reported as refreshed, the
+        # rest keep refreshing in the background and the query proceeds without
+        # waiting. Clamped to [0.5, 30.0]. Env: REFRESH_BUDGET_S.
+        self.refresh_budget_s: float = 3.0
+
         # Phase 2.2.2.1 — bounded client-owned conversation history. The
         # middleware stays stateless; these cap how much of the client-sent
         # history/question one request may use (see conversation.select_history).
@@ -372,6 +393,7 @@ class MiddlewareConfig:
         self._clamp_adaptive_limits()
         self._clamp_corrective_limits()
         self._clamp_hierarchy_limits()
+        self._clamp_refresh_budget()
         self._clamp_graph_limits()
         self._clamp_corpus_limits()
         self._clamp_evidence_policy()
@@ -576,6 +598,8 @@ class MiddlewareConfig:
         _int("MAX_SECONDARY_PER_EVENT", "max_secondary_per_event")
         _bool("ENABLE_TOOLS", "enable_tools")
         _int("MAX_TOOL_ITERATIONS", "max_tool_iterations")
+        _int("ANALYSIS_MAX_TOOL_ITERATIONS", "analysis_max_tool_iterations")
+        _int("ANALYSIS_MAX_CONTEXT_CHARS", "analysis_max_context_chars")
         _bool("ALLOW_WRITE_TOOLS", "allow_write_tools")
         _int("MAX_REFRESHES_PER_QUERY", "max_refreshes_per_query")
         _bool("ENABLE_DETERMINISTIC_TOOL_ROUTING", "enable_deterministic_tool_routing")
@@ -584,6 +608,7 @@ class MiddlewareConfig:
         _bool("ENABLE_FETCH_ON_MISS", "enable_fetch_on_miss")
         _float("FETCH_ON_MISS_TIMEOUT_S", "fetch_on_miss_timeout_s")
         _int("FETCH_ON_MISS_PER_QUERY", "fetch_on_miss_per_query")
+        _float("REFRESH_BUDGET_S", "refresh_budget_s")
         _str("ANSWER_POLICY", "answer_policy")
         _bool("ALLOW_GENERAL_FALLBACK", "allow_general_fallback")
         _bool("RETURN_TIMINGS", "return_timings")
@@ -689,6 +714,8 @@ class MiddlewareConfig:
         _clamp("adaptive_max_retrieval_rounds", *_ADAPTIVE_MAX_RETRIEVAL_ROUNDS_RANGE)
         _clamp("adaptive_max_planning_calls", *_ADAPTIVE_MAX_PLANNING_CALLS_RANGE)
         _clamp("adaptive_max_context_chars", *_ADAPTIVE_MAX_CONTEXT_CHARS_RANGE)
+        _clamp("analysis_max_tool_iterations", *_ANALYSIS_MAX_TOOL_ITERATIONS_RANGE)
+        _clamp("analysis_max_context_chars", *_ANALYSIS_MAX_CONTEXT_CHARS_RANGE)
 
         if clamped:
             logger.warning(
@@ -817,6 +844,18 @@ class MiddlewareConfig:
                 value, bounded,
             )
         self.max_corrective_retries = bounded
+
+    def _clamp_refresh_budget(self) -> None:
+        """Clamp the in-query refresh budget to the documented [0.5, 30.0]s range."""
+        try:
+            value = float(self.refresh_budget_s)
+        except (TypeError, ValueError):
+            value = 3.0
+        bounded = max(0.5, min(30.0, value))
+        if bounded != value:
+            logger.warning(
+                "Clamped refresh_budget_s to safe range: %s->%s", value, bounded)
+        self.refresh_budget_s = bounded
 
     def _clamp_evidence_policy(self) -> None:
         """Clamp Phase 2.3 authority and event-packing policy bounds."""

@@ -25,10 +25,12 @@ def isolated_tools():
     snapshot = dict(REGISTRY)
     REGISTRY.clear()
     middleware_app._tools_supported = True
+    middleware_app._tools_cooldown_until = 0.0
     yield
     REGISTRY.clear()
     REGISTRY.update(snapshot)
     middleware_app._tools_supported = True
+    middleware_app._tools_cooldown_until = 0.0
 
 
 def _response(content="plain answer", tool_calls=None, finish_reason="stop"):
@@ -291,7 +293,15 @@ async def test_tools_unsupported_fallback(monkeypatch, mode):
 
     assert answer == "plain answer [Source: sqlite/NVDA]"
     assert citations[0].source_type == "sqlite"
-    assert middleware_app._tools_supported is False
+    if mode == "http_error":
+        # A genuine capability rejection disables tools permanently.
+        assert middleware_app._tools_supported is False
+    else:
+        # A flaky empty first response only starts a cooldown; tools are not
+        # permanently disabled and will be retried after the cooldown window.
+        assert middleware_app._tools_supported is True
+        assert middleware_app._tools_available() is False
+        assert middleware_app._tools_cooldown_until > 0.0
     assert client.post.await_count == 2
     assert "tools" not in client.post.await_args_list[-1].kwargs["json"]
 

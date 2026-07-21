@@ -55,7 +55,9 @@ if ! curl -s http://127.0.0.1:8087/health >/dev/null 2>&1; then
             --port 8087 \
             --ctx-size 32768 \
             --n-gpu-layers 99 \
+            --jinja \
             --embeddings \
+            --pooling mean \
             > logs/llama-server.log 2>&1 &
         LLAMA_PID=$!
         log_info "llama-server started (PID: $LLAMA_PID)"

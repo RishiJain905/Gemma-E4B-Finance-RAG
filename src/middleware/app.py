@@ -15,6 +15,7 @@ import asyncio
 import contextvars
 import json
 import logging
+import threading
 import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
@@ -73,7 +74,14 @@ NO_GENERAL_FALLBACK_MESSAGE = (
 config: Optional[MiddlewareConfig] = None
 store: Optional[Store] = None
 model_client: Optional[httpx.AsyncClient] = None
+# Tool-calling capability state. ``_tools_supported`` flips off PERMANENTLY only
+# on a genuine capability rejection (a 400/404/500 mentioning "tool" — the server
+# lacks --jinja / tool support). A single flaky empty first tool-mode response no
+# longer disables tools forever; it starts a short cooldown (``_tools_cooldown_until``)
+# after which tools are retried automatically. Read both through ``_tools_available()``.
 _tools_supported: bool = True
+_TOOLS_EMPTY_RESPONSE_COOLDOWN_S: float = 300.0
+_tools_cooldown_until: float = 0.0
 MACRO_SNAPSHOT_METRICS = ["GDP", "CPIAUCSL", "FEDFUNDS", "UNRATE", "DGS10", "T10Y2Y"]
 _MODEL_TASKS_CACHE: Optional[dict] = None
 FETCH_ON_MISS_MIN_CONFIDENCE = 0.9
@@ -100,6 +108,16 @@ _tools_used_var: contextvars.ContextVar[Optional[list[str]]] = contextvars.Conte
 )
 _answer_policy_override_var: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar(
     "answer_policy_override", default=None
+)
+# Per-request answer mode (qa|analysis). "qa" preserves byte-identical legacy
+# behavior; "analysis" selects the senior-analyst policy, skips the
+# deterministic/catalog fast paths, bypasses caveat/refusal rewriting, and uses
+# the wider analysis generation + tool + context budgets. Set at the top of
+# _build_query_context (via _reset_request_scoped_state) so every downstream
+# helper — including the ones the stream generator runs in the same task — reads
+# the same mode.
+_mode_var: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "answer_mode", default="qa"
 )
 _evidence_trace_var: contextvars.ContextVar[Optional[EvidenceTraceCollector]] = contextvars.ContextVar(
     "evidence_trace", default=None
@@ -656,13 +674,81 @@ def _build_evidence_ledger(retrieval: dict) -> list:
         build_evidence_items(usable_facts(retrieval), usable_documents(retrieval)))
 
 
-def _reset_request_scoped_state(answer_policy: Optional[str]) -> None:
+def _reset_request_scoped_state(
+    answer_policy: Optional[str], mode: Optional[str] = None
+) -> None:
     """Reset per-request contextvars: tool-call log, answer-policy override,
-    and evidence-trace collector."""
+    answer mode, and evidence-trace collector."""
     _tools_used_var.set([])
     _evidence_trace_var.set(None)
     normalized = str(answer_policy or "").strip().lower()
     _answer_policy_override_var.set(normalized if normalized in ("strict", "graded") else None)
+    normalized_mode = str(mode or "").strip().lower()
+    _mode_var.set("analysis" if normalized_mode == "analysis" else "qa")
+
+
+def _request_mode() -> str:
+    """Return the current request's answer mode: 'analysis' or 'qa'."""
+    return "analysis" if _mode_var.get() == "analysis" else "qa"
+
+
+def _is_analysis_mode() -> bool:
+    """Whether the current request runs in senior-analyst mode."""
+    return _mode_var.get() == "analysis"
+
+
+def _tools_available() -> bool:
+    """Whether model tool-calling should be attempted right now.
+
+    False when tools were permanently disabled by a capability rejection, or
+    while the short cooldown from a flaky empty tool-mode response is active.
+    """
+    if not _tools_supported:
+        return False
+    return time.monotonic() >= _tools_cooldown_until
+
+
+def _effective_max_tool_iterations() -> int:
+    """Bounded tool/planning iteration budget for this request.
+
+    Analyst mode gets the larger ``analysis_max_tool_iterations`` budget (a good
+    analyst checks several data sources before opining); qa mode keeps the
+    ordinary ``max_tool_iterations``.
+    """
+    if _is_analysis_mode():
+        return int(getattr(config, "analysis_max_tool_iterations", 5))
+    return int(getattr(config, "max_tool_iterations", 3))
+
+
+class _OrchestratorConfigView:
+    """Read-through view of the live config with analysis-mode budget overrides.
+
+    Only overrides the retrieval-budget knobs the orchestrator reads: a wider
+    ``top_k_documents`` document pull and ``analysis_context_override`` to raise
+    the packed-context cap past the per-lane defaults. Every other attribute
+    delegates to the real config, so the orchestrator sees an otherwise identical
+    runtime and qa-mode requests (which never build this view) are unaffected.
+    """
+
+    __slots__ = ("_base", "top_k_documents", "analysis_context_override")
+
+    def __init__(self, base, *, top_k_documents: int, analysis_context_override: int):
+        object.__setattr__(self, "_base", base)
+        object.__setattr__(self, "top_k_documents", top_k_documents)
+        object.__setattr__(self, "analysis_context_override", analysis_context_override)
+
+    def __getattr__(self, name):  # only for names not in __slots__
+        return getattr(self._base, name)
+
+
+def _analysis_orchestrator_config() -> "_OrchestratorConfigView":
+    """Config view that gives an analysis-mode request a wider retrieval budget."""
+    base_top_k = int(getattr(config, "top_k_documents", 5) or 5)
+    return _OrchestratorConfigView(
+        config,
+        top_k_documents=max(base_top_k, 8),
+        analysis_context_override=int(getattr(config, "analysis_max_context_chars", 24000)),
+    )
 
 
 def _record_tool_used(name: str) -> None:
@@ -739,6 +825,7 @@ def _system_prompt_for_request(
         intent=intent,
         grounding_level=grounding_level,
         tools_enabled=tools_enabled,
+        mode=_request_mode(),
     )
 
 
@@ -765,6 +852,11 @@ def _is_declined_answer(answer: str) -> bool:
 
 def _apply_answer_policy(answer: str, grounding_level: str) -> str:
     """Enforce deterministic labels/refusals that should not depend on sampling."""
+    # Analyst mode never rewrites the model's answer: no forced NO_GENERAL_
+    # FALLBACK_MESSAGE (even if the refused branch is later reachable), and no
+    # "Not from your data" prefix. The point of the mode is the model's own view.
+    if _is_analysis_mode():
+        return answer
     if _answer_policy() == "strict":
         return answer
     if not answer or answer.startswith(("Error calling model:", "Model unavailable.")):
@@ -788,15 +880,19 @@ def _apply_answer_policy(answer: str, grounding_level: str) -> str:
 
 def _response_grounding(answer: str, grounding_level: str) -> str:
     """Map the actual answer path to response metadata."""
-    if _is_declined_answer(answer):
+    # Analyst mode reports grounding honestly from evidence counts but never
+    # comes back "refused": a thin-evidence analysis is still an analytical view,
+    # not a refusal. A declined-looking answer is still detected for qa mode.
+    analysis = _is_analysis_mode()
+    if _is_declined_answer(answer) and not analysis:
         return "refused"
     if grounding_level == "grounded":
         return "grounded"
     if grounding_level == "partial":
         return "partial"
-    if grounding_level in {"none", "general"} and _allow_general_fallback():
+    if grounding_level in {"none", "general"} and (analysis or _allow_general_fallback()):
         return "general"
-    return "refused"
+    return "general" if analysis else "refused"
 
 
 async def _invoke_model(
@@ -846,7 +942,12 @@ async def lifespan(app: FastAPI):
         embedding_endpoint=config.embedding_endpoint,
         embedding_cache_size=config.embedding_cache_size,
     )
-    model_client = httpx.AsyncClient(timeout=60)
+    # Per-operation timeouts (not a flat deadline): a long analysis generation
+    # can exceed 60s of total wall-clock while each individual read stays fast.
+    # read=300 bounds a single stalled read; connect/write/pool stay tight.
+    model_client = httpx.AsyncClient(
+        timeout=httpx.Timeout(connect=5.0, read=300.0, write=30.0, pool=30.0)
+    )
 
     # Shared retriever so the BM25 lexical index is built once and reused
     # across requests (Phase 2.1.2). Warm it eagerly on startup.
@@ -1332,7 +1433,7 @@ async def _build_query_context(request: QueryRequest) -> dict:
     timings: dict[str, object] = {
         "stages": {field: None for field in QUALITY_STAGE_TIMING_FIELDS},
     }
-    _reset_request_scoped_state(request.answer_policy)
+    _reset_request_scoped_state(request.answer_policy, getattr(request, "mode", None))
 
     compile_start = time.perf_counter()
     _emit_stage("compile", "started")
@@ -1425,8 +1526,16 @@ async def _freshness_stage(
     entity. ``intent_like`` only needs ``ticker`` and ``ticker_confidence`` keys.
     """
     stage_start = time.perf_counter()
-    freshness_meta = _evaluate_and_refresh(intent_like.get("ticker"), do_refresh)
+    # Run the whole freshness evaluate + (parallel, budgeted) refresh OFF the
+    # event loop: the freshness-report read and every in-query source refresh
+    # are blocking I/O. Doing this inline used to block the loop for 5-9s on an
+    # ordinary query (serial synchronous network refreshes). No graph/stream
+    # emitter is called inside _evaluate_and_refresh, so moving it to a worker
+    # thread keeps the contextvar-based emitters intact (they stay on this side).
     ticker = intent_like.get("ticker")
+    freshness_meta = await asyncio.to_thread(
+        _evaluate_and_refresh, ticker, do_refresh, _refresh_budget_s()
+    )
     if (
         getattr(config, "enable_fetch_on_miss", True)
         and ticker
@@ -1471,7 +1580,12 @@ async def _build_legacy_query_context(
     from .retriever import Retriever
 
     r = retriever or Retriever(store=store, config=config)
-    retrieval = r.retrieve(
+    # Blocking retrieval (Chroma/SQLite/lexical/embedding I/O) runs off the event
+    # loop; asyncio.to_thread copies context so the contextvar-based graph/stream
+    # emitters still resolve in the worker thread. Offload only — retrieval stays
+    # single-threaded per request, so the retriever's mutable state is safe.
+    retrieval = await asyncio.to_thread(
+        r.retrieve,
         query=retrieval_query,
         intent=retrieval_intent,
         top_k_documents=config.top_k_documents,
@@ -1844,10 +1958,20 @@ async def _build_adaptive_query_context(shared: dict) -> dict:
                 time.perf_counter() - tool_started
             ) * 1000
 
-    result = orchestrate(
+    # Analyst mode retrieves over a wider budget (more documents, a larger packed
+    # context window) via a read-through config view; qa mode passes the real
+    # config unchanged. Retrieval is blocking (Chroma/SQLite/lexical/embedding),
+    # so run the whole orchestration off the event loop. asyncio.to_thread copies
+    # the current context, so the contextvar-based graph/stream emitters used
+    # inside orchestrate still resolve in the worker thread. This is an offload,
+    # not intra-request parallelism — each request's retrieval stays
+    # single-threaded, so the retriever's mutable self._timings is safe.
+    orch_config = _analysis_orchestrator_config() if _is_analysis_mode() else config
+    result = await asyncio.to_thread(
+        orchestrate,
         plan,
         store,
-        config,
+        orch_config,
         retriever=r,
         available_metrics=_adaptive_available_metrics(),
         execute_fn=timed_execute_route,
@@ -2008,6 +2132,14 @@ def _effective_intent(intent: dict, compiled) -> dict:
 
 def _task_settings(request: QueryRequest, intent: dict) -> tuple[float, int]:
     """Return temperature and max_tokens for this request."""
+    # Analyst mode reasons to a verdict over a wider budget: the analysis_mode
+    # task params (configs/model.yaml) provide temp/max_tokens, with a request
+    # override always winning and safe defaults if the task block is absent.
+    if _is_analysis_mode():
+        task = _task_params("analysis_mode")
+        temperature = request.temperature or task.get("temperature") or 0.55
+        max_tokens = request.max_tokens or task.get("max_tokens") or 3072
+        return temperature, max_tokens
     task = _task_params("analysis") if intent.get("question_type") == "projection" else {}
     temperature = request.temperature or task.get("temperature") or config.default_temperature
     max_tokens = request.max_tokens or task.get("max_tokens") or config.max_tokens
@@ -2142,6 +2274,7 @@ def _build_query_response(
 
     return QueryResponse(
         answer=answer_text,
+        mode="analysis" if _is_analysis_mode() else None,
         answer_origin=context.get("answer_origin"),
         generation_skipped=context.get("generation_skipped"),
         generation_skip_reason=context.get("generation_skip_reason"),
@@ -2211,6 +2344,10 @@ def _try_deterministic_response(context: dict) -> Optional[QueryResponse]:
     boundary. Returning ``None`` means the caller must run normal generation
     exactly once.
     """
+    # Analyst mode always reasons with the model — never a deterministic/catalog
+    # template answer and never a generation skip. answer_origin stays "model".
+    if _is_analysis_mode():
+        return None
     if not bool(getattr(config, "enable_deterministic_answers", False)):
         return None
     result = context.get("_orchestration_result")
@@ -2301,6 +2438,8 @@ def _try_deterministic_response(context: dict) -> Optional[QueryResponse]:
 
 def _deterministic_contract_eligible(context: dict) -> bool:
     """Cheap streaming preflight used to avoid probing the model unnecessarily."""
+    if _is_analysis_mode():
+        return False
     if not bool(getattr(config, "enable_deterministic_answers", False)):
         return False
     result = context.get("_orchestration_result")
@@ -2433,7 +2572,7 @@ def _response_to_dict(response: QueryResponse) -> dict:
     # Keep optional rollout/observer fields byte-compatible on runtimes whose
     # pydantic serializer does not yet honor Field(exclude_if=...).
     for key in (
-        "generation_skipped", "generation_skip_reason", "evidence_sufficiency",
+        "mode", "generation_skipped", "generation_skip_reason", "evidence_sufficiency",
         "evidence_citations", "answer_validation", "graph_trace_id",
     ):
         if data.get(key) is None:
@@ -2588,7 +2727,7 @@ async def query_stream(request: QueryRequest):
             request_emitter.error("query failed", terminal=True)
         raise
     run_tool_final = (
-        tool_final and _tools_supported and not _context_used_deterministic_tools(context)
+        tool_final and _tools_available() and not _context_used_deterministic_tools(context)
     )
     model_available: Optional[bool] = None
     if not _deterministic_contract_eligible(context):
@@ -3032,16 +3171,108 @@ def _refresh_ticker_sources(ticker: str, sources: list[str]) -> tuple[list[str],
     return refreshed, errors
 
 
+# Shared, bounded background pool for in-query freshness refreshes. A single
+# persistent executor runs every per-source refresh submitted during a query;
+# futures the wall-clock budget does not wait for keep running here to
+# completion (never cancelled mid-write), so their data lands for subsequent
+# queries. Built lazily so importing the module never spins up threads.
+_refresh_executor: Optional["object"] = None
+_refresh_executor_lock = threading.Lock()
+
+
+def _get_refresh_executor():
+    """Return the shared, lazily-built background refresh pool."""
+    global _refresh_executor
+    if _refresh_executor is None:
+        with _refresh_executor_lock:
+            if _refresh_executor is None:
+                from concurrent.futures import ThreadPoolExecutor
+
+                _refresh_executor = ThreadPoolExecutor(
+                    max_workers=8, thread_name_prefix="inquery-refresh"
+                )
+    return _refresh_executor
+
+
+def _refresh_budget_s() -> float:
+    """Wall-clock budget (seconds) for in-query refresh, clamped defensively.
+
+    Reads ``config.refresh_budget_s`` (already clamped at load) but re-clamps
+    here so a mock/partial config in tests can never grant an unbounded or
+    zero budget.
+    """
+    try:
+        value = float(getattr(config, "refresh_budget_s", 3.0))
+    except (TypeError, ValueError):
+        value = 3.0
+    return max(0.5, min(30.0, value))
+
+
+def _refresh_ticker_sources_budgeted(
+    ticker: str, sources: list[str], budget_s: float
+) -> tuple[list[str], list[str], list]:
+    """Refresh stale sources in parallel under a wall-clock budget.
+
+    Each source is refreshed on the shared background pool via the existing
+    serial ``_refresh_ticker_sources`` (one source per task), so the per-source
+    failure isolation is preserved verbatim (exception -> log + mark stale +
+    continue). Returns ``(refreshed, stale_used, pending_futures)``:
+
+      * ``refreshed``      — sources that completed successfully within budget;
+      * ``stale_used``     — sources still running when the budget expired
+        (their futures keep running in the background) plus any that failed,
+        in the caller's original order;
+      * ``pending_futures``— the still-running futures, exposed so callers /
+        tests can await background completion. They are never cancelled.
+    """
+    if not sources:
+        return [], [], []
+
+    from concurrent.futures import wait as _futures_wait
+
+    executor = _get_refresh_executor()
+    future_to_source = {
+        executor.submit(_refresh_ticker_sources, ticker, [logical]): logical
+        for logical in sources
+    }
+    done, not_done = _futures_wait(
+        list(future_to_source), timeout=max(0.0, budget_s)
+    )
+
+    order = {s: i for i, s in enumerate(sources)}
+    refreshed: list[str] = []
+    failed: list[str] = []
+    for fut in done:
+        logical = future_to_source[fut]
+        try:
+            done_refreshed, _errors = fut.result()
+        except Exception as e:  # noqa: BLE001 - defensive; isolation is inside the task
+            logger.warning("In-query refresh task crashed for %s/%s: %s", ticker, logical, e)
+            done_refreshed = []
+        (refreshed if logical in done_refreshed else failed).append(logical)
+
+    unfinished = [future_to_source[f] for f in not_done]
+    refreshed.sort(key=lambda s: order[s])
+    stale_used = sorted(set(unfinished) | set(failed), key=lambda s: order[s])
+    return refreshed, stale_used, list(not_done)
+
+
 def _logical_cache_source(logical: str) -> str:
     from src.storage.store import Store
     cfg = Store.FRESHNESS_SOURCES.get(logical)
     return cfg["cache_source"] if cfg else logical
 
 
-def _evaluate_and_refresh(ticker: Optional[str], do_refresh: bool) -> dict:
+def _evaluate_and_refresh(
+    ticker: Optional[str], do_refresh: bool, budget_s: float = 3.0
+) -> dict:
     """Check freshness for a ticker and optionally refresh stale sources.
 
-    Returns the freshness metadata block for the query response.
+    Returns the freshness metadata block for the query response. Stale sources
+    are refreshed in parallel under a ``budget_s`` wall-clock budget; sources
+    that finish in time are reported in ``refreshed_during_query`` and the rest
+    (still running in the background) in ``stale_sources_used`` with a warning.
+    Runs entirely off the event loop (called via ``asyncio.to_thread``).
     """
     meta = {
         "overall": "unknown",
@@ -3071,9 +3302,19 @@ def _evaluate_and_refresh(ticker: Optional[str], do_refresh: bool) -> dict:
 
     if do_refresh:
         meta["_write_requested"] = True
-        refreshed, _errors = _refresh_ticker_sources(ticker, stale)
+        refreshed, stale_used, _pending = _refresh_ticker_sources_budgeted(
+            ticker, stale, budget_s
+        )
         meta["refreshed_during_query"] = refreshed
-        meta["stale_sources_used"] = [s for s in stale if s not in refreshed]
+        meta["stale_sources_used"] = stale_used
+        if stale_used:
+            # Budget expired (or a source failed) before these completed; they
+            # keep refreshing in the background for the next query. Reuse the
+            # existing stale-data warning text.
+            meta["warning"] = (
+                f"{ticker} has stale data for: {', '.join(stale_used)}. "
+                "Answer may not reflect the latest information."
+            )
     else:
         meta["stale_sources_used"] = stale
         meta["warning"] = (
@@ -3180,7 +3421,7 @@ async def _run_tool_planning_rounds(
     so the non-streaming ``/query`` path is byte-for-byte unchanged; the stream
     path reuses the same rounds and then streams a final request.
     """
-    global _tools_supported
+    global _tools_supported, _tools_cooldown_until
     from .tools import ToolContext, dispatch_tool_traced, openai_schema
 
     schema = openai_schema()
@@ -3188,7 +3429,7 @@ async def _run_tool_planning_rounds(
         allow_write=config.allow_write_tools,
         max_refreshes=config.max_refreshes_per_query,
     )
-    for iteration in range(config.max_tool_iterations):
+    for iteration in range(_effective_max_tool_iterations()):
         payload = {**base_payload, "messages": messages, "tools": schema}
         try:
             resp = await model_client.post(config.llama_endpoint, json=payload)
@@ -3199,7 +3440,12 @@ async def _run_tool_planning_rounds(
             body = e.response.text if e.response is not None else ""
             status = e.response.status_code if e.response is not None else None
             if status in (400, 404, 500) and "tool" in body.lower():
-                logger.warning("Model tools unsupported; falling back to plain calls")
+                logger.warning(
+                    "Model rejected tool calls (HTTP %s); disabling tools for this "
+                    "process. The llama-server likely lacks tool support — restart it "
+                    "with --jinja to enable function calling.",
+                    status,
+                )
                 _tools_supported = False
                 return _ToolPlanningOutcome(kind="plain_fallback", messages=messages)
             logger.error("Model call failed: %s", e)
@@ -3220,8 +3466,12 @@ async def _run_tool_planning_rounds(
                 kind="error", messages=messages,
                 error_message=f"Error calling model: malformed response ({e})")
         if iteration == 0 and not tool_calls and not content.strip():
-            logger.warning("Model returned empty content with tools; disabling tools")
-            _tools_supported = False
+            logger.warning(
+                "Model returned empty content with tools; skipping tools for %.0fs "
+                "then retrying (not a permanent capability rejection)",
+                _TOOLS_EMPTY_RESPONSE_COOLDOWN_S,
+            )
+            _tools_cooldown_until = time.monotonic() + _TOOLS_EMPTY_RESPONSE_COOLDOWN_S
             return _ToolPlanningOutcome(kind="plain_fallback", messages=messages)
         if not tool_calls:
             return _ToolPlanningOutcome(kind="answered", messages=messages, content=content)
@@ -3264,7 +3514,7 @@ async def _call_model(
     if not model_client or not config:
         return "Model unavailable. Please ensure llama-server is running.", []
 
-    tools_on = bool(getattr(config, "enable_tools", False)) and _tools_supported
+    tools_on = bool(getattr(config, "enable_tools", False)) and _tools_available()
     plain_messages = _model_messages(prompt, intent, grounding_level, tools_enabled=False)
     base_payload = {
         "model": config.model_name,

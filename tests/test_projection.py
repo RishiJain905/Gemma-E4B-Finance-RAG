@@ -147,7 +147,9 @@ def test_projection_prompt_has_caveat():
 
     assert "Analyst Consensus" in prompt
     assert "not guarantees" in prompt
-    assert "not financial advice" in prompt
+    # The projection instruction keeps the "analyst estimates, not guarantees"
+    # framing but no longer appends "not financial advice" (opinion/analysis work).
+    assert "not financial advice" not in prompt
     assert "Retrieved Financial Facts" not in prompt
 
 

@@ -93,7 +93,9 @@ _STABLE_INCOMPLETE_CODES = frozenset({
 _MAX_SCOPED_CATALOG_ENTITIES = 3
 
 # Intents whose evidence lives in documents (why / risk / news / filings), plus
-# trend which needs a time series the read tools do not return. When one of
+# trend, which this router does not template a deterministic answer for (a
+# time series is not a safe fit for a one-line canned answer) even though the
+# model-facing get_price_history tool can now serve it directly. When one of
 # these co-occurs with a routable numeric core the route is executed but marked
 # incomplete + requires_documents (the compound rule).
 _DOCUMENT_INTENTS = frozenset({"explanation", "news", "risk"})
@@ -1247,7 +1249,7 @@ def execute_route(
 # ── Deterministic answer templates ────────────────────────
 
 _PROJECTION_CAVEAT = (
-    "These are analyst estimates, not guarantees, and not financial advice."
+    "These are analyst estimates, not guarantees."
 )
 
 

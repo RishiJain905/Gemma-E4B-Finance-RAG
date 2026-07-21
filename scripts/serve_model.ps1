@@ -60,6 +60,10 @@ function Start-Server {
     Write-Host "Starting TraceAlchemy on port $Port ..."
     Write-Host "   GPU: $($cfg.gpu_arch) | Quant: $($cfg.quantization) | Context: $($cfg.max_context)"
 
+    # --jinja is REQUIRED for OpenAI-style tool calling: without it llama-server
+    # rejects `tools` payloads and the middleware permanently disables tools for
+    # the process (_tools_supported kill-switch). -ub/-b raise the prefill batch
+    # so long evidence prompts process fast (matches the known-good manual args).
     $args = @(
         "-m", "`"$MainModel`"",
         "--host", "127.0.0.1",
@@ -70,7 +74,10 @@ function Start-Server {
         "-fa", "on",
         "-ctk", "$($cfg.cache_type_key)",
         "-ctv", "$($cfg.cache_type_value)",
+        "-ub", "8192",
+        "-b", "8192",
         "-t", "$($cfg.cpu_threads)",
+        "--jinja",
         "--embeddings",
         "--pooling", "mean"
     )

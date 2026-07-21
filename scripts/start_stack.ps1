@@ -1,4 +1,7 @@
-# start_stack.ps1 — Bring up the Gemma-E4B-Finance-RAG middleware on Windows.
+# start_stack.ps1 - Bring up the Gemma-E4B-Finance-RAG middleware on Windows.
+# NOTE: keep this file pure ASCII - Windows PowerShell 5.1 reads BOM-less
+# files as ANSI, and multi-byte characters (em-dashes) misdecode into quote
+# characters that break parsing.
 # Assumes llama-server is already running on :8087 (started separately with
 # --embeddings enabled). Starts the FastAPI middleware on :8000.
 
@@ -17,7 +20,7 @@ try {
     $h = Invoke-WebRequest -Uri "http://127.0.0.1:8087/health" -TimeoutSec 5 -UseBasicParsing
     Write-Host "[INFO] llama-server reachable: $($h.Content)" -ForegroundColor Green
 } catch {
-    Write-Host "[WARN] llama-server not reachable on :8087 — start it manually with --embeddings" -ForegroundColor Yellow
+    Write-Host "[WARN] llama-server not reachable on :8087 - start it manually with --embeddings" -ForegroundColor Yellow
 }
 
 # Check configs

@@ -426,9 +426,18 @@ class PromptAugmenter:
                 "Consensus section. Label every number with its period (for example, "
                 "FY2027E). Clearly separate sourced figures from interpretation, and "
                 "end with a one-sentence caveat that these are analyst estimates, "
-                "not guarantees, and not financial advice. Never state a "
+                "not guarantees. Never state a "
                 "self-invented price target or forecast; if no consensus data is "
                 "provided, say so plainly."
+            ),
+            "opinion": (
+                "Give a balanced, evidence-grounded assessment that ends with a clear "
+                "leaning (e.g. leaning positive / leaning negative / genuinely mixed) "
+                "and the main reason. Use the retrieved facts and documents; cite them. "
+                "Do not refuse the question and do not hide behind 'I cannot give "
+                "financial advice' — the user wants an analytical view. One short "
+                "closing sentence may note it is an analytical view, not personalized "
+                "advice."
             ),
             "sentiment": (
                 "Summarize the overall sentiment from the documents. Note whether "

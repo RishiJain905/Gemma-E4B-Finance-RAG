@@ -66,6 +66,9 @@ start_server() {
     echo "Starting TraceAlchemy on port $PORT..."
     echo "Windows + AMD RDNA3? Use serve_model.ps1 instead."
 
+    # --jinja is REQUIRED for OpenAI-style tool calling: without it llama-server
+    # rejects `tools` payloads and the middleware permanently disables tools for
+    # the process (_tools_supported kill-switch).
     local -a args=(
         -m "$MAIN_MODEL"
         --host 127.0.0.1
@@ -73,6 +76,7 @@ start_server() {
         -c "$MAX_CONTEXT"
         -ngl "$GPU_LAYERS"
         -t "$CPU_THREADS"
+        --jinja
         --embeddings
         --pooling mean
     )

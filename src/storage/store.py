@@ -685,6 +685,19 @@ class Store:
             offset=offset,
         )
 
+    def get_price_history(
+        self,
+        ticker: str,
+        *,
+        metrics: Optional[list[str]] = None,
+        days: int = 30,
+        source_name: str = "massive",
+    ) -> dict:
+        """Read bounded daily OHLCV bars for one ticker through the facade."""
+        return self.sqlite.list_price_bars(
+            ticker, metrics=metrics, days=days, source_name=source_name,
+        )
+
     def list_memberships(
         self,
         security_id: Optional[str] = None,
@@ -1679,6 +1692,10 @@ class Store:
     def get_filing(self, accession: str) -> Optional[dict]:
         """Read one safe filing record through the facade."""
         return self.sqlite.get_filing(accession)
+
+    def count_filing_types(self, ticker: str, *, limit: int = 20) -> list[dict]:
+        """Return distinct filing types and counts for one ticker through the facade."""
+        return self.sqlite.count_filing_types(ticker, limit=limit)
 
     def list_freshness(
         self,

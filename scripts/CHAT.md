@@ -32,6 +32,8 @@ server doesn't report a `capabilities` block.
 | Command | Description |
 |---|---|
 | `<just type a question>` | Ask the RAG (`POST /query`, streamed by default). |
+| `/analysis <question>` | One-shot **analyst mode**: the model internalizes the retrieved evidence and gives its own opinionated judgment (verdict, bull/bear case, risks — never refuses). Skips deterministic templates; uses a bigger evidence budget and more tool rounds. |
+| `/analysis on\|off` | Sticky analyst mode for every following question (prompt shows `· analyst`); bare `/analysis` prints usage + current state. |
 | `/ask` | Compose a **multiline** question (see below), then submit it once. |
 | `/refresh` | Run **all** ingestion jobs (`scheduler all --force`). |
 | `/refresh daily\|hourly\|weekly\|all\|status` | Run that scheduler mode. |
@@ -349,3 +351,65 @@ Notes:
 - If `status` shows an indexing backlog or error partitions, run
   `python -m src.scheduler repair [--source NAME]` — it re-indexes stored
   records without re-downloading from providers.
+
+## Managing the watchlist (coverage tiers)
+
+The "watchlist" lives in `configs/coverage.yaml` (NOT `watchlist.yaml`, which
+is only a deprecated compatibility mirror — keep the two in sync when you
+edit). Coverage is tiered; a ticker's tier decides how much the scheduler
+ingests and therefore how good `/analysis` answers are for it:
+
+- **`deep.tickers`** — the full treatment: fundamentals, news, **analyst
+  estimates and price targets**, SEC companyfacts, **full filing text with
+  section indexing**, earnings transcripts, IR pages, GDELT sentiment.
+  Put tickers here when you want real `/analysis` quality — buy/sell theses,
+  filing breakdowns, forward P/E reasoning. Each deep ticker costs meaningful
+  ingestion work (EDGAR fetches, embeddings), so keep this list to the names
+  you actually analyze.
+- **`broad.additions`** — market data + news only (yfinance/Finnhub/Massive)
+  plus SEC filing-*event* discovery; no filing text, estimates, or
+  transcripts. Put tickers here when you want prices/news context and
+  fact lookups but don't need deep analysis. Cheap per ticker.
+- Universe members (S&P 500 / Nasdaq-100) get identity/index-membership
+  registry rows automatically — you never list those by hand.
+
+### Adding a ticker
+
+1. Edit `configs/coverage.yaml`: append the symbol to `deep.tickers` or
+   `broad.additions` (and mirror it in `watchlist.yaml` `core`/`extended`).
+2. Run `python -m src.scheduler daily --force` — registers the ticker and
+   pulls its market data/news/estimates. The **onboarding hook** notices a
+   deep ticker with no substantive filings stored and automatically backfills
+   its recent 10-K/10-Qs on that same run.
+3. Optional, for immediate/complete filing history instead of waiting on the
+   hook: `python scripts/backfill_filings.py --tickers XYZ`.
+4. Health check any time: `python scripts/reconcile_filings.py` prints a
+   per-ticker filing-coverage gap report (`--repair` fixes gaps it finds).
+
+Note: two tests pin the committed watchlist shape
+(`tests/test_yfinance_ingestor.py::test_load_watchlist_real_config` and
+`::test_ticker_properties_with_real_config`) — update their counts/lists
+deliberately when you change membership, then run the verify gate.
+
+### Off-index tickers (not in the S&P 500 / Nasdaq-100)
+
+Deep tickers outside the active index union fail coverage validation unless
+opted in. Add the symbol to `deep.allow_outside_indexes` as well — the
+opt-in is inert for tickers the universe snapshots already record as index
+members, so listing a name in both places is always safe (the committed
+policy lists the whole deep set there for exactly this reason).
+
+### Foreign private issuers (NBIS-style)
+
+Foreign private issuers do not file 10-K/10-Q — they file **20-F**
+(annual) and **6-K** (interim). The backfill's default
+`--filing-types 10-K,10-Q,8-K` finds nothing for them, so backfill those
+tickers explicitly:
+
+```bash
+python scripts/backfill_filings.py --tickers NBIS --filing-types 20-F,6-K
+```
+
+Also expect `reconcile_filings.py` to flag them under its default 10-K/10-Q
+recency rule — a foreign issuer with a current 20-F is healthy even when the
+report says "no recent 10-Q".

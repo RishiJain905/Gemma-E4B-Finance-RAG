@@ -127,10 +127,12 @@ def _isolated_state():
     snapshot = dict(REGISTRY)
     REGISTRY.clear()
     middleware_app._tools_supported = True
+    middleware_app._tools_cooldown_until = 0.0
     yield
     REGISTRY.clear()
     REGISTRY.update(snapshot)
     middleware_app._tools_supported = True
+    middleware_app._tools_cooldown_until = 0.0
     middleware_app._stream_emitter_var.set(None)
 
 

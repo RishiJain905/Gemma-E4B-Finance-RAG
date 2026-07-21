@@ -11,7 +11,7 @@ import logging
 import os
 import sqlite3
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -2898,6 +2898,71 @@ CREATE INDEX IF NOT EXISTS idx_securities_industry ON securities(industry);
                 "SELECT COUNT(*) FROM corpus_observations"
             ).fetchone()[0])
 
+    _PRICE_BAR_METRICS = frozenset({"open", "high", "low", "close", "volume"})
+    _MAX_PRICE_HISTORY_DAYS = 365
+    _MAX_PRICE_HISTORY_ROWS = 500
+
+    def list_price_bars(
+        self,
+        ticker: str,
+        *,
+        metrics: Optional[list[str]] = None,
+        days: int = 30,
+        source_name: str = "massive",
+    ) -> dict:
+        """Return bounded daily OHLCV bars for one ticker from corpus_observations.
+
+        Reads the structured market-bar observations MassiveIngestor writes
+        (metric_id in open/high/low/close/volume, one row per ticker/date/metric).
+        Bounded by both a day-count window and a hard row cap so a wide request
+        cannot pull an unbounded scan; unknown metric names are dropped rather
+        than erroring so a caller mixing valid/invalid names still gets a result.
+        """
+        ticker = str(ticker or "").strip().upper()
+        if not ticker:
+            return {"ticker": ticker, "metrics": [], "bars": [], "error": "ticker is required"}
+        requested = [m for m in (metrics or ["close"]) if m in self._PRICE_BAR_METRICS]
+        if not requested:
+            return {
+                "ticker": ticker, "metrics": [], "bars": [],
+                "error": f"no valid metrics requested; choose from {sorted(self._PRICE_BAR_METRICS)}",
+            }
+        days = max(1, min(int(days), self._MAX_PRICE_HISTORY_DAYS))
+        date_to = datetime.now(timezone.utc).date()
+        date_from = date_to - timedelta(days=days)
+        placeholders = ",".join("?" for _ in requested)
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT period_end, metric_id, value_numeric, unit FROM corpus_observations "
+                f"WHERE source_name = ? AND metric_id IN ({placeholders}) "
+                "AND period_end >= ? AND period_end <= ? AND tickers_json LIKE ? "
+                "ORDER BY period_end ASC, metric_id ASC LIMIT ?",
+                [
+                    source_name, *requested,
+                    date_from.isoformat(), date_to.isoformat(),
+                    f'%"{ticker}"%', self._MAX_PRICE_HISTORY_ROWS,
+                ],
+            ).fetchall()
+
+        by_date: dict[str, dict] = {}
+        unit = None
+        for row in rows:
+            item = dict(row)
+            bar = by_date.setdefault(item["period_end"], {"date": item["period_end"]})
+            bar[item["metric_id"]] = item["value_numeric"]
+            if item["metric_id"] != "volume":
+                unit = item.get("unit") or unit
+        bars = [by_date[d] for d in sorted(by_date)]
+        return {
+            "ticker": ticker,
+            "metrics": requested,
+            "unit": unit,
+            "date_from": date_from.isoformat(),
+            "date_to": date_to.isoformat(),
+            "bars": bars,
+            "source": source_name,
+        }
+
     def list_observations(
         self,
         *,
@@ -5565,6 +5630,21 @@ CREATE INDEX IF NOT EXISTS idx_securities_industry ON securities(industry);
         with self._connect() as conn:
             row = conn.execute(sql, (accession,)).fetchone()
         return dict(row) if row else None
+
+    def count_filing_types(self, ticker: str, *, limit: int = 20) -> list[dict]:
+        """Return distinct filing types and counts for one ticker, most common first."""
+        self._validate_inventory_page(limit, 0)
+        sql = """
+            SELECT filing_type, COUNT(*) AS count
+            FROM filings
+            WHERE ticker = ?
+            GROUP BY filing_type
+            ORDER BY count DESC, filing_type ASC
+            LIMIT ?
+        """
+        with self._connect() as conn:
+            rows = conn.execute(sql, (ticker.upper(), limit)).fetchall()
+        return [dict(row) for row in rows]
 
     def list_freshness(
         self,

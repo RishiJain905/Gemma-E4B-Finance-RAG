@@ -80,6 +80,10 @@ model:
       description: "Deep financial analysis and reasoning"
       temperature: 0.5
       max_tokens: 2048
+    analysis_mode:
+      description: "Senior-analyst /analysis mode: verdict-first reasoning with a wider budget"
+      temperature: 0.55
+      max_tokens: 3072
 
   # ── Embedding ────────────────────────────────────────
   embedding:

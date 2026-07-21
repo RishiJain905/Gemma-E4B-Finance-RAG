@@ -40,9 +40,11 @@ def reset_middleware_globals(monkeypatch, tmp_path):
     monkeypatch.setattr(sanity, "_CONFIG_PATH", config_path)
     sanity._reset_cache()
     monkeypatch.setattr(middleware_app, "_tools_supported", True)
+    monkeypatch.setattr(middleware_app, "_tools_cooldown_until", 0.0)
     yield
     sanity._reset_cache()
     middleware_app._tools_supported = True
+    middleware_app._tools_cooldown_until = 0.0
 
 
 @pytest.fixture
@@ -235,7 +237,7 @@ def test_tools_endpoint(monkeypatch):
     assert data["allow_write_tools"] is True
     tools = {tool["name"]: tool for tool in data["tools"]}
     assert set(tools) == set(REGISTRY)
-    assert len(tools) == 12
+    assert len(tools) == 14
     assert tools["describe_coverage"]["write"] is False
     assert tools["refresh_data"]["write"] is True
     assert all(not tool["write"] for name, tool in tools.items() if name != "refresh_data")

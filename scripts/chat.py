@@ -256,6 +256,7 @@ def _payload(
     *,
     history: list[dict] | None = None,
     session_id: str | None = None,
+    mode: str | None = None,
 ) -> dict:
     payload = {"question": question, "refresh": refresh}
     if ticker:
@@ -266,6 +267,10 @@ def _payload(
         payload["history"] = history
     if session_id:
         payload["session_id"] = session_id
+    # Only send mode when it's the non-default analysis mode, so an older server
+    # that doesn't know the field is never sent an unexpected key.
+    if mode == "analysis":
+        payload["mode"] = mode
     return payload
 
 
@@ -445,6 +450,8 @@ def _render_metadata(data: dict, *, verbose: bool) -> None:
     and non-streaming paths. Every field is optional so a minimal response
     from an older middleware still renders cleanly with no KeyErrors.
     """
+    if data.get("mode") == "analysis":
+        print(col("  [analyst] analytical view — not personalized financial advice", C.CY))
     tag = _grounding_tag(data.get("grounding"))
     if tag:
         print(f"  {tag}")
@@ -590,6 +597,10 @@ class ChatSession:
         self.stream_unavailable = not stream_enabled
         self.verbose = False
         self.answer_policy: str | None = None  # per-session /grounding override
+        # Sticky analyst mode (/analysis on|off). When on, every plain-typed
+        # question is sent with mode="analysis"; a one-shot /analysis <question>
+        # overrides for a single request regardless of this flag.
+        self.analysis_mode: bool = False
         # Conversation memory — instance-scoped so two ChatSessions never share
         # turns. No module-level history / mutable default / global last-ticker.
         self.history: list[dict] = []
@@ -652,9 +663,10 @@ class ChatSession:
     def prompt_suffix(self) -> str:
         """Compact session/turn indicator for the input prompt (2.2.2.3)."""
         short = self.session_id[:4]
+        analyst = " · analyst" if self.analysis_mode else ""
         if not self.history_enabled:
-            return f"session {short} · history off"
-        return f"session {short} · {len(self.history)} turns"
+            return f"session {short} · history off{analyst}"
+        return f"session {short} · {len(self.history)} turns{analyst}"
 
     def middleware_up(self) -> bool:
         try:
@@ -738,11 +750,20 @@ class ChatSession:
 
     # ── Query ──────────────────────────────────────────
 
-    def query(self, question: str, ticker: str | None, refresh: bool) -> None:
+    def query(
+        self, question: str, ticker: str | None, refresh: bool,
+        mode: str | None = None,
+    ) -> None:
+        # Effective mode: an explicit one-shot mode wins; otherwise the sticky
+        # session flag decides. qa is the default and sends no mode key.
+        effective_mode = mode if mode is not None else (
+            "analysis" if self.analysis_mode else None
+        )
         payload = _payload(
             question, ticker, refresh, getattr(self, "answer_policy", None),
             history=self._outgoing_history(),
             session_id=self.session_id if self.history_enabled else None,
+            mode=effective_mode,
         )
         result: dict | None = None
         if self.stream_enabled and not self.stream_unavailable:
@@ -1169,6 +1190,8 @@ def print_capabilities(client: httpx.Client) -> None:
 HELP = f"""
 {C.B}Commands{C.R}
   {C.CY}<just type a question>{C.R}   ask the RAG (POST /query)
+  {C.CY}/analysis <question>{C.R}     one-shot analyst-mode answer (verdict, no refusals)
+  {C.CY}/analysis on|off{C.R}         toggle sticky analyst mode for every question
   {C.CY}/ask{C.R}                     compose a multiline question (/send, /cancel, /preview)
   {C.CY}/refresh{C.R}                 run ALL ingestion jobs (scheduler all --force)
   {C.CY}/refresh daily|hourly|weekly|all|status{C.R}   run that scheduler mode
@@ -1293,6 +1316,21 @@ def main():
                 elif cmd == "verbose":
                     session.verbose = rest.lower() in ("on", "true", "1", "yes")
                     print(col(f"  verbose = {session.verbose}", C.DIM))
+                elif cmd == "analysis":
+                    val = rest.strip().lower()
+                    if val == "on":
+                        session.analysis_mode = True
+                        print(col("  analyst mode = on (every question runs as analysis)", C.DIM))
+                    elif val == "off":
+                        session.analysis_mode = False
+                        print(col("  analyst mode = off", C.DIM))
+                    elif rest.strip():
+                        # One-shot analysis query; keeps pinned ticker + refresh state.
+                        session.query(rest.strip(), ticker, autorefresh, mode="analysis")
+                    else:
+                        state = "on" if session.analysis_mode else "off"
+                        print(col(f"  usage: /analysis <question> | /analysis on|off "
+                                  f"(currently {state})", C.YE))
                 elif cmd == "grounding":
                     val = rest.strip().lower()
                     if val in ("strict", "graded"):

@@ -299,10 +299,27 @@ class IntentParser:
             r"\bheadwind\b",
             r"\bdownside\b",
         ],
+        # Opinion / recommendation asks. Deliberately specific so plain fact
+        # lookups ("what is NVDA's revenue") never match: every cue here needs an
+        # explicit buy/sell/hold, valuation-judgment, or "your view" phrasing.
+        "opinion": [
+            r"\bgood buy\b",
+            r"\bworth buying\b",
+            r"\bworth (?:holding|owning|selling)\b",
+            r"\bshould i (?:buy|sell|hold|own|add|trim)\b",
+            r"\bis it a (?:buy|sell|hold)\b",
+            r"\b(?:a )?(?:buy|sell|hold) (?:or|vs\.?) (?:a )?(?:buy|sell|hold)\b",
+            r"\byour (?:opinion|view|take|thoughts?)\b",
+            r"\bwhat do you think\b",
+            r"\bbullish or bearish\b",
+            r"\b(?:over|under)valued\b",
+            r"\bwould you (?:buy|sell|hold|recommend|invest)\b",
+        ],
     }
 
     _TYPE_PRIORITY = (
         "comparison",
+        "opinion",
         "trend",
         "explanation",
         "projection",

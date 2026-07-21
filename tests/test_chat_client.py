@@ -65,6 +65,7 @@ def _bare_session(client, *, stream_enabled=False, stream_unavailable=True, verb
     session.stream_unavailable = stream_unavailable
     session.verbose = verbose
     session.answer_policy = None
+    session.analysis_mode = False
     session.history = []
     session.session_id = "sess-test"
     session.history_enabled = True
@@ -1212,3 +1213,67 @@ def test_query_captures_last_trace_id_from_response():
     session = _bare_session(FakeClient())
     session.query("q", ticker=None, refresh=False)
     assert session.last_trace_id == "trace-xyz"
+
+
+# ── Analyst mode (/analysis) ───────────────────────────────────────────────
+
+
+def _capturing_client():
+    class FakeClient:
+        def __init__(self):
+            self.posts = []
+
+        def post(self, path, json=None):
+            self.posts.append((path, json))
+            return FakeResponse(data=_query_data("analyst answer"))
+
+    return FakeClient()
+
+
+def test_analysis_oneshot_sends_mode():
+    client = _capturing_client()
+    session = _bare_session(client)
+    session.query("is NVDA a good buy?", ticker=None, refresh=False, mode="analysis")
+    assert client.posts[0][1]["mode"] == "analysis"
+
+
+def test_plain_query_omits_mode_key():
+    client = _capturing_client()
+    session = _bare_session(client)
+    session.query("what is NVDA revenue?", ticker=None, refresh=False)
+    assert "mode" not in client.posts[0][1]
+
+
+def test_sticky_analysis_toggles_mode_on_plain_queries():
+    client = _capturing_client()
+    session = _bare_session(client)
+    session.analysis_mode = True
+    session.query("outlook?", ticker="NVDA", refresh=False)
+    assert client.posts[0][1]["mode"] == "analysis"
+    session.analysis_mode = False
+    session.query("revenue?", ticker="NVDA", refresh=False)
+    assert "mode" not in client.posts[1][1]
+
+
+def test_payload_only_adds_mode_for_analysis():
+    assert "mode" not in chat._payload("q", None, True, mode=None)
+    assert "mode" not in chat._payload("q", None, True, mode="qa")
+    assert chat._payload("q", None, True, mode="analysis")["mode"] == "analysis"
+
+
+def test_help_lists_analysis_commands():
+    assert "/analysis" in chat.HELP
+
+
+def test_prompt_suffix_shows_analyst_when_sticky_on():
+    session = _bare_session(_capturing_client())
+    assert "analyst" not in session.prompt_suffix()
+    session.analysis_mode = True
+    assert "analyst" in session.prompt_suffix()
+
+
+def test_metadata_tag_shows_analyst_header(capsys):
+    data = _query_data()
+    data["mode"] = "analysis"
+    chat._render_metadata(data, verbose=False)
+    assert "[analyst]" in capsys.readouterr().out

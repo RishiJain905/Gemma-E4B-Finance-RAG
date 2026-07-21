@@ -360,6 +360,7 @@ compare against pre-2.3.3.3 relevance-only ranking.
 | `enable_fetch_on_miss` | `true` | `ENABLE_FETCH_ON_MISS` | Bounded live fetch for a never-seen ticker during a query. |
 | `fetch_on_miss_timeout_s` | `10.0` | `FETCH_ON_MISS_TIMEOUT_S` | Timeout for that fetch. |
 | `fetch_on_miss_per_query` | `1` | `FETCH_ON_MISS_PER_QUERY` | Max fetch-on-miss attempts per query. |
+| `refresh_budget_s` | `3.0` | `REFRESH_BUDGET_S` | Wall-clock budget (seconds, clamped `0.5`–`30.0`) for in-query freshness refresh. Stale sources refresh in parallel off the event loop; those finishing within the budget are reported in `refreshed_during_query`, the rest keep refreshing in the background (never cancelled) and land for the next query while the current one proceeds. |
 
 #### Streaming, timings & embedding cache (Phase 2.1.8)
 

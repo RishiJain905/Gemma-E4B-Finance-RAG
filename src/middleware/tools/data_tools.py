@@ -308,6 +308,229 @@ def get_price_targets_handler(store, ticker):
         return {"error": str(e), "ticker": ticker}
 
 
+def get_price_history_handler(store, ticker, metrics=None, days=30):
+    """Return bounded daily OHLCV bars for one ticker."""
+    ticker = ticker.upper()
+    try:
+        return store.get_price_history(ticker, metrics=metrics, days=days)
+    except Exception as e:  # noqa: BLE001
+        logger.exception("get_price_history failed for %s", ticker)
+        return {"error": str(e), "ticker": ticker}
+
+
+# Bounded output caps for get_filing_overview so a single filing can never
+# balloon the tool result. The whole payload stays under ~6000 chars.
+_FILING_OVERVIEW_CHAR_BUDGET = 6000
+_FILING_OVERVIEW_MAX_SECTIONS = 12
+_FILING_OVERVIEW_SECTION_CHARS = 700
+_FILING_OVERVIEW_EXCERPT_CHUNKS = 6
+_FILING_TYPE_COUNT_LIMIT = 20
+
+# Filing types that carry a substantive narrative (periodic/annual reports,
+# proxy statements, registration statements) as opposed to purely
+# transactional filings (e.g. Form 4 insider transactions) that have no
+# analytical prose worth breaking down. Order doubles as a same-date tiebreak
+# when more than one substantive type was filed on the same day.
+SUBSTANTIVE_FILING_TYPES = ["10-K", "10-Q", "8-K", "DEF 14A", "20-F", "6-K", "S-1"]
+
+# Periodic report forms carry the analytical prose a "break down the latest
+# filing" ask is actually about. A periodic filing beats a NEWER event filing
+# (8-K) in the default pick; steer with filing_type for a specific 8-K.
+PERIODIC_FILING_TYPES = frozenset({"10-K", "10-Q", "20-F"})
+
+
+def _select_latest_filing(store, ticker, filing_type):
+    """Pick the filing get_filing_overview should break down.
+
+    When ``filing_type`` is given, honor it exactly (existing behavior). When
+    unset, prefer the latest filing among :data:`SUBSTANTIVE_FILING_TYPES` —
+    queried one type at a time so a recent run of Form 4s can never bury a
+    10-K behind a fixed page window — falling back to the true latest filing
+    of any type only when no substantive one exists.
+    """
+    if filing_type:
+        rows = store.list_filings(ticker=ticker, filing_type=filing_type, limit=1, offset=0)
+        return rows[0] if rows else None
+
+    candidates = []
+    for substantive_type in SUBSTANTIVE_FILING_TYPES:
+        rows = store.list_filings(
+            ticker=ticker, filing_type=substantive_type, limit=1, offset=0
+        )
+        if rows:
+            candidates.append(rows[0])
+    if candidates:
+        # Periodic reports (10-K/10-Q/20-F) outrank even a newer event filing:
+        # they are what a "break down the latest filing" ask means, and their
+        # text is section-indexed while 8-Ks usually carry metadata only.
+        return max(
+            candidates,
+            key=lambda row: (
+                row.get("filing_type") in PERIODIC_FILING_TYPES,
+                str(row.get("filing_date") or ""),
+                -SUBSTANTIVE_FILING_TYPES.index(row.get("filing_type")),
+            ),
+        )
+
+    rows = store.list_filings(ticker=ticker, limit=1, offset=0)
+    return rows[0] if rows else None
+
+
+def _filing_coverage_note(store, ticker, chosen_type):
+    """Build a coverage_note + available_filing_types pair for a non-substantive pick."""
+    type_counts = []
+    try:
+        type_counts = store.count_filing_types(ticker, limit=_FILING_TYPE_COUNT_LIMIT)
+    except Exception:  # noqa: BLE001 - coverage honesty is best-effort
+        logger.exception("get_filing_overview filing-type counts failed for %s", ticker)
+
+    present_types = {row.get("filing_type") for row in type_counts}
+    missing = [t for t in SUBSTANTIVE_FILING_TYPES if t not in present_types]
+    if missing:
+        note = (
+            f"Only non-substantive filings are stored for {ticker} "
+            f"(latest is {chosen_type}); missing substantive types: {', '.join(missing)}."
+        )
+    else:
+        note = f"The latest filing for {ticker} is a non-substantive type ({chosen_type})."
+    return note, type_counts
+
+
+def _filing_excerpt_fallback(store, accession, remaining_budget):
+    """Pull bounded raw chunk excerpts by accession when no sections are indexed.
+
+    Reads by metadata (document-family id), never by similarity search, so it
+    reflects the actual filing text, not a query match.
+    """
+    try:
+        chunks = store.get_document_family(
+            f"sec:{accession}", limit=_FILING_OVERVIEW_EXCERPT_CHUNKS, offset=0
+        )
+    except Exception:  # noqa: BLE001 - excerpt fallback is best-effort
+        logger.exception("get_filing_overview excerpt fallback failed for %s", accession)
+        return []
+
+    chunks = sorted(chunks, key=lambda row: (row.get("metadata") or {}).get("chunk_index", 0))
+    sections = []
+    used = 0
+    for chunk in chunks:
+        remaining = remaining_budget - used
+        if remaining <= 100:
+            break
+        text = (chunk.get("document") or "")[: min(_FILING_OVERVIEW_SECTION_CHARS, remaining)]
+        if not text:
+            continue
+        meta = chunk.get("metadata") or {}
+        sections.append({"chunk_index": meta.get("chunk_index"), "excerpt": text})
+        used += len(text)
+    return sections
+
+
+def get_filing_overview_handler(store, ticker, filing_type=None):
+    """Break down the latest filing for one ticker: metadata + sections + excerpts.
+
+    Read-only. When ``filing_type`` is not given, prefers the latest filing
+    among substantive types (10-K, 10-Q, 8-K, DEF 14A, 20-F, 6-K, S-1) over a
+    more recent but non-substantive one (e.g. an insider Form 4), falling back
+    to the true latest filing only when nothing substantive is stored. Returns
+    the chosen filing's safe metadata (type/date/period/accession), its
+    indexed section inventory (or, when unindexed, bounded excerpts read
+    directly from stored chunks by filing id) and a bounded first-chars
+    excerpt per key section. When the available data is limited (a
+    non-substantive filing, or no filings at all) the result carries a
+    `coverage_note` plus `available_filing_types` so the gap can be explained
+    instead of silently returning a bare or empty breakdown. Section/excerpt
+    text is read by metadata filter, never by similarity search, so it
+    reflects the actual filing, not a query. The whole payload is capped near
+    ~6000 chars.
+    """
+    ticker = str(ticker or "").strip().upper()
+    normalized_type = str(filing_type or "").strip().upper() or None
+    try:
+        filing = _select_latest_filing(store, ticker, normalized_type)
+        if not filing:
+            return {
+                "ticker": ticker,
+                "status": "not_found",
+                "filing": None,
+                "sections": [],
+                "coverage_note": f"No SEC filings are stored for {ticker}.",
+                "available_filing_types": [],
+            }
+
+        accession = filing.get("accession")
+        chosen_type = str(filing.get("filing_type") or "").strip().upper()
+        overview = {
+            "ticker": ticker,
+            "status": "found",
+            "filing": {
+                "filing_type": filing.get("filing_type"),
+                "filing_date": filing.get("filing_date"),
+                "period": filing.get("period"),
+                "accession": accession,
+                "source_url": filing.get("source_url"),
+            },
+            "sections": [],
+        }
+
+        if chosen_type not in SUBSTANTIVE_FILING_TYPES:
+            note, type_counts = _filing_coverage_note(store, ticker, chosen_type)
+            overview["coverage_note"] = note
+            overview["available_filing_types"] = type_counts
+
+        families = []
+        if accession:
+            try:
+                families = store.get_filing_section_families(
+                    accession, limit=_FILING_OVERVIEW_MAX_SECTIONS, offset=0
+                )
+            except Exception:  # noqa: BLE001 - section index is best-effort
+                logger.exception("get_filing_overview section inventory failed for %s", accession)
+                families = []
+
+        if not families:
+            if accession:
+                overview["sections"] = _filing_excerpt_fallback(
+                    store, accession, _FILING_OVERVIEW_CHAR_BUDGET
+                )
+            if overview["sections"]:
+                overview["excerpt_source"] = "chroma_raw_chunks"
+            else:
+                overview["status"] = "metadata_only"
+                overview["note"] = "filing text is not indexed; only metadata is available"
+            return overview
+
+        used = 0
+        for family in families:
+            if len(overview["sections"]) >= _FILING_OVERVIEW_MAX_SECTIONS:
+                break
+            meta = family.get("metadata") or {}
+            parent_id = family.get("id")
+            section = {
+                "section_index": meta.get("section_index"),
+                "section_title": meta.get("section_title") or meta.get("item") or meta.get("title"),
+                "chunk_count": family.get("chunk_count"),
+            }
+            remaining = _FILING_OVERVIEW_CHAR_BUDGET - used
+            if remaining > 100 and parent_id:
+                try:
+                    chunks = store.get_section_chunks(parent_id, limit=1, offset=0)
+                except Exception:  # noqa: BLE001 - excerpt is best-effort
+                    chunks = []
+                if chunks:
+                    excerpt = (chunks[0].get("document") or "")[
+                        : min(_FILING_OVERVIEW_SECTION_CHARS, remaining)
+                    ]
+                    if excerpt:
+                        section["excerpt"] = excerpt
+                        used += len(excerpt)
+            overview["sections"].append(section)
+        return overview
+    except Exception as e:  # noqa: BLE001
+        logger.exception("get_filing_overview failed for %s", ticker)
+        return {"error": str(e), "ticker": ticker}
+
+
 def check_freshness_handler(store, ticker):
     """Return freshness status for one ticker."""
     ticker = ticker.upper()
@@ -420,6 +643,8 @@ get_sentiment = get_sentiment_handler
 get_guidance = get_guidance_handler
 get_estimates = get_estimates_handler
 get_price_targets = get_price_targets_handler
+get_price_history = get_price_history_handler
+get_filing_overview = get_filing_overview_handler
 check_freshness = check_freshness_handler
 refresh_data = refresh_data_handler
 
@@ -616,6 +841,80 @@ register(
             "required": ["ticker"],
         },
         handler=get_price_targets_handler,
+        write=False,
+    )
+)
+
+register(
+    Tool(
+        name="get_price_history",
+        description=(
+            "Use for historical daily price data — a trend, chart, 'how has the price "
+            "moved', or a specific past date's price — for one ticker over a lookback "
+            "window in days. Returns bounded daily open/high/low/close/volume bars, "
+            "oldest first. For today's single latest value use get_fundamentals or "
+            "query_facts instead; this tool is for a time series, not a point value."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "ticker": {
+                    "type": "string",
+                    "description": "Ticker to retrieve price history for, e.g. 'NVDA'.",
+                },
+                "metrics": {
+                    "type": "array",
+                    "items": {
+                        "type": "string",
+                        "enum": ["open", "high", "low", "close", "volume"],
+                    },
+                    "description": "Which daily bar fields to return; defaults to ['close'].",
+                },
+                "days": {
+                    "type": "integer",
+                    "description": "Lookback window in days ending today, clamped to 1-365 (default 30).",
+                },
+            },
+            "required": ["ticker"],
+        },
+        handler=get_price_history_handler,
+        write=False,
+    )
+)
+
+register(
+    Tool(
+        name="get_filing_overview",
+        description=(
+            "Use to read or break down a company's latest SEC filing (10-K, 10-Q, "
+            "8-K, annual report). By default prefers the latest SUBSTANTIVE filing "
+            "(10-K, 10-Q, 8-K, DEF 14A, 20-F, 6-K, S-1) over a more recent but "
+            "non-substantive one (e.g. an insider Form 4) — steer to an exact type "
+            "with filing_type. Returns the filing's metadata (type, date, period, "
+            "accession) plus its section inventory and a short excerpt of each key "
+            "section, read directly from that filing — not a similarity search. "
+            "When the available data is limited (only insider/prospectus-type "
+            "filings stored, or no filings at all) the result includes a "
+            "coverage_note explaining the gap plus available_filing_types, so a "
+            "sparse result can be explained rather than treated as a dead end. "
+            "Prefer this over search_documents when the question is about THE latest "
+            "filing itself; use search_documents for a cross-filing qualitative search."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "ticker": {
+                    "type": "string",
+                    "description": "Ticker whose latest filing to break down, e.g. 'NVDA'.",
+                },
+                "filing_type": {
+                    "type": "string",
+                    "description": "Optional filing type filter, e.g. '10-K', '10-Q', '8-K'.",
+                },
+            },
+            "required": ["ticker"],
+        },
+        handler=get_filing_overview_handler,
         write=False,
     )
 )

@@ -65,6 +65,14 @@ class QueryRequest(BaseModel):
                     "server-side lookup key; bounded/sanitized, never persisted.",
     )
     ticker: Optional[str] = Field(None, description="Optional ticker override")
+    mode: Optional[Literal["qa", "analysis"]] = Field(
+        None,
+        description="Answer mode. None (or 'qa') is the default grounded Q&A "
+                    "behavior, byte-identical to pre-analysis requests. 'analysis' "
+                    "runs the senior-analyst policy: always reason to a verdict, "
+                    "never refuse an opinion, skip the deterministic/catalog "
+                    "fast paths, and use the wider analysis generation budget.",
+    )
     temperature: Optional[float] = Field(None, ge=0.0, le=2.0,
                                          description="Model temperature override")
     max_tokens: Optional[int] = Field(None, ge=64, le=8192,
@@ -144,6 +152,13 @@ class QueryResponse(BaseModel):
     """Structured response from the middleware."""
 
     answer: str = Field(..., description="Grounded final answer")
+    mode: Optional[Literal["qa", "analysis"]] = Field(
+        None,
+        exclude_if=lambda value: value is None,
+        description="Echo of the answer mode used. Present ('analysis') only when "
+                    "the request ran in analyst mode; omitted for ordinary qa "
+                    "requests so the response stays byte-compatible for legacy clients.",
+    )
     answer_origin: Optional[Literal["deterministic", "model", "degraded"]] = Field(
         None,
         description=(

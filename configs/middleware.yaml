@@ -204,6 +204,13 @@ enable_fetch_on_miss: true
 fetch_on_miss_timeout_s: 10.0
 fetch_on_miss_per_query: 1
 
+# In-query freshness-refresh wall-clock budget (seconds). Stale sources are
+# refreshed in parallel off the event loop; those finishing within this budget
+# are reported as refreshed_during_query, the rest keep refreshing in the
+# background (never cancelled) and the query proceeds without waiting. Clamped
+# to [0.5, 30.0]. Env: REFRESH_BUDGET_S.
+refresh_budget_s: 3.0
+
 # Phase 2.2.2.1 — bounded client-owned conversation history.
 # The middleware stays stateless; the client (scripts/chat.py) owns the turns
 # and sends them per request. These cap how much of that history/question one
