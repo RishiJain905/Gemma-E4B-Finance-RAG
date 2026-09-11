@@ -231,9 +231,65 @@ def test_fmp_symbol_entitlement_skips_ticker_continues_batch(tmp_path: Path) -> 
     assert result["status"] in {"ok", "partial"}
     assert result.get("remaining_work_skipped") is not True
     assert result.get("error_class") not in {"entitlement", "authentication"}
+    assert "error_class" not in result or result.get("error_class") is None
     assert result["status"] != "disabled_entitlement"
     assert "NVDA" in seen
     assert store.get_fundamental("NVDA", "total_revenue")["value"] == 2_000_000.0
+    assert store.get_fundamental("CRWD", "total_revenue") is None
+    assert any("CRWD" in err and "entitlement" in err.lower() for err in result["errors"])
+
+
+def test_fmp_base_provider_error_entitlement_continues_batch(tmp_path: Path) -> None:
+    """Budgeted HTTP raises base ProviderError before VendorProviderError wrapping."""
+    from src.ingestion.errors import ErrorClass, ProviderError
+    from src.ingestion.fmp_ingestor import FMPIngestor
+
+    store, _ = _store(tmp_path)
+    seen: list[str] = []
+
+    def http_get(url: str, **kwargs):
+        params = kwargs.get("params") or {}
+        symbol = str(params.get("symbol") or "")
+        seen.append(symbol)
+        if symbol == "CRWD":
+            raise ProviderError(
+                "Premium Query Parameter: symbol is not available under your "
+                "current subscription",
+                error_class=ErrorClass.ENTITLEMENT,
+                status_code=402,
+            )
+        if url.rstrip("/").endswith("/income-statement"):
+            return FakeResponse(
+                [
+                    {
+                        "date": "2025-12-31",
+                        "revenue": 3_000_000,
+                        "netIncome": 700_000,
+                        "eps": 4.2,
+                    }
+                ]
+            )
+        if url.rstrip("/").endswith("/ratios-ttm"):
+            return FakeResponse([{"peRatioTTM": 30.0, "returnOnEquityTTM": 0.4}])
+        raise AssertionError(url)
+
+    result = FMPIngestor(
+        store=store,
+        coverage_resolver=_coverage(["CRWD", "NVDA", "AAPL"]),
+        api_key="test-fmp",
+        http_get=http_get,
+        now_fn=lambda: "2026-07-14T13:00:00Z",
+        sleep_fn=lambda _s: None,
+    ).ingest()
+
+    assert result["status"] == "ok"
+    assert result.get("remaining_work_skipped") is False
+    assert "error_class" not in result
+    assert "retry_after" not in result
+    assert "reset_at" not in result
+    assert "NVDA" in seen and "AAPL" in seen
+    assert store.get_fundamental("NVDA", "total_revenue")["value"] == 3_000_000.0
+    assert store.get_fundamental("AAPL", "total_revenue")["value"] == 3_000_000.0
     assert store.get_fundamental("CRWD", "total_revenue") is None
     assert any("CRWD" in err and "entitlement" in err.lower() for err in result["errors"])
 

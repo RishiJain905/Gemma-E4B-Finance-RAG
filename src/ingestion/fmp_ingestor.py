@@ -11,6 +11,7 @@ from typing import Any, Callable, Optional
 
 import requests
 
+from src.ingestion.errors import ErrorClass, ProviderError
 from src.ingestion.normalization import NORMALIZATION_VERSION
 from src.ingestion.records import ObservationRecord
 from src.ingestion.vendor_common import (
@@ -157,37 +158,40 @@ class FMPIngestor:
             result["requests"] += 1
             result["attempts"] += 1
             self._store_ratios(ticker, ratios, accessed, result)
-        except VendorProviderError as exc:
-            # Free-tier FMP often returns HTTP 402 for individual premium
-            # symbols. Treat those as a per-ticker skip so working tickers in
-            # the same batch are not blocked by a provider-wide cooldown.
+        except (VendorProviderError, ProviderError) as exc:
+            # Budgeted scheduler HTTP raises base ProviderError (ENTITLEMENT)
+            # on free-tier 402 before request_json can wrap VendorProviderError.
+            # Treat symbol-scoped entitlement/contract blocks as per-ticker skips
+            # so working tickers are not aborted by a provider-wide cooldown.
             if self._is_per_ticker_entitlement(exc):
                 skip_msg = (
                     f"{ticker}: free-tier entitlement skip "
                     f"(symbol unavailable under current plan)"
                 )
                 result["errors"].append(skip_msg)
-                self._set_status(ticker, "skipped", "item", str(exc))
-                status = (
-                    "partial"
-                    if result["facts_stored"] or result["observations_stored"]
-                    else "ok"
-                )
-                return finish_result(result, status)
+                self._set_status(ticker, "skipped_entitlement", "item", str(exc))
+                finished = finish_result(result, "ok")
+                finished.pop("error_class", None)
+                finished.pop("retry_after", None)
+                finished.pop("reset_at", None)
+                finished["remaining_work_skipped"] = False
+                return finished
 
             status = self._status_for_error(exc)
-            error_class = (
-                exc.error_class.value
-                if hasattr(exc.error_class, "value")
-                else str(exc.error_class)
+            error_class = self._error_class_value(exc)
+            self._set_status(
+                ticker,
+                status,
+                error_class,
+                str(exc),
+                getattr(exc, "retry_after", None),
             )
-            self._set_status(ticker, status, error_class, str(exc), exc.retry_after)
             return finish_result(
                 result,
                 status,
                 error_class=error_class,
-                retry_after=exc.retry_after,
-                reset_at=exc.reset_at,
+                retry_after=getattr(exc, "retry_after", None),
+                reset_at=getattr(exc, "reset_at", None),
             )
 
         status = "partial" if result["malformed"] or result["errors"] else "ok"
@@ -374,57 +378,39 @@ class FMPIngestor:
             logger.debug("Could not persist FMP status", exc_info=True)
 
     @staticmethod
-    def _status_for_error(error: VendorProviderError) -> str:
-        error_class = (
-            error.error_class.value
-            if hasattr(error.error_class, "value")
-            else str(error.error_class)
-        )
+    def _error_class_value(error: ProviderError) -> str:
+        error_class = getattr(error, "error_class", "")
+        if isinstance(error_class, ErrorClass):
+            return error_class.value
+        if hasattr(error_class, "value"):
+            return str(error_class.value)
+        return str(error_class or "")
+
+    @classmethod
+    def _status_for_error(cls, error: ProviderError) -> str:
         return {
             "authentication": "disabled_authentication",
             "entitlement": "disabled_entitlement",
             "rate_limited": "rate_limited",
-        }.get(error_class, "error")
+        }.get(cls._error_class_value(error), "error")
 
-    @staticmethod
-    def _is_per_ticker_entitlement(error: VendorProviderError) -> bool:
+    @classmethod
+    def _is_per_ticker_entitlement(cls, error: ProviderError) -> bool:
         """Return True when a failure is a single-symbol free-tier block.
 
         FMP free keys return HTTP 402 (and entitlement-class payloads) for some
-        symbols while others remain available. Those must not open a source-wide
-        circuit/cooldown.
+        symbols while others remain available. Budgeted scheduler HTTP raises
+        base ProviderError before VendorProviderError wrapping — both must skip.
         """
-        error_class = (
-            error.error_class.value
-            if hasattr(error.error_class, "value")
-            else str(error.error_class)
-        )
+        error_class = cls._error_class_value(error)
+        message = str(error).lower()
         if int(getattr(error, "status_code", 0) or 0) == 402:
             return True
-        if error_class != "entitlement":
-            return False
-        message = str(error).lower()
-        markers = (
-            "symbol is not available",
-            "not available under your current subscription",
-            "premium query parameter",
-            "premium endpoint",
-            "your current subscription",
-        )
-        # Symbol-scoped FMP calls: entitlement during ingest_ticker is per-ticker
-        # unless the payload clearly describes a provider-wide plan disable.
-        provider_wide_markers = (
-            "api key",
-            "invalid api",
-            "not authorized for this endpoint",
-            "endpoint is not available",
-        )
-        if any(marker in message for marker in provider_wide_markers):
-            return False
-        if any(marker in message for marker in markers):
+        if any(marker in message for marker in ("subscription", "premium")):
             return True
-        # Default: entitlement raised inside ingest_ticker is symbol-scoped.
-        return True
+        if error_class in {"entitlement", "contract"}:
+            return True
+        return False
 
     def _now(self) -> str:
         value = self.now_fn()
