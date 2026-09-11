@@ -190,7 +190,7 @@ sources:
     dependencies: []
     cursor_kind: timestamp
     overlap: 24h
-    requests_per_minute: 10
+    requests_per_minute: 30
     requests_per_day: 200
     requests_per_run: 40
     batch_size: 1

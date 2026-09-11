@@ -103,6 +103,75 @@ def test_authentication_and_entitlement_are_not_retried(
     assert policy.circuit_opened_at is not None
 
 
+@pytest.mark.parametrize(
+    ("status_code", "message"),
+    [
+        (
+            402,
+            "Premium Query Parameter: symbol is not available under your current subscription",
+        ),
+        (
+            402,
+            "Special Endpoint : this value set for 'symbol' is not available under your current subscription",
+        ),
+        (
+            403,
+            'Special Endpoint : this value set for "symbol" requires you to upgrade your plan',
+        ),
+    ],
+)
+def test_fmp_special_endpoint_402_is_item_not_entitlement(
+    status_code: int,
+    message: str,
+) -> None:
+    from src.ingestion.errors import error_class_for_http
+
+    assert error_class_for_http(status_code, message) is ErrorClass.ITEM
+    # Provider-wide plan blocks without symbol scoping remain entitlement.
+    assert (
+        error_class_for_http(403, "plan does not include this entitlement")
+        is ErrorClass.ENTITLEMENT
+    )
+
+
+def test_fmp_item_skip_does_not_open_provider_circuit_mid_batch() -> None:
+    """ITEM-class symbol blocks must not trip the HTTP circuit for later tickers."""
+    requested: list[str] = []
+    policy = ProviderRequestPolicy(
+        source="fmp",
+        max_attempts=1,
+        sleep_fn=lambda _delay: None,
+        now_fn=lambda: datetime(2026, 7, 14, 12, 0, tzinfo=timezone.utc),
+    )
+
+    def request(partition: str) -> _Response:
+        requested.append(partition)
+        if partition == "CRWD":
+            return _Response(
+                402,
+                payload={
+                    "Error Message": (
+                        "Special Endpoint : this value set for 'symbol' is not "
+                        "available under your current subscription"
+                    )
+                },
+            )
+        return _Response(200, payload=[{"symbol": partition}])
+
+    with pytest.raises(ProviderError) as caught:
+        policy.request(lambda: request("CRWD"))
+
+    assert caught.value.error_class is ErrorClass.ITEM
+    assert caught.value.circuit_open is False
+    assert policy.circuit_opened_at is None
+    assert policy.remaining_work_skipped is False
+
+    # Later free-tier ticker still runs — circuit stayed closed.
+    ok = policy.request(lambda: request("NVDA"))
+    assert ok.status_code == 200
+    assert requested == ["CRWD", "NVDA"]
+
+
 def test_provider_error_message_redacts_credentials_and_payload_size() -> None:
     policy = ProviderRequestPolicy(source="vendor", max_attempts=1)
     response = _Response(

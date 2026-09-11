@@ -331,6 +331,64 @@ class TestUnifiedSchedulerPartialFailure:
             call.args[0] for call in mock_run.call_args_list
         ]
 
+    def test_success_does_not_open_circuit_for_stray_error_class(self, scheduler):
+        """Healthy run_status must not circuit-break on a leftover detail.error_class."""
+
+        def side(name, deep=False, force=False):
+            if name == "fmp":
+                return {
+                    "status": "ok",
+                    "stored": 4,
+                    "requests": 2,
+                    "error_class": "entitlement",
+                }
+            return {"ok": True}
+
+        _stub_run_source(scheduler, side_effect=side)
+        result = scheduler.run_daily(force=True, source="fmp")
+
+        assert result["fmp"]["status"] == "success"
+        assert result["fmp"].get("remaining_work_skipped") is not True
+        budget = result["fmp"].get("budget") or {}
+        # open_provider_circuit sets provider_remaining to 0
+        assert budget.get("provider_remaining") != 0
+        assert budget.get("provider_cooldown") is not True
+        provider = (
+            scheduler.status_report(source="fmp")["sources"]["fmp"].get("provider") or {}
+        )
+        assert provider.get("status") != "circuit_open"
+        cursor = scheduler.store.get_source_cursor_state("fmp", "__provider__")
+        if cursor is not None:
+            assert cursor.get("status") != "circuit_open"
+
+    def test_partial_item_skip_does_not_open_provider_circuit(self, scheduler):
+        """Mid-batch ITEM/entitlement skip detail must not open a source cooldown."""
+
+        def side(name, deep=False, force=False):
+            if name == "fmp":
+                return {
+                    "status": "partial",
+                    "stored": 8,
+                    "requests": 12,
+                    "error_class": "item",
+                    "errors": ["CRWD: free-tier entitlement skip"],
+                    "remaining_work_skipped": False,
+                }
+            return {"ok": True}
+
+        _stub_run_source(scheduler, side_effect=side)
+        result = scheduler.run_daily(force=True, source="fmp")
+
+        assert result["fmp"]["status"] == "partial"
+        assert result["fmp"].get("remaining_work_skipped") is not True
+        budget = result["fmp"].get("budget") or {}
+        assert budget.get("provider_remaining") != 0
+        assert budget.get("provider_cooldown") is not True
+        provider = (
+            scheduler.status_report(source="fmp")["sources"]["fmp"].get("provider") or {}
+        )
+        assert provider.get("status") != "circuit_open"
+
     def test_nested_provider_failures_are_not_reported_as_partial_success(self):
         status, reason = UnifiedScheduler._classify_detail(
             {

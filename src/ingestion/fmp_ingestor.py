@@ -11,6 +11,7 @@ from typing import Any, Callable, Optional
 
 import requests
 
+from src.ingestion.errors import ErrorClass, ProviderError
 from src.ingestion.normalization import NORMALIZATION_VERSION
 from src.ingestion.records import ObservationRecord
 from src.ingestion.vendor_common import (
@@ -57,7 +58,8 @@ RATIO_METRICS = (
 class FMPIngestor:
     """Ingest FMP income statements and TTM ratios into fundamentals/observations."""
 
-    BASE_URL = "https://financialmodelingprep.com/api/v3"
+    # Stable API (legacy /api/v3 paths are entitlement-blocked for new free keys).
+    BASE_URL = "https://financialmodelingprep.com/stable"
     SOURCE_NAME = "fmp"
     COVERAGE_SOURCE = "fmp"
     API_KEY_ENV = "FMP_API_KEY"
@@ -145,23 +147,51 @@ class FMPIngestor:
 
         accessed = self._now()
         try:
-            income = self._get(f"/income-statement/{ticker}", {"period": "annual", "limit": 1})
+            income = self._get(
+                "/income-statement",
+                {"symbol": ticker, "period": "annual", "limit": 1},
+            )
             result["requests"] += 1
             result["attempts"] += 1
             self._store_income(ticker, income, accessed, result)
-            ratios = self._get(f"/ratios-ttm/{ticker}", {})
+            ratios = self._get("/ratios-ttm", {"symbol": ticker})
             result["requests"] += 1
             result["attempts"] += 1
             self._store_ratios(ticker, ratios, accessed, result)
-        except VendorProviderError as exc:
+        except (VendorProviderError, ProviderError) as exc:
+            # Budgeted scheduler HTTP raises base ProviderError (ENTITLEMENT)
+            # on free-tier 402 before request_json can wrap VendorProviderError.
+            # Treat symbol-scoped entitlement/contract blocks as per-ticker skips
+            # so working tickers are not aborted by a provider-wide cooldown.
+            if self._is_per_ticker_entitlement(exc):
+                skip_msg = (
+                    f"{ticker}: free-tier entitlement skip "
+                    f"(symbol unavailable under current plan)"
+                )
+                result["errors"].append(skip_msg)
+                self._set_status(ticker, "skipped_entitlement", "item", str(exc))
+                finished = finish_result(result, "ok")
+                finished.pop("error_class", None)
+                finished.pop("retry_after", None)
+                finished.pop("reset_at", None)
+                finished["remaining_work_skipped"] = False
+                return finished
+
             status = self._status_for_error(exc)
-            self._set_status(ticker, status, exc.error_class, str(exc), exc.retry_after)
+            error_class = self._error_class_value(exc)
+            self._set_status(
+                ticker,
+                status,
+                error_class,
+                str(exc),
+                getattr(exc, "retry_after", None),
+            )
             return finish_result(
                 result,
                 status,
-                error_class=exc.error_class,
-                retry_after=exc.retry_after,
-                reset_at=exc.reset_at,
+                error_class=error_class,
+                retry_after=getattr(exc, "retry_after", None),
+                reset_at=getattr(exc, "reset_at", None),
             )
 
         status = "partial" if result["malformed"] or result["errors"] else "ok"
@@ -181,7 +211,7 @@ class FMPIngestor:
             return
         report = rows[0]
         period = as_date(report.get("date") or report.get("fillingDate") or accessed[:10], "date")
-        source_url = f"{self.base_url}/income-statement/{ticker}"
+        source_url = f"{self.base_url}/income-statement?symbol={ticker}"
         for field, metric_id, unit in INCOME_METRICS:
             value = parse_number(report.get(field))
             if value is None:
@@ -209,7 +239,7 @@ class FMPIngestor:
             return
         report = rows[0]
         period = as_date(accessed[:10], "as_of")
-        source_url = f"{self.base_url}/ratios-ttm/{ticker}"
+        source_url = f"{self.base_url}/ratios-ttm?symbol={ticker}"
         seen: set[str] = set()
         for field, metric_id, unit in RATIO_METRICS:
             if metric_id in seen:
@@ -348,12 +378,39 @@ class FMPIngestor:
             logger.debug("Could not persist FMP status", exc_info=True)
 
     @staticmethod
-    def _status_for_error(error: VendorProviderError) -> str:
+    def _error_class_value(error: ProviderError) -> str:
+        error_class = getattr(error, "error_class", "")
+        if isinstance(error_class, ErrorClass):
+            return error_class.value
+        if hasattr(error_class, "value"):
+            return str(error_class.value)
+        return str(error_class or "")
+
+    @classmethod
+    def _status_for_error(cls, error: ProviderError) -> str:
         return {
             "authentication": "disabled_authentication",
             "entitlement": "disabled_entitlement",
             "rate_limited": "rate_limited",
-        }.get(error.error_class, "error")
+        }.get(cls._error_class_value(error), "error")
+
+    @classmethod
+    def _is_per_ticker_entitlement(cls, error: ProviderError) -> bool:
+        """Return True when a failure is a single-symbol free-tier block.
+
+        FMP free keys return HTTP 402 (and entitlement-class payloads) for some
+        symbols while others remain available. Budgeted scheduler HTTP raises
+        base ProviderError before VendorProviderError wrapping — both must skip.
+        """
+        error_class = cls._error_class_value(error)
+        message = str(error).lower()
+        if int(getattr(error, "status_code", 0) or 0) == 402:
+            return True
+        if any(marker in message for marker in ("subscription", "premium")):
+            return True
+        if error_class in {"entitlement", "contract", "item"}:
+            return True
+        return False
 
     def _now(self) -> str:
         value = self.now_fn()

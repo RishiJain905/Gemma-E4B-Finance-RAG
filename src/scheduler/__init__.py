@@ -1252,12 +1252,16 @@ class UnifiedScheduler:
                 detail_error_class = normalize_error_class(
                     self._detail_value(detail, "error_class")
                 )
-                if detail_error_class in {
-                    ErrorClass.AUTHENTICATION.value,
-                    ErrorClass.ENTITLEMENT.value,
-                    ErrorClass.RATE_LIMITED.value,
-                    ErrorClass.QUOTA_EXHAUSTED.value,
-                }:
+                if (
+                    run_status not in {"success", "partial"}
+                    and detail_error_class
+                    in {
+                        ErrorClass.AUTHENTICATION.value,
+                        ErrorClass.ENTITLEMENT.value,
+                        ErrorClass.RATE_LIMITED.value,
+                        ErrorClass.QUOTA_EXHAUSTED.value,
+                    }
+                ):
                     retry_after = self._detail_value(detail, "retry_after")
                     reset_at = self._detail_value(detail, "reset_at")
                     if reset_at is None and retry_after is not None:

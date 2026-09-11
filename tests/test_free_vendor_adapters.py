@@ -139,7 +139,11 @@ def test_fmp_income_and_ratios(tmp_path: Path) -> None:
     store, _ = _store(tmp_path)
 
     def http_get(url: str, **kwargs):
-        if "income-statement" in url:
+        params = kwargs.get("params") or {}
+        assert "apikey" in params
+        if url.rstrip("/").endswith("/income-statement"):
+            assert params.get("symbol") == "AAA"
+            assert params.get("period") == "annual"
             return FakeResponse(
                 [
                     {
@@ -150,7 +154,8 @@ def test_fmp_income_and_ratios(tmp_path: Path) -> None:
                     }
                 ]
             )
-        if "ratios-ttm" in url:
+        if url.rstrip("/").endswith("/ratios-ttm"):
+            assert params.get("symbol") == "AAA"
             return FakeResponse(
                 [
                     {
@@ -171,10 +176,168 @@ def test_fmp_income_and_ratios(tmp_path: Path) -> None:
         sleep_fn=lambda _s: None,
     ).ingest()
 
+    assert FMPIngestor.BASE_URL.endswith("/stable")
     assert result["status"] == "ok"
     assert result["facts_stored"] >= 4
     assert store.get_fundamental("AAA", "total_revenue")["value"] == 1_200_000.0
     assert store.get_fundamental("AAA", "pe_ratio_ttm")["value"] == 18.2
+
+
+def test_fmp_symbol_entitlement_skips_ticker_continues_batch(tmp_path: Path) -> None:
+    """HTTP 402 on one free-tier symbol must not abort the rest of the ingest."""
+    from src.ingestion.fmp_ingestor import FMPIngestor
+
+    store, _ = _store(tmp_path)
+    seen: list[str] = []
+
+    def http_get(url: str, **kwargs):
+        params = kwargs.get("params") or {}
+        symbol = str(params.get("symbol") or "")
+        seen.append(symbol)
+        if symbol == "CRWD":
+            return FakeResponse(
+                {
+                    "Error Message": (
+                        "Premium Query Parameter: "
+                        "symbol is not available under your current subscription"
+                    )
+                },
+                status_code=402,
+            )
+        if url.rstrip("/").endswith("/income-statement"):
+            return FakeResponse(
+                [
+                    {
+                        "date": "2025-12-31",
+                        "revenue": 2_000_000,
+                        "netIncome": 500_000,
+                        "eps": 3.1,
+                    }
+                ]
+            )
+        if url.rstrip("/").endswith("/ratios-ttm"):
+            return FakeResponse([{"peRatioTTM": 25.0, "returnOnEquityTTM": 0.3}])
+        raise AssertionError(url)
+
+    result = FMPIngestor(
+        store=store,
+        coverage_resolver=_coverage(["CRWD", "NVDA"]),
+        api_key="test-fmp",
+        http_get=http_get,
+        now_fn=lambda: "2026-07-14T13:00:00Z",
+        sleep_fn=lambda _s: None,
+    ).ingest()
+
+    assert result["status"] in {"ok", "partial"}
+    assert result.get("remaining_work_skipped") is not True
+    assert result.get("error_class") not in {"entitlement", "authentication"}
+    assert "error_class" not in result or result.get("error_class") is None
+    assert result["status"] != "disabled_entitlement"
+    assert "NVDA" in seen
+    assert store.get_fundamental("NVDA", "total_revenue")["value"] == 2_000_000.0
+    assert store.get_fundamental("CRWD", "total_revenue") is None
+    assert any("CRWD" in err and "entitlement" in err.lower() for err in result["errors"])
+
+
+def test_fmp_base_provider_error_entitlement_continues_batch(tmp_path: Path) -> None:
+    """Budgeted HTTP raises base ProviderError before VendorProviderError wrapping."""
+    from src.ingestion.errors import ErrorClass, ProviderError
+    from src.ingestion.fmp_ingestor import FMPIngestor
+
+    store, _ = _store(tmp_path)
+    seen: list[str] = []
+
+    def http_get(url: str, **kwargs):
+        params = kwargs.get("params") or {}
+        symbol = str(params.get("symbol") or "")
+        seen.append(symbol)
+        if symbol == "CRWD":
+            raise ProviderError(
+                "Special Endpoint : this value set for 'symbol' is not available "
+                "under your current subscription",
+                error_class=ErrorClass.ITEM,
+                status_code=402,
+            )
+        if url.rstrip("/").endswith("/income-statement"):
+            return FakeResponse(
+                [
+                    {
+                        "date": "2025-12-31",
+                        "revenue": 3_000_000,
+                        "netIncome": 700_000,
+                        "eps": 4.2,
+                    }
+                ]
+            )
+        if url.rstrip("/").endswith("/ratios-ttm"):
+            return FakeResponse([{"peRatioTTM": 30.0, "returnOnEquityTTM": 0.4}])
+        raise AssertionError(url)
+
+    result = FMPIngestor(
+        store=store,
+        coverage_resolver=_coverage(["CRWD", "NVDA", "AAPL"]),
+        api_key="test-fmp",
+        http_get=http_get,
+        now_fn=lambda: "2026-07-14T13:00:00Z",
+        sleep_fn=lambda _s: None,
+    ).ingest()
+
+    assert result["status"] == "ok"
+    assert result.get("remaining_work_skipped") is False
+    assert "error_class" not in result
+    assert "retry_after" not in result
+    assert "reset_at" not in result
+    assert "NVDA" in seen and "AAPL" in seen
+    assert store.get_fundamental("NVDA", "total_revenue")["value"] == 3_000_000.0
+    assert store.get_fundamental("AAPL", "total_revenue")["value"] == 3_000_000.0
+    assert store.get_fundamental("CRWD", "total_revenue") is None
+    assert any("CRWD" in err and "entitlement" in err.lower() for err in result["errors"])
+
+
+def test_fmp_item_classified_402_via_request_json_continues_batch(tmp_path: Path) -> None:
+    """HTTP 402 special-endpoint payload is ITEM and does not abort the batch."""
+    from src.ingestion.errors import ErrorClass, error_class_for_http
+    from src.ingestion.fmp_ingestor import FMPIngestor
+
+    message = (
+        "Special Endpoint : this value set for 'symbol' is not available under "
+        "your current subscription"
+    )
+    assert error_class_for_http(402, message) is ErrorClass.ITEM
+
+    store, _ = _store(tmp_path)
+    seen: list[str] = []
+
+    def http_get(url: str, **kwargs):
+        params = kwargs.get("params") or {}
+        symbol = str(params.get("symbol") or "")
+        seen.append(symbol)
+        if symbol == "CRWD":
+            return FakeResponse({"Error Message": message}, status_code=402)
+        if url.rstrip("/").endswith("/income-statement"):
+            return FakeResponse(
+                [{"date": "2025-12-31", "revenue": 4_000_000, "netIncome": 800_000}]
+            )
+        if url.rstrip("/").endswith("/ratios-ttm"):
+            return FakeResponse([{"peRatioTTM": 22.0}])
+        raise AssertionError(url)
+
+    result = FMPIngestor(
+        store=store,
+        coverage_resolver=_coverage(["CRWD", "META", "MSFT", "NVDA"]),
+        api_key="test-fmp",
+        http_get=http_get,
+        now_fn=lambda: "2026-07-14T13:00:00Z",
+        sleep_fn=lambda _s: None,
+    ).ingest()
+
+    assert result["status"] == "ok"
+    assert result.get("remaining_work_skipped") is False
+    assert "error_class" not in result
+    for ticker in ("META", "MSFT", "NVDA"):
+        assert ticker in seen
+        assert store.get_fundamental(ticker, "total_revenue")["value"] == 4_000_000.0
+    assert store.get_fundamental("CRWD", "total_revenue") is None
 
 
 def test_fmp_missing_key_disables(tmp_path: Path) -> None:

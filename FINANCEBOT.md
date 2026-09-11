@@ -30,7 +30,7 @@ Create `.env` in the project root. Do **not** commit it.
 | `EIA_API_KEY` | Optional | EIA energy |
 | `OPENFDA_API_KEY` | Optional | openFDA events |
 | `ALPHA_VANTAGE_API_KEY` | Optional | OVERVIEW + income + news sentiment (~25 req/day free) |
-| `FMP_API_KEY` | Optional | FMP annual income + TTM ratios (~250 calls/day free Basic) |
+| `FMP_API_KEY` | Optional | FMP annual income + TTM ratios via `/stable` (~250 calls/day free Basic) |
 | `MARKETAUX_API_KEY` | Optional | Marketaux ticker news (~100 req/day; alias `MARKETAUX_API_TOKEN`) |
 | `OPENFIGI_API_KEY` | Optional | OpenFIGI ticker↔FIGI enrichment (works without key; better limits with key) |
 | `TWELVE_DATA_API_KEY` | Optional / unused by default | Future adapter only |
