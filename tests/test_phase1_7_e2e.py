@@ -160,7 +160,19 @@ def test_scenario_3_circuit_breaker_recovery():
 # Scenario 4: Dead-Letter Queue
 # ════════════════════════════════════════════════════════
 
-def test_scenario_4_dead_letter_queue(store):
+def test_scenario_4_dead_letter_queue(store, monkeypatch):
+    for name in (
+        "FINNHUB_API_KEY",
+        "MASSIVE_API_KEY",
+        "BLS_API_KEY",
+        "BEA_API_KEY",
+        "EIA_API_KEY",
+        "OPENFDA_API_KEY",
+        "ALPHA_VANTAGE_API_KEY",
+        "FMP_API_KEY",
+        "MARKETAUX_API_KEY",
+    ):
+        monkeypatch.setenv(name, "test-key")
     scheduler = UnifiedScheduler(store=store, inter_source_delay=0)
     # Make every source fail persistently.
     scheduler._run_source = MagicMock(side_effect=RuntimeError("persistent failure"))
@@ -171,7 +183,7 @@ def test_scenario_4_dead_letter_queue(store):
     pending = dlq.get_pending()
     pending_sources = {p["source"] for p in pending}
     assert "fred" in pending_sources
-    assert "gdelt" not in pending_sources
+    assert "gdelt" in pending_sources
     assert len(pending) == sum(
         spec.is_available for spec in scheduler.SOURCES.values()
     )
