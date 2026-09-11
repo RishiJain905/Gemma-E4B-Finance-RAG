@@ -183,6 +183,61 @@ def test_fmp_income_and_ratios(tmp_path: Path) -> None:
     assert store.get_fundamental("AAA", "pe_ratio_ttm")["value"] == 18.2
 
 
+def test_fmp_symbol_entitlement_skips_ticker_continues_batch(tmp_path: Path) -> None:
+    """HTTP 402 on one free-tier symbol must not abort the rest of the ingest."""
+    from src.ingestion.fmp_ingestor import FMPIngestor
+
+    store, _ = _store(tmp_path)
+    seen: list[str] = []
+
+    def http_get(url: str, **kwargs):
+        params = kwargs.get("params") or {}
+        symbol = str(params.get("symbol") or "")
+        seen.append(symbol)
+        if symbol == "CRWD":
+            return FakeResponse(
+                {
+                    "Error Message": (
+                        "Premium Query Parameter: "
+                        "symbol is not available under your current subscription"
+                    )
+                },
+                status_code=402,
+            )
+        if url.rstrip("/").endswith("/income-statement"):
+            return FakeResponse(
+                [
+                    {
+                        "date": "2025-12-31",
+                        "revenue": 2_000_000,
+                        "netIncome": 500_000,
+                        "eps": 3.1,
+                    }
+                ]
+            )
+        if url.rstrip("/").endswith("/ratios-ttm"):
+            return FakeResponse([{"peRatioTTM": 25.0, "returnOnEquityTTM": 0.3}])
+        raise AssertionError(url)
+
+    result = FMPIngestor(
+        store=store,
+        coverage_resolver=_coverage(["CRWD", "NVDA"]),
+        api_key="test-fmp",
+        http_get=http_get,
+        now_fn=lambda: "2026-07-14T13:00:00Z",
+        sleep_fn=lambda _s: None,
+    ).ingest()
+
+    assert result["status"] in {"ok", "partial"}
+    assert result.get("remaining_work_skipped") is not True
+    assert result.get("error_class") not in {"entitlement", "authentication"}
+    assert result["status"] != "disabled_entitlement"
+    assert "NVDA" in seen
+    assert store.get_fundamental("NVDA", "total_revenue")["value"] == 2_000_000.0
+    assert store.get_fundamental("CRWD", "total_revenue") is None
+    assert any("CRWD" in err and "entitlement" in err.lower() for err in result["errors"])
+
+
 def test_fmp_missing_key_disables(tmp_path: Path) -> None:
     from src.ingestion.fmp_ingestor import FMPIngestor
 

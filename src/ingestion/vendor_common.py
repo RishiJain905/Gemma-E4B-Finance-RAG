@@ -168,7 +168,7 @@ def request_json(
             if status_code >= 400 or any(marker in lowered for marker in rate_limit_markers):
                 if any(marker in lowered for marker in rate_limit_markers) and status_code < 400:
                     status_code = 429
-                error_class = error_class_for_http(status_code).value
+                error_class = error_class_for_http(status_code, message).value
                 if any(marker in lowered for marker in rate_limit_markers):
                     error_class = "rate_limited"
                 retry_after = None

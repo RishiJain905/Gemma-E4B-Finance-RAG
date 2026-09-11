@@ -117,7 +117,8 @@ def error_class_for_http(status_code: int, message: str = "") -> ErrorClass:
         return ErrorClass.AUTHENTICATION
     if status_code == 429:
         return ErrorClass.RATE_LIMITED
-    if status_code == 403 or any(
+    # FMP free-tier symbol blocks commonly return HTTP 402.
+    if status_code in {402, 403} or any(
         marker in lowered
         for marker in (
             "entitlement",
