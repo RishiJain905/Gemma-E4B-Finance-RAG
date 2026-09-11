@@ -7,6 +7,10 @@ __all__ = [
     "YFinanceIngestor",
     "FinnhubIngestor",
     "MassiveIngestor",
+    "AlphaVantageIngestor",
+    "FMPIngestor",
+    "MarketauxIngestor",
+    "OpenFIGIIngestor",
     "FederalReserveIngestor",
     "TreasuryIngestor",
     "BLSIngestor",
@@ -34,6 +38,22 @@ def __getattr__(name: str):
         from .massive_ingestor import MassiveIngestor
 
         return MassiveIngestor
+    if name == "AlphaVantageIngestor":
+        from .alpha_vantage_ingestor import AlphaVantageIngestor
+
+        return AlphaVantageIngestor
+    if name == "FMPIngestor":
+        from .fmp_ingestor import FMPIngestor
+
+        return FMPIngestor
+    if name == "MarketauxIngestor":
+        from .marketaux_ingestor import MarketauxIngestor
+
+        return MarketauxIngestor
+    if name == "OpenFIGIIngestor":
+        from .openfigi import OpenFIGIIngestor
+
+        return OpenFIGIIngestor
     official = {
         "FederalReserveIngestor": ("official.federal_reserve", "FederalReserveIngestor"),
         "TreasuryIngestor": ("official.treasury", "TreasuryIngestor"),

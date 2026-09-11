@@ -5,7 +5,6 @@ Analytical tools over middleware data sources.
 
 import logging
 import os
-import time
 from datetime import datetime, timezone
 
 from . import sanity

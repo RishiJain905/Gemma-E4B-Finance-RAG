@@ -54,20 +54,19 @@ def test_scheduler_daily_updates_store(store):
 
 
 def test_scheduler_hourly_only_massive_news(store, monkeypatch):
-    """run_hourly() runs Massive news while GDELT remains disabled."""
+    """run_hourly() runs Massive news; GDELT is daily-only now."""
     monkeypatch.setenv("MASSIVE_API_KEY", "test-key")
     sched = UnifiedScheduler(store=store, inter_source_delay=0)
     sched.reset_schedule()
     sched._run_source = MagicMock(return_value={"ok": True})
 
     results = sched.run_hourly(force=True)
-    assert set(results) == {"massive_news", "gdelt"}
-    assert results["gdelt"]["status"] == "skipped"
-    assert results["gdelt"]["reason"] == "configured_disabled"
+    assert set(results) == {"massive_news"}
     sched._run_source.assert_called_once()
     assert sched._run_source.call_args.args[0] == "massive_news"
     assert "yfinance" not in results
     assert "fred" not in results
+    assert "gdelt" not in results
 
 
 def test_scheduler_weekly_marks_store(store):

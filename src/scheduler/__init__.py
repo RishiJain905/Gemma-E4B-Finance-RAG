@@ -63,6 +63,10 @@ class UnifiedScheduler:
     BUDGETED_HTTP_SOURCES = frozenset(
         {
             "finnhub",
+            "alpha_vantage",
+            "fmp",
+            "marketaux",
+            "openfigi",
             "massive",
             "massive_news",
             "federal_reserve",
@@ -120,13 +124,33 @@ class UnifiedScheduler:
             "ttl_key": "estimates",
             "weight": 8,
         },
+        "alpha_vantage": {
+            "class": "AlphaVantageIngestor",
+            "ttl_key": "alpha_vantage",
+            "weight": 9,
+        },
+        "fmp": {
+            "class": "FMPIngestor",
+            "ttl_key": "fmp",
+            "weight": 10,
+        },
+        "marketaux": {
+            "class": "MarketauxIngestor",
+            "ttl_key": "marketaux_news",
+            "weight": 11,
+        },
+        "openfigi": {
+            "class": "OpenFIGIIngestor",
+            "ttl_key": "openfigi",
+            "weight": 12,
+        },
     }
 
     # Run-mode source selections.
     DAILY_SOURCES = [
         "yfinance", "fred", "sec_filings", "sec_companyfacts", "ir_pages", "estimates",
     ]
-    HOURLY_SOURCES = ["gdelt"]
+    HOURLY_SOURCES = ["massive_news"]
     WEEKLY_SOURCES = ["earnings_transcripts", "sec_filings"]
     BOOTSTRAP_SOURCE_ORDER = (
         "universe_nasdaq100",
@@ -134,6 +158,10 @@ class UnifiedScheduler:
         "universe_sec",
         "sec_filings",
         "finnhub",
+        "alpha_vantage",
+        "fmp",
+        "marketaux",
+        "openfigi",
         "massive",
         "fred",
         "federal_reserve",
@@ -146,11 +174,15 @@ class UnifiedScheduler:
         "openfda",
         "nhtsa",
         "usaspending",
+        "gdelt",
     )
     BOUNDED_REFRESH_SOURCES = {
         "yfinance_fundamentals": "yfinance",
         "yfinance_news": "yfinance",
         "finnhub_news": "finnhub",
+        "alpha_vantage": "alpha_vantage",
+        "fmp": "fmp",
+        "marketaux_news": "marketaux",
         "massive_market": "massive",
         "massive_actions": "massive",
         "sec_companyfacts": "sec_companyfacts",
@@ -426,6 +458,46 @@ class UnifiedScheduler:
                 initial_lookback_days=lookback_days,
             ).ingest_news(tickers=tickers)
 
+        if name == "alpha_vantage":
+            from src.ingestion.alpha_vantage_ingestor import AlphaVantageIngestor
+
+            tickers = self._selected_partitions.get(name, [])
+            return AlphaVantageIngestor(
+                store=self.store,
+                coverage_resolver=self.coverage,
+                http_get=self._budgeted_http_get(name),
+            ).ingest(tickers=tickers or None)
+
+        if name == "fmp":
+            from src.ingestion.fmp_ingestor import FMPIngestor
+
+            tickers = self._selected_partitions.get(name, [])
+            return FMPIngestor(
+                store=self.store,
+                coverage_resolver=self.coverage,
+                http_get=self._budgeted_http_get(name),
+            ).ingest(tickers=tickers or None)
+
+        if name == "marketaux":
+            from src.ingestion.marketaux_ingestor import MarketauxIngestor
+
+            tickers = self._selected_partitions.get(name, [])
+            return MarketauxIngestor(
+                store=self.store,
+                coverage_resolver=self.coverage,
+                http_get=self._budgeted_http_get(name),
+                overlap_hours=int((self.SOURCES[name].overlap or "0h")[:-1]),
+            ).ingest_news(tickers=tickers or None)
+
+        if name == "openfigi":
+            from src.ingestion.openfigi import OpenFIGIIngestor
+
+            tickers = self._selected_partitions.get(name, [])
+            return OpenFIGIIngestor(
+                store=self.store,
+                coverage_resolver=self.coverage,
+            ).ingest(tickers=tickers or None)
+
         if name == "massive":
             from src.ingestion.massive_ingestor import MassiveIngestor
 
@@ -586,6 +658,7 @@ class UnifiedScheduler:
         try:
             wrapped_http = logical in {
                 "finnhub_news", "massive_market", "massive_actions",
+                "alpha_vantage", "fmp", "marketaux_news",
             }
             reserved = (
                 budget.reserve_work(work_items=1)
@@ -645,6 +718,31 @@ class UnifiedScheduler:
                     store=self.store, coverage_resolver=self.coverage,
                 ).fetch_and_store_for_ticker(symbol)
                 detail = {"status": "success", "items": int(stored or 0)}
+            elif logical == "alpha_vantage":
+                from src.ingestion.alpha_vantage_ingestor import AlphaVantageIngestor
+
+                detail = AlphaVantageIngestor(
+                    store=self.store,
+                    coverage_resolver=self.coverage,
+                    http_get=self._budgeted_http_get(registry_name),
+                    include_news=False,
+                ).ingest_ticker(symbol)
+            elif logical == "fmp":
+                from src.ingestion.fmp_ingestor import FMPIngestor
+
+                detail = FMPIngestor(
+                    store=self.store,
+                    coverage_resolver=self.coverage,
+                    http_get=self._budgeted_http_get(registry_name),
+                ).ingest_ticker(symbol)
+            elif logical == "marketaux_news":
+                from src.ingestion.marketaux_ingestor import MarketauxIngestor
+
+                detail = MarketauxIngestor(
+                    store=self.store,
+                    coverage_resolver=self.coverage,
+                    http_get=self._budgeted_http_get(registry_name),
+                ).ingest_ticker_news(symbol)
             else:
                 from src.macros.estimates_ingestor import EstimatesIngestor
 

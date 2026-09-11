@@ -29,10 +29,35 @@ Create `.env` in the project root. Do **not** commit it.
 | `BEA_API_KEY` | Optional | BEA national accounts |
 | `EIA_API_KEY` | Optional | EIA energy |
 | `OPENFDA_API_KEY` | Optional | openFDA events |
+| `ALPHA_VANTAGE_API_KEY` | Optional | OVERVIEW + income + news sentiment (~25 req/day free) |
+| `FMP_API_KEY` | Optional | FMP annual income + TTM ratios (~250 calls/day free Basic) |
+| `MARKETAUX_API_KEY` | Optional | Marketaux ticker news (~100 req/day; alias `MARKETAUX_API_TOKEN`) |
+| `OPENFIGI_API_KEY` | Optional | OpenFIGI ticker↔FIGI enrichment (works without key; better limits with key) |
 | `TWELVE_DATA_API_KEY` | Optional / unused by default | Future adapter only |
 
 Placeholders live in `.env.example`. A missing optional key does not block other
 sources (`disabled_missing_key` in `python -m src.scheduler status`).
+
+### Free / freemium sources (added)
+
+| Source | Registry name | What it stores | Free-tier caveat |
+|--------|---------------|----------------|------------------|
+| Alpha Vantage | `alpha_vantage` | Fundamentals/observations + news headlines/snippets/URLs | ~25 requests/day — deep coverage only |
+| Financial Modeling Prep | `fmp` | Annual income + TTM ratios → fundamentals/observations | ~250 calls/day Basic |
+| Marketaux | `marketaux` | Ticker news headlines/snippets/URLs (+ sentiment when present) | ~100 req/day, ~3 articles/req |
+| OpenFIGI | `openfigi` | FIGI aliases on securities (`vendor_symbol`) | Key optional; helper also in `src/ingestion/openfigi.py` |
+| GDELT | `gdelt` | News + tone (existing adapter) | Enabled on **daily/all** with safe budgets; hourly stays `massive_news` |
+
+After keys are set:
+
+```bash
+python -m src.scheduler daily --source alpha_vantage
+python -m src.scheduler daily --source fmp
+python -m src.scheduler daily --source marketaux
+python -m src.scheduler daily --source openfigi
+python -m src.scheduler daily --source gdelt
+python -m src.scheduler status
+```
 
 ### Optional model / FinanceBot knobs (no secrets)
 

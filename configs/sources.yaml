@@ -1,6 +1,6 @@
 # configs/sources.yaml
 # Scheduler-owned source cadence, cursor, quota, and bounded-work registry.
-version: "2.3.4.1-r2"
+version: "2.3.4.2-free-adapters"
 
 # Phase 2.3 capability rollout gates. These are intentionally independent of
 # per-source definitions so schema/config can ship before network work starts.
@@ -156,6 +156,89 @@ sources:
     retry_policy: vendor_news
     ttl_key: finnhub_news
     ttl_hours: 6
+
+  # Free tier ~25 req/day: OVERVIEW + INCOME_STATEMENT per deep ticker + one NEWS_SENTIMENT batch.
+  alpha_vantage:
+    capability_group: company_data
+    enabled: true
+    required_env: ALPHA_VANTAGE_API_KEY
+    scope: deep
+    cadence: daily
+    run_modes: [daily, all]
+    priority: 41
+    dependencies: []
+    cursor_kind: timestamp
+    overlap: 24h
+    requests_per_minute: 5
+    requests_per_day: 25
+    requests_per_run: 20
+    batch_size: 1
+    max_work_items_per_run: 6
+    retry_policy: vendor_market
+    ttl_key: alpha_vantage
+    ttl_hours: 24
+
+  # Free Basic ~250 calls/day: annual income + ratios-ttm for deep coverage.
+  fmp:
+    capability_group: company_data
+    enabled: true
+    required_env: FMP_API_KEY
+    scope: deep
+    cadence: daily
+    run_modes: [daily, all]
+    priority: 42
+    dependencies: []
+    cursor_kind: timestamp
+    overlap: 24h
+    requests_per_minute: 10
+    requests_per_day: 200
+    requests_per_run: 40
+    batch_size: 1
+    max_work_items_per_run: 20
+    retry_policy: vendor_market
+    ttl_key: fmp
+    ttl_hours: 24
+
+  # Free ~100 req/day, ~3 articles/req — deep coverage only.
+  marketaux:
+    capability_group: company_news
+    enabled: true
+    required_env: MARKETAUX_API_KEY
+    scope: deep
+    cadence: daily
+    run_modes: [daily, all]
+    priority: 43
+    dependencies: []
+    cursor_kind: timestamp
+    overlap: 24h
+    requests_per_minute: 10
+    requests_per_day: 90
+    requests_per_run: 20
+    batch_size: 1
+    max_work_items_per_run: 20
+    retry_policy: vendor_news
+    ttl_key: marketaux_news
+    ttl_hours: 24
+
+  # Optional FIGI identity enrichment (API key optional; better limits with OPENFIGI_API_KEY).
+  openfigi:
+    capability_group: universe
+    enabled: true
+    scope: deep
+    cadence: daily
+    run_modes: [daily, all]
+    priority: 44
+    dependencies: []
+    cursor_kind: none
+    overlap: null
+    requests_per_minute: 10
+    requests_per_day: 100
+    requests_per_run: 10
+    batch_size: 10
+    max_work_items_per_run: 20
+    retry_policy: public_api
+    ttl_key: openfigi
+    ttl_hours: 168
 
   massive:
     capability_group: market_data
@@ -410,24 +493,26 @@ sources:
     ttl_key: usaspending
     ttl_hours: 24
 
+  # Re-enabled on daily (not hourly) with safe DOC API budgets (~1 req / 5s).
+  # Hourly cadence stays with massive_news to avoid shared-throttle collisions.
   gdelt:
     capability_group: company_news
-    enabled: false
+    enabled: true
     scope: deep
-    cadence: hourly
-    run_modes: [hourly, all]
+    cadence: daily
+    run_modes: [daily, all]
     priority: 80
     dependencies: []
     cursor_kind: timestamp
     overlap: 6h
-    requests_per_minute: 30
-    requests_per_day: 1000
-    requests_per_run: 100
+    requests_per_minute: 10
+    requests_per_day: 100
+    requests_per_run: 20
     batch_size: 1
-    max_work_items_per_run: 100
+    max_work_items_per_run: 10
     retry_policy: public_news
     ttl_key: gdelt_news
-    ttl_hours: 6
+    ttl_hours: 24
 
   earnings_transcripts:
     capability_group: deep_documents
