@@ -57,6 +57,9 @@ def scheduler(store, monkeypatch):
         "BEA_API_KEY",
         "EIA_API_KEY",
         "OPENFDA_API_KEY",
+        "ALPHA_VANTAGE_API_KEY",
+        "FMP_API_KEY",
+        "MARKETAUX_API_KEY",
     ):
         monkeypatch.setenv(name, "test-key")
     return UnifiedScheduler(store=store, inter_source_delay=0)
@@ -87,12 +90,12 @@ class TestUnifiedSchedulerInit:
         assert {
             "yfinance", "sec_filings", "sec_companyfacts", "fred", "gdelt",
             "earnings_transcripts", "ir_pages", "estimates", "finnhub", "massive",
-            "massive_news",
+            "massive_news", "alpha_vantage", "fmp", "marketaux", "openfigi",
             "universe_nasdaq100", "universe_ivv", "universe_sec", "federal_reserve",
             "treasury", "bls", "bea", "eia", "ny_fed", "cftc", "openfda",
             "nhtsa", "usaspending",
         } <= set(scheduler.SOURCES)
-        assert scheduler.registry.version == "2.3.4.1-r2"
+        assert scheduler.registry.version == "2.3.4.2-free-adapters"
 
     def test_source_ordering(self, scheduler):
         ordered = [name for name, _ in scheduler._ordered_sources()]
@@ -105,8 +108,10 @@ class TestUnifiedSchedulerInit:
     def test_ttl_loading(self, scheduler):
         # Values come from configs/watchlist.yaml schedule section.
         assert scheduler.ttls["fundamentals"] == 24
-        assert scheduler.ttls["gdelt_news"] == 6
+        assert scheduler.ttls["gdelt_news"] == 24
         assert scheduler.ttls["transcripts"] == 168
+        assert scheduler.ttls["alpha_vantage"] == 24
+        assert scheduler.ttls["marketaux_news"] == 24
 
     def test_custom_store(self, store):
         sched = UnifiedScheduler(store=store)
@@ -127,11 +132,8 @@ class TestUnifiedSchedulerRunModes:
         m = _stub_run_source(scheduler)
         result = scheduler.run_all_stale()
         assert set(result) == set(scheduler.SOURCES)
-        assert result["gdelt"]["status"] == "skipped"
-        assert all(
-            r["status"] == "success" for name, r in result.items() if name != "gdelt"
-        )
-        assert m.call_count == len(scheduler.SOURCES) - 1
+        assert all(r["status"] == "success" for r in result.values())
+        assert m.call_count == len(scheduler.SOURCES)
 
     def test_run_all_stale_force(self, scheduler):
         # Mark everything fresh; force=True must still run all.
@@ -141,11 +143,8 @@ class TestUnifiedSchedulerRunModes:
             )
         m = _stub_run_source(scheduler)
         result = scheduler.run_all_stale(force=True)
-        assert m.call_count == len(scheduler.SOURCES) - 1
-        assert result["gdelt"]["status"] == "skipped"
-        assert all(
-            r["status"] == "success" for name, r in result.items() if name != "gdelt"
-        )
+        assert m.call_count == len(scheduler.SOURCES)
+        assert all(r["status"] == "success" for r in result.values())
 
     def test_run_daily(self, scheduler):
         m = _stub_run_source(scheduler)
@@ -155,8 +154,8 @@ class TestUnifiedSchedulerRunModes:
             "finnhub", "massive", "universe_nasdaq100", "universe_ivv", "universe_sec",
             "federal_reserve", "treasury", "bls", "bea", "eia", "ny_fed",
             "openfda", "nhtsa", "usaspending",
+            "alpha_vantage", "fmp", "marketaux", "openfigi", "gdelt",
         } <= set(result)
-        assert "gdelt" not in result
         assert "earnings_transcripts" not in result
         assert "cftc" not in result
         assert m.call_count == len(result)
@@ -164,8 +163,7 @@ class TestUnifiedSchedulerRunModes:
     def test_run_hourly(self, scheduler):
         m = _stub_run_source(scheduler)
         result = scheduler.run_hourly()
-        assert set(result) == {"massive_news", "gdelt"}
-        assert result["gdelt"]["status"] == "skipped"
+        assert set(result) == {"massive_news"}
         assert m.call_count == 1
         assert m.call_args.args[0] == "massive_news"
 
@@ -204,16 +202,13 @@ class TestUnifiedSchedulerPartialFailure:
         assert result["fred"]["status"] == "error"
         assert "FRED down" in result["fred"]["error"]
         # Sources after the failing one still ran.
-        assert result["gdelt"]["status"] == "skipped"
+        assert result["gdelt"]["status"] == "success"
         assert result["earnings_transcripts"]["status"] == "success"
 
     def test_all_sources_fail(self, scheduler):
         _stub_run_source(scheduler, side_effect=RuntimeError("boom"))
         result = scheduler.run_all_stale()
-        assert result["gdelt"]["status"] == "skipped"
-        assert all(
-            r["status"] == "error" for name, r in result.items() if name != "gdelt"
-        )
+        assert all(r["status"] == "error" for r in result.values())
 
     def test_massive_news_rate_limit_does_not_stop_other_sources(self, scheduler):
         """A failed Massive news run is stale while later sources still execute."""
@@ -583,11 +578,9 @@ class TestUnifiedSchedulerStatus:
 
     def test_status_never_run(self, scheduler):
         report = scheduler.status_report()
-        assert report["sources"]["gdelt"]["status"] == "configured_disabled"
         assert all(
             source["status"] == "never_fetched"
-            for name, source in report["sources"].items()
-            if name != "gdelt"
+            for source in report["sources"].values()
         )
 
     def test_status_with_errors(self, scheduler):

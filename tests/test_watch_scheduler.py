@@ -194,24 +194,19 @@ def test_freshness_staleness_math(store):
     assert by_name["finnhub"]["state"] == "fresh"
     assert by_name["finnhub"]["age_hours"] is not None
     assert by_name["finnhub"]["ttl_hours"] == pytest.approx(24.0, abs=0.2)
-    assert by_name["gdelt"]["state"] == "disabled"
+    assert by_name["gdelt"]["state"] == "stale"
     assert by_name["estimates"]["state"] == "stale"
     assert by_name["sec_filings"]["state"] == "never"
     assert by_name["massive"]["ttl_hours"] == pytest.approx(24.0, abs=0.2)
     assert by_name["massive_news"]["ttl_hours"] == pytest.approx(1.0, abs=0.2)
 
     rendered = ws.render_freshness(snapshot)
-    assert "gdelt" in rendered and "state=disabled" in rendered
+    assert "gdelt" in rendered and "state=stale" in rendered
     assert "massive" in rendered and "massive_news" in rendered
 
-    # stale-first ordering: stale, configured-disabled, never, then fresh
+    # stale-first ordering: stale, never, then fresh (configured-disabled may be absent)
     states = [e["state"] for e in snapshot.freshness]
-    assert (
-        states.index("stale")
-        < states.index("disabled")
-        < states.index("never")
-        < states.index("fresh")
-    )
+    assert states.index("stale") < states.index("never") < states.index("fresh")
 
 
 def _write_fake_chroma(db_path, revision):

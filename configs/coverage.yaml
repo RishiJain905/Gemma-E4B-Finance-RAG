@@ -1,6 +1,6 @@
 # configs/coverage.yaml
 # Source-aware security coverage policy. This file contains no provider credentials.
-revision: "2.3.2.3-r2"
+revision: "2.3.2.4-free-adapters"
 fallback_when_registry_empty: deep
 
 # The former watchlist `core` set is preserved as explicit deep coverage.
@@ -57,6 +57,29 @@ sources:
     required_env: FINNHUB_API_KEY
     scopes: [broad]
     capabilities: [company_news]
+  alpha_vantage:
+    enabled: true
+    optional: true
+    required_env: ALPHA_VANTAGE_API_KEY
+    scopes: [deep]
+    capabilities: [market_summary, company_news]
+  fmp:
+    enabled: true
+    optional: true
+    required_env: FMP_API_KEY
+    scopes: [deep]
+    capabilities: [market_summary]
+  marketaux:
+    enabled: true
+    optional: true
+    required_env: MARKETAUX_API_KEY
+    scopes: [deep]
+    capabilities: [company_news]
+  openfigi:
+    enabled: true
+    optional: true
+    scopes: [deep]
+    capabilities: [security_identity]
   massive:
     enabled: true
     optional: true

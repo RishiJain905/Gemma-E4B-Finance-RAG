@@ -252,7 +252,7 @@ sources:
     assert registry.select("daily", source="deep_docs") == []
 
 
-def test_default_hourly_registry_uses_massive_news_and_disables_gdelt():
+def test_default_hourly_registry_uses_massive_news_and_daily_gdelt():
     registry = SourceRegistry.load(environ={"MASSIVE_API_KEY": "test-key"})
 
     assert [spec.name for spec in registry.select("hourly")] == ["massive_news"]
@@ -264,8 +264,11 @@ def test_default_hourly_registry_uses_massive_news_and_disables_gdelt():
     assert news.ttl_hours == 1
 
     gdelt = registry.get("gdelt")
-    assert gdelt.status == "configured_disabled"
-    assert gdelt.disabled_reason == "disabled by configuration"
+    assert gdelt.status == "enabled"
+    assert "daily" in gdelt.run_modes
+    assert "hourly" not in gdelt.run_modes
+    assert gdelt.requests_per_day <= 100
+    assert gdelt.max_work_items_per_run <= 10
 
 
 @pytest.mark.parametrize(

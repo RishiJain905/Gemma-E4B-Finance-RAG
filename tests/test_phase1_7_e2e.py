@@ -54,7 +54,19 @@ def _backdate(store, ticker, source, hours_ago):
 # Scenario 1: Full Daily Run
 # ════════════════════════════════════════════════════════
 
-def test_scenario_1_full_daily_run(store):
+def test_scenario_1_full_daily_run(store, monkeypatch):
+    for name in (
+        "FINNHUB_API_KEY",
+        "MASSIVE_API_KEY",
+        "BLS_API_KEY",
+        "BEA_API_KEY",
+        "EIA_API_KEY",
+        "OPENFDA_API_KEY",
+        "ALPHA_VANTAGE_API_KEY",
+        "FMP_API_KEY",
+        "MARKETAUX_API_KEY",
+    ):
+        monkeypatch.setenv(name, "test-key")
     scheduler = UnifiedScheduler(store=store, inter_source_delay=0)
     scheduler._run_source = MagicMock(return_value={"ok": True})
 
@@ -65,28 +77,27 @@ def test_scenario_1_full_daily_run(store):
         "yfinance", "fred", "sec_filings", "sec_companyfacts", "ir_pages", "estimates",
         "universe_nasdaq100", "universe_ivv", "universe_sec", "finnhub", "massive",
         "federal_reserve", "treasury", "bls", "bea", "eia", "ny_fed", "openfda",
-        "nhtsa", "usaspending",
+        "nhtsa", "usaspending", "alpha_vantage", "fmp", "marketaux", "openfigi", "gdelt",
     } <= set(result)
     assert all(
         result[name]["status"] == "success"
         for name in (
             "yfinance", "fred", "sec_filings", "sec_companyfacts", "ir_pages",
             "estimates", "universe_nasdaq100", "universe_ivv", "universe_sec",
-            "federal_reserve", "treasury", "ny_fed", "nhtsa", "usaspending",
+            "federal_reserve", "treasury", "ny_fed", "nhtsa", "usaspending", "gdelt",
         )
     )
-    assert "gdelt" not in result
     assert "earnings_transcripts" not in result
 
     # cache_meta entries were created under the unified:* convention.
-    for name in ("yfinance", "fred", "sec_filings", "ir_pages", "estimates"):
+    for name in ("yfinance", "fred", "sec_filings", "ir_pages", "estimates", "gdelt"):
         cache = store.get_cache_status("SCHEDULER", f"unified:{name}")
         assert cache is not None and cache["status"] == "fresh"
 
     # status_report reflects the run.
     report = scheduler.status_report()
     assert report["sources"]["yfinance"]["status"] == "fresh"
-    assert report["sources"]["gdelt"]["status"] == "configured_disabled"
+    assert report["sources"]["gdelt"]["status"] == "fresh"
 
 
 # ════════════════════════════════════════════════════════

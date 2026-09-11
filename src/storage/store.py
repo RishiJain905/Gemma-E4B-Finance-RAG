@@ -2009,6 +2009,9 @@ class Store:
         "yfinance_fundamentals": {"cache_source": "yfinance_fundamentals", "ttl_key": "fundamentals"},
         "yfinance_news":         {"cache_source": "yfinance_news",         "ttl_key": "news"},
         "finnhub_news":          {"cache_source": "finnhub_news",          "ttl_key": "finnhub_news"},
+        "alpha_vantage":         {"cache_source": "alpha_vantage_fundamentals", "ttl_key": "alpha_vantage"},
+        "fmp":                   {"cache_source": "fmp_fundamentals",       "ttl_key": "fmp"},
+        "marketaux_news":        {"cache_source": "marketaux_news",        "ttl_key": "marketaux_news"},
         "massive_market":        {"cache_source": "massive_market",        "ttl_key": "massive_market"},
         "massive_actions":       {"cache_source": "massive_actions",       "ttl_key": "massive_actions"},
         "sec_filings":           {"cache_source": "sec_filings_discovery", "ttl_key": "sec_filings"},
@@ -2023,7 +2026,8 @@ class Store:
         "fundamentals": 24, "news": 6, "macro": 24, "sec_filings": 12,
         "sec_companyfacts": 24,
         "finnhub_news": 6, "massive_market": 24, "massive_actions": 24,
-        "gdelt_news": 6, "transcripts": 168, "ir_pages": 24, "estimates": 24,
+        "gdelt_news": 24, "transcripts": 168, "ir_pages": 24, "estimates": 24,
+        "alpha_vantage": 24, "fmp": 24, "marketaux_news": 24, "openfigi": 168,
     }
 
     def _schedule_ttls(self) -> dict:
