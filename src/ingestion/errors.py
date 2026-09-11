@@ -117,8 +117,29 @@ def error_class_for_http(status_code: int, message: str = "") -> ErrorClass:
         return ErrorClass.AUTHENTICATION
     if status_code == 429:
         return ErrorClass.RATE_LIMITED
-    # FMP free-tier symbol blocks commonly return HTTP 402.
-    if status_code in {402, 403} or any(
+
+    # FMP free-tier per-symbol blocks (HTTP 402 / "special endpoint") are
+    # item-scoped. Classifying them as ENTITLEMENT opens the provider HTTP
+    # circuit mid-batch and aborts later free-tier tickers.
+    symbol_scoped = (
+        status_code == 402
+        or "special endpoint" in lowered
+        or "value set for 'symbol'" in lowered
+        or 'value set for "symbol"' in lowered
+    )
+    free_tier_marker = any(
+        marker in lowered
+        for marker in (
+            "subscription",
+            "upgrade your plan",
+            "premium",
+            "special endpoint",
+        )
+    )
+    if symbol_scoped and free_tier_marker:
+        return ErrorClass.ITEM
+
+    if status_code == 403 or any(
         marker in lowered
         for marker in (
             "entitlement",

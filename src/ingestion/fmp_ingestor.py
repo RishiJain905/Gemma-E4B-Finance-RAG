@@ -408,7 +408,7 @@ class FMPIngestor:
             return True
         if any(marker in message for marker in ("subscription", "premium")):
             return True
-        if error_class in {"entitlement", "contract"}:
+        if error_class in {"entitlement", "contract", "item"}:
             return True
         return False
 
