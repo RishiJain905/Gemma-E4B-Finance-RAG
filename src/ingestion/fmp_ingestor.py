@@ -57,7 +57,8 @@ RATIO_METRICS = (
 class FMPIngestor:
     """Ingest FMP income statements and TTM ratios into fundamentals/observations."""
 
-    BASE_URL = "https://financialmodelingprep.com/api/v3"
+    # Stable API (legacy /api/v3 paths are entitlement-blocked for new free keys).
+    BASE_URL = "https://financialmodelingprep.com/stable"
     SOURCE_NAME = "fmp"
     COVERAGE_SOURCE = "fmp"
     API_KEY_ENV = "FMP_API_KEY"
@@ -145,11 +146,14 @@ class FMPIngestor:
 
         accessed = self._now()
         try:
-            income = self._get(f"/income-statement/{ticker}", {"period": "annual", "limit": 1})
+            income = self._get(
+                "/income-statement",
+                {"symbol": ticker, "period": "annual", "limit": 1},
+            )
             result["requests"] += 1
             result["attempts"] += 1
             self._store_income(ticker, income, accessed, result)
-            ratios = self._get(f"/ratios-ttm/{ticker}", {})
+            ratios = self._get("/ratios-ttm", {"symbol": ticker})
             result["requests"] += 1
             result["attempts"] += 1
             self._store_ratios(ticker, ratios, accessed, result)
@@ -181,7 +185,7 @@ class FMPIngestor:
             return
         report = rows[0]
         period = as_date(report.get("date") or report.get("fillingDate") or accessed[:10], "date")
-        source_url = f"{self.base_url}/income-statement/{ticker}"
+        source_url = f"{self.base_url}/income-statement?symbol={ticker}"
         for field, metric_id, unit in INCOME_METRICS:
             value = parse_number(report.get(field))
             if value is None:
@@ -209,7 +213,7 @@ class FMPIngestor:
             return
         report = rows[0]
         period = as_date(accessed[:10], "as_of")
-        source_url = f"{self.base_url}/ratios-ttm/{ticker}"
+        source_url = f"{self.base_url}/ratios-ttm?symbol={ticker}"
         seen: set[str] = set()
         for field, metric_id, unit in RATIO_METRICS:
             if metric_id in seen:

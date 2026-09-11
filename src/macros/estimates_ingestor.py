@@ -77,7 +77,7 @@ class EstimatesIngestor:
             "timeout": 30,
             "fmp": {
                 "api_key": "${FMP_API_KEY}",
-                "base_url": "https://financialmodelingprep.com/api/v3",
+                "base_url": "https://financialmodelingprep.com/stable",
             },
             "finnhub": {
                 "api_key": "${FINNHUB_API_KEY}",
@@ -196,12 +196,12 @@ class EstimatesIngestor:
         facts: list[dict] = []
         key = self._api_key("fmp")
         cfg = self.config.get("fmp", {}) or {}
-        base_url = str(cfg.get("base_url", "https://financialmodelingprep.com/api/v3")).rstrip("/")
+        base_url = str(cfg.get("base_url", "https://financialmodelingprep.com/stable")).rstrip("/")
 
         try:
             resp = self.session.get(
-                f"{base_url}/analyst-estimates/{ticker}",
-                params={"apikey": key},
+                f"{base_url}/analyst-estimates",
+                params={"symbol": ticker, "apikey": key},
                 timeout=self.timeout,
             )
             resp.raise_for_status()
@@ -211,10 +211,9 @@ class EstimatesIngestor:
             logger.debug("FMP analyst estimates failed for %s: %s", ticker, exc)
             errors.append(f"fmp_estimates: {exc}")
 
-        price_base = base_url.replace("/api/v3", "/api/v4")
         try:
             resp = self.session.get(
-                f"{price_base}/price-target-consensus",
+                f"{base_url}/price-target-consensus",
                 params={"symbol": ticker, "apikey": key},
                 timeout=self.timeout,
             )

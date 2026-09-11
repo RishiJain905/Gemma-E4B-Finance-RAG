@@ -139,7 +139,11 @@ def test_fmp_income_and_ratios(tmp_path: Path) -> None:
     store, _ = _store(tmp_path)
 
     def http_get(url: str, **kwargs):
-        if "income-statement" in url:
+        params = kwargs.get("params") or {}
+        assert "apikey" in params
+        if url.rstrip("/").endswith("/income-statement"):
+            assert params.get("symbol") == "AAA"
+            assert params.get("period") == "annual"
             return FakeResponse(
                 [
                     {
@@ -150,7 +154,8 @@ def test_fmp_income_and_ratios(tmp_path: Path) -> None:
                     }
                 ]
             )
-        if "ratios-ttm" in url:
+        if url.rstrip("/").endswith("/ratios-ttm"):
+            assert params.get("symbol") == "AAA"
             return FakeResponse(
                 [
                     {
@@ -171,6 +176,7 @@ def test_fmp_income_and_ratios(tmp_path: Path) -> None:
         sleep_fn=lambda _s: None,
     ).ingest()
 
+    assert FMPIngestor.BASE_URL.endswith("/stable")
     assert result["status"] == "ok"
     assert result["facts_stored"] >= 4
     assert store.get_fundamental("AAA", "total_revenue")["value"] == 1_200_000.0

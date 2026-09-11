@@ -86,7 +86,7 @@ def _write_provider_config(tmp_path: Path, provider: str, key_var: str) -> Path:
                 "timeout: 5",
                 "fmp:",
                 f'  api_key: "${{{key_var}}}"',
-                '  base_url: "https://financialmodelingprep.com/api/v3"',
+                '  base_url: "https://financialmodelingprep.com/stable"',
                 "finnhub:",
                 f'  api_key: "${{{key_var}}}"',
                 '  base_url: "https://finnhub.io/api/v1"',
