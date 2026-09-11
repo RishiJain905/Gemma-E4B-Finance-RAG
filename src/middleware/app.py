@@ -3,9 +3,12 @@ src/middleware/app.py
 FastAPI application — the main entry point for the middleware layer.
 
 Endpoints:
-  GET  /health    — Health check (storage + model)
-  POST /query     — Ask a financial question (full pipeline)
-  POST /search    — Raw hybrid search (bypasses model)
+  GET  /health              — Health check (storage + model)
+  POST /query               — Ask a financial question (full pipeline + tools)
+  POST /search              — Raw hybrid search (bypasses model)
+  POST /financebot/rag      — FinanceBot retrieval with hit/miss contract
+  POST /financebot/tools    — FinanceBot dispatch of registered RAG tools
+  GET  /tools               — List tools (including classify_trade_bias)
 
 Usage:
     uvicorn src.middleware.app:app --host 0.0.0.0 --port 8000 --reload
@@ -26,6 +29,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 
 from src.storage.store import Store
+
 from . import prompt_policy
 from .config import MiddlewareConfig
 from .evidence import (
@@ -36,13 +40,22 @@ from .evidence import (
     usable_facts,
 )
 from .evidence_trace import EvidenceTraceCollector
+from .financebot import (
+    invoke_financebot_tool,
+    list_financebot_tools,
+    run_financebot_retrieval,
+)
 from .graph_api import create_graph_router
 from .models import (
+    MAX_QUESTION_CHARS,
     EvidenceCitation,
+    FinanceBotRagRequest,
+    FinanceBotRagResponse,
+    FinanceBotToolRequest,
+    FinanceBotToolResponse,
     FreshnessResponse,
     HealthResponse,
     MacroSnapshotResponse,
-    MAX_QUESTION_CHARS,
     QueryRequest,
     QueryResponse,
     RefreshRequest,
@@ -845,6 +858,7 @@ async def lifespan(app: FastAPI):
     store = Store(
         embedding_endpoint=config.embedding_endpoint,
         embedding_cache_size=config.embedding_cache_size,
+        embedding_model=config.model_name,
     )
     model_client = httpx.AsyncClient(timeout=60)
 
@@ -865,9 +879,11 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(
-    title="Gemma-E4B-Finance-RAG Middleware",
-    description="Hybrid RAG query router — retrieves facts + documents, "
-                "augments prompts, and returns grounded answers.",
+    title="FinanceBot hybrid RAG (Gemma-E4B-Finance-RAG)",
+    description=(
+        "Hybrid finance RAG for FinanceBot — retrieval, registered tools "
+        "(including long/short classify_trade_bias), and optional local generation."
+    ),
     version="1.0.0",
     lifespan=lifespan,
 )
@@ -1128,6 +1144,7 @@ async def tools():
     return {
         "enabled": bool(config.enable_tools) if config else False,
         "allow_write_tools": bool(config.allow_write_tools) if config else False,
+        "financebot_dispatch": "POST /financebot/tools",
         "tools": [
             {
                 "name": tool.name,
@@ -3423,6 +3440,83 @@ async def search(request: SearchRequest):
     )
 
 
+# ── FinanceBot adapter (RAG source of truth; all tools retained) ──
+
+@app.post("/financebot/rag", response_model=FinanceBotRagResponse)
+async def financebot_rag(request: FinanceBotRagRequest):
+    """Hybrid retrieval for FinanceBot with an explicit hit/miss contract.
+
+    Does not call a local chat model. On ``status=hit`` FinanceBot must answer
+    from the returned facts/documents only. On ``status=miss``,
+    ``web_search_allowed`` is true and open-web fallback is permitted.
+    All registered RAG tools remain available at ``POST /financebot/tools`` and
+    ``GET /tools`` (including ``classify_trade_bias`` for long vs short).
+    """
+    if not store:
+        raise HTTPException(status_code=503, detail="Store not initialized")
+
+    from .retriever import Retriever
+    r = retriever or Retriever(store=store, config=config)
+    min_facts = request.min_facts
+    min_documents = request.min_documents
+    min_score = request.min_document_score
+    if config is not None:
+        if min_facts == 1:
+            min_facts = int(getattr(config, "financebot_min_facts", 1) or 1)
+        if min_documents == 1:
+            min_documents = int(getattr(config, "financebot_min_documents", 1) or 1)
+        if min_score == 0.0:
+            min_score = float(getattr(config, "financebot_min_document_score", 0.0) or 0.0)
+
+    payload = run_financebot_retrieval(
+        store=store,
+        retriever=r,
+        query=request.query,
+        ticker=request.ticker,
+        n_results=request.n_results,
+        min_facts=min_facts,
+        min_documents=min_documents,
+        min_document_score=min_score,
+    )
+    return FinanceBotRagResponse(**payload)
+
+
+@app.post("/financebot/tools", response_model=FinanceBotToolResponse)
+async def financebot_tools(request: FinanceBotToolRequest):
+    """Invoke any registered RAG tool without a local chat model.
+
+    This is the FinanceBot path for ``classify_trade_bias`` (long vs short),
+    ``get_price_targets``, ``query_facts``, ``describe_coverage``, and every
+    other tool attached to this RAG. Write tools still require
+    ``allow_write_tools``.
+    """
+    if not store:
+        raise HTTPException(status_code=503, detail="Store not initialized")
+    allow_write = bool(getattr(config, "allow_write_tools", False)) if config else False
+    max_refreshes = int(getattr(config, "max_refreshes_per_query", 2) or 2) if config else 2
+    payload = invoke_financebot_tool(
+        store=store,
+        name=request.name,
+        arguments=request.arguments,
+        allow_write=allow_write,
+        max_refreshes=max_refreshes,
+    )
+    return FinanceBotToolResponse(**payload)
+
+
+@app.get("/financebot/tools")
+async def financebot_list_tools():
+    """List every registered RAG tool FinanceBot can call."""
+    enabled = bool(getattr(config, "enable_tools", False)) if config else False
+    allow_write = bool(getattr(config, "allow_write_tools", False)) if config else False
+    return {
+        "enabled": enabled,
+        "allow_write_tools": allow_write,
+        "financebot_direct_dispatch": True,
+        "tools": list_financebot_tools(),
+    }
+
+
 # ── Macro / Sentiment / Guidance ───────────────────────
 
 @app.get("/macro/snapshot", response_model=MacroSnapshotResponse)
@@ -3498,9 +3592,12 @@ async def guidance(ticker: str):
 @app.get("/")
 async def root():
     return {
-        "service": "Gemma-E4B-Finance-RAG Middleware",
+        "service": "FinanceBot hybrid RAG (Gemma-E4B-Finance-RAG)",
         "docs": "/docs",
         "health": "/health",
         "query": "POST /query",
         "search": "POST /search",
+        "financebot_rag": "POST /financebot/rag",
+        "financebot_tools": "POST /financebot/tools",
+        "tools": "GET /tools",
     }

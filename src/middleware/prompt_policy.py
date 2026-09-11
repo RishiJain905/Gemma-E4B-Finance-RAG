@@ -114,7 +114,9 @@ def _graded_system_prompt(
     if tools_enabled:
         tool_guidance = (
             "\n- Tools are available. Prefer calling the appropriate tool for "
-            "targeted facts, ranking/filtering, or freshness before refusing."
+            "targeted facts, ranking/filtering, or freshness before refusing. "
+            "For long vs short / buy vs sell, you MUST call classify_trade_bias "
+            "and report its bias (long, short, or neutral); do not guess."
         )
 
     return (

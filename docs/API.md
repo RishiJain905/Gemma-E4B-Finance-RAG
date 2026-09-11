@@ -18,11 +18,14 @@ Service info and quick links.
 
 ```json
 {
-  "service": "Gemma-E4B-Finance-RAG Middleware",
+  "service": "FinanceBot hybrid RAG (Gemma-E4B-Finance-RAG)",
   "docs": "/docs",
   "health": "/health",
   "query": "POST /query",
-  "search": "POST /search"
+  "search": "POST /search",
+  "financebot_rag": "POST /financebot/rag",
+  "financebot_tools": "POST /financebot/tools",
+  "tools": "GET /tools"
 }
 ```
 
@@ -81,7 +84,12 @@ tool-gating state.
 |-------|------|---------|
 | `enabled` | bool | Whether `/query` is configured to advertise tools to the model. |
 | `allow_write_tools` | bool | Whether state-changing tools may run. |
-| `tools` | array | Registered tools with `name`, `description`, and `write` flag. |
+| `financebot_dispatch` | string | FinanceBot tool endpoint (`POST /financebot/tools`). |
+| `tools` | array | Registered tools with `name`, `description`, and `write` flag. Includes `classify_trade_bias` (long vs short). |
+
+The full registry is also available at `GET /financebot/tools` and any tool can
+be invoked without a local chat model via `POST /financebot/tools`. See
+[FINANCEBOT.md](../FINANCEBOT.md).
 
 **Example:**
 
@@ -288,6 +296,41 @@ Availability is capability-gated (read `capabilities` from `/health`):
 If the model is unavailable, the legacy path (both flags off) returns **404**;
 with progress events or tool-final streaming on it degrades gracefully to a
 streamed degraded answer instead of poisoning the client's streaming capability.
+
+---
+
+## POST `/financebot/rag`
+
+FinanceBot retrieval adapter: hybrid search with an explicit hit/miss contract.
+Does **not** call a local chat model. See [FINANCEBOT.md](../FINANCEBOT.md).
+
+**Request:** `{query, ticker?, n_results?, min_facts?, min_documents?, min_document_score?}`
+
+**Response:** `status` is `hit` or `miss`. On hit, `web_search_allowed` is
+false and `source_of_truth` is `"rag"`. On miss, `web_search_allowed` is true.
+
+When the question is long vs short / buy vs sell, `trade_bias` is the
+`classify_trade_bias` result. FinanceBot **must** answer from `trade_bias.bias`
+and must not guess. A trade-bias hit counts as a RAG hit even if document
+retrieval was empty.
+
+All 13 registered RAG tools remain on `GET /tools` and `POST /financebot/tools`.
+
+---
+
+## POST `/financebot/tools`
+
+Dispatch any registered RAG tool (same registry as `/query`), including
+`classify_trade_bias` for long vs short. Write tools still require
+`allow_write_tools`.
+
+**Request:** `{name, arguments}`
+
+**Response:** `{tool, arguments, result, write, error?}`
+
+## GET `/financebot/tools`
+
+Lists the same tool registry as `GET /tools` for FinanceBot.
 
 ---
 

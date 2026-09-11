@@ -387,6 +387,90 @@ class SearchResponse(BaseModel):
     ticker: Optional[str] = None
 
 
+class FinanceBotRagRequest(BaseModel):
+    """FinanceBot RAG lookup — retrieval only, no local chat generation."""
+
+    query: str = Field(..., min_length=1, max_length=16000,
+                       description="Finance question to ground against the RAG corpus")
+    ticker: Optional[str] = Field(
+        None, description="Optional ticker filter / override")
+    n_results: int = Field(5, ge=1, le=20,
+                           description="Max facts and documents to retrieve")
+    min_facts: int = Field(
+        1, ge=1, le=20,
+        description="Minimum structured facts required to count as a hit",
+    )
+    min_documents: int = Field(
+        1, ge=1, le=20,
+        description="Minimum qualifying documents required to count as a hit",
+    )
+    min_document_score: float = Field(
+        0.0, ge=0.0,
+        description="Minimum document score (fusion/rerank/derived) to count",
+    )
+
+
+class FinanceBotRagResponse(BaseModel):
+    """Structured hit/miss payload for FinanceBot's RAG-first contract.
+
+    On ``status="hit"``, FinanceBot must answer from ``facts`` / ``documents``
+    only. On ``status="miss"``, ``web_search_allowed`` is true and open-web
+    fallback is permitted.
+    """
+
+    status: Literal["hit", "miss"] = Field(
+        ..., description="Whether the RAG corpus had relevant evidence")
+    web_search_allowed: bool = Field(
+        ..., description="True only on miss — FinanceBot may then use open web")
+    source_of_truth: Optional[Literal["rag"]] = Field(
+        None, description="'rag' on hit; null on miss")
+    query: str
+    ticker: Optional[str] = None
+    facts: list[dict] = Field(default_factory=list)
+    documents: list[dict] = Field(default_factory=list)
+    fact_count: int = 0
+    document_count: int = 0
+    top_score: Optional[float] = None
+    retrieval_strategy: Optional[str] = Field(
+        None, description="vector | hybrid | hybrid+rerank when available")
+    model_generation: bool = Field(
+        False,
+        description="Always false — this endpoint never calls a local chat model",
+    )
+    message: str = Field(
+        ...,
+        description="Human-readable contract reminder for the calling assistant",
+    )
+    trade_bias: Optional[dict] = Field(
+        None,
+        description=(
+            "classify_trade_bias result when the question is long vs short / "
+            "buy vs sell. FinanceBot MUST answer from bias and must not guess."
+        ),
+    )
+
+
+class FinanceBotToolRequest(BaseModel):
+    """Invoke a registered RAG tool (same registry as /query)."""
+
+    name: str = Field(..., min_length=1, max_length=128,
+                      description="Registered tool name, e.g. classify_trade_bias")
+    arguments: dict = Field(
+        default_factory=dict,
+        description="JSON arguments matching the tool schema",
+    )
+
+
+class FinanceBotToolResponse(BaseModel):
+    """Result of a FinanceBot tool dispatch."""
+
+    tool: str
+    arguments: dict = Field(default_factory=dict)
+    result: dict = Field(default_factory=dict)
+    write: bool = False
+    error: Optional[str] = None
+
+
 class MacroSnapshotResponse(BaseModel):
     """Snapshot of key macro-economic indicators."""
     gdp: Optional[float] = None

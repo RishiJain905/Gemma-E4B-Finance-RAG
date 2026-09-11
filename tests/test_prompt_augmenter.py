@@ -246,6 +246,23 @@ class TestPromptAugmenter:
         assert estimate > 0
         assert estimate < len(text)  # Should be less than char count
 
+    def test_long_or_short_requires_classify_trade_bias(self):
+        """Long vs short questions tell the model it must call classify_trade_bias."""
+        from src.middleware.prompt_augmenter import PromptAugmenter
+        augmenter = PromptAugmenter()
+        prompt = augmenter.build_prompt(
+            question="is NVDA a long or short trade",
+            intent={"ticker": "NVDA", "question_type": "general"},
+            retrieval={
+                "facts": [{"metric": "recommendation_mean", "value": 1.8,
+                           "ticker": "NVDA", "source_type": "estimates"}],
+                "documents": [],
+                "ticker": "NVDA",
+            },
+        )
+        assert "classify_trade_bias" in prompt
+        assert "long, short, or neutral" in prompt
+
 
 # ── Evidence ledger header (2.2.4.3) ───────────────────────────────────────
 

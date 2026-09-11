@@ -16,6 +16,7 @@ import logging
 from typing import TYPE_CHECKING, Optional
 
 from .config import MiddlewareConfig
+from .deterministic_router import is_trade_bias_question
 from .evidence import document_body, evidence_counts, usable_documents
 
 logger = logging.getLogger(__name__)
@@ -169,7 +170,9 @@ class PromptAugmenter:
             sections.append(self._build_no_data_section(ticker))
 
         # 5. Question-specific instructions
-        sections.append(self._build_question_instruction(question_type, ticker))
+        sections.append(self._build_question_instruction(
+            question_type, ticker, question=question,
+        ))
 
         # 6. The actual question
         sections.append(f"## User Question\n\n{question}")
@@ -400,7 +403,8 @@ class PromptAugmenter:
     # ── Question-Specific Instructions ─────────────────
 
     def _build_question_instruction(self, question_type: str,
-                                    ticker: Optional[str]) -> str:
+                                    ticker: Optional[str],
+                                    question: str = "") -> str:
         """Build question-type-specific instructions."""
         instructions = {
             "fact_lookup": (
@@ -449,6 +453,11 @@ class PromptAugmenter:
             question_type,
             "Answer the question using the provided context. Be accurate and concise."
         )
+        if is_trade_bias_question(question):
+            instruction += (
+                " You MUST call classify_trade_bias and report its bias "
+                "(long, short, or neutral). Do not invent a directional call."
+            )
 
         return f"## Instructions\n\n{instruction}"
 

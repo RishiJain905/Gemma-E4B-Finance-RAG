@@ -44,6 +44,9 @@ def tool_result_count(result: object) -> Optional[int]:
         value = result.get(key)
         if isinstance(value, dict):
             return len(value)
+    signals = result.get("signals")
+    if isinstance(signals, list):
+        return len(signals)
     articles = result.get("article_count")
     return articles if isinstance(articles, int) else None
 

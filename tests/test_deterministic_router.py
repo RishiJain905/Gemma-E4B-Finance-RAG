@@ -559,6 +559,46 @@ def test_latest_fact_lookup_still_routes():
     assert decision.tool_invocations[0].name == "get_fundamentals"
 
 
+def test_long_or_short_routes_to_classify_trade_bias():
+    plan = make_plan(
+        "is NVDA a long or short trade",
+        entities=["NVDA"],
+        intents=["general"],
+        primary_intent="general",
+    )
+    decision = route(plan, KNOWN_METRICS)
+
+    assert decision.matched and decision.complete
+    assert decision.tool_invocations[0].name == "classify_trade_bias"
+    assert decision.tool_invocations[0].arguments == {"ticker": "NVDA"}
+    assert decision.reason_codes == [dr.REASON_TRADE_BIAS]
+
+
+def test_buy_or_sell_routes_to_classify_trade_bias():
+    plan = make_plan(
+        "should I buy or sell NVDA",
+        entities=["NVDA"],
+        intents=["general"],
+        primary_intent="general",
+    )
+    decision = route(plan, KNOWN_METRICS)
+
+    assert decision.matched and decision.complete
+    assert decision.tool_invocations[0].name == "classify_trade_bias"
+
+
+def test_long_or_short_without_ticker_abstains():
+    plan = make_plan(
+        "is this a long or short trade",
+        entities=(),
+        intents=["general"],
+        primary_intent="general",
+    )
+    decision = route(plan, KNOWN_METRICS)
+    assert decision.matched is False
+    assert decision.abstain_reason == dr.ABSTAIN_AMBIGUOUS_ENTITY
+
+
 # ── Finding 2: complete only when all plan obligations are covered ──
 
 def test_projection_plus_uncovered_metric_is_incomplete():

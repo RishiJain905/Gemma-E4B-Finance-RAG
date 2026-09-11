@@ -7,6 +7,11 @@ document embeddings in dual backends; and answers natural-language financial
 questions using a fine-tuned **Gemma 4 E4B** model (codename *TraceAlchemy*)
 served locally by `llama-server`.
 
+**FinanceBot (Grok)** can use this same hybrid RAG as its **source of truth**.
+Gemma is optional. See **[FINANCEBOT.md](FINANCEBOT.md)** for the RAG-first /
+web-only-on-miss contract, env placeholders, populate commands, and the
+`classify_trade_bias` long-vs-short tool (all existing RAG tools remain).
+
 Built on top of
 [trjxter/TraceAlchemy-Gemma-4-E4B-Finance-IT-gguf](https://huggingface.co/trjxter/TraceAlchemy-Gemma-4-E4B-Finance-IT-gguf),
 a finance-specialized GGUF model. The model server runs on **Windows + AMD
@@ -80,7 +85,9 @@ pip install -r requirements.txt
 
 ### 3. Configure environment variables
 
-Create a `.env` file in the project root with:
+Create a `.env` file in the project root (copy [`.env.example`](.env.example)).
+Do not commit `.env`. FinanceBot setup is also documented in
+[FINANCEBOT.md](FINANCEBOT.md).
 
 ```dotenv
 FRED_API_KEY=your_fred_api_key_here
@@ -470,6 +477,10 @@ The middleware exposes the following endpoints (full schemas and examples in
 | GET    | `/macro/snapshot`      | Key macro indicators (cached FRED data)          |
 | GET    | `/sentiment/{ticker}`  | Sentiment from preserved GDELT evidence          |
 | GET    | `/guidance/{ticker}`   | Latest earnings guidance                         |
+| GET    | `/tools`               | List registered RAG tools (including `classify_trade_bias`) |
+| POST   | `/financebot/rag`      | FinanceBot hybrid retrieval with hit/miss (`web_search_allowed`) |
+| POST   | `/financebot/tools`    | FinanceBot dispatch of **all** registered RAG tools |
+| GET    | `/financebot/tools`    | Same registry as `/tools`, for FinanceBot |
 
 ---
 

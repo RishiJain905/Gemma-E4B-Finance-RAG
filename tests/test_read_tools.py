@@ -225,6 +225,54 @@ def test_get_price_targets_returns_estimate_facts_with_periods(store):
     }
 
 
+def test_classify_trade_bias_long_from_recommendation(store, monkeypatch):
+    _seed_metric(
+        store, "NVDA", "recommendation_mean", 1.8,
+        period="2027-07E", unit="score", period_type="estimate", source_type="estimates",
+    )
+    monkeypatch.setattr(
+        data_tools, "get_sentiment_handler",
+        lambda store, ticker, days=7: {"average_tone": None, "article_count": 0},
+    )
+
+    result = data_tools.classify_trade_bias_handler(store, ticker="nvda")
+
+    assert result["ticker"] == "NVDA"
+    assert result["bias"] == "long"
+    assert result["evidence_status"] == "hit"
+    assert result["web_search_allowed"] is False
+    assert result["must_answer"] is True
+
+
+def test_classify_trade_bias_short_from_recommendation(store, monkeypatch):
+    _seed_metric(
+        store, "NVDA", "recommendation_mean", 4.6,
+        period="2027-07E", unit="score", period_type="estimate", source_type="estimates",
+    )
+    monkeypatch.setattr(
+        data_tools, "get_sentiment_handler",
+        lambda store, ticker, days=7: {"average_tone": None, "article_count": 0},
+    )
+
+    result = data_tools.classify_trade_bias_handler(store, ticker="nvda")
+
+    assert result["bias"] == "short"
+    assert result["evidence_status"] == "hit"
+
+
+def test_classify_trade_bias_miss_without_evidence(store, monkeypatch):
+    monkeypatch.setattr(
+        data_tools, "get_sentiment_handler",
+        lambda store, ticker, days=7: {"average_tone": None, "article_count": 0},
+    )
+
+    result = data_tools.classify_trade_bias_handler(store, ticker="ZZZZ")
+
+    assert result["bias"] == "neutral"
+    assert result["evidence_status"] == "miss"
+    assert result["web_search_allowed"] is True
+
+
 def test_check_freshness(store):
     store.mark_source_fresh("NVDA", "yfinance_fundamentals", 24)
 
@@ -248,6 +296,7 @@ def test_all_read_tools_registered_write_false():
         "get_guidance",
         "get_estimates",
         "get_price_targets",
+        "classify_trade_bias",
         "check_freshness",
     }
 

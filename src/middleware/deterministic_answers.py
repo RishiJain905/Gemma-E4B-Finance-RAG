@@ -33,6 +33,7 @@ class TemplateClass(str, Enum):
     TARGET = "target"
     GUIDANCE = "guidance"
     MACRO = "macro"
+    TRADE_BIAS = "trade_bias"
 
 
 @dataclass(frozen=True)
@@ -68,6 +69,7 @@ _REASON_TO_TEMPLATE = {
     dr.REASON_GUIDANCE: TemplateClass.GUIDANCE,
     dr.REASON_MACRO: TemplateClass.MACRO,
     dr.REASON_FRESHNESS: TemplateClass.FRESHNESS,
+    dr.REASON_TRADE_BIAS: TemplateClass.TRADE_BIAS,
 }
 
 
@@ -152,6 +154,8 @@ def _known_result_shape(template: TemplateClass, invocation, result) -> bool:
         return isinstance(raw.get("macro"), dict)
     if template is TemplateClass.FRESHNESS:
         return "overall" in raw and isinstance(raw.get("sources", {}), dict)
+    if template is TemplateClass.TRADE_BIAS:
+        return raw.get("bias") in {"long", "short", "neutral"}
     return False
 
 
@@ -196,6 +200,8 @@ def _has_material_result(template: TemplateClass, invocation) -> bool:
         return bool(raw.get("macro"))
     if template is TemplateClass.FRESHNESS:
         return bool(raw.get("sources")) or bool(raw.get("overall"))
+    if template is TemplateClass.TRADE_BIAS:
+        return raw.get("evidence_status") == "hit" and bool(raw.get("signals"))
     return False
 
 
@@ -300,7 +306,7 @@ def check_final_answer_contract(
     freshness = freshness or {}
     if freshness.get("refreshed_during_query") or freshness.get("fetched_on_miss"):
         return ContractCheck(False, "write_performed", template)
-    if template is not TemplateClass.FRESHNESS:
+    if template not in {TemplateClass.FRESHNESS, TemplateClass.TRADE_BIAS}:
         if freshness.get("stale_sources_used") or str(freshness.get("overall", "")).lower() == "stale":
             return ContractCheck(False, "stale_policy_violation", template)
         if _has_flag(facts, "stale") or _has_flag(raw_results, "stale"):
@@ -596,6 +602,29 @@ def _render_freshness(invocation, ledger) -> RenderedAnswer:
     return RenderedAnswer(text, TemplateClass.FRESHNESS)
 
 
+def _render_trade_bias(invocation, ledger) -> RenderedAnswer:
+    """Force a long / short / neutral answer from classify_trade_bias."""
+    raw = invocation.result if isinstance(invocation.result, dict) else {}
+    ticker = str(raw.get("ticker") or invocation.arguments.get("ticker") or "")
+    bias = str(raw.get("bias") or "neutral")
+    confidence = raw.get("confidence")
+    item = _find_item(ledger, ticker=ticker, metric="trade_bias", value=bias)
+    citation = f" [{getattr(item, 'evidence_id')}]" if item is not None else ""
+    caveat = " This is not financial advice."
+    if raw.get("evidence_status") == "miss":
+        text = (
+            f"No indexed long/short evidence for {ticker}; RAG miss. "
+            f"Open-web fallback is allowed.{caveat}"
+        )
+        return RenderedAnswer(text, TemplateClass.TRADE_BIAS)
+    conf = f" (confidence {confidence})" if confidence is not None else ""
+    text = (
+        f"{ticker} is a {bias} trade{conf}.{citation} "
+        f"Answer from classify_trade_bias; do not guess.{caveat}"
+    )
+    return RenderedAnswer(text, TemplateClass.TRADE_BIAS, ({"result": bias},))
+
+
 def render_deterministic_answer(result, *, evidence_ledger: Iterable[Any]) -> RenderedAnswer:
     """Render one allowlisted typed answer; never calls or rewrites through a model."""
     execution = getattr(result, "tool_execution", None)
@@ -618,6 +647,8 @@ def render_deterministic_answer(result, *, evidence_ledger: Iterable[Any]) -> Re
         rendered = _render_macro(invocation, ledger)
     elif template is TemplateClass.FRESHNESS:
         rendered = _render_freshness(invocation, ledger)
+    elif template is TemplateClass.TRADE_BIAS:
+        rendered = _render_trade_bias(invocation, ledger)
     else:  # pragma: no cover - enum + allowlist make this defensive only
         raise DeterministicAnswerError("unsupported deterministic template")
     if not rendered.text.strip():

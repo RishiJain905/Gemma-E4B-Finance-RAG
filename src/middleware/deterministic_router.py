@@ -9,7 +9,8 @@ pure, explicit rules and no model call — whether a request can be answered by
 the existing read-only finance tools. Safe analytical, comparison, projection,
 and bounded-calculation requests map onto ``get_fundamentals`` / ``query_facts``
 / ``get_estimates`` / ``get_price_targets`` / ``get_guidance`` /
-``get_macro_snapshot`` / ``get_sentiment``. Anything ambiguous, qualitative, or
+``get_macro_snapshot`` / ``get_sentiment`` / ``classify_trade_bias``.
+Anything ambiguous, qualitative, or
 write-requiring makes the router *abstain* so the caller keeps the existing
 hybrid retrieval + model path.
 
@@ -58,6 +59,7 @@ REASON_MACRO = "route_get_macro_snapshot"
 REASON_FRESHNESS = "route_check_freshness"
 REASON_SENTIMENT = "route_get_sentiment"
 REASON_COVERAGE = "route_describe_coverage"
+REASON_TRADE_BIAS = "route_classify_trade_bias"
 
 ABSTAIN_AMBIGUOUS_ENTITY = "ambiguous_entity"
 ABSTAIN_AMBIGUOUS_METRIC = "ambiguous_metric"
@@ -200,6 +202,20 @@ _FRESHNESS_STATUS_RE = re.compile(
     r"how (?:fresh|current|recent)|when (?:was|were).*(?:updated|fetched))\b",
     re.IGNORECASE,
 )
+_TRADE_BIAS_RE = re.compile(
+    r"\b(?:long or short|short or long|long vs\.? short|short vs\.? long|"
+    r"long/short|buy or sell|sell or buy|overweight or underweight|"
+    r"trade bias|directional (?:call|bias)|should I (?:buy|sell|short|long)|"
+    r"bullish or bearish)\b",
+    re.IGNORECASE,
+)
+
+
+def is_trade_bias_question(text: str) -> bool:
+    """True when the ask requires classify_trade_bias (long vs short)."""
+    return bool(_TRADE_BIAS_RE.search(text or ""))
+
+
 _ALL_TICKERS_RE = re.compile(
     r"\b(?:all|every)\s+(?:active\s+)?tickers?\b|\bwhat tickers\b|"
     r"\bwhich companies can you answer questions about\b",
@@ -603,6 +619,22 @@ def route(plan: "QueryPlan", available_metrics: Iterable[str]) -> RouteDecision:
                 REASON_FRESHNESS,
             )],
             reason_codes=[REASON_FRESHNESS],
+        )
+
+    if is_trade_bias_question(text):
+        if len(entities) != 1:
+            return _abstain(ABSTAIN_AMBIGUOUS_ENTITY, [ABSTAIN_AMBIGUOUS_ENTITY])
+        subquery_id = plan.subqueries[0].id if plan.subqueries else "sq0"
+        return RouteDecision(
+            matched=True,
+            complete=True,
+            tool_invocations=[ToolInvocation(
+                "classify_trade_bias",
+                {"ticker": entities[0]},
+                subquery_id,
+                REASON_TRADE_BIAS,
+            )],
+            reason_codes=[REASON_TRADE_BIAS],
         )
 
     coverage = _coverage_invocation(plan)
@@ -1290,6 +1322,8 @@ def build_deterministic_answer(
             return _answer_macro(result)
         if reason == REASON_SENTIMENT:
             return _answer_sentiment(result, inv.arguments)
+        if reason == REASON_TRADE_BIAS:
+            return _answer_trade_bias(result)
         if reason == REASON_COVERAGE:
             if _is_filtered_security_source_set(execution.invocations):
                 return _answer_coverage_set(execution.invocations)
@@ -1385,6 +1419,23 @@ def _answer_sentiment(result: dict, args: dict) -> Optional[str]:
     ticker = args.get("ticker")
     days = args.get("days")
     return f"News sentiment summary for {ticker} over the last {days} days: {result}."
+
+
+def _answer_trade_bias(result: dict) -> Optional[str]:
+    """Render the required long/short classification from indexed evidence."""
+    if not result or result.get("error"):
+        return None
+    ticker = result.get("ticker")
+    bias = result.get("bias")
+    if not ticker or not bias:
+        return None
+    confidence = result.get("confidence")
+    message = result.get("message") or f"RAG trade bias for {ticker} is {bias}."
+    caveat = " This is not financial advice."
+    if result.get("evidence_status") == "miss":
+        return f"{message}{caveat}"
+    conf = f" (confidence {confidence})" if confidence is not None else ""
+    return f"{ticker} trade bias is {bias}{conf}. {message}{caveat}"
 
 
 def _coverage_answer_metadata(result: dict) -> dict:

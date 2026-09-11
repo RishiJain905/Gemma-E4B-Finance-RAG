@@ -1973,6 +1973,27 @@ def _normalize_tool_facts(execution: "ExecutionResult") -> list[dict]:
                         "source_type": "fred",
                     })
 
+        if inv.name == "classify_trade_bias":
+            ticker = res.get("ticker") or inv.arguments.get("ticker")
+            facts.append({
+                "metric": "trade_bias",
+                "value": res.get("bias"),
+                "ticker": ticker,
+                "source_type": "tool",
+                "kind": "tool_result",
+            })
+            for signal in res.get("signals") or []:
+                if not isinstance(signal, dict) or not signal.get("name"):
+                    continue
+                facts.append({
+                    "metric": str(signal["name"]),
+                    "value": signal.get("value"),
+                    "ticker": ticker,
+                    "period": signal.get("period"),
+                    "source_type": "tool",
+                    "kind": "tool_result",
+                })
+
         if inv.name == "check_freshness":
             ticker = res.get("ticker") or inv.arguments.get("ticker")
             for source, detail in (res.get("sources") or {}).items():

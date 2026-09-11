@@ -265,6 +265,29 @@ ELIGIBLE_CASES = [
         _plan(intents=("fact_lookup",), metrics=()),
         id="freshness",
     ),
+    pytest.param(
+        da.TemplateClass.TRADE_BIAS,
+        _execution(
+            "classify_trade_bias",
+            dr.REASON_TRADE_BIAS,
+            {
+                "ticker": "NVDA",
+                "bias": "long",
+                "confidence": 1.0,
+                "evidence_status": "hit",
+                "web_search_allowed": False,
+                "must_answer": True,
+                "signals": [{"name": "recommendation_mean", "value": 1.8, "direction": "long"}],
+            },
+            arguments={"ticker": "NVDA"},
+        ),
+        [{
+            "ticker": "NVDA", "metric": "trade_bias", "value": "long",
+            "source_type": "tool",
+        }],
+        _plan(intents=("general",), metrics=()),
+        id="trade_bias",
+    ),
 ]
 
 
@@ -294,6 +317,40 @@ def test_typed_templates_preserve_values_provenance_and_caveats(
         assert "[E1]" in rendered.text
     if template in {da.TemplateClass.ESTIMATE, da.TemplateClass.TARGET, da.TemplateClass.GUIDANCE}:
         assert "not guarantees" in rendered.text
+    if template is da.TemplateClass.TRADE_BIAS:
+        assert "long" in rendered.text
+        assert "classify_trade_bias" in rendered.text
+
+
+def test_trade_bias_miss_still_renders_forced_answer():
+    execution = _execution(
+        "classify_trade_bias",
+        dr.REASON_TRADE_BIAS,
+        {
+            "ticker": "ZZZZ",
+            "bias": "neutral",
+            "confidence": 0.0,
+            "evidence_status": "miss",
+            "web_search_allowed": True,
+            "must_answer": True,
+            "signals": [],
+        },
+        arguments={"ticker": "ZZZZ"},
+    )
+    result, ledger = _case(
+        template=da.TemplateClass.TRADE_BIAS,
+        execution=execution,
+        facts=[],
+        plan=_plan(intents=("general",), metrics=()),
+    )
+    contract = da.check_final_answer_contract(
+        result, evidence_ledger=ledger, freshness={"overall": "fresh"},
+    )
+    rendered = da.render_deterministic_answer(result, evidence_ledger=ledger)
+    assert contract.eligible is True
+    assert contract.template is da.TemplateClass.TRADE_BIAS
+    assert "RAG miss" in rendered.text
+    assert "Open-web fallback is allowed" in rendered.text
 
 
 def _config(**overrides):

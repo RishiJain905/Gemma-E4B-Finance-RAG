@@ -5,6 +5,7 @@ Analytical tools over middleware data sources.
 
 import logging
 import os
+import time
 from datetime import datetime, timezone
 
 from . import sanity
@@ -308,6 +309,131 @@ def get_price_targets_handler(store, ticker):
         return {"error": str(e), "ticker": ticker}
 
 
+def _numeric_fact_value(row) -> float | None:
+    """Extract a float from a fundamentals row or None."""
+    if not isinstance(row, dict) or row.get("value") is None:
+        return None
+    try:
+        return float(row["value"])
+    except (TypeError, ValueError):
+        return None
+
+
+def classify_trade_bias_handler(store, ticker):
+    """Classify a ticker as long, short, or neutral from indexed RAG evidence.
+
+    Models and FinanceBot MUST call this for long-vs-short / buy-vs-sell
+    questions instead of guessing. A miss (no indexed signals) sets
+    ``web_search_allowed`` so the caller may use open web only then.
+    """
+    ticker = str(ticker or "").strip().upper()
+    if not ticker:
+        return {"error": "ticker is required", "bias": None}
+
+    signals: list[dict] = []
+    votes: list[int] = []
+
+    rec_row = store.get_fundamental(ticker, "recommendation_mean")
+    rec_val = _numeric_fact_value(rec_row)
+    if rec_val is not None:
+        # Standard broker scale: 1 = Strong Buy … 5 = Sell.
+        if rec_val <= 2.5:
+            direction, vote = "long", 1
+        elif rec_val >= 3.5:
+            direction, vote = "short", -1
+        else:
+            direction, vote = "neutral", 0
+        votes.append(vote)
+        signals.append({
+            "name": "recommendation_mean",
+            "value": rec_val,
+            "period": rec_row.get("period") if rec_row else None,
+            "direction": direction,
+            "note": "1=Strong Buy, 5=Sell",
+        })
+
+    target_row = store.get_fundamental(ticker, "price_target_mean")
+    price_row = store.get_fundamental(ticker, "price")
+    target_val = _numeric_fact_value(target_row)
+    price_val = _numeric_fact_value(price_row)
+    if target_val is not None and price_val not in (None, 0):
+        upside = (target_val - price_val) / price_val
+        if upside >= 0.05:
+            direction, vote = "long", 1
+        elif upside <= -0.05:
+            direction, vote = "short", -1
+        else:
+            direction, vote = "neutral", 0
+        votes.append(vote)
+        signals.append({
+            "name": "price_vs_target",
+            "value": round(upside, 6),
+            "price": price_val,
+            "price_target_mean": target_val,
+            "direction": direction,
+        })
+
+    try:
+        sentiment = get_sentiment_handler(store, ticker, days=7)
+    except Exception:  # noqa: BLE001 — sentiment is optional for this classification
+        sentiment = {}
+    tone = sentiment.get("average_tone") if isinstance(sentiment, dict) else None
+    if isinstance(tone, (int, float)):
+        if tone >= 1:
+            direction, vote = "long", 1
+        elif tone <= -1:
+            direction, vote = "short", -1
+        else:
+            direction, vote = "neutral", 0
+        votes.append(vote)
+        signals.append({
+            "name": "sentiment_tone",
+            "value": float(tone),
+            "article_count": sentiment.get("article_count"),
+            "direction": direction,
+        })
+
+    if not signals:
+        return {
+            "ticker": ticker,
+            "bias": "neutral",
+            "confidence": 0.0,
+            "evidence_status": "miss",
+            "web_search_allowed": True,
+            "signals": [],
+            "must_answer": True,
+            "message": (
+                f"No indexed long/short evidence for {ticker}; RAG miss. "
+                "Open-web fallback is allowed."
+            ),
+        }
+
+    score = sum(votes)
+    if score > 0:
+        bias = "long"
+    elif score < 0:
+        bias = "short"
+    else:
+        directional = [s["direction"] for s in signals if s["direction"] in ("long", "short")]
+        bias = directional[0] if directional else "neutral"
+
+    n_votes = max(len(votes), 1)
+    confidence = round(min(1.0, abs(score) / n_votes), 3)
+    return {
+        "ticker": ticker,
+        "bias": bias,
+        "confidence": confidence,
+        "evidence_status": "hit",
+        "web_search_allowed": False,
+        "signals": signals,
+        "must_answer": True,
+        "message": (
+            f"RAG trade bias for {ticker} is {bias}. "
+            "Answer from this tool; do not use open web."
+        ),
+    }
+
+
 def check_freshness_handler(store, ticker):
     """Return freshness status for one ticker."""
     ticker = ticker.upper()
@@ -420,6 +546,7 @@ get_sentiment = get_sentiment_handler
 get_guidance = get_guidance_handler
 get_estimates = get_estimates_handler
 get_price_targets = get_price_targets_handler
+classify_trade_bias = classify_trade_bias_handler
 check_freshness = check_freshness_handler
 refresh_data = refresh_data_handler
 
@@ -616,6 +743,32 @@ register(
             "required": ["ticker"],
         },
         handler=get_price_targets_handler,
+        write=False,
+    )
+)
+
+register(
+    Tool(
+        name="classify_trade_bias",
+        description=(
+            "REQUIRED for any question about whether a stock is a long or a short, "
+            "buy or sell, overweight or underweight, or a trade bias. Do NOT guess "
+            "or invent a directional call — call this tool and report its `bias` "
+            "field (long, short, or neutral) from indexed RAG evidence "
+            "(analyst recommendation_mean, price vs target, sentiment). "
+            "If evidence_status is miss, say so rather than fabricating a trade."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "ticker": {
+                    "type": "string",
+                    "description": "Ticker to classify as long/short, e.g. 'NVDA'.",
+                },
+            },
+            "required": ["ticker"],
+        },
+        handler=classify_trade_bias_handler,
         write=False,
     )
 )
