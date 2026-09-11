@@ -160,6 +160,12 @@ class MiddlewareConfig:
         self.enable_streaming: bool = True
         self.embedding_cache_size: int = 256
 
+        # FinanceBot RAG adapter thresholds (retrieval-only hit/miss contract).
+        # Env: FINANCEBOT_MIN_FACTS, FINANCEBOT_MIN_DOCUMENTS, FINANCEBOT_MIN_DOCUMENT_SCORE.
+        self.financebot_min_facts: int = 1
+        self.financebot_min_documents: int = 1
+        self.financebot_min_document_score: float = 0.0
+
         # Phase 2.3 additive rollout gates. Off preserves the Phase 2.2 query
         # and Corpus Explorer paths; stored evidence and schema remain intact.
         self.enable_phase2_3_retrieval: bool = False
@@ -611,6 +617,15 @@ class MiddlewareConfig:
         _float("CORPUS_OVERVIEW_CACHE_TTL_S", "corpus_overview_cache_ttl_s")
         _float("CORPUS_OPAQUE_ID_TTL_S", "corpus_opaque_id_ttl_s")
         _int("EMBEDDING_CACHE_SIZE", "embedding_cache_size")
+        # Model-agnostic endpoint / name overrides (FinanceBot does not require Gemma).
+        _str("LLAMA_ENDPOINT", "llama_endpoint")
+        _str("CHAT_ENDPOINT", "llama_endpoint")  # alias
+        _str("EMBEDDING_ENDPOINT", "embedding_endpoint")
+        _str("MODEL_NAME", "model_name")
+        _str("EMBEDDING_MODEL", "model_name")  # alias — embeddings + optional chat id
+        _int("FINANCEBOT_MIN_FACTS", "financebot_min_facts")
+        _int("FINANCEBOT_MIN_DOCUMENTS", "financebot_min_documents")
+        _float("FINANCEBOT_MIN_DOCUMENT_SCORE", "financebot_min_document_score")
         _int("CONVERSATION_MAX_TURNS", "conversation_max_turns")
         _int("CONVERSATION_MAX_HISTORY_CHARS", "conversation_max_history_chars")
         _int("CONVERSATION_MAX_QUESTION_CHARS", "conversation_max_question_chars")

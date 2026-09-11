@@ -18,9 +18,10 @@ logger = logging.getLogger(__name__)
 
 
 class TraceAlchemyEmbeddingFunction(EmbeddingFunction):
-    """
-    Custom embedding function that calls your local llama-server
-    /v1/embeddings endpoint with --pooling mean enabled.
+    """OpenAI-compatible embedding client (llama-server or any `/v1/embeddings`).
+
+    The class name is historical. Endpoint and model id are configurable
+    (``EMBEDDING_ENDPOINT``, ``MODEL_NAME`` / ``EMBEDDING_MODEL``).
     """
 
     def __init__(self, endpoint: str = "http://127.0.0.1:8087/v1/embeddings",
@@ -126,6 +127,10 @@ def _load_chunking_config() -> dict:
         return {}
 
 
+# Model-agnostic alias — any OpenAI-compatible /v1/embeddings server works.
+OpenAICompatibleEmbeddingFunction = TraceAlchemyEmbeddingFunction
+
+
 class ChromaStore:
     """
     Wraps ChromaDB collection operations.
@@ -156,6 +161,7 @@ class ChromaStore:
                  collection_name: str = "tracealchemy_docs",
                  embedding_endpoint: str = "http://127.0.0.1:8087/v1/embeddings",
                  embedding_cache_size: int = 256,
+                 embedding_model: str = "tracealchemy",
                  chunk_chars: Optional[int] = None,
                  chunk_overlap: Optional[int] = None,
                  chunk_strategy: Optional[str] = None,
@@ -175,6 +181,7 @@ class ChromaStore:
         # Create embedding function
         self.embedding_fn = TraceAlchemyEmbeddingFunction(
             endpoint=embedding_endpoint,
+            model=embedding_model,
             embedding_cache_size=embedding_cache_size,
         )
         self.last_search_timings = {"embedding": 0.0, "chroma": 0.0}
