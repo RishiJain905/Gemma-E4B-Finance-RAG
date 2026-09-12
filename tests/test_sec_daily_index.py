@@ -250,8 +250,22 @@ def test_holiday_403_is_marked_absent_when_a_later_date_succeeds(store: Store) -
 
     assert result["absent"] == ["2026-06-19"]
     assert result["failed"] == 0
+    assert result.get("errors") == []
     assert "error_class" not in result
     assert store.get_sec_daily_index_status("2026-06-19") == "absent"
+    from src.scheduler import UnifiedScheduler
+
+    status, reason = UnifiedScheduler._classify_detail(
+        {
+            "mode": "daily_index",
+            "checked": 1,
+            "new_filings": int(result.get("registered") or 0),
+            "failed": result["failed"],
+            "details": result,
+        }
+    )
+    assert status == "success"
+    assert reason is None
     # The absent date is never re-fetched.
     discovery.discover_dates(["2026-06-19"])
     assert get.call_count == 2

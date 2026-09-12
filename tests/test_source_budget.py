@@ -136,3 +136,42 @@ def test_budgeted_http_client_waits_for_next_minute_without_bypassing_quota():
     assert http_get("https://example.test/second").status_code == 200
     assert sleeps == [60.0]
     assert budget.attempted_requests == 2
+
+
+def test_alpha_vantage_style_minute_budget_paces_instead_of_aborting():
+    """A 5/min free-tier budget must wait for the window rather than skip the 6th call."""
+    clock = {"now": 0.0}
+    sleeps: list[float] = []
+
+    class Response:
+        status_code = 200
+        headers = {}
+
+    budget = _budget(
+        requests_per_minute=5,
+        requests_per_run=20,
+        requests_per_day=25,
+        now_fn=lambda: clock["now"],
+        minute_started=0.0,
+    )
+
+    def sleep(seconds):
+        sleeps.append(seconds)
+        clock["now"] += seconds
+
+    http_get = budget.wrap_http_get(
+        lambda *_args, **_kwargs: Response(),
+        wait_for_minute=True,
+        max_wait_seconds=60,
+        sleep_fn=sleep,
+    )
+
+    for index in range(6):
+        assert http_get(f"https://example.test/{index}").status_code == 200
+
+    assert budget.attempted_requests == 6
+    assert budget.exhausted_reason is None
+    # Five paced intervals of 12s plus a residual wait into the next minute window.
+    assert sleeps
+    assert sum(sleeps) >= 60.0
+    assert all(delay > 0 for delay in sleeps)

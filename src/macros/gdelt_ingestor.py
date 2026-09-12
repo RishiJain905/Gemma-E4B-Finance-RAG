@@ -125,8 +125,9 @@ class GDELTIngestor:
         return {
             "max_records": 250,
             "lookback_days": 7,
-            "request_delay": 5.0,
-            "max_retries_on_429": 2,
+            "request_delay": 7.0,
+            "max_retries_on_429": 4,
+            "max_query_terms_per_ticker": 1,
             "financial_topics": ["FINANCE", "MARKETS", "CORPORATE"],
         }
 
@@ -159,6 +160,17 @@ class GDELTIngestor:
         "MSTR": ["MicroStrategy", "Strategy", "MSTR"],
     }
 
+    def _query_terms_for_ticker(self, ticker: str) -> list[str]:
+        """Return DOC query terms for a ticker, capped to limit API fan-out."""
+        terms = list(self.TICKER_TO_QUERY.get(ticker.upper(), [ticker]))
+        try:
+            limit = int(self.config.get("max_query_terms_per_ticker", 1))
+        except (TypeError, ValueError):
+            limit = 1
+        if limit < 1:
+            limit = 1
+        return terms[:limit] or [ticker]
+
     # ── Public API ─────────────────────────────────────
 
     def fetch_news_for_ticker(
@@ -178,7 +190,7 @@ class GDELTIngestor:
         Returns:
             List of processed article dicts
         """
-        query_terms = self.TICKER_TO_QUERY.get(ticker.upper(), [ticker])
+        query_terms = self._query_terms_for_ticker(ticker)
         max_records = max_records or self.config.get("max_records", 250)
         lookback_days = lookback_days or self.config.get("lookback_days", 7)
 
@@ -402,8 +414,8 @@ class GDELTIngestor:
         Enforces minimum gap between requests and retries 429 with exponential
         backoff (request_delay * 2**attempt), capped by max_retries_on_429.
         """
-        delay = float(self.config.get("request_delay", 5.0))
-        max_retries = int(self.config.get("max_retries_on_429", 2))
+        delay = float(self.config.get("request_delay", 7.0))
+        max_retries = int(self.config.get("max_retries_on_429", 4))
         label = log_context or url
         retry_timestamps: list[str] = []
 
@@ -826,7 +838,7 @@ class GDELTIngestor:
 
     def _respect_rate_limit(self) -> None:
         """Enforce minimum gap since the last GDELT HTTP call."""
-        delay = float(self.config.get("request_delay", 5.0))
+        delay = float(self.config.get("request_delay", 7.0))
         if delay <= 0:
             return
         with _gdelt_request_lock:

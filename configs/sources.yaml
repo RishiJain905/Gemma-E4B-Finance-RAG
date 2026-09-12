@@ -493,8 +493,9 @@ sources:
     ttl_key: usaspending
     ttl_hours: 24
 
-  # Re-enabled on daily (not hourly) with safe DOC API budgets (~1 req / 5s).
+  # Re-enabled on daily (not hourly) with safe DOC API budgets (~1 req / 7s).
   # Hourly cadence stays with massive_news to avoid shared-throttle collisions.
+  # Deep coverage is 6 tickers; keep work-item cap aligned so one paced pass fits.
   gdelt:
     capability_group: company_news
     enabled: true
@@ -505,11 +506,11 @@ sources:
     dependencies: []
     cursor_kind: timestamp
     overlap: 6h
-    requests_per_minute: 10
+    requests_per_minute: 8
     requests_per_day: 100
-    requests_per_run: 20
+    requests_per_run: 24
     batch_size: 1
-    max_work_items_per_run: 10
+    max_work_items_per_run: 6
     retry_policy: public_news
     ttl_key: gdelt_news
     ttl_hours: 24

@@ -462,10 +462,12 @@ class UnifiedScheduler:
             from src.ingestion.alpha_vantage_ingestor import AlphaVantageIngestor
 
             tickers = self._selected_partitions.get(name, [])
+            # Free tier is ~5 req/min; pace across the minute window instead of
+            # burning the burst and aborting the deep batch mid-run.
             return AlphaVantageIngestor(
                 store=self.store,
                 coverage_resolver=self.coverage,
-                http_get=self._budgeted_http_get(name),
+                http_get=self._budgeted_http_get(name, wait_for_minute=True),
             ).ingest(tickers=tickers or None)
 
         if name == "fmp":
@@ -724,7 +726,9 @@ class UnifiedScheduler:
                 detail = AlphaVantageIngestor(
                     store=self.store,
                     coverage_resolver=self.coverage,
-                    http_get=self._budgeted_http_get(registry_name),
+                    http_get=self._budgeted_http_get(
+                        registry_name, wait_for_minute=True
+                    ),
                     include_news=False,
                 ).ingest_ticker(symbol)
             elif logical == "fmp":
