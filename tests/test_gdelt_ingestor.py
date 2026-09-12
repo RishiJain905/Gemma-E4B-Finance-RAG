@@ -69,6 +69,20 @@ class TestGDELTIngestor:
         ingestor = GDELTIngestor(store=store)
         assert len(ingestor.TICKER_TO_QUERY) > 20
         assert "NVDA" in ingestor.TICKER_TO_QUERY
+        assert float(ingestor.config.get("request_delay", 0)) >= 7.0
+        assert int(ingestor.config.get("max_retries_on_429", 0)) >= 4
+        assert int(ingestor.config.get("max_query_terms_per_ticker", 0)) == 1
+
+    def test_query_terms_are_capped_to_limit_fan_out(self, store):
+        """Deep daily runs keep one primary term unless config raises the cap."""
+        from src.macros.gdelt_ingestor import GDELTIngestor
+
+        ingestor = GDELTIngestor(store=store)
+        assert ingestor._query_terms_for_ticker("META") == ["Meta"]
+        ingestor.config["max_query_terms_per_ticker"] = 2
+        assert ingestor._query_terms_for_ticker("META") == ["Meta", "Facebook"]
+        ingestor.config["max_query_terms_per_ticker"] = 0
+        assert ingestor._query_terms_for_ticker("META") == ["Meta"]
 
     def test_process_articles_dedup(self, store):
         """Duplicate URLs are removed during processing."""
@@ -386,12 +400,14 @@ class TestGDELTIngestor:
         mock_response.text = '{"articles": []}'
         mock_response.headers = {"content-type": "application/json"}
 
+        ingestor.config["max_query_terms_per_ticker"] = 2
         with patch.object(
             ingestor, "_gdelt_http_get", return_value=mock_response,
         ) as mock_http, patch.object(ingestor, "_fetch_gkg_tone_map", return_value={}):
             ingestor.fetch_news_for_ticker("NVDA", max_records=10)
 
         assert mock_http.call_count == len(ingestor.TICKER_TO_QUERY["NVDA"])
+        assert mock_http.call_count == 2
 
     def test_fetch_financial_news_searches_topics(self, store):
         """fetch_financial_news searches each configured topic."""
