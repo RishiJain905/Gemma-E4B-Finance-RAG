@@ -203,6 +203,19 @@ class SECDailyIndexDiscovery:
             if absent:
                 result["absent"] = absent
                 result["failed"] = max(int(result["failed"]) - len(absent), 0)
+                # Drop holiday/unpublished 403s from the error list so a clean
+                # pass (failed == 0) is not misclassified as provider_partial.
+                absent_set = set(absent)
+                errors = result.get("errors")
+                if isinstance(errors, list):
+                    result["errors"] = [
+                        err
+                        for err in errors
+                        if not any(
+                            str(err).startswith(f"{index_date}:")
+                            for index_date in absent_set
+                        )
+                    ]
                 if int(result["failed"]) == 0:
                     for key in ("error_class", "retry_after", "reset_at",
                                 "provider_wide", "circuit_open"):

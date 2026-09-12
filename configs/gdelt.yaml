@@ -4,8 +4,12 @@
 # GDELT 2.0 query parameters
 max_records: 250          # Max articles per query (GDELT limit)
 lookback_days: 7          # How far back to search on initial run
-request_delay: 5.0        # GDELT DOC API: max 1 req / 5 sec (shared throttle)
-max_retries_on_429: 2     # Retries after 429 with exponential backoff (delay * 2^n)
+# Shared DOC API throttle is ~1 req / 5s; keep a cushion so deep daily runs
+# (domain-scoped query + optional bare fallback + GKG) do not 429 immediately.
+request_delay: 7.0
+max_retries_on_429: 4     # Retries after 429 with exponential backoff (delay * 2^n)
+# Prefer the primary company-name term; aliases multiply DOC calls and trip 429s.
+max_query_terms_per_ticker: 1
 gkg_max_files_per_fetch: 24   # Max GKG 15-min CSV files per enrichment pass
 use_title_tone_fallback: true  # Lexicon fallback when GKG URL match missing
 

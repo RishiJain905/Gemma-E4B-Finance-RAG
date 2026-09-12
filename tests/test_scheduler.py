@@ -556,6 +556,22 @@ class TestUnifiedSchedulerPartialFailure:
         ingestor_class.return_value.ingest_all.assert_not_called()
         budgeted_get.assert_called_once_with("massive_news", wait_for_minute=True)
 
+    def test_alpha_vantage_dispatch_waits_for_minute_budget(self, scheduler, monkeypatch):
+        """Free-tier AV (~5 req/min) must pace instead of aborting mid-batch."""
+        ingestor_class = MagicMock()
+        ingestor_class.return_value.ingest.return_value = {"status": "ok"}
+        budgeted_get = MagicMock(return_value=MagicMock())
+        scheduler._budgeted_http_get = budgeted_get
+        monkeypatch.setattr(
+            "src.ingestion.alpha_vantage_ingestor.AlphaVantageIngestor",
+            ingestor_class,
+        )
+
+        result = scheduler._run_source("alpha_vantage")
+
+        assert result == {"status": "ok"}
+        budgeted_get.assert_called_once_with("alpha_vantage", wait_for_minute=True)
+
     def test_stagger_delay(self, store):
         registry = SourceRegistry.load(
             environ={
