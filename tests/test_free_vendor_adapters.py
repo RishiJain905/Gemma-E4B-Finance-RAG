@@ -495,7 +495,7 @@ def test_request_json_provider_note_waits_full_minute() -> None:
     assert sleeps == [60.0, 60.0]
 
 
-def test_alpha_vantage_provider_note_retries_and_continues_batch(tmp_path: Path) -> None:
+def test_alpha_vantage_note_retries_and_continues_batch(tmp_path: Path) -> None:
     """Provider rate_limited on one ticker must not abort remaining deep tickers.
 
     Mirrors the 2026-09-13 daily shape: local minute budget still had headroom

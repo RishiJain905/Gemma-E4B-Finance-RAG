@@ -133,7 +133,8 @@ class AlphaVantageIngestor:
         }
         rate_limited_tickers = 0
         for ticker in selected:
-            ticker_result = self._ingest_ticker_with_rate_limit_retry(str(ticker).upper())
+            symbol = str(ticker).upper()
+            ticker_result = self._ingest_ticker_with_rate_limit_retry(symbol)
             result["tickers"] += 1
             for key in (
                 "stored",
@@ -157,12 +158,15 @@ class AlphaVantageIngestor:
             if ticker_result.get("status") == "rate_limited":
                 rate_limited_tickers += 1
                 result["errors"].append(
-                    f"{ticker}: provider rate_limited after bounded retries; continuing batch"
+                    f"{ticker}: provider rate_limited after retries; continuing"
                 )
                 if result["status"] == "ok":
                     result["status"] = "partial"
                 continue
-            if ticker_result.get("status") in {"error", "partial"} and result["status"] == "ok":
+            if (
+                ticker_result.get("status") in {"error", "partial"}
+                and result["status"] == "ok"
+            ):
                 result["status"] = ticker_result["status"]
 
         if self.include_news and result.get("status") not in terminal and selected:
@@ -187,7 +191,10 @@ class AlphaVantageIngestor:
                 result["errors"].append(
                     "NEWS_SENTIMENT: provider rate_limited after bounded retries"
                 )
-            elif news_result.get("status") in {"error", "partial"} and result["status"] == "ok":
+            elif (
+                news_result.get("status") in {"error", "partial"}
+                and result["status"] == "ok"
+            ):
                 result["status"] = news_result["status"]
 
         if rate_limited_tickers and result.get("status") == "ok":
