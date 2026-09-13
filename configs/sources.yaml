@@ -157,7 +157,9 @@ sources:
     ttl_key: finnhub_news
     ttl_hours: 6
 
-  # Free tier ~25 req/day: OVERVIEW + INCOME_STATEMENT per deep ticker + one NEWS_SENTIMENT batch.
+  # Free tier ~25 req/day, ~5/min advertised: OVERVIEW + INCOME_STATEMENT per deep
+  # ticker + one NEWS_SENTIMENT batch. Pace at ≤4 rpm (≥15s gap) so provider Notes
+  # are less likely mid-batch; day budget stays ≤25.
   alpha_vantage:
     capability_group: company_data
     enabled: true
@@ -169,7 +171,7 @@ sources:
     dependencies: []
     cursor_kind: timestamp
     overlap: 24h
-    requests_per_minute: 5
+    requests_per_minute: 4
     requests_per_day: 25
     requests_per_run: 20
     batch_size: 1

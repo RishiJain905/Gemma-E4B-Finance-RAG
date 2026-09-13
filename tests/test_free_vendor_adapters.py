@@ -459,3 +459,115 @@ def test_registry_free_adapters_and_gdelt_daily() -> None:
     assert missing.get("fmp").status == "disabled_missing_key"
     assert missing.get("marketaux").status == "disabled_missing_key"
     assert missing.get("openfigi").status == "enabled"
+
+
+def test_request_json_provider_note_waits_full_minute() -> None:
+    """Alpha Vantage Note/Information bodies must back off ~60s, not 2**attempt."""
+    from src.ingestion.vendor_common import request_json
+
+    sleeps: list[float] = []
+    calls = {"n": 0}
+
+    def http_get(_url: str, **_kwargs):
+        calls["n"] += 1
+        if calls["n"] < 3:
+            return FakeResponse(
+                {
+                    "Note": (
+                        "Thank you for using Alpha Vantage! Our standard API call "
+                        "frequency is 5 calls per minute and 25 calls per day."
+                    )
+                }
+            )
+        return FakeResponse({"Symbol": "AAA", "MarketCapitalization": "1"})
+
+    payload, attempts, retries = request_json(
+        http_get,
+        "https://www.alphavantage.co/query",
+        params={"function": "OVERVIEW", "symbol": "AAA", "apikey": "x"},
+        max_attempts=3,
+        sleep_fn=sleeps.append,
+        now_fn=lambda: "2026-09-13T12:00:00Z",
+    )
+    assert payload["Symbol"] == "AAA"
+    assert attempts == 3
+    assert len(retries) == 2
+    assert sleeps == [60.0, 60.0]
+
+
+def test_alpha_vantage_provider_note_retries_and_continues_batch(tmp_path: Path) -> None:
+    """Provider rate_limited on one ticker must not abort remaining deep tickers.
+
+    Mirrors the 2026-09-13 daily shape: local minute budget still had headroom
+    (exhausted_reason=null) while Alpha Vantage returned Note/Information bodies
+    classified as rate_limited — previously the batch set remaining_work_skipped
+    and stopped after ~5 tickers.
+    """
+    from src.ingestion.alpha_vantage_ingestor import AlphaVantageIngestor
+
+    store, _chroma = _store(tmp_path)
+    sleeps: list[float] = []
+    overview_hits: list[str] = []
+
+    def http_get(_url: str, **kwargs):
+        params = kwargs["params"]
+        fn = params.get("function")
+        symbol = str(params.get("symbol") or "")
+        if fn == "NEWS_SENTIMENT":
+            return FakeResponse({"feed": []})
+        if fn == "OVERVIEW":
+            overview_hits.append(symbol)
+            if symbol == "AAA":
+                return FakeResponse(
+                    {
+                        "Information": (
+                            "Thank you for using Alpha Vantage! Our standard API "
+                            "call frequency is 5 calls per minute and 25 calls per day."
+                        )
+                    }
+                )
+            return FakeResponse(
+                {
+                    "Symbol": symbol,
+                    "MarketCapitalization": "2000000",
+                    "PERatio": "10",
+                    "LatestQuarter": "2026-03-31",
+                }
+            )
+        if fn == "INCOME_STATEMENT":
+            return FakeResponse(
+                {
+                    "annualReports": [
+                        {
+                            "fiscalDateEnding": "2025-12-31",
+                            "totalRevenue": "1000",
+                            "netIncome": "100",
+                        }
+                    ]
+                }
+            )
+        raise AssertionError(fn)
+
+    result = AlphaVantageIngestor(
+        store=store,
+        coverage_resolver=_coverage(["AAA", "BBB"]),
+        api_key="test-av-key",
+        http_get=http_get,
+        now_fn=lambda: "2026-09-13T19:00:00Z",
+        sleep_fn=sleeps.append,
+        max_attempts=2,
+        ticker_rate_limit_retries=1,
+        min_request_interval_seconds=0.0,
+        rate_limit_backoff_seconds=60.0,
+        include_news=True,
+    ).ingest()
+
+    assert "BBB" in overview_hits
+    assert result.get("remaining_work_skipped") is not True
+    assert result["status"] in {"ok", "partial"}
+    assert result["status"] != "rate_limited"
+    assert result.get("error_class") != "rate_limited"
+    assert store.get_fundamental("BBB", "market_cap")["value"] == 2_000_000.0
+    assert store.get_fundamental("AAA", "market_cap") is None
+    assert any(abs(s - 60.0) < 0.01 for s in sleeps)
+    assert any("AAA" in err and "rate_limited" in err for err in result["errors"])

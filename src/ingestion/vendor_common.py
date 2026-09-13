@@ -138,12 +138,23 @@ def request_json(
         "rate limit",
         "thank you for using alpha vantage",
         "api call frequency",
+        "call frequency",
         "limit reached",
+        "calls per minute",
+        "calls per day",
     ),
+    rate_limit_backoff_seconds: float = 60.0,
 ) -> tuple[object, int, list[str]]:
-    """GET JSON with bounded retries for transient/429 failures."""
+    """GET JSON with bounded retries for transient/429 failures.
+
+    Provider Note/Information bodies (common on Alpha Vantage free tier) are
+    classified as ``rate_limited``. Without a Retry-After header the default
+    backoff is a full minute so free-tier pacing can recover; transient
+    transport errors still use exponential backoff capped at 30s.
+    """
     attempts = 0
     retries: list[str] = []
+    rate_limit_backoff = max(float(rate_limit_backoff_seconds), 0.0)
     for attempt in range(1, max_attempts + 1):
         attempts = attempt
         try:
@@ -195,7 +206,18 @@ def request_json(
                 )
                 if error_class in {"rate_limited", "transient"} and attempt < max_attempts:
                     retries.append(str(now_fn()))
-                    delay = retry_after if retry_after is not None else min(2 ** attempt, 30)
+                    if error_class == "rate_limited":
+                        delay = (
+                            retry_after
+                            if retry_after is not None
+                            else rate_limit_backoff
+                        )
+                    else:
+                        delay = (
+                            retry_after
+                            if retry_after is not None
+                            else min(2 ** attempt, 30)
+                        )
                     sleep_fn(float(delay))
                     continue
                 raise error
