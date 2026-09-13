@@ -462,8 +462,8 @@ class UnifiedScheduler:
             from src.ingestion.alpha_vantage_ingestor import AlphaVantageIngestor
 
             tickers = self._selected_partitions.get(name, [])
-            # Free tier is ~5 req/min; pace across the minute window instead of
-            # burning the burst and aborting the deep batch mid-run.
+            # Free tier is ~5/min advertised; config paces at ≤4/min and the
+            # ingestor recovers from provider Notes without aborting the batch.
             return AlphaVantageIngestor(
                 store=self.store,
                 coverage_resolver=self.coverage,

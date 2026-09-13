@@ -83,8 +83,12 @@ class AlphaVantageIngestor:
         timeout: float = 30.0,
         max_attempts: int = 3,
         include_news: bool = True,
+        min_request_interval_seconds: float = 15.0,
+        rate_limit_backoff_seconds: float = 60.0,
+        ticker_rate_limit_retries: int = 1,
         now_fn: Callable[[], object] = utc_now,
         sleep_fn: Callable[[float], None] = time.sleep,
+        monotonic_fn: Callable[[], float] = time.monotonic,
     ) -> None:
         self.store = store or Store()
         self.coverage = coverage_resolver or CoverageResolver(self.store)
@@ -96,8 +100,14 @@ class AlphaVantageIngestor:
         self.timeout = max(float(timeout), 0.1)
         self.max_attempts = max(int(max_attempts), 1)
         self.include_news = bool(include_news)
+        # Free tier advertises ~5/min; default to ≤4/min (≥15s) to reduce provider Notes.
+        self.min_request_interval_seconds = max(float(min_request_interval_seconds), 0.0)
+        self.rate_limit_backoff_seconds = max(float(rate_limit_backoff_seconds), 0.0)
+        self.ticker_rate_limit_retries = max(int(ticker_rate_limit_retries), 0)
         self.now_fn = now_fn
         self.sleep_fn = sleep_fn
+        self.monotonic_fn = monotonic_fn
+        self._last_request_at: Optional[float] = None
 
     def ingest(self, tickers: Optional[list[str]] = None) -> dict:
         """Ingest OVERVIEW + annual income + optional NEWS_SENTIMENT for coverage tickers."""
@@ -114,14 +124,17 @@ class AlphaVantageIngestor:
             )
             return finish_result(result, "disabled_missing_key", error_class="authentication")
 
+        # Auth/entitlement remain batch-terminal. Provider Note rate limits are
+        # retried per ticker and must not abort remaining deep tickers.
         terminal = {
             "disabled_missing_key",
             "disabled_authentication",
             "disabled_entitlement",
-            "rate_limited",
         }
+        rate_limited_tickers = 0
         for ticker in selected:
-            ticker_result = self.ingest_ticker(str(ticker).upper())
+            symbol = str(ticker).upper()
+            ticker_result = self._ingest_ticker_with_rate_limit_retry(symbol)
             result["tickers"] += 1
             for key in (
                 "stored",
@@ -142,7 +155,18 @@ class AlphaVantageIngestor:
                 if ticker_result.get("error_class"):
                     result["error_class"] = ticker_result["error_class"]
                 break
-            if ticker_result.get("status") in {"error", "partial"} and result["status"] == "ok":
+            if ticker_result.get("status") == "rate_limited":
+                rate_limited_tickers += 1
+                result["errors"].append(
+                    f"{ticker}: provider rate_limited after retries; continuing"
+                )
+                if result["status"] == "ok":
+                    result["status"] = "partial"
+                continue
+            if (
+                ticker_result.get("status") in {"error", "partial"}
+                and result["status"] == "ok"
+            ):
                 result["status"] = ticker_result["status"]
 
         if self.include_news and result.get("status") not in terminal and selected:
@@ -160,10 +184,40 @@ class AlphaVantageIngestor:
             if news_result.get("status") in terminal:
                 result["status"] = news_result["status"]
                 result["remaining_work_skipped"] = True
-            elif news_result.get("status") in {"error", "partial"} and result["status"] == "ok":
+            elif news_result.get("status") == "rate_limited":
+                # Tickers already attempted; do not mark remaining_work_skipped.
+                if result["status"] == "ok":
+                    result["status"] = "partial"
+                result["errors"].append(
+                    "NEWS_SENTIMENT: provider rate_limited after bounded retries"
+                )
+            elif (
+                news_result.get("status") in {"error", "partial"}
+                and result["status"] == "ok"
+            ):
                 result["status"] = news_result["status"]
 
+        if rate_limited_tickers and result.get("status") == "ok":
+            result["status"] = "partial"
         return finish_result(result, result["status"])
+
+
+    def _ingest_ticker_with_rate_limit_retry(self, ticker: str) -> dict:
+        """Run ingest_ticker with bounded cooldown retries on provider rate limits."""
+        attempts = self.ticker_rate_limit_retries + 1
+        last = self.ingest_ticker(ticker)
+        for _ in range(1, attempts):
+            if last.get("status") != "rate_limited":
+                break
+            delay = float(last.get("retry_after") or self.rate_limit_backoff_seconds)
+            logger.info(
+                "Alpha Vantage rate_limited for %s; waiting %.1fs before ticker retry",
+                ticker,
+                delay,
+            )
+            self.sleep_fn(delay)
+            last = self.ingest_ticker(ticker)
+        return last
 
     def ingest_ticker(self, ticker: str) -> dict:
         """Fetch OVERVIEW and annual INCOME_STATEMENT for one ticker."""
@@ -464,16 +518,32 @@ class AlphaVantageIngestor:
             )
         return records
 
+    def _pace_before_request(self) -> None:
+        """Enforce a free-tier-friendly gap between Alpha Vantage calls."""
+        if self.min_request_interval_seconds <= 0:
+            return
+        now = float(self.monotonic_fn())
+        if self._last_request_at is not None:
+            elapsed = now - self._last_request_at
+            wait_for = self.min_request_interval_seconds - elapsed
+            if wait_for > 0:
+                self.sleep_fn(wait_for)
+
     def _get(self, params: dict[str, object]) -> object:
-        payload, _attempts, _retries = request_json(
-            self.http_get,
-            self.base_url,
-            params={**params, "apikey": self.api_key},
-            timeout=self.timeout,
-            max_attempts=self.max_attempts,
-            sleep_fn=self.sleep_fn,
-            now_fn=self.now_fn,
-        )
+        self._pace_before_request()
+        try:
+            payload, _attempts, _retries = request_json(
+                self.http_get,
+                self.base_url,
+                params={**params, "apikey": self.api_key},
+                timeout=self.timeout,
+                max_attempts=self.max_attempts,
+                sleep_fn=self.sleep_fn,
+                now_fn=self.now_fn,
+                rate_limit_backoff_seconds=self.rate_limit_backoff_seconds,
+            )
+        finally:
+            self._last_request_at = float(self.monotonic_fn())
         return payload
 
     def _set_status(
