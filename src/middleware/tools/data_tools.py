@@ -318,12 +318,129 @@ def _numeric_fact_value(row) -> float | None:
         return None
 
 
+# Fallback bias thresholds for indexed yfinance fundamentals (Yahoo decimal
+# ratios: 0.10 == 10%). Used only when analyst recommendation / price-target
+# signals are absent so broad-universe tickers can still hit.
+_FALLBACK_REVENUE_GROWTH_LONG = 0.10
+_FALLBACK_REVENUE_GROWTH_SHORT = -0.05
+_FALLBACK_PROFIT_MARGIN_LONG = 0.10
+_FALLBACK_ROE_LONG = 0.15
+_FALLBACK_FORWARD_PE_LONG_MAX = 20.0
+_FALLBACK_FORWARD_PE_SHORT_MIN = 50.0
+
+
+def _direction_vote(direction: str) -> int:
+    """Map long/short/neutral to a signed vote."""
+    if direction == "long":
+        return 1
+    if direction == "short":
+        return -1
+    return 0
+
+
+def _fundamentals_fallback_signals(store, ticker: str) -> list[dict]:
+    """Build transparent bias signals from indexed yfinance-style fundamentals.
+
+    Thresholds (Yahoo decimal ratios unless noted):
+    - revenue_growth: long >= 0.10, short <= -0.05
+    - profit_margin: long >= 0.10, short < 0
+    - return_on_equity: long >= 0.15, short < 0
+    - forward_pe: long when 0 < pe <= 20, short when pe < 0 or pe > 50
+
+    Any present metric with a numeric value becomes a signal (including
+    neutral), so a ticker with only common fundamentals can hit without
+    deep-coverage estimates. Does not invent prices from the open web.
+    """
+    signals: list[dict] = []
+
+    growth_row = store.get_fundamental(ticker, "revenue_growth")
+    growth_val = _numeric_fact_value(growth_row)
+    if growth_val is not None:
+        if growth_val >= _FALLBACK_REVENUE_GROWTH_LONG:
+            direction = "long"
+        elif growth_val <= _FALLBACK_REVENUE_GROWTH_SHORT:
+            direction = "short"
+        else:
+            direction = "neutral"
+        signals.append({
+            "name": "revenue_growth",
+            "value": growth_val,
+            "period": growth_row.get("period") if growth_row else None,
+            "direction": direction,
+            "note": (
+                f"fallback: long>={_FALLBACK_REVENUE_GROWTH_LONG}, "
+                f"short<={_FALLBACK_REVENUE_GROWTH_SHORT}"
+            ),
+        })
+
+    margin_row = store.get_fundamental(ticker, "profit_margin")
+    margin_val = _numeric_fact_value(margin_row)
+    if margin_val is not None:
+        if margin_val >= _FALLBACK_PROFIT_MARGIN_LONG:
+            direction = "long"
+        elif margin_val < 0:
+            direction = "short"
+        else:
+            direction = "neutral"
+        signals.append({
+            "name": "profit_margin",
+            "value": margin_val,
+            "period": margin_row.get("period") if margin_row else None,
+            "direction": direction,
+            "note": f"fallback: long>={_FALLBACK_PROFIT_MARGIN_LONG}, short<0",
+        })
+
+    roe_row = store.get_fundamental(ticker, "return_on_equity")
+    roe_val = _numeric_fact_value(roe_row)
+    if roe_val is not None:
+        if roe_val >= _FALLBACK_ROE_LONG:
+            direction = "long"
+        elif roe_val < 0:
+            direction = "short"
+        else:
+            direction = "neutral"
+        signals.append({
+            "name": "return_on_equity",
+            "value": roe_val,
+            "period": roe_row.get("period") if roe_row else None,
+            "direction": direction,
+            "note": f"fallback: long>={_FALLBACK_ROE_LONG}, short<0",
+        })
+
+    pe_row = store.get_fundamental(ticker, "forward_pe")
+    pe_val = _numeric_fact_value(pe_row)
+    if pe_val is not None:
+        if pe_val < 0 or pe_val > _FALLBACK_FORWARD_PE_SHORT_MIN:
+            direction = "short"
+        elif 0 < pe_val <= _FALLBACK_FORWARD_PE_LONG_MAX:
+            direction = "long"
+        else:
+            direction = "neutral"
+        signals.append({
+            "name": "forward_pe",
+            "value": pe_val,
+            "period": pe_row.get("period") if pe_row else None,
+            "direction": direction,
+            "note": (
+                f"fallback: long when 0<pe<={_FALLBACK_FORWARD_PE_LONG_MAX}, "
+                f"short when pe<0 or pe>{_FALLBACK_FORWARD_PE_SHORT_MIN}"
+            ),
+        })
+
+    return signals
+
+
 def classify_trade_bias_handler(store, ticker):
     """Classify a ticker as long, short, or neutral from indexed RAG evidence.
 
     Models and FinanceBot MUST call this for long-vs-short / buy-vs-sell
-    questions instead of guessing. A miss (no indexed signals) sets
+    questions instead of guessing. Works for any ticker string — deep
+    coverage is not required. Prefers analyst recommendation / price-target
+    signals when present; otherwise falls back to indexed yfinance
+    fundamentals (revenue_growth, profit_margin, return_on_equity,
+    forward_pe). A miss (no usable indexed signals) sets
     ``web_search_allowed`` so the caller may use open web only then.
+    Does not invent prices from the open web.
     """
     ticker = str(ticker or "").strip().upper()
     if not ticker:
@@ -372,25 +489,12 @@ def classify_trade_bias_handler(store, ticker):
             "direction": direction,
         })
 
-    try:
-        sentiment = get_sentiment_handler(store, ticker, days=7)
-    except Exception:  # noqa: BLE001 — sentiment is optional for this classification
-        sentiment = {}
-    tone = sentiment.get("average_tone") if isinstance(sentiment, dict) else None
-    if isinstance(tone, (int, float)):
-        if tone >= 1:
-            direction, vote = "long", 1
-        elif tone <= -1:
-            direction, vote = "short", -1
-        else:
-            direction, vote = "neutral", 0
-        votes.append(vote)
-        signals.append({
-            "name": "sentiment_tone",
-            "value": float(tone),
-            "article_count": sentiment.get("article_count"),
-            "direction": direction,
-        })
+    # Broad-universe fallback: indexed fundamentals when analyst signals miss.
+    # GDELT/sentiment is intentionally not required (often empty for broad names).
+    if not signals:
+        for signal in _fundamentals_fallback_signals(store, ticker):
+            votes.append(_direction_vote(signal["direction"]))
+            signals.append(signal)
 
     if not signals:
         return {
@@ -751,11 +855,14 @@ register(
         name="classify_trade_bias",
         description=(
             "REQUIRED for any question about whether a stock is a long or a short, "
-            "buy or sell, overweight or underweight, or a trade bias. Do NOT guess "
-            "or invent a directional call — call this tool and report its `bias` "
-            "field (long, short, or neutral) from indexed RAG evidence "
-            "(analyst recommendation_mean, price vs target, sentiment). "
-            "If evidence_status is miss, say so rather than fabricating a trade."
+            "buy or sell, overweight or underweight, or a trade bias. Accepts any "
+            "ticker — deep coverage is not required. Do NOT guess or invent a "
+            "directional call — call this tool and report its `bias` field "
+            "(long, short, or neutral) from indexed RAG evidence: analyst "
+            "recommendation_mean and price vs target when present, otherwise "
+            "fallback fundamentals (revenue_growth, profit_margin, "
+            "return_on_equity, forward_pe). If evidence_status is miss, say so "
+            "rather than fabricating a trade; open-web is allowed only then."
         ),
         parameters={
             "type": "object",

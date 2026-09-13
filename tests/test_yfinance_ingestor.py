@@ -430,13 +430,16 @@ def test_ingest_ticker_invalid_ticker_returns_early(caplog):
 # ── Fundamentals Ingestion Tests ────────────────────
 
 def test_fundamental_metrics_constant():
-    """FUNDAMENTAL_METRICS has exactly 18 entries."""
+    """FUNDAMENTAL_METRICS includes core fundamentals plus analyst/spot fields."""
     ingestor = YFinanceIngestor()
-    assert len(ingestor.FUNDAMENTAL_METRICS) == 18
+    assert len(ingestor.FUNDAMENTAL_METRICS) == 21
     names = [m[0] for m in ingestor.FUNDAMENTAL_METRICS]
     assert "market_cap" in names
     assert "pe_ratio_ttm" in names
     assert "quick_ratio" in names
+    assert "recommendation_mean" in names
+    assert "price_target_mean" in names
+    assert "price" in names
 
 def test_normalize_value():
     """_normalize_value handles numeric, None, and invalid inputs."""
