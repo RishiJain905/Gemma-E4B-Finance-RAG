@@ -273,6 +273,49 @@ def test_classify_trade_bias_miss_without_evidence(store, monkeypatch):
     assert result["web_search_allowed"] is True
 
 
+def test_classify_trade_bias_hit_from_yfinance_fundamentals_fallback(store, monkeypatch):
+    """SNDK-like: only common yfinance fundamentals → hit via fallback signals."""
+    monkeypatch.setattr(
+        data_tools, "get_sentiment_handler",
+        lambda store, ticker, days=7: {"average_tone": None, "article_count": 0},
+    )
+    for metric, value in {
+        "forward_pe": 12.5,
+        "revenue_growth": 0.22,
+        "profit_margin": 0.18,
+        "return_on_equity": 0.25,
+    }.items():
+        _seed_metric(
+            store, "SNDK", metric, value,
+            period="2026-Q1", unit="ratio", period_type="ttm", source_type="yfinance",
+        )
+
+    result = data_tools.classify_trade_bias_handler(store, ticker="sndk")
+
+    assert result["ticker"] == "SNDK"
+    assert result["evidence_status"] == "hit"
+    assert result["web_search_allowed"] is False
+    assert result["bias"] == "long"
+    assert result["must_answer"] is True
+    signal_names = {s["name"] for s in result["signals"]}
+    assert "recommendation_mean" not in signal_names
+    assert "price_vs_target" not in signal_names
+    assert {"revenue_growth", "profit_margin", "return_on_equity", "forward_pe"} <= signal_names
+    assert all(s.get("note", "").startswith("fallback:") for s in result["signals"])
+
+
+def test_classify_trade_bias_empty_ticker_still_miss(store, monkeypatch):
+    monkeypatch.setattr(
+        data_tools, "get_sentiment_handler",
+        lambda store, ticker, days=7: {"average_tone": None, "article_count": 0},
+    )
+
+    result = data_tools.classify_trade_bias_handler(store, ticker="  ")
+
+    assert result["bias"] is None
+    assert "error" in result
+
+
 def test_check_freshness(store):
     store.mark_source_fresh("NVDA", "yfinance_fundamentals", 24)
 

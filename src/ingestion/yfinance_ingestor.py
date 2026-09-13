@@ -138,6 +138,11 @@ class YFinanceIngestor:
         ("operating_cf",      "operatingCashflow",  "usd",     "ttm"),
         ("current_ratio",     "currentRatio",      "ratio",    "ttm"),
         ("quick_ratio",       "quickRatio",        "ratio",    "ttm"),
+        # Analyst / spot fields when Yahoo provides them for broad tickers
+        # (lets classify_trade_bias use the classic path beyond deep estimates).
+        ("recommendation_mean", "recommendationMean", "score", "point_in_time"),
+        ("price_target_mean",   "targetMeanPrice",    "usd",   "forward"),
+        ("price",               "currentPrice",       "usd",   "point_in_time"),
     ]
 
     # ── Normalization Helpers ───────────────────────────
@@ -457,6 +462,9 @@ class YFinanceIngestor:
 
         for metric_name, info_key, unit, period_type in self.FUNDAMENTAL_METRICS:
             raw_value = info.get(info_key)
+            # currentPrice is often absent; regularMarketPrice is the common spot.
+            if raw_value is None and metric_name == "price":
+                raw_value = info.get("regularMarketPrice")
             if raw_value is None:
                 logger.debug("Ticker %s has no %s (%s), skipping", ticker, metric_name, info_key)
                 continue
