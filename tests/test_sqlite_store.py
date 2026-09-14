@@ -140,6 +140,18 @@ def test_get_unprocessed_filings(store: SQLiteStore):
     assert accs == {"acc-2"}
 
 
+def test_get_unprocessed_filings_filters_by_filing_types(store: SQLiteStore):
+    store.register_filing("AAPL", "10-K", "2025-09-30", "2025-FY", "acc-10k", "http://sec.gov")
+    store.register_filing("AAPL", "4", "2025-12-31", "2025-FY", "acc-form4", "http://sec.gov")
+    store.register_filing("AAPL", "424B2", "2025-11-30", "2025-FY", "acc-424", "http://sec.gov")
+
+    unprocessed = store.get_unprocessed_filings(
+        limit=10, filing_types=["10-K", "10-Q", "8-K"],
+    )
+    accs = {r["accession"] for r in unprocessed}
+    assert accs == {"acc-10k"}
+
+
 # ── Cache Management ──────────────────────────────
 
 def test_mark_cache_fresh(store: SQLiteStore):
@@ -561,3 +573,33 @@ def test_list_tickers_uses_canonical_active_symbols_without_aliases(store: SQLit
         conn.commit()
 
     assert store.list_tickers() == ["BRK-B"]
+
+
+def test_get_unprocessed_filings_prefers_unprocessed_over_index_pending(store: SQLiteStore):
+    store.register_filing("AAPL", "10-K", "2025-12-31", "2025-FY", "acc-new", "http://sec.gov")
+    store.register_filing("AAPL", "10-Q", "2025-09-30", "2025-Q3", "acc-pending", "http://sec.gov")
+    store.mark_filing_index_pending(
+        "acc-pending", file_path="pending.txt", error="No usable filing sections after validation",
+    )
+
+    rows = store.get_unprocessed_filings(limit=10)
+    assert [r["accession"] for r in rows] == ["acc-new", "acc-pending"]
+    assert rows[0]["status"] == "unprocessed"
+    assert rows[1]["status"] == "index_pending"
+
+
+def test_get_unprocessed_filings_reserves_index_pending_retry_slots(store: SQLiteStore):
+    for i in range(8):
+        store.register_filing(
+            "AAPL", "10-K", f"2025-0{i+1}-15", "2025-FY", f"acc-new-{i}", "http://sec.gov",
+        )
+    store.register_filing("AAPL", "8-K", "2025-01-01", "2025", "acc-pend", "http://sec.gov")
+    store.mark_filing_index_pending(
+        "acc-pend", file_path="pending.txt", error="No usable filing sections after validation",
+    )
+
+    rows = store.get_unprocessed_filings(limit=5)
+    statuses = [r["status"] for r in rows]
+    assert statuses.count("unprocessed") == 4
+    assert statuses.count("index_pending") == 1
+    assert rows[-1]["accession"] == "acc-pend"

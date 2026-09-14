@@ -12,6 +12,7 @@ Usage:
 import logging
 import json
 import re
+from dataclasses import replace
 from pathlib import Path
 import time
 from datetime import datetime, timezone
@@ -20,12 +21,17 @@ from typing import Optional
 from .edgar_fetcher import SECEdgarFilingFetcher
 from .event_classifier import RULE_VERSION, SECEventClassifier
 from .filing_parser import TraceAlchemyFilingParser
-from .filing_sections import split_filing_sections
+from .filing_sections import FilingSection, split_filing_sections
 from src.storage.store import Store
 from src.ingestion.normalization import NORMALIZATION_VERSION, content_hash
 from src.ingestion.records import EventRecord, NarrativeRecord
 
 logger = logging.getLogger(__name__)
+
+# Soft cap for indexed section bodies. max_section_chars still drops
+# multi-MB XBRL/exhibit leftovers; this truncates large-but-valid
+# sections so embedding does not OOM the worker.
+_INDEX_SECTION_SOFT_CAP = 250_000
 
 
 class FilingProcessor:
@@ -162,7 +168,10 @@ class FilingProcessor:
             {processed: N, failed: N, errors: [...]}
         """
         self._index_run_counts = self._empty_index_counts()
-        unprocessed = self.store.sqlite.get_unprocessed_filings(limit=limit)
+        filing_types = sorted(self.index_forms) if self.index_filing_text else None
+        unprocessed = self.store.sqlite.get_unprocessed_filings(
+            limit=limit, filing_types=filing_types,
+        )
         if not unprocessed:
             logger.info("No unprocessed filings found")
             result = {"processed": 0, "failed": 0, "errors": []}
@@ -210,8 +219,15 @@ class FilingProcessor:
         Returns:
             {processed: N, failed: N, errors: [...]}
         """
-        unprocessed = self.store.sqlite.get_unprocessed_filings(limit=limit)
-        ticker_filings = [f for f in unprocessed if f.get("ticker", "").upper() == ticker.upper()]
+        filing_types = sorted(self.index_forms) if self.index_filing_text else None
+        # Over-fetch then filter by ticker so index-form prioritization still applies.
+        unprocessed = self.store.sqlite.get_unprocessed_filings(
+            limit=max(limit * 20, 50), filing_types=filing_types,
+        )
+        ticker_filings = [
+            f for f in unprocessed
+            if f.get("ticker", "").upper() == ticker.upper()
+        ][:limit]
 
         if not ticker_filings:
             logger.info("No unprocessed filings for %s", ticker)
@@ -270,19 +286,29 @@ class FilingProcessor:
 
         Steps:
           1. Download the filing text from EDGAR
-          2. Run TraceAlchemy parser to extract facts
-          3. Store via Store.process_filing()
+          2. Run TraceAlchemy parser to extract facts (best-effort)
+          3. Store via Store.process_filing() and/or section indexing
           4. Log completion
 
         Returns:
-            True if at least one fact was extracted and stored
+            True when the filing was successfully parsed and/or indexed.
+            Broad non-index forms still use the event evidence path.
         """
         accession = filing.get("accession", "unknown")
         ticker = filing.get("ticker", "")
         filing_type = filing.get("filing_type", "")
         period = filing.get("period", "")
-
-        if str(filing.get("discovery_scope") or "deep").lower() == "broad":
+        form_upper = str(filing_type or "").strip().upper()
+        wants_text_index = (
+            self.index_filing_text and form_upper in self.index_forms
+        )
+        # Broad discovery normally uses the lightweight event path. Indexable
+        # forms (10-K/10-Q/8-K) still need the full text download + section
+        # index path even when discovery_scope is broad.
+        if (
+            not wants_text_index
+            and str(filing.get("discovery_scope") or "deep").lower() == "broad"
+        ):
             return self._process_event_filing(filing)
 
         logger.info(
@@ -290,8 +316,21 @@ class FilingProcessor:
             ticker, filing_type, period, accession,
         )
 
-        # Step 1: Download
-        text = self.fetcher.download_filing_text(filing)
+        # Step 1: Prefer a durable local artifact (index_pending retries), else download.
+        text = None
+        existing_path = str(filing.get("file_path") or "").strip()
+        if existing_path:
+            artifact = Path(existing_path)
+            if artifact.is_file():
+                try:
+                    text = artifact.read_text(encoding="utf-8")
+                except OSError as error:
+                    logger.warning(
+                        "Could not read local filing artifact %s for %s: %s",
+                        artifact, accession, error,
+                    )
+        if not text:
+            text = self.fetcher.download_filing_text(filing)
         if not text:
             logger.warning("No text downloaded for filing %s, marking as error", accession)
             self.store.sqlite.mark_cache_stale(
@@ -300,20 +339,26 @@ class FilingProcessor:
             )
             return False
 
-        # Step 2: Parse
+        # Step 2: Parse (best-effort). Empty facts no longer block indexing for
+        # configured index forms — MiniLM embeddings can index without TraceAlchemy.
         facts = self.parser.extract_facts_from_filing(
             ticker=ticker,
             filing_type=filing_type,
             filing_text=text,
             period=period,
-        )
+        ) or []
 
-        if not facts:
+        if not facts and not wants_text_index:
             logger.warning(
                 "No facts extracted from %s %s (%s)",
                 ticker, filing_type, accession,
             )
             return False
+        if not facts and wants_text_index:
+            logger.info(
+                "No facts extracted from %s %s (%s); continuing with section indexing",
+                ticker, filing_type, accession,
+            )
 
         filing_record = {
             **filing,
@@ -341,23 +386,56 @@ class FilingProcessor:
         usable_sections = []
         for section in candidates[: self.max_sections_per_filing]:
             if len(section.text) > self.max_section_chars:
+                # Drop only the oversized body; siblings remain indexable.
+                # Embedding multi-MB leftovers (XBRL/exhibits) OOMs the worker.
                 skipped += 1
                 logger.warning(
                     "Skipping oversized SEC section %s (%d chars; cap %d)",
                     section.document_id, len(section.text), self.max_section_chars,
                 )
                 continue
+            soft_cap = min(self.max_section_chars, _INDEX_SECTION_SOFT_CAP)
+            if len(section.text) > soft_cap:
+                logger.warning(
+                    "Truncating SEC section %s for embedding (%d -> %d chars)",
+                    section.document_id, len(section.text), soft_cap,
+                )
+                section = replace(section, text=section.text[:soft_cap])
             usable_sections.append(section)
 
         if not usable_sections:
-            reason = "No usable filing sections after validation"
-            self.store.sqlite.mark_filing_index_pending(
-                accession, file_path=str(artifact_path), error=reason,
-            )
-            logger.warning("SEC filing %s index pending: %s", accession, reason)
-            self._index_run_counts["skipped"] += skipped
-            self._index_run_counts["index_pending"] += 1
-            return False
+            # Last resort: bounded whole-document prefix so Item-less short
+            # filings and unsplit flat giants still contribute retrieval text.
+            whole = (text or "").strip()
+            if whole:
+                usable_sections = [
+                    FilingSection(
+                        accession=str(accession),
+                        ticker=str(ticker).upper(),
+                        form=str(filing_type),
+                        filing_date=str(filing.get("filing_date") or ""),
+                        report_period=str(filing.get("period") or ""),
+                        section_key="full_document",
+                        section_heading="Full document",
+                        section_index=0,
+                        text=whole[: min(self.max_section_chars, _INDEX_SECTION_SOFT_CAP)],
+                        source_url=str(filing.get("source_url") or ""),
+                        parsed_path=str(artifact_path),
+                    )
+                ]
+                logger.info(
+                    "Falling back to truncated full_document for %s (%d chars)",
+                    accession, len(usable_sections[0].text),
+                )
+            else:
+                reason = "No usable filing sections after validation"
+                self.store.sqlite.mark_filing_index_pending(
+                    accession, file_path=str(artifact_path), error=reason,
+                )
+                logger.warning("SEC filing %s index pending: %s", accession, reason)
+                self._index_run_counts["skipped"] += skipped
+                self._index_run_counts["index_pending"] += 1
+                return False
 
         # Save structured facts without the legacy whole-document vector or
         # parsed mark. The final mark follows verified section indexing.

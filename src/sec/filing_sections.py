@@ -27,8 +27,14 @@ _NAV_LINES = frozenset({"TABLE OF CONTENTS", "INDEX", "PART I", "PART II", "PART
 # heading-plus-page-number stubs that carry no evidence.
 _FLAT_TEXT_MIN_CHARS_PER_LINE = 2000
 _FLAT_TEXT_MIN_SECTION_BODY_CHARS = 80
+# Break before PART markers and Item headings, including 8-K decimals
+# (Item 5.02) and colon/dash variants (ITEM 1: / ITEM 1 —) common in
+# flat/HTML-stripped EDGAR text.
 _INLINE_SECTION_BREAK_RE = re.compile(
-    r"\s(?=(?:PART\s+[IVX]{1,4}(?:\s*$|\s*[.:—-]|\s+ITEM\b)|ITEM\s+\d{1,2}[A-Z]?\.\s+[A-Z]))",
+    r"\s(?=(?:"
+    r"PART\s+[IVX]{1,4}(?:\s*$|\s*[.:—\-–]|\s+ITEM\b)|"
+    r"ITEM\s+\d{1,2}(?:\.\d{2})?[A-Z]?\s*[.:—\-–]?\s+[A-Z]"
+    r"))",
     re.IGNORECASE,
 )
 
@@ -202,4 +208,25 @@ def split_filing_sections(
                 parsed_path=parsed_path,
             )
         )
+
+    # Short 8-Ks (and other Item-less artifacts) still carry useful prose.
+    # Prefer a single whole-document section over returning nothing.
+    if not sections:
+        whole = (parsed_text or "").strip()
+        if whole:
+            sections.append(
+                FilingSection(
+                    accession=accession,
+                    ticker=ticker,
+                    form=form,
+                    filing_date=filing_date,
+                    report_period=report_period,
+                    section_key="full_document",
+                    section_heading="Full document",
+                    section_index=0,
+                    text=whole,
+                    source_url=source_url,
+                    parsed_path=parsed_path,
+                )
+            )
     return sections
