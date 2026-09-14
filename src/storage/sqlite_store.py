@@ -989,18 +989,43 @@ CREATE INDEX IF NOT EXISTS idx_securities_industry ON securities(industry);
                 placeholders = ",".join("?" for _ in forms)
                 type_clause = f" AND UPPER(filing_type) IN ({placeholders})"
                 params.extend(forms)
-        # Prefer fresh unprocessed rows so failed index_pending retries cannot
-        # starve the discovery backlog on every drain batch.
-        sql = (
-            "SELECT * FROM filings WHERE status IN ('unprocessed', 'index_pending')"
-            f"{type_clause} "
-            "ORDER BY CASE status WHEN 'unprocessed' THEN 0 ELSE 1 END, "
-            "filing_date DESC LIMIT ?"
-        )
-        params.append(limit)
+        # Prefer fresh unprocessed rows, but reserve a slice of each batch for
+        # index_pending retries so fixed filings are not stranded behind a
+        # large unprocessed backlog.
+        pending_slots = min(limit, max(1, limit // 5)) if limit >= 5 else 0
+        fresh_slots = limit - pending_slots
         with self._connect() as conn:
-            rows = conn.execute(sql, params).fetchall()
-            return [dict(r) for r in rows]
+            fresh: list[dict] = []
+            pending: list[dict] = []
+            if fresh_slots:
+                fresh = [
+                    dict(r) for r in conn.execute(
+                        "SELECT * FROM filings WHERE status='unprocessed'"
+                        f"{type_clause} ORDER BY filing_date DESC LIMIT ?",
+                        [*params, fresh_slots],
+                    ).fetchall()
+                ]
+            # Backfill unused fresh slots with pending, and vice versa.
+            pending_limit = limit - len(fresh)
+            if pending_limit > 0:
+                pending = [
+                    dict(r) for r in conn.execute(
+                        "SELECT * FROM filings WHERE status='index_pending'"
+                        f"{type_clause} ORDER BY filing_date DESC LIMIT ?",
+                        [*params, pending_limit],
+                    ).fetchall()
+                ]
+            if len(fresh) + len(pending) < limit:
+                extra = limit - len(fresh) - len(pending)
+                more_fresh = [
+                    dict(r) for r in conn.execute(
+                        "SELECT * FROM filings WHERE status='unprocessed'"
+                        f"{type_clause} ORDER BY filing_date DESC LIMIT ? OFFSET ?",
+                        [*params, extra, len(fresh)],
+                    ).fetchall()
+                ]
+                fresh.extend(more_fresh)
+            return fresh + pending
 
     # ── Cache Management ──────────────────────────────
 

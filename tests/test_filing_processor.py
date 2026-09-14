@@ -499,11 +499,45 @@ def test_live_end_to_end_pipeline(tmp_path):
     assert parsed_count >= 1, "expected at least one filing marked parsed"
 
 
-def test_oversized_section_is_truncated_not_skipped(tmp_path):
-    """Sections over max_section_chars are truncated and still indexed."""
+def test_oversized_section_skipped_siblings_still_indexed(tmp_path):
+    """Oversized sections are skipped; in-cap siblings still index."""
     store = MagicMock()
     store.add_filing_sections.return_value = {
         "sections_written": 1, "chunks_written": 2, "replacements": 0, "skipped": 0,
+    }
+    store.count_filing_sections.return_value = 1
+    body = (
+        "Item 1. Business\nWe sell products.\n"
+        + "Item 7. MD&A\n" + ("Revenue grew. " * 400)
+    )
+    fetcher = MagicMock()
+    fetcher.download_filing_text.return_value = body
+    parser = MagicMock()
+    parser.extract_facts_from_filing.return_value = []
+    processor = FilingProcessor(
+        store=store, fetcher=fetcher, parser=parser,
+        sec_config={
+            "index_filing_text": True,
+            "max_sections_per_filing": 100,
+            "max_section_chars": 80,
+            "index_forms": ["10-K"],
+        },
+        parsed_dir=tmp_path / "parsed",
+    )
+
+    assert processor._process_single_filing(_make_filing(accession="ACC-HUGE")) is True
+    sections = store.add_filing_sections.call_args.args[0]
+    assert len(sections) == 1
+    assert sections[0].section_key == "item_1"
+    assert len(sections[0].text) <= 80
+    store.sqlite.mark_filing_index_pending.assert_not_called()
+
+
+def test_all_oversized_falls_back_to_truncated_full_document(tmp_path):
+    """When every split section exceeds the cap, index a bounded whole doc."""
+    store = MagicMock()
+    store.add_filing_sections.return_value = {
+        "sections_written": 1, "chunks_written": 1, "replacements": 0, "skipped": 0,
     }
     store.count_filing_sections.return_value = 1
     huge = "Item 1. Business\n" + ("A" * 5_000)
@@ -522,9 +556,10 @@ def test_oversized_section_is_truncated_not_skipped(tmp_path):
         parsed_dir=tmp_path / "parsed",
     )
 
-    assert processor._process_single_filing(_make_filing(accession="ACC-HUGE")) is True
+    assert processor._process_single_filing(_make_filing(accession="ACC-ONLY-HUGE")) is True
     sections = store.add_filing_sections.call_args.args[0]
     assert len(sections) == 1
+    assert sections[0].section_key == "full_document"
     assert len(sections[0].text) == 1000
     store.sqlite.mark_filing_index_pending.assert_not_called()
 
@@ -563,3 +598,34 @@ def test_index_pending_reuses_local_artifact_without_download(tmp_path):
     assert processor._process_single_filing(filing) is True
     fetcher.download_filing_text.assert_not_called()
     store.sqlite.mark_filing_parsed.assert_called_once()
+
+
+def test_large_in_cap_section_is_soft_truncated(tmp_path, monkeypatch):
+    """Sections under max_section_chars but over the soft embedding cap are truncated."""
+    import src.sec.filing_processor as fp
+    monkeypatch.setattr(fp, "_INDEX_SECTION_SOFT_CAP", 200)
+    store = MagicMock()
+    store.add_filing_sections.return_value = {
+        "sections_written": 1, "chunks_written": 1, "replacements": 0, "skipped": 0,
+    }
+    store.count_filing_sections.return_value = 1
+    body = "Item 1. Business\n" + ("We sell products worldwide. " * 40)
+    fetcher = MagicMock()
+    fetcher.download_filing_text.return_value = body
+    parser = MagicMock()
+    parser.extract_facts_from_filing.return_value = []
+    processor = FilingProcessor(
+        store=store, fetcher=fetcher, parser=parser,
+        sec_config={
+            "index_filing_text": True,
+            "max_sections_per_filing": 100,
+            "max_section_chars": 1_000_000,
+            "index_forms": ["10-K"],
+        },
+        parsed_dir=tmp_path / "parsed",
+    )
+
+    assert processor._process_single_filing(_make_filing(accession="ACC-SOFT")) is True
+    sections = store.add_filing_sections.call_args.args[0]
+    assert len(sections) == 1
+    assert len(sections[0].text) == 200

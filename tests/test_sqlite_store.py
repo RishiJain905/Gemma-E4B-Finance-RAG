@@ -586,3 +586,20 @@ def test_get_unprocessed_filings_prefers_unprocessed_over_index_pending(store: S
     assert [r["accession"] for r in rows] == ["acc-new", "acc-pending"]
     assert rows[0]["status"] == "unprocessed"
     assert rows[1]["status"] == "index_pending"
+
+
+def test_get_unprocessed_filings_reserves_index_pending_retry_slots(store: SQLiteStore):
+    for i in range(8):
+        store.register_filing(
+            "AAPL", "10-K", f"2025-0{i+1}-15", "2025-FY", f"acc-new-{i}", "http://sec.gov",
+        )
+    store.register_filing("AAPL", "8-K", "2025-01-01", "2025", "acc-pend", "http://sec.gov")
+    store.mark_filing_index_pending(
+        "acc-pend", file_path="pending.txt", error="No usable filing sections after validation",
+    )
+
+    rows = store.get_unprocessed_filings(limit=5)
+    statuses = [r["status"] for r in rows]
+    assert statuses.count("unprocessed") == 4
+    assert statuses.count("index_pending") == 1
+    assert rows[-1]["accession"] == "acc-pend"

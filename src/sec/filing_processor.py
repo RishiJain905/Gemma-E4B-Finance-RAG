@@ -21,12 +21,17 @@ from typing import Optional
 from .edgar_fetcher import SECEdgarFilingFetcher
 from .event_classifier import RULE_VERSION, SECEventClassifier
 from .filing_parser import TraceAlchemyFilingParser
-from .filing_sections import split_filing_sections
+from .filing_sections import FilingSection, split_filing_sections
 from src.storage.store import Store
 from src.ingestion.normalization import NORMALIZATION_VERSION, content_hash
 from src.ingestion.records import EventRecord, NarrativeRecord
 
 logger = logging.getLogger(__name__)
+
+# Soft cap for indexed section bodies. max_section_chars still drops
+# multi-MB XBRL/exhibit leftovers; this truncates large-but-valid
+# sections so embedding does not OOM the worker.
+_INDEX_SECTION_SOFT_CAP = 250_000
 
 
 class FilingProcessor:
@@ -381,24 +386,56 @@ class FilingProcessor:
         usable_sections = []
         for section in candidates[: self.max_sections_per_filing]:
             if len(section.text) > self.max_section_chars:
-                # Prefer indexing a bounded prefix over dropping the section
-                # entirely (giant exhibits / unsplit flat 10-K bodies).
+                # Drop only the oversized body; siblings remain indexable.
+                # Embedding multi-MB leftovers (XBRL/exhibits) OOMs the worker.
+                skipped += 1
                 logger.warning(
-                    "Truncating oversized SEC section %s (%d chars; cap %d)",
+                    "Skipping oversized SEC section %s (%d chars; cap %d)",
                     section.document_id, len(section.text), self.max_section_chars,
                 )
-                section = replace(section, text=section.text[: self.max_section_chars])
+                continue
+            soft_cap = min(self.max_section_chars, _INDEX_SECTION_SOFT_CAP)
+            if len(section.text) > soft_cap:
+                logger.warning(
+                    "Truncating SEC section %s for embedding (%d -> %d chars)",
+                    section.document_id, len(section.text), soft_cap,
+                )
+                section = replace(section, text=section.text[:soft_cap])
             usable_sections.append(section)
 
         if not usable_sections:
-            reason = "No usable filing sections after validation"
-            self.store.sqlite.mark_filing_index_pending(
-                accession, file_path=str(artifact_path), error=reason,
-            )
-            logger.warning("SEC filing %s index pending: %s", accession, reason)
-            self._index_run_counts["skipped"] += skipped
-            self._index_run_counts["index_pending"] += 1
-            return False
+            # Last resort: bounded whole-document prefix so Item-less short
+            # filings and unsplit flat giants still contribute retrieval text.
+            whole = (text or "").strip()
+            if whole:
+                usable_sections = [
+                    FilingSection(
+                        accession=str(accession),
+                        ticker=str(ticker).upper(),
+                        form=str(filing_type),
+                        filing_date=str(filing.get("filing_date") or ""),
+                        report_period=str(filing.get("period") or ""),
+                        section_key="full_document",
+                        section_heading="Full document",
+                        section_index=0,
+                        text=whole[: min(self.max_section_chars, _INDEX_SECTION_SOFT_CAP)],
+                        source_url=str(filing.get("source_url") or ""),
+                        parsed_path=str(artifact_path),
+                    )
+                ]
+                logger.info(
+                    "Falling back to truncated full_document for %s (%d chars)",
+                    accession, len(usable_sections[0].text),
+                )
+            else:
+                reason = "No usable filing sections after validation"
+                self.store.sqlite.mark_filing_index_pending(
+                    accession, file_path=str(artifact_path), error=reason,
+                )
+                logger.warning("SEC filing %s index pending: %s", accession, reason)
+                self._index_run_counts["skipped"] += skipped
+                self._index_run_counts["index_pending"] += 1
+                return False
 
         # Save structured facts without the legacy whole-document vector or
         # parsed mark. The final mark follows verified section indexing.
