@@ -45,7 +45,17 @@ def mock_processor():
     store = MagicMock()
     fetcher = MagicMock()
     parser = MagicMock()
-    proc = FilingProcessor(store=store, fetcher=fetcher, parser=parser)
+    # Pin legacy (non-index) defaults so unit tests stay independent of sec.yaml.
+    proc = FilingProcessor(
+        store=store, fetcher=fetcher, parser=parser,
+        sec_config={
+            "index_filing_text": False,
+            "index_event_filings": True,
+            "index_forms": ["10-K", "10-Q", "8-K"],
+            "max_sections_per_filing": 200,
+            "max_section_chars": 2_000_000,
+        },
+    )
     return proc
 
 
@@ -164,6 +174,48 @@ def test_process_single_filing_empty_facts(mock_processor):
 
     assert result is False
     mock_processor.store.process_filing.assert_not_called()
+
+
+def test_broad_index_form_uses_text_path_when_indexing_enabled(tmp_path):
+    """Broad 10-K still downloads full text + indexes when index_filing_text is on."""
+    store = MagicMock()
+    store.add_filing_sections.return_value = {
+        "sections_written": 1, "chunks_written": 1, "replacements": 0, "skipped": 0,
+    }
+    store.count_filing_sections.return_value = 1
+    fetcher = MagicMock()
+    fetcher.download_filing_text.return_value = "Item 1. Business\nWe sell widgets.\n"
+    parser = MagicMock()
+    parser.extract_facts_from_filing.return_value = []
+    processor = FilingProcessor(
+        store=store, fetcher=fetcher, parser=parser,
+        sec_config={
+            "index_filing_text": True,
+            "max_sections_per_filing": 100,
+            "max_section_chars": 1_000_000,
+            "index_forms": ["10-K", "10-Q", "8-K"],
+        },
+        parsed_dir=tmp_path / "parsed",
+    )
+    filing = _make_filing(accession="ACC-BROAD-10K")
+    filing["discovery_scope"] = "broad"
+
+    assert processor._process_single_filing(filing) is True
+    fetcher.download_filing_text.assert_called_once()
+    fetcher.download_relevant_documents.assert_not_called()
+    store.add_filing_sections.assert_called_once()
+    store.sqlite.mark_filing_parsed.assert_called_once()
+
+
+def test_process_pending_passes_index_forms_filter(mock_processor):
+    """When indexing is enabled, the pending queue filters to index_forms."""
+    mock_processor.index_filing_text = True
+    mock_processor.index_forms = {"10-K", "10-Q", "8-K"}
+    mock_processor.store.sqlite.get_unprocessed_filings.return_value = []
+    mock_processor.process_pending_filings(limit=7)
+    kwargs = mock_processor.store.sqlite.get_unprocessed_filings.call_args.kwargs
+    assert kwargs["limit"] == 7
+    assert set(kwargs["filing_types"]) == {"10-K", "10-Q", "8-K"}
 
 
 def test_process_single_filing_happy_path(mock_processor):

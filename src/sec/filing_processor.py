@@ -162,7 +162,10 @@ class FilingProcessor:
             {processed: N, failed: N, errors: [...]}
         """
         self._index_run_counts = self._empty_index_counts()
-        unprocessed = self.store.sqlite.get_unprocessed_filings(limit=limit)
+        filing_types = sorted(self.index_forms) if self.index_filing_text else None
+        unprocessed = self.store.sqlite.get_unprocessed_filings(
+            limit=limit, filing_types=filing_types,
+        )
         if not unprocessed:
             logger.info("No unprocessed filings found")
             result = {"processed": 0, "failed": 0, "errors": []}
@@ -210,8 +213,15 @@ class FilingProcessor:
         Returns:
             {processed: N, failed: N, errors: [...]}
         """
-        unprocessed = self.store.sqlite.get_unprocessed_filings(limit=limit)
-        ticker_filings = [f for f in unprocessed if f.get("ticker", "").upper() == ticker.upper()]
+        filing_types = sorted(self.index_forms) if self.index_filing_text else None
+        # Over-fetch then filter by ticker so index-form prioritization still applies.
+        unprocessed = self.store.sqlite.get_unprocessed_filings(
+            limit=max(limit * 20, 50), filing_types=filing_types,
+        )
+        ticker_filings = [
+            f for f in unprocessed
+            if f.get("ticker", "").upper() == ticker.upper()
+        ][:limit]
 
         if not ticker_filings:
             logger.info("No unprocessed filings for %s", ticker)
@@ -270,19 +280,29 @@ class FilingProcessor:
 
         Steps:
           1. Download the filing text from EDGAR
-          2. Run TraceAlchemy parser to extract facts
-          3. Store via Store.process_filing()
+          2. Run TraceAlchemy parser to extract facts (best-effort)
+          3. Store via Store.process_filing() and/or section indexing
           4. Log completion
 
         Returns:
-            True if at least one fact was extracted and stored
+            True when the filing was successfully parsed and/or indexed.
+            Broad non-index forms still use the event evidence path.
         """
         accession = filing.get("accession", "unknown")
         ticker = filing.get("ticker", "")
         filing_type = filing.get("filing_type", "")
         period = filing.get("period", "")
-
-        if str(filing.get("discovery_scope") or "deep").lower() == "broad":
+        form_upper = str(filing_type or "").strip().upper()
+        wants_text_index = (
+            self.index_filing_text and form_upper in self.index_forms
+        )
+        # Broad discovery normally uses the lightweight event path. Indexable
+        # forms (10-K/10-Q/8-K) still need the full text download + section
+        # index path even when discovery_scope is broad.
+        if (
+            not wants_text_index
+            and str(filing.get("discovery_scope") or "deep").lower() == "broad"
+        ):
             return self._process_event_filing(filing)
 
         logger.info(
@@ -300,20 +320,26 @@ class FilingProcessor:
             )
             return False
 
-        # Step 2: Parse
+        # Step 2: Parse (best-effort). Empty facts no longer block indexing for
+        # configured index forms — MiniLM embeddings can index without TraceAlchemy.
         facts = self.parser.extract_facts_from_filing(
             ticker=ticker,
             filing_type=filing_type,
             filing_text=text,
             period=period,
-        )
+        ) or []
 
-        if not facts:
+        if not facts and not wants_text_index:
             logger.warning(
                 "No facts extracted from %s %s (%s)",
                 ticker, filing_type, accession,
             )
             return False
+        if not facts and wants_text_index:
+            logger.info(
+                "No facts extracted from %s %s (%s); continuing with section indexing",
+                ticker, filing_type, accession,
+            )
 
         filing_record = {
             **filing,

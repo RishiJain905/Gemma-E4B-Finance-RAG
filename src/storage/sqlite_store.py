@@ -964,14 +964,39 @@ CREATE INDEX IF NOT EXISTS idx_securities_industry ON securities(industry);
             conn.execute(sql, (file_path, error, accession))
             conn.commit()
 
-    def get_unprocessed_filings(self, limit: int = 10) -> list[dict]:
-        """Get filings that haven't been parsed yet."""
+    def get_unprocessed_filings(
+        self,
+        limit: int = 10,
+        filing_types: Optional[list[str] | tuple[str, ...] | set[str]] = None,
+    ) -> list[dict]:
+        """Get filings that haven't been parsed yet.
+
+        Args:
+            limit: Max rows to return.
+            filing_types: Optional form filter (e.g. 10-K/10-Q/8-K). When set,
+                only those filing_type values are returned so Form 4 / 424B2
+                backlog cannot starve text indexing.
+        """
+        params: list = []
+        type_clause = ""
+        if filing_types:
+            forms = sorted({
+                str(form).upper().strip()
+                for form in filing_types
+                if str(form).strip()
+            })
+            if forms:
+                placeholders = ",".join("?" for _ in forms)
+                type_clause = f" AND UPPER(filing_type) IN ({placeholders})"
+                params.extend(forms)
         sql = (
-            "SELECT * FROM filings WHERE status IN ('unprocessed', 'index_pending') "
+            "SELECT * FROM filings WHERE status IN ('unprocessed', 'index_pending')"
+            f"{type_clause} "
             "ORDER BY filing_date DESC LIMIT ?"
         )
+        params.append(limit)
         with self._connect() as conn:
-            rows = conn.execute(sql, (limit,)).fetchall()
+            rows = conn.execute(sql, params).fetchall()
             return [dict(r) for r in rows]
 
     # ── Cache Management ──────────────────────────────
