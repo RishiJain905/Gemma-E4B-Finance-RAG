@@ -148,3 +148,58 @@ def test_normal_multiline_text_is_not_reflowed() -> None:
     sections = split_filing_sections(text, _metadata())
     assert len(sections) == 1
     assert sections[0].text.splitlines()[-1] == "Short but real body line."
+
+
+def test_flat_8k_decimal_item_is_reflowed() -> None:
+    """Whitespace-collapsed 8-K Item 5.02 / 8.01 markers become sections."""
+    prose = (
+        "On September 4, 2026, the Company announced the appointment of Jane Doe "
+        "as Chief Financial Officer effective immediately. " * 8
+    )
+    flat = (
+        "xbrl soup accession header filler " * 200
+        + "Item 5.02 Departure of Directors or Certain Officers; Election of Directors. "
+        + prose
+        + "Item 9.01 Financial Statements and Exhibits. "
+        + "Exhibit 99.1 Press release dated September 4, 2026. "
+        + "lorem " * 40
+    ).strip()
+    assert "\n" not in flat
+
+    sections = split_filing_sections(flat, {**_metadata(), "filing_type": "8-K"})
+
+    keys = [s.section_key for s in sections]
+    assert "item_5_02" in keys
+    assert any(k.startswith("item_9_01") for k in keys)
+    assert any("Jane Doe" in s.text for s in sections)
+
+
+def test_flat_item_colon_and_dash_headings_are_reflowed() -> None:
+    """INTU/DELL-style ITEM 1: / ITEM 1 — headings survive flat-text reflow."""
+    prose = "The Company designs and sells software products worldwide. " * 15
+    flat = (
+        "submission header filler " * 200
+        + "PART I ITEM 1: Business 4 ITEM 1A: Risk Factors 15 "
+        + "PART I ITEM 1 - BUSINESS BACKGROUND "
+        + prose
+        + "ITEM 1A — RISK FACTORS "
+        + "Investing in our securities involves risk. " * 15
+    ).strip()
+    assert "\n" not in flat
+
+    sections = split_filing_sections(flat, _metadata())
+    keys = [s.section_key for s in sections]
+    assert any(k.startswith("item_1") for k in keys)
+    assert any("software products" in s.text for s in sections)
+
+
+def test_item_less_flat_text_falls_back_to_full_document() -> None:
+    """When no Item/PART markers exist, still emit one indexable section."""
+    text = "filler " * 500 + "The board approved a special dividend of $1.00 per share."
+    assert "\n" not in text.strip()
+
+    sections = split_filing_sections(text, {**_metadata(), "filing_type": "8-K"})
+
+    assert len(sections) == 1
+    assert sections[0].section_key == "full_document"
+    assert "special dividend" in sections[0].text

@@ -497,3 +497,69 @@ def test_live_end_to_end_pipeline(tmp_path):
 
     assert fact_count >= 1, "expected at least one fundamental fact persisted"
     assert parsed_count >= 1, "expected at least one filing marked parsed"
+
+
+def test_oversized_section_is_truncated_not_skipped(tmp_path):
+    """Sections over max_section_chars are truncated and still indexed."""
+    store = MagicMock()
+    store.add_filing_sections.return_value = {
+        "sections_written": 1, "chunks_written": 2, "replacements": 0, "skipped": 0,
+    }
+    store.count_filing_sections.return_value = 1
+    huge = "Item 1. Business\n" + ("A" * 5_000)
+    fetcher = MagicMock()
+    fetcher.download_filing_text.return_value = huge
+    parser = MagicMock()
+    parser.extract_facts_from_filing.return_value = []
+    processor = FilingProcessor(
+        store=store, fetcher=fetcher, parser=parser,
+        sec_config={
+            "index_filing_text": True,
+            "max_sections_per_filing": 100,
+            "max_section_chars": 1000,
+            "index_forms": ["10-K"],
+        },
+        parsed_dir=tmp_path / "parsed",
+    )
+
+    assert processor._process_single_filing(_make_filing(accession="ACC-HUGE")) is True
+    sections = store.add_filing_sections.call_args.args[0]
+    assert len(sections) == 1
+    assert len(sections[0].text) == 1000
+    store.sqlite.mark_filing_index_pending.assert_not_called()
+
+
+def test_index_pending_reuses_local_artifact_without_download(tmp_path):
+    """Retry path reads file_path when present instead of re-downloading."""
+    artifact = tmp_path / "parsed" / "ACC-LOCAL.txt"
+    artifact.parent.mkdir(parents=True)
+    artifact.write_text(
+        "Item 1. Business\nWe sell products worldwide.\n"
+        "Item 7. MD&A\nRevenue grew.\n",
+        encoding="utf-8",
+    )
+    store = MagicMock()
+    store.add_filing_sections.return_value = {
+        "sections_written": 2, "chunks_written": 2, "replacements": 0, "skipped": 0,
+    }
+    store.count_filing_sections.return_value = 2
+    fetcher = MagicMock()
+    parser = MagicMock()
+    parser.extract_facts_from_filing.return_value = []
+    processor = FilingProcessor(
+        store=store, fetcher=fetcher, parser=parser,
+        sec_config={
+            "index_filing_text": True,
+            "max_sections_per_filing": 100,
+            "max_section_chars": 1_000_000,
+            "index_forms": ["10-K"],
+        },
+        parsed_dir=tmp_path / "parsed",
+    )
+    filing = _make_filing(accession="ACC-LOCAL")
+    filing["file_path"] = str(artifact)
+    filing["status"] = "index_pending"
+
+    assert processor._process_single_filing(filing) is True
+    fetcher.download_filing_text.assert_not_called()
+    store.sqlite.mark_filing_parsed.assert_called_once()

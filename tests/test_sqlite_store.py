@@ -573,3 +573,16 @@ def test_list_tickers_uses_canonical_active_symbols_without_aliases(store: SQLit
         conn.commit()
 
     assert store.list_tickers() == ["BRK-B"]
+
+
+def test_get_unprocessed_filings_prefers_unprocessed_over_index_pending(store: SQLiteStore):
+    store.register_filing("AAPL", "10-K", "2025-12-31", "2025-FY", "acc-new", "http://sec.gov")
+    store.register_filing("AAPL", "10-Q", "2025-09-30", "2025-Q3", "acc-pending", "http://sec.gov")
+    store.mark_filing_index_pending(
+        "acc-pending", file_path="pending.txt", error="No usable filing sections after validation",
+    )
+
+    rows = store.get_unprocessed_filings(limit=10)
+    assert [r["accession"] for r in rows] == ["acc-new", "acc-pending"]
+    assert rows[0]["status"] == "unprocessed"
+    assert rows[1]["status"] == "index_pending"

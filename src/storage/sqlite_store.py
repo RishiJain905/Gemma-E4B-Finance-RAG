@@ -989,10 +989,13 @@ CREATE INDEX IF NOT EXISTS idx_securities_industry ON securities(industry);
                 placeholders = ",".join("?" for _ in forms)
                 type_clause = f" AND UPPER(filing_type) IN ({placeholders})"
                 params.extend(forms)
+        # Prefer fresh unprocessed rows so failed index_pending retries cannot
+        # starve the discovery backlog on every drain batch.
         sql = (
             "SELECT * FROM filings WHERE status IN ('unprocessed', 'index_pending')"
             f"{type_clause} "
-            "ORDER BY filing_date DESC LIMIT ?"
+            "ORDER BY CASE status WHEN 'unprocessed' THEN 0 ELSE 1 END, "
+            "filing_date DESC LIMIT ?"
         )
         params.append(limit)
         with self._connect() as conn:

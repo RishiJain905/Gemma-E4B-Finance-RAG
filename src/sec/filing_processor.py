@@ -12,6 +12,7 @@ Usage:
 import logging
 import json
 import re
+from dataclasses import replace
 from pathlib import Path
 import time
 from datetime import datetime, timezone
@@ -310,8 +311,21 @@ class FilingProcessor:
             ticker, filing_type, period, accession,
         )
 
-        # Step 1: Download
-        text = self.fetcher.download_filing_text(filing)
+        # Step 1: Prefer a durable local artifact (index_pending retries), else download.
+        text = None
+        existing_path = str(filing.get("file_path") or "").strip()
+        if existing_path:
+            artifact = Path(existing_path)
+            if artifact.is_file():
+                try:
+                    text = artifact.read_text(encoding="utf-8")
+                except OSError as error:
+                    logger.warning(
+                        "Could not read local filing artifact %s for %s: %s",
+                        artifact, accession, error,
+                    )
+        if not text:
+            text = self.fetcher.download_filing_text(filing)
         if not text:
             logger.warning("No text downloaded for filing %s, marking as error", accession)
             self.store.sqlite.mark_cache_stale(
@@ -367,12 +381,13 @@ class FilingProcessor:
         usable_sections = []
         for section in candidates[: self.max_sections_per_filing]:
             if len(section.text) > self.max_section_chars:
-                skipped += 1
+                # Prefer indexing a bounded prefix over dropping the section
+                # entirely (giant exhibits / unsplit flat 10-K bodies).
                 logger.warning(
-                    "Skipping oversized SEC section %s (%d chars; cap %d)",
+                    "Truncating oversized SEC section %s (%d chars; cap %d)",
                     section.document_id, len(section.text), self.max_section_chars,
                 )
-                continue
+                section = replace(section, text=section.text[: self.max_section_chars])
             usable_sections.append(section)
 
         if not usable_sections:
